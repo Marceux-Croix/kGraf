@@ -76,7 +76,9 @@ fn widget_renders_once_then_idles_and_a_click_selects() {
     let target = view.target().expect("target created");
     let pixels = target.read_pixels(&rs.device, &rs.queue).expect("readback");
     let lit = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[..3] != BACKGROUND_SRGB)
         .count();
     assert!(lit > 50, "the panel shows the galaxy: {lit} lit pixels");
@@ -204,7 +206,9 @@ fn a_project_panel_reports_an_unindexed_directory_then_shows_the_indexed_galaxy(
         .read_pixels(&rs.device, &rs.queue)
         .expect("readback");
     let lit = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[..3] != BACKGROUND_SRGB)
         .count();
     assert!(lit > 0, "the project's galaxy is drawn");

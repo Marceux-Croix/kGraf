@@ -465,11 +465,20 @@ impl ApprovalHook for ShellApprovalHook {
                 // the model wrote this argv, and the user must read the call
                 // that will run, not one an escape sequence painted over it.
                 question: {
-                    let note = verdict
+                    let mut note = verdict
                         .script_note
                         .as_deref()
                         .map(|n| format!(" {n}"))
                         .unwrap_or_default();
+                    // What the user's mode grants on its own goes before
+                    // the allowlist: an unattended denial quotes this
+                    // question, and a worker that reads only the allowlist
+                    // takes a granted program (`cp` in Accept edits) for a
+                    // refused one and works around it.
+                    if let Some(grants) = self.policy.mode_program_grants() {
+                        note.push(' ');
+                        note.push_str(&grants);
+                    }
                     match self.policy.build_allowlist() {
                         build if build.is_empty() => {
                             format!("Run `{}`?{note}", crate::quote_argv(&cmd))

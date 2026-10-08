@@ -5944,7 +5944,10 @@ async fn a_hosted_run_answers_a_workers_question_through_the_planner_first() {
         )
         .await
         .expect("answered");
-    assert_eq!(answer, "src/a.txt");
+    // A lead says the orchestrator answered, not the user, and grants nothing.
+    let (lead, body) = answer.split_once("\n\n").expect("a lead, then the answer");
+    assert_eq!(body, "src/a.txt");
+    assert!(lead.contains("not by the user"), "{lead}");
     assert_eq!(script.answers.load(Ordering::SeqCst), 1, "one answer call");
     let rows: Vec<_> = host
         .ledger()
@@ -7844,6 +7847,70 @@ fn an_output_cap_above_the_models_limit_is_lowered_with_a_notice() {
     let notes = host.output_clamp_notes(131_072, 131_072);
     assert_eq!(notes.len(), 2, "{notes:?}");
     assert!(host.output_clamp_notes(4_096, 4_096).is_empty());
+}
+
+/// A planner reasoning level reaches the planner's caller and is said at
+/// every run's start; without one, the caller carries none and nothing is
+/// said.
+#[test]
+fn a_planner_reasoning_level_reaches_the_planner_caller_and_is_said() {
+    use kgraf_provider::ReasoningEffort;
+    for level in [None, Some(ReasoningEffort::Off), Some(ReasoningEffort::Low)] {
+        let (_dir, mut config) = project();
+        config.routes = vec!["ollama:zz-unlisted-model".into()];
+        config.planner = Some("ollama:zz-unlisted-model".into());
+        config.planner_reasoning = level;
+        let host = Host::open(config).expect("open");
+        let caller = host.planner_caller("a", "t").expect("caller");
+        assert_eq!(caller.reasoning_effort, level);
+        let mut said = Vec::new();
+        host.startup(&mut |n| said.push(n)).expect("startup");
+        let sentences: Vec<_> = said
+            .iter()
+            .filter_map(|n| match n {
+                crate::Notice::PlannerReasoning(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        match level {
+            None => assert!(sentences.is_empty(), "{said:?}"),
+            Some(ReasoningEffort::Off) => {
+                assert_eq!(sentences.len(), 1, "{said:?}");
+                assert!(
+                    sentences[0].contains("`ollama:zz-unlisted-model` asks for no reasoning")
+                        && sentences[0].contains("fails its call"),
+                    "{}",
+                    sentences[0]
+                );
+            }
+            Some(_) => {
+                assert_eq!(sentences.len(), 1, "{said:?}");
+                assert!(
+                    sentences[0].contains("level `low`")
+                        && sentences[0].contains("does not check it"),
+                    "{}",
+                    sentences[0]
+                );
+            }
+        }
+    }
+}
+
+/// A run file without the setting reads as no setting, and a run without
+/// the setting writes no field, so older files and runs are unchanged.
+#[test]
+fn a_run_file_without_planner_reasoning_is_unchanged() {
+    let (_dir, config) = project();
+    let text = serde_json::to_string(&config).expect("json");
+    assert!(!text.contains("planner_reasoning"), "{text}");
+    let back: crate::RunConfig = serde_json::from_str(&text).expect("read back");
+    assert_eq!(back.planner_reasoning, None);
+    let mut with = config.clone();
+    with.planner_reasoning = Some(kgraf_provider::ReasoningEffort::Off);
+    let text = serde_json::to_string(&with).expect("json");
+    assert!(text.contains("\"planner_reasoning\":\"off\""), "{text}");
+    let back: crate::RunConfig = serde_json::from_str(&text).expect("read back");
+    assert_eq!(back.planner_reasoning, with.planner_reasoning);
 }
 
 /// A model the catalog does not list has no known limit: the cap stands and

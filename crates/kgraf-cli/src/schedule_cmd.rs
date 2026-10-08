@@ -673,6 +673,8 @@ fn run_now_with(
             shell_timeout: args.shell_timeout,
             fetch_deps: args.fetch_deps,
             planner_max_tokens: args.planner_max_tokens,
+            // A scheduled run keeps the provider's default reasoning.
+            planner_reasoning: None,
             retry_gate: None,
             waive_gate: None,
             gate_note: None,

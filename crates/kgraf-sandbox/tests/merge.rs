@@ -1367,8 +1367,28 @@ fn a_hung_git_is_killed_at_the_timeout() {
         git_timeout: std::time::Duration::from_secs(2),
         ..Limits::default()
     };
-    let mb =
-        MergeBack::open_with(e.mgr.clone(), BRANCH, identity(), limits, Git::at(script)).unwrap();
+    // Linux refuses to run a file another process holds open for writing
+    // ("Text file busy"): a thread of this test binary that forks while the
+    // script is being written keeps a copy of the write handle until it runs
+    // its own program. That clears within moments, so retry for a bounded time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mb = loop {
+        match MergeBack::open_with(
+            e.mgr.clone(),
+            BRANCH,
+            identity(),
+            limits.clone(),
+            Git::at(script.clone()),
+        ) {
+            Err(err)
+                if format!("{err:?}").contains("ExecutableFileBusy")
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.unwrap(),
+        }
+    };
     let mut a = attempt(&e, "a");
     write(&a, "x", "x\n");
     let started = std::time::Instant::now();

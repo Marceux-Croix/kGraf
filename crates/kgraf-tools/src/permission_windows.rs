@@ -674,8 +674,10 @@ fn decode_utf16le_base64(text: &str) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| u16::from_le_bytes(*p))
         .collect();
     String::from_utf16(&units).ok()
 }

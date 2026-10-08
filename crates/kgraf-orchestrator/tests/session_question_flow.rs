@@ -72,6 +72,7 @@ fn unhang(p: &Parts) {
 
 fn plan_model_caller(p: &Parts, provider: Arc<ScriptFake>) -> ModelCaller {
     ModelCaller {
+        reasoning_effort: None,
         provider,
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),
@@ -189,6 +190,22 @@ impl QuestionAnswerer for Fake {
     }
 }
 
+/// What a worker reads for the orchestrator's answer: a lead saying the
+/// orchestrator answered, not the user, and that the answer grants no
+/// permission, then the answer. A bare "Yes" to "can you approve this
+/// command?" was read by a worker as the user's grant.
+fn assert_orchestrator_answer(answer: &str) {
+    let (lead, body) = answer
+        .split_once("\n\n")
+        .unwrap_or_else(|| panic!("a lead, then the answer: {answer:?}"));
+    assert_eq!(body, ANSWER);
+    assert!(
+        lead.contains("by the orchestrator") && lead.contains("not by the user"),
+        "{lead}"
+    );
+    assert!(lead.contains("grants no permission"), "{lead}");
+}
+
 /// A plan whose contracts are pinned to routes: `(id, instruction, path, route)`.
 fn routed_plan(contracts: &[(&str, &str, &str, &str)]) -> String {
     let list: Vec<serde_json::Value> = contracts
@@ -290,7 +307,7 @@ async fn an_orchestrator_first_answer_is_one_ledgered_call_settled_at_its_row() 
         )
         .await
         .expect("answered");
-    assert_eq!(answer, ANSWER);
+    assert_orchestrator_answer(&answer);
 
     let rows: Vec<_> = p
         .ledger
@@ -775,7 +792,7 @@ async fn a_late_answer_answers_the_question_still_open_in_the_box() {
         .expect("answered in time")
         .expect("join")
         .expect("answered");
-    assert_eq!(answer, ANSWER);
+    assert_orchestrator_answer(&answer);
     assert!(handle.pending_questions().await.is_empty());
     unhang(&p);
     handle.stop().await;
@@ -1834,9 +1851,9 @@ async fn session_texts_are_stored_scrubbed_and_read_by_the_model_whole() {
         .await
         .expect("answered");
     assert_eq!(
-        answer,
-        format!("use {secret}"),
-        "the worker reads the whole answer"
+        answer.split_once("\n\n").map(|(_, body)| body),
+        Some(format!("use {secret}").as_str()),
+        "the worker reads the whole answer, after the lead naming who answered"
     );
     assert!(
         model.prompts().join("\n").contains(secret),

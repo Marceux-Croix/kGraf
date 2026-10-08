@@ -397,6 +397,15 @@ enum Command {
         /// setting, else 32,768.
         #[arg(long)]
         planner_max_tokens: Option<u32>,
+        /// Reasoning level of every orchestrator call on the planner's route:
+        /// off, low, medium or high. Without it, no reasoning field is sent
+        /// and the provider's default applies. `off` is sent where a wire form
+        /// is verified to turn reasoning off (Chat Completions: `none`), and
+        /// an answer that still carries reasoning fails its call; an adapter
+        /// with no verified off form refuses the call. A graded level cannot
+        /// be checked from an answer, and the run says so when it opens.
+        #[arg(long)]
+        planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
         /// Seconds a worker's question waits for the orchestrator's model to
         /// answer it, and a connection judgment may run (30 to 1800). A
         /// later answer still reaches the worker at its next round. Default:
@@ -600,8 +609,8 @@ enum Command {
         #[command(subcommand)]
         action: DepsAction,
     },
-    /// Checks of kGraf's sandbox on this machine. Not listed in `--help`.
-    #[command(hide = true)]
+    /// Set up and check kGraf's sandbox on this machine. Windows needs a
+    /// one-time setup with administrator rights; macOS and Linux need none.
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
@@ -610,9 +619,44 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SandboxAction {
+    /// Create the sandbox users and firewall rules (Windows; asks for
+    /// administrator rights once). Running it again refreshes them.
+    Setup {
+        /// A name suffix for a separate test setup.
+        #[arg(long, hide = true)]
+        tag: Option<String>,
+    },
+    /// Remove everything `setup` created (Windows; asks for administrator
+    /// rights).
+    Remove {
+        #[arg(long, hide = true)]
+        tag: Option<String>,
+    },
+    /// Show what the setup created and whether it is complete.
+    Status {
+        #[arg(long, hide = true)]
+        tag: Option<String>,
+    },
+    /// The step `setup` and `remove` start with administrator rights.
+    #[command(hide = true)]
+    Elevated {
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        owner_pid: u32,
+        #[arg(long)]
+        owner_sid: String,
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Run one command under a proxy-only network policy with a hidden
     /// folder, and report whether the sandbox held. Exits with an error when
     /// the system denies what the sandbox needs.
+    #[command(hide = true)]
     Selfcheck,
 }
 
@@ -1170,6 +1214,7 @@ fn run_cli() -> Result<()> {
             check_compile_timeout,
             shell_timeout,
             planner_max_tokens,
+            planner_reasoning,
             retry_gate,
             waive_gate,
             gate_note,
@@ -1241,6 +1286,7 @@ fn run_cli() -> Result<()> {
                     check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
                     shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
                     planner_max_tokens: limits.planner_max_tokens.0,
+                    planner_reasoning,
                     retry_gate,
                     waive_gate,
                     gate_note,
@@ -1443,6 +1489,17 @@ fn run_cli() -> Result<()> {
             DiagAction::Export { out } => diag_cmd::export(out, &root),
         },
         Command::Sandbox { action } => match action {
+            SandboxAction::Setup { tag } => sandbox_cmd::setup(tag.as_deref()),
+            SandboxAction::Remove { tag } => sandbox_cmd::remove(tag.as_deref()),
+            SandboxAction::Status { tag } => sandbox_cmd::status(tag.as_deref()),
+            SandboxAction::Elevated {
+                action,
+                pipe,
+                nonce,
+                owner_pid,
+                owner_sid,
+                tag,
+            } => sandbox_cmd::elevated(&action, pipe, nonce, owner_pid, owner_sid, tag),
             SandboxAction::Selfcheck => sandbox_cmd::selfcheck(),
         },
         Command::Deps { action } => match action {
@@ -2568,6 +2625,39 @@ mod tests {
             let with: Vec<&str> = base.iter().copied().chain(["--keep-worktrees"]).collect();
             assert!(kept(&with));
         }
+    }
+
+    /// `--planner-reasoning` is absent by default, takes the four levels by
+    /// name, and refuses any other word, `none` included.
+    #[test]
+    fn planner_reasoning_takes_a_named_level_and_is_absent_by_default() {
+        let parse = |extra: &[&str]| {
+            let base = [
+                "kgraf",
+                "orchestrate",
+                "--route",
+                "ollama:llama3",
+                "--prices",
+                "p.json",
+            ];
+            Cli::try_parse_from(base.iter().chain(extra.iter()).copied()).map(|cli| {
+                let Command::Orchestrate {
+                    planner_reasoning, ..
+                } = cli.command
+                else {
+                    panic!("not orchestrate");
+                };
+                planner_reasoning
+            })
+        };
+        assert_eq!(parse(&[]).expect("parse"), None);
+        for level in kgraf_provider::ReasoningEffort::ALL {
+            assert_eq!(
+                parse(&["--planner-reasoning", level.as_str()]).expect("parse"),
+                Some(level)
+            );
+        }
+        assert!(parse(&["--planner-reasoning", "none"]).is_err());
     }
 
     /// Decision 0089: `--model-route` is repeatable on both run commands and

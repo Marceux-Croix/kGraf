@@ -14,9 +14,13 @@ use crate::{
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// An absent `path`, or an empty or blank one, is `default`: models send
+/// `{"path": ""}` for the workspace root, which the descriptions call the
+/// default, and opening the empty path failed with "cannot open :".
 fn path_field<'a>(input: &'a Value, default: &'a str) -> Result<&'a Path, ToolError> {
     match input.get("path") {
         None => Ok(Path::new(default)),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(Path::new(default)),
         Some(v) => v
             .as_str()
             .map(Path::new)
@@ -603,6 +607,23 @@ mod tests {
             .await
             .expect("call");
         assert_eq!(out.render(), "a_dir/\nb.txt");
+    }
+
+    /// An empty or blank `path` lists the workspace root, the default the
+    /// description names; it failed with "cannot open :" before.
+    #[tokio::test]
+    async fn list_directory_reads_an_empty_path_as_the_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("b.txt"), "").expect("seed");
+        for path in ["", "  "] {
+            let input = json!({ "path": path });
+            ListDirectoryTool.access(&input).expect("access");
+            let out = ListDirectoryTool
+                .call(input, &ctx(dir.path().to_path_buf()), &permit())
+                .await
+                .expect("call");
+            assert_eq!(out.render(), "b.txt", "path {path:?}");
+        }
     }
 
     /// Regression: listing a symlinked directory used

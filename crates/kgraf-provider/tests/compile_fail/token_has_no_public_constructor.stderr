@@ -1,5 +1,5 @@
-error[E0599]: no function or associated item named `new` found for struct `CallToken<'ledger>` in the current scope
+error[E0599]: no associated function or constant named `new` found for struct `CallToken<'ledger>` in the current scope
   --> tests/compile_fail/token_has_no_public_constructor.rs:10:29
    |
 10 |     let _token = CallToken::new();
-   |                             ^^^ function or associated item not found in `CallToken<'_>`
+   |                             ^^^ associated function or constant not found in `CallToken<'_>`

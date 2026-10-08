@@ -138,6 +138,24 @@ pub enum ProviderError {
         stop_reason: String,
     },
 
+    /// The request asked for reasoning off ([`crate::ReasoningEffort::Off`])
+    /// and the answer carried reasoning anyway: the server ignored the
+    /// control. Raised after the call is settled, so its tokens are in the
+    /// ledger. The answer is not returned, because a caller that chose "off"
+    /// must not get a full-length think as if the setting had worked.
+    #[error(
+        "`{adapter}` was asked for no reasoning, but model `{model}` answered with \
+         {reasoning_chars} characters of reasoning text and {reasoning_tokens} reported \
+         reasoning tokens: the server ignored the reasoning-off setting. The call was billed \
+         and recorded. Remove the setting for this route, or use a server that honors it"
+    )]
+    ReasoningNotOff {
+        adapter: &'static str,
+        model: String,
+        reasoning_chars: usize,
+        reasoning_tokens: u64,
+    },
+
     /// Usage arrived but could not be normalized.
     #[error("cannot normalize usage from `{adapter}`")]
     Usage {

@@ -135,6 +135,7 @@ futures-executor = "0.3"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
+ignore = "0.4.33"
 # Maintained fork of the archived serde_yaml; SKILL.md frontmatter is YAML, and a
 # hand-rolled subset parser would misread the files it does not expect.
 serde_yaml_ng = "0.10"

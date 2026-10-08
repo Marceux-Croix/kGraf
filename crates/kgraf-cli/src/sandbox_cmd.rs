@@ -162,3 +162,169 @@ mod tests {
         }
     }
 }
+
+// ---- the Windows sandbox user (decision 0097) -------------------------------
+
+/// Where this user's sandbox passwords are kept (sealed for this user).
+#[cfg(windows)]
+fn credentials_path(tag: Option<&str>) -> Result<std::path::PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", kgraf_diag::paths::APP_NAME)
+        .ok_or_else(|| anyhow::anyhow!("cannot find this user's configuration folder"))?;
+    let file = match tag {
+        Some(t) => format!("sandbox-credentials-{t}.bin"),
+        None => "sandbox-credentials.bin".to_owned(),
+    };
+    Ok(dirs.config_dir().join(file))
+}
+
+#[cfg(windows)]
+fn owner_names(tag: Option<&str>) -> Result<kgraf_sandbox::sandbox_user::OwnerNames> {
+    use kgraf_sandbox::sandbox_user::{OwnerNames, windows::accounts};
+    let sid = accounts::current_user_sid()?;
+    Ok(OwnerNames::derive(&sid, tag)?)
+}
+
+#[cfg(windows)]
+fn print_event(
+    names: &kgraf_sandbox::sandbox_user::OwnerNames,
+    e: &kgraf_sandbox::sandbox_user::handshake::Event,
+) {
+    use kgraf_sandbox::sandbox_user::handshake::Event;
+    use kgraf_sandbox::sandbox_user::plan::StepId;
+    match e {
+        Event::Started => println!("The administrator step started."),
+        Event::Step { key, outcome } => {
+            let what = StepId::from_key(key).map_or_else(|| key.clone(), |s| s.describe(names));
+            println!("  {outcome:<12} {what}");
+        }
+        Event::Failed { key, message } => eprintln!("  failed       {key}: {message}"),
+        Event::PasswordReceived(role) => println!("  received     the {role} user's password"),
+        Event::Finished => println!("The administrator step finished."),
+    }
+}
+
+#[cfg(windows)]
+fn launch_exe() -> Result<String> {
+    Ok(std::env::current_exe()?.to_string_lossy().into_owned())
+}
+
+/// `kgraf sandbox setup`.
+pub fn setup(tag: Option<&str>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use kgraf_sandbox::sandbox_user::windows::setup::{Launch, setup};
+        let names = owner_names(tag)?;
+        let store = credentials_path(tag)?;
+        let exe = launch_exe()?;
+        println!(
+            "kGraf asks Windows for administrator rights once, to create its sandbox users and firewall rules."
+        );
+        setup(
+            &names,
+            &Launch {
+                exe: &exe,
+                subcommand: "sandbox elevated",
+            },
+            &store,
+            &mut |e| print_event(&names, e),
+        )?;
+        println!(
+            "The Windows sandbox user is set up. Passwords are stored for this Windows user only."
+        );
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        println!("{}", kgraf_sandbox::sandbox_user::no_setup_needed_notice());
+        Ok(())
+    }
+}
+
+/// `kgraf sandbox remove`.
+pub fn remove(tag: Option<&str>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use kgraf_sandbox::sandbox_user::windows::setup::{Launch, remove};
+        let names = owner_names(tag)?;
+        let store = credentials_path(tag)?;
+        let exe = launch_exe()?;
+        remove(
+            &names,
+            &Launch {
+                exe: &exe,
+                subcommand: "sandbox elevated",
+            },
+            &store,
+            &mut |e| print_event(&names, e),
+        )?;
+        println!("The Windows sandbox user and its firewall rules are removed.");
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        println!("{}", kgraf_sandbox::sandbox_user::no_setup_needed_notice());
+        Ok(())
+    }
+}
+
+/// `kgraf sandbox status`.
+pub fn status(tag: Option<&str>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let names = owner_names(tag)?;
+        let store = credentials_path(tag)?;
+        let report = kgraf_sandbox::sandbox_user::windows::setup::status(&names, &store)?;
+        println!("{report}");
+        if !report.ready {
+            bail!("the Windows sandbox user is not fully set up");
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        println!("{}", kgraf_sandbox::sandbox_user::no_setup_needed_notice());
+        Ok(())
+    }
+}
+
+/// The hidden step `setup` and `remove` start with administrator rights.
+pub fn elevated(
+    action: &str,
+    pipe: String,
+    nonce: String,
+    owner_pid: u32,
+    owner_sid: String,
+    tag: Option<String>,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use kgraf_sandbox::sandbox_user::windows::setup::{
+            ElevatedAction, ElevatedArgs, elevated_main,
+        };
+        let action = match action {
+            "setup" => ElevatedAction::Setup,
+            "remove" => ElevatedAction::Remove,
+            other => bail!("unknown elevated action `{other}`"),
+        };
+        let code = elevated_main(&ElevatedArgs {
+            action,
+            pipe,
+            nonce,
+            owner_pid,
+            owner_sid,
+            tag,
+        });
+        if code != 0 {
+            std::process::exit(code);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (action, pipe, nonce, owner_pid, owner_sid, tag);
+        bail!("the elevated sandbox step exists only on Windows")
+    }
+}

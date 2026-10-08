@@ -66,6 +66,10 @@ jobs:
 
       - name: Run the bundle
         shell: bash
+        env:
+          # The runner is elevated and throwaway, so the sandbox user setup
+          # test may create its tagged test users and firewall rules.
+          KGRAF_SANDBOX_SETUP_TEST: "1"
         run: |
           set -u
           stage="$(ls -d target/wintest/bundle/kgraf-wintest-*/ | head -1)"

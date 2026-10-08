@@ -270,9 +270,86 @@ impl Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// No reasoning at all. Only an adapter that has a wire form proved to
+    /// turn reasoning off sends it; every other adapter refuses it before the
+    /// request goes out. An adapter that sends it checks the answer with
+    /// [`check_reasoning_off`], so a server that ignores it is an error, not
+    /// a silent full-length think.
+    Off,
     Low,
     Medium,
     High,
+}
+
+impl ReasoningEffort {
+    /// Every level, in the order a user is shown them.
+    pub const ALL: [ReasoningEffort; 4] = [
+        ReasoningEffort::Off,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+
+    /// The level's name as kGraf spells it in flags and files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "off",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == text)
+            .ok_or_else(|| {
+                format!(
+                    "`{text}` is not a reasoning level; use one of: {}",
+                    Self::ALL.map(Self::as_str).join(", ")
+                )
+            })
+    }
+}
+
+/// Refuse an answer that carries reasoning when the request asked for none.
+///
+/// A server that does not know the off control ignores it and thinks at full
+/// length, and nothing else in the answer says so. Reasoning text in the
+/// answer, or reasoning tokens in its usage, is the evidence. Called by an
+/// adapter after the call is settled in the ledger: the call billed, and the
+/// error says that the setting had no effect. A request that did not ask for
+/// [`ReasoningEffort::Off`] always passes.
+pub fn check_reasoning_off(
+    adapter: &'static str,
+    request: &Request,
+    response: &Response,
+) -> Result<(), crate::ProviderError> {
+    if request.reasoning_effort != Some(ReasoningEffort::Off) {
+        return Ok(());
+    }
+    let reasoning_chars = response.reasoning().chars().count();
+    let reasoning_tokens = response.usage.reasoning_output;
+    if reasoning_chars == 0 && reasoning_tokens == 0 {
+        return Ok(());
+    }
+    Err(crate::ProviderError::ReasoningNotOff {
+        adapter,
+        model: response.model.clone(),
+        reasoning_chars,
+        reasoning_tokens,
+    })
 }
 
 /// A tool the model may call.
@@ -454,6 +531,75 @@ mod tests {
             request_id: None,
             finish_reason: Some("stop".into()),
         }
+    }
+
+    fn asking(effort: Option<ReasoningEffort>) -> Request {
+        let mut request = Request::new("m", "q", 100);
+        request.reasoning_effort = effort;
+        request
+    }
+
+    /// The off check refuses reasoning text and reported reasoning tokens
+    /// alike, and passes an answer without either.
+    #[test]
+    fn an_answer_with_reasoning_is_refused_when_reasoning_was_asked_off() {
+        let off = asking(Some(ReasoningEffort::Off));
+        let thought = reply(
+            vec![
+                Content::Reasoning { text: "hm".into() },
+                Content::text("391"),
+            ],
+            5,
+            0,
+        );
+        match check_reasoning_off("t", &off, &thought) {
+            Err(crate::ProviderError::ReasoningNotOff {
+                reasoning_chars,
+                reasoning_tokens,
+                ..
+            }) => assert_eq!((reasoning_chars, reasoning_tokens), (2, 0)),
+            other => panic!("expected ReasoningNotOff, got {other:?}"),
+        }
+        // Hidden reasoning that the usage still counts is the same failure.
+        let hidden = reply(vec![Content::text("391")], 4, 120);
+        assert!(matches!(
+            check_reasoning_off("t", &off, &hidden),
+            Err(crate::ProviderError::ReasoningNotOff {
+                reasoning_tokens: 120,
+                ..
+            })
+        ));
+        let plain = reply(vec![Content::text("391")], 4, 0);
+        assert!(check_reasoning_off("t", &off, &plain).is_ok());
+    }
+
+    /// Only "off" is checked: no setting and a graded level pass an answer
+    /// that reasons, so a run without the setting is unchanged.
+    #[test]
+    fn the_off_check_leaves_every_other_level_alone() {
+        let thought = reply(vec![Content::Reasoning { text: "hm".into() }], 5, 9);
+        for effort in [
+            None,
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+        ] {
+            assert!(check_reasoning_off("t", &asking(effort), &thought).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_reasoning_level_reads_back_from_its_own_name_and_refuses_others() {
+        for level in ReasoningEffort::ALL {
+            assert_eq!(level.as_str().parse::<ReasoningEffort>(), Ok(level));
+            // The file form is the flag form.
+            assert_eq!(
+                serde_json::to_value(level).ok(),
+                Some(serde_json::json!(level.as_str()))
+            );
+        }
+        let error = "none".parse::<ReasoningEffort>().unwrap_err();
+        assert!(error.contains("off, low, medium, high"), "{error}");
     }
 
     /// A local server counted 1,659 output tokens for a reply that carried

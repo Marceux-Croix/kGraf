@@ -239,6 +239,12 @@ qualified name still picks its one node).
 
 An index pass skips `target`, `node_modules`, `.git` and similar tool output at any depth,
 and `build`, `dist`, `venv` and the like only at the top level, so `src/build/` is indexed.
+An index pass also honors the project's `.gitignore` files (the root file and any file in a
+subfolder) and the root's `.git/info/exclude`, so a file git ignores is not indexed. It does
+not read your global git excludes, a `.ignore` file, or a `.gitignore` in a folder above the
+project, so the same repository gives the same index on every machine. Folders that start with
+a dot, such as `.github`, are indexed; only `.git` is always skipped. A file that becomes
+ignored loses its rows at the next pass.
 It prints the excluded directories, files over 2 MiB, files whose bytes are not UTF-8, and
 any symbolic link or unreadable file whose indexed rows it kept.
 
@@ -1373,6 +1379,13 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   `--planner-max-tokens` (default 32,768) is the output limit of each orchestrator call. An
   answer cut off at that limit fails and names the flag; interface contracts carry whole
   files, so they may need more. See "Run limits" below for where the default comes from.
+- `--planner-reasoning <off|low|medium|high>` sets the reasoning level of each orchestrator
+  call on the planner's route. Without it, no reasoning field is sent. `off` is checked on
+  every answer: an answer that still carries reasoning fails its call, so a server that
+  ignores the setting is visible at once. A provider with no verified off control refuses
+  the call before sending it. A graded level is sent but cannot be checked; the run says
+  so when it opens. Which servers honor which level: [MODEL-SUPPORT.md](MODEL-SUPPORT.md),
+  "Known limits".
 - One Rust interface costs about 12.5 seconds of checks and one Python interface about
   5.4 seconds on a small project. The run report says whether checks were on.
 
@@ -1593,6 +1606,39 @@ an inventory is there.
   tool and their prompt is unchanged.
 
 The orchestrator's own planning calls use no tools, so skills apply to workers only.
+
+## Windows: the sandbox user (`kgraf sandbox setup`)
+
+On Windows, kGraf runs sandboxed commands as a dedicated local user, so Git Bash
+and Windows' own TLS (Schannel) work inside the sandbox and the sandbox user's
+network can be blocked (decision 0097). This needs administrator rights once per
+machine:
+
+```
+kgraf sandbox setup     # asks for administrator rights through the UAC prompt
+kgraf sandbox status    # what exists; needs no administrator rights
+kgraf sandbox remove    # undoes everything setup made; asks for administrator rights
+```
+
+What `setup` creates, for the Windows user who runs it:
+
+- two local users, `kgraf-off-<hash>` (no network but kGraf's proxy) and
+  `kgraf-on-<hash>` (network open, for dependency installs), in a local group
+  `kgraf-sandbox-<hash>`; the hash comes from your Windows account's SID;
+- the users may not log on remotely, over the network, as a batch job or as a
+  service, and they are hidden from the sign-in screen;
+- four Windows Firewall block rules for the offline user: everything off this
+  machine, inbound from off this machine, local TCP except kGraf's proxy ports
+  47100 to 47131, and local UDP;
+- an undo record under `%ProgramData%\kGraf\sandbox\`.
+
+The users' passwords are random, 40 characters long, and stored only for your
+Windows user, sealed with Windows' data protection (DPAPI), in kGraf's configuration
+folder. Running `setup` again resets the passwords and refreshes the rules. Setup
+stops with a message if Windows Firewall is off or a group policy makes local rules
+ineffective, and it never takes over an account it did not create.
+
+On macOS and Linux these commands say that no setup is needed.
 
 ## Windows sandbox: checks and the worker shell run with the network open
 

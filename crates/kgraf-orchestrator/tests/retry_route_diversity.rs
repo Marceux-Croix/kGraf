@@ -52,6 +52,7 @@ async fn run_with_policy(routing: RoutingPolicy) -> (usize, usize) {
     let alpha = Arc::new(StallFake::default());
     let beta = Arc::new(StallFake::default());
     let caller = |provider: Arc<ScriptFake>| ModelCaller {
+        reasoning_effort: None,
         provider,
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),

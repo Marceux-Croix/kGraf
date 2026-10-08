@@ -338,7 +338,7 @@ pub const CATALOG: &[Entry] = &[
         refuses_temperature_with_reasoning: false,
         requires_credential: true,
         shares_credential_with: Some("kimi"),
-        confidence: Confidence::Documented,
+        confidence: Confidence::Verified,
         streamed_usage: None,
         reasoning_visibility: ReasoningVisibility::None,
         reasoning_dialect: ReasoningDialect::Inclusive,
@@ -362,7 +362,7 @@ pub const CATALOG: &[Entry] = &[
         refuses_temperature_with_reasoning: false,
         requires_credential: true,
         shares_credential_with: None,
-        confidence: Confidence::Documented,
+        confidence: Confidence::Verified,
         // Verified against a recorded live stream (verified against a real server), not the earlier
         // recollection: `tests/fixtures/2026-09-26-kimi-chat-stream.sse`
         // carries usage inside `choices[0].usage` on the finish chunk
@@ -378,9 +378,8 @@ pub const CATALOG: &[Entry] = &[
                refused here with 401; they use the kimi-code route. Documentation \
                moved to platform.kimi.ai. First live call 2026-09-26 (kimi-k3): \
                model echoed, reasoning tokens reported in completion details, and \
-               cache writes reported in prompt details; the cache-read field has not \
-               yet been seen on a warm call, so the usage shape is not fully verified. \
-               A live streamed call on 2026-09-26 confirmed usage arrives inside \
+               cache writes reported in prompt details. A live run on 2026-09-28 \
+               showed a cache read of 256 tokens on a second call. A live streamed call on 2026-09-26 confirmed usage arrives inside \
                `choices[0].usage`, repeated verbatim top-level on the closing chunk.",
     },
     Entry {
@@ -416,7 +415,7 @@ pub const CATALOG: &[Entry] = &[
         refuses_temperature_with_reasoning: false,
         requires_credential: true,
         shares_credential_with: None,
-        confidence: Confidence::Verified,
+        confidence: Confidence::Documented,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         reasoning_visibility: ReasoningVisibility::Full,
         reasoning_dialect: ReasoningDialect::Inclusive,
@@ -606,7 +605,7 @@ pub const CATALOG: &[Entry] = &[
         refuses_temperature_with_reasoning: false,
         requires_credential: false,
         shares_credential_with: None,
-        confidence: Confidence::Documented,
+        confidence: Confidence::Verified,
         streamed_usage: Some((StreamedUsageLocation::TopLevelChunk, Confidence::Unverified)),
         // Full: a thinking model's text arrives whole as `reasoning` (streamed
         // `delta.reasoning`, buffered `message.reasoning`), recorded live with
@@ -2073,6 +2072,66 @@ mod tests {
                 Confidence::Unverified
             };
             assert_eq!(claim.confidence, expected, "{}", claim.route);
+        }
+    }
+
+    /// The generative routes with a recorded live exchange, and the date of
+    /// the first one, as `docs/MODEL-SUPPORT.md` records them. A route is added
+    /// here only together with its recorded exchange.
+    const LIVE_RECORDED_GENERATIVE: &[(&str, &str)] = &[
+        ("anthropic", "2026-09-28"),
+        ("openai", "2026-09-26"),
+        ("kimi-anthropic", "2026-09-26"),
+        ("kimi", "2026-09-26"),
+        ("ollama", "2026-09-28"),
+    ];
+
+    #[test]
+    fn the_catalog_confidence_matches_the_recorded_live_exchanges() {
+        let support = include_str!("../../../docs/MODEL-SUPPORT.md");
+        let mut seen = 0;
+        for line in support.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            // `| generative | `id` | vendor | wire | status |` splits to 7 cells.
+            if cells.len() != 7 || cells[1] != "generative" {
+                continue;
+            }
+            let id = cells[2].trim_matches('`');
+            let status = cells[5];
+            let entry = CATALOG
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("{id} is in MODEL-SUPPORT.md but not in the catalog"));
+            seen += 1;
+            let recorded = LIVE_RECORDED_GENERATIVE.iter().find(|(r, _)| *r == id);
+            match recorded {
+                Some((_, date)) => {
+                    assert!(
+                        status.starts_with("VERIFIED") && status.contains(date),
+                        "{id}: the doc row must say VERIFIED with {date}, has {status:?}"
+                    );
+                    assert_eq!(entry.confidence, Confidence::Verified, "{id}");
+                }
+                None => {
+                    assert!(
+                        status.starts_with("BUILT, UNTESTED"),
+                        "{id}: no live exchange is listed for it, yet the doc says {status:?}"
+                    );
+                    assert_ne!(
+                        entry.confidence,
+                        Confidence::Verified,
+                        "{id} has no recorded live exchange, so it cannot be Verified"
+                    );
+                }
+            }
+        }
+        assert!(seen >= 20, "the doc table was not parsed: {seen} rows");
+        // Every route listed as recorded must be in the doc table.
+        for (id, _) in LIVE_RECORDED_GENERATIVE {
+            assert!(
+                support.contains(&format!("| generative | `{id}` |")),
+                "{id}"
+            );
         }
     }
 

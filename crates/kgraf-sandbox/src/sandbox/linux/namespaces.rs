@@ -463,7 +463,7 @@ fn hand_off_loopback_listener(handoff: libc::c_int, port: u16) -> Result<(), Ste
         #[repr(C, align(8))]
         struct Control([u8; 64]);
         let mut control = Control([0; 64]);
-        let mut byte = [b'L'];
+        let mut byte = *b"L";
         let mut iov = libc::iovec {
             iov_base: byte.as_mut_ptr().cast(),
             iov_len: 1,

@@ -163,7 +163,7 @@ impl RunStarter for ScheduledRuns {
         // Take a run slot, or refuse: the cap is checked and taken in one step.
         let taken = self
             .active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < self.max_concurrent).then_some(n + 1)
             });
         if taken.is_err() {

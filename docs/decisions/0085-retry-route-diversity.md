@@ -66,3 +66,15 @@ intake, each stated as a run notice, and one refusal is reworded:
 Tests: `a_task_kind_word_in_route_is_left_unset_with_a_notice`,
 `an_absolute_write_inside_the_repository_is_made_relative_with_a_notice`,
 `a_protected_write_is_refused_with_its_own_reason`.
+
+## Amendment (2026-10-08): the decomposition prompt says a route is left null
+
+The prompt said a contract's `route` "is null unless the request's Routes line lists that
+exact route name". A local planner read that as leave to pin: in a two-route run it set
+`route` to its own route on all four contracts, and a planned pin is honored, so the second
+route got no contract. The prompt now says to leave `route` null, that kGraf spreads contracts
+with no route over all the routes, and to set one only when the user's instruction asks for
+that route for that work, as a name the Routes line lists exactly. Intake is unchanged: a
+configured route the plan names is still a pin.
+
+Tests: `the_prompt_keeps_route_and_task_kind_apart`.

@@ -340,3 +340,24 @@ without the clear), `a_parent_that_answers_first_is_held_until_its_child_is_merg
 fresh slot). The "not one-shot" fix has no deterministic test: the order of a stop and a
 worker's finish in the loop cannot be set from outside it; the second-stop test covers it
 under load.
+
+## Amendment (2026-10-08): an orchestrator answer says who answered and grants nothing
+
+A worker refused `python3` asked with `ask_user_question` whether the command could be
+approved. The orchestrator's model answered "Yes" from the run record, and the worker read
+that as the user's approval and ran the refused command again. The permission check refused
+it again, as it must, but the answer had misled the worker. Two changes:
+
+- Every answer the orchestrator's model gives a worker (at once, in place of a box answer, or
+  late at a round boundary) starts with a lead: it was answered by the orchestrator from the
+  run record, not by the user, and it grants no permission; a call a permission refused stays
+  refused.
+- The answer prompt says the orchestrator cannot grant a permission: a question that asks to
+  approve, allow or run a command, program, path or tool is never answerable from the record,
+  so it goes on to the user (or, with nobody attending, the worker is told to state its
+  assumption).
+
+Tests: `an_orchestrator_first_answer_is_one_ledgered_call_settled_at_its_row`,
+`a_late_answer_answers_the_question_still_open_in_the_box` and
+`session_texts_are_stored_scrubbed_and_read_by_the_model_whole` (each fails without the lead),
+`the_answer_prompt_says_a_permission_question_is_not_answerable`.

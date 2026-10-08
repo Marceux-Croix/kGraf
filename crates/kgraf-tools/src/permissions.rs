@@ -1664,6 +1664,39 @@ impl PermissionControl {
         }
     }
 
+    /// The programs the current mode grants on its own, as one sentence for
+    /// a shell question: Auto's allow set, or Accept edits' file programs.
+    /// `None` when the mode grants no program by name.
+    ///
+    /// A worker refused one command reads only the question it was asked. A
+    /// question that listed the build allowlist and not the mode's grants
+    /// told a worker in Accept edits that `cp` was not allowed, so it wrote
+    /// the copy by hand and never ran the program the mode grants.
+    pub fn mode_program_grants(&self) -> Option<String> {
+        let s = self.state();
+        let (lead, programs): (&str, Vec<String>) = match s.settings.mode {
+            PermissionMode::AcceptEdits => (
+                "The Accept edits permission mode runs these file programs without approval",
+                {
+                    let mut p: Vec<String> =
+                        FILE_EDIT_PROGRAMS.iter().map(|p| (*p).to_owned()).collect();
+                    p.sort();
+                    p
+                },
+            ),
+            PermissionMode::Auto if !s.settings.allow.programs.is_empty() => (
+                "The Auto permission mode's allow set runs these programs without approval",
+                s.settings.allow.programs.iter().cloned().collect(),
+            ),
+            _ => return None,
+        };
+        Some(format!(
+            "{lead}: {}, each given as its own command, or in a `sh -c` script whose every \
+             command is granted.",
+            programs.join(", ")
+        ))
+    }
+
     /// Whether the current mode grants some named programs on its own: Auto
     /// with programs in its allow set, or Accept edits' file programs. A
     /// shell script is judged command by command

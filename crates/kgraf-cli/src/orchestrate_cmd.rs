@@ -74,6 +74,9 @@ pub struct OrchestrateArgs {
     pub shell_timeout: Option<Duration>,
     /// Output ceiling of each orchestrator call.
     pub planner_max_tokens: u32,
+    /// `--planner-reasoning`: the reasoning level of each orchestrator call;
+    /// `None` sends no reasoning field.
+    pub planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
     /// A held or failed gate to retry, or to waive, before `--resume`.
     pub retry_gate: Option<String>,
     pub waive_gate: Option<String>,
@@ -150,6 +153,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         // together.
         sessions: args.sessions,
         planner_max_tokens: args.planner_max_tokens,
+        planner_reasoning: args.planner_reasoning,
         routing: args.routing,
         tbench_bridge_socket: args.tbench_bridge_socket.clone(),
         dependency_fetch: args.fetch_deps,
@@ -239,6 +243,7 @@ fn notice_line(n: &Notice) -> String {
         Notice::OutputCapClamped { which, clamp } => {
             format!("clamped    {}", clamp.sentence(which))
         }
+        Notice::PlannerReasoning(sentence) => format!("reasoning  {sentence}"),
         Notice::RuleConflict(conflict) => format!("notice     {}", conflict.sentence()),
         Notice::RuleMatchesNoTool(sentence) => format!("notice     {sentence}"),
         Notice::ChecksNetworkOpen(sentence) | Notice::ShellNetworkOpen(sentence) => {
@@ -1361,6 +1366,7 @@ mod tests {
             check_compile_timeout: Duration::from_secs(600),
             shell_timeout: None,
             planner_max_tokens: kgraf_host::limits::DEFAULT_PLANNER_MAX_TOKENS,
+            planner_reasoning: None,
             retry_gate: None,
             waive_gate: None,
             gate_note: None,

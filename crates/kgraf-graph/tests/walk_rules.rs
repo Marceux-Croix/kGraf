@@ -201,3 +201,110 @@ fn a_file_that_becomes_non_utf8_loses_its_stale_rows_and_is_reported() {
     let third = Indexer::new(&store).index().expect("third");
     assert_eq!(third.files_removed, 0);
 }
+
+/// A repository with ignore rules at the root and in a subfolder, a hidden
+/// folder that must stay indexed, and a `.git` folder that must not be.
+fn ignore_fixture(root: &Path) {
+    write(
+        root,
+        ".gitignore",
+        "target/\nnode_modules/\ngenerated/\n*.gen.rs\n!keep.gen.rs\n",
+    );
+    write(root, "src/lib.rs", "pub fn listed_source() {}\n");
+    write(root, "target/debug/out.rs", "pub fn ignored_target() {}\n");
+    write(root, "node_modules/dep/i.js", "function ignoredDep() {}\n");
+    write(root, "generated/g.rs", "pub fn ignored_generated() {}\n");
+    write(root, "src/api.gen.rs", "pub fn ignored_pattern() {}\n");
+    write(root, "src/keep.gen.rs", "pub fn negated_back_in() {}\n");
+    write(root, "sub/.gitignore", "local_only.rs\n");
+    write(
+        root,
+        "sub/local_only.rs",
+        "pub fn ignored_nested_rule() {}\n",
+    );
+    write(root, "sub/shown.rs", "pub fn shown_nested() {}\n");
+    write(root, ".git/info/exclude", "scratch/\n");
+    write(root, "scratch/s.rs", "pub fn ignored_by_exclude() {}\n");
+    write(root, ".git/hooks/h.rs", "pub fn inside_dot_git() {}\n");
+    write(
+        root,
+        ".github/scripts/ci.py",
+        "def hidden_folder_source():\n    pass\n",
+    );
+}
+
+#[test]
+fn the_index_honors_gitignore_and_keeps_hidden_folders() {
+    let (dir, store) = fresh();
+    ignore_fixture(dir.path());
+    Indexer::new(&store).index().expect("index");
+
+    for listed in [
+        "listed_source",
+        "negated_back_in",
+        "shown_nested",
+        "hidden_folder_source",
+    ] {
+        assert!(
+            store.resolve_symbol(listed).is_ok(),
+            "{listed} should be indexed"
+        );
+    }
+    for skipped in [
+        "ignored_target",
+        "ignoredDep",
+        "ignored_generated",
+        "ignored_pattern",
+        "ignored_nested_rule",
+        "ignored_by_exclude",
+        "inside_dot_git",
+    ] {
+        assert!(
+            store.resolve_symbol(skipped).is_err(),
+            "{skipped} should not be indexed"
+        );
+    }
+    assert!(store.file(".github/scripts/ci.py").expect("file").is_some());
+}
+
+#[test]
+fn a_file_that_becomes_ignored_loses_its_rows() {
+    let (dir, store) = fresh();
+    write(dir.path(), "gen/a.rs", "pub fn soon_ignored() {}\n");
+    Indexer::new(&store).index().expect("first");
+    assert!(store.resolve_symbol("soon_ignored").is_ok());
+
+    write(dir.path(), ".gitignore", "gen/\n");
+    Indexer::new(&store).index().expect("second");
+    assert!(store.resolve_symbol("soon_ignored").is_err());
+}
+
+#[test]
+fn git_is_skipped_even_when_the_exclusion_list_is_replaced() {
+    let (dir, store) = fresh();
+    write(
+        dir.path(),
+        ".git/hooks/h.rs",
+        "pub fn inside_dot_git() {}\n",
+    );
+    write(dir.path(), "src/a.rs", "pub fn plain() {}\n");
+    Indexer::new(&store)
+        .with_excluded_dirs(Vec::new())
+        .index()
+        .expect("index");
+    assert!(store.resolve_symbol("plain").is_ok());
+    assert!(store.resolve_symbol("inside_dot_git").is_err());
+}
+
+#[test]
+fn a_rule_in_a_folder_above_the_root_does_not_hide_the_project() {
+    // A project folder inside a repository that ignores its own location
+    // (a linked worktree under an ignored folder) must still index.
+    let (dir, _) = fresh();
+    let project = dir.path().join("ignored_home/project");
+    write(dir.path(), ".gitignore", "ignored_home/\n");
+    write(&project, "src/a.rs", "pub fn project_source() {}\n");
+    let store = GraphStore::open_in_memory(&project).expect("store");
+    Indexer::new(&store).index().expect("index");
+    assert!(store.resolve_symbol("project_source").is_ok());
+}

@@ -345,6 +345,44 @@ pub const ANY_DEPTH_EXCLUDED: &[&str] = &[
     ".venv",
 ];
 
+/// Whether a directory is excluded: `rel` is its path relative to the root,
+/// `depth` its depth below the root (1 for a top-level directory). Free of the
+/// indexer so the walker's `'static` filter can own the list.
+fn is_excluded_by(rules: &[String], rel: &str, name: &str, depth: usize) -> bool {
+    rules.iter().any(|entry| {
+        if entry.contains('/') {
+            rel == entry.trim_end_matches('/')
+        } else {
+            entry == name && (depth == 1 || ANY_DEPTH_EXCLUDED.contains(&name))
+        }
+    })
+}
+
+/// Directory paths the walk filter reports from the walker's `'static` closure.
+type Shared = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn push_shared(sink: &Shared, item: String) {
+    // A poisoned lock still holds a valid list of paths.
+    sink.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+}
+
+fn take_shared(sink: &Shared) -> Vec<String> {
+    std::mem::take(&mut *sink.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The path an `ignore` error names, looking through its wrappers.
+fn failing_path(error: &ignore::Error) -> Option<std::path::PathBuf> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            failing_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(failing_path),
+        ignore::Error::Loop { child, .. } => Some(child.clone()),
+        _ => None,
+    }
+}
+
 /// A changed file between the change decision and its write.
 struct Staged {
     file: FileRecord,
@@ -470,18 +508,6 @@ impl<'store> Indexer<'store> {
     pub fn with_bus_owned_dirs(mut self, dirs: Vec<String>) -> Self {
         self.bus_owned = dirs;
         self
-    }
-
-    /// Whether a directory is excluded: `rel` is its path relative to the root,
-    /// `depth` its depth below the root (1 for a top-level directory).
-    fn is_excluded(&self, rel: &str, name: &str, depth: usize) -> bool {
-        self.excluded_dirs.iter().any(|entry| {
-            if entry.contains('/') {
-                rel == entry.trim_end_matches('/')
-            } else {
-                entry == name && (depth == 1 || ANY_DEPTH_EXCLUDED.contains(&name))
-            }
-        })
     }
 
     /// An indexed file the bus wrote: its title heading is the bus's.
@@ -958,26 +984,58 @@ impl<'store> Indexer<'store> {
     /// Eligible files in the tree, plus what the walk skipped or could not judge.
     fn walk(&self, root: &Path) -> Walked {
         let mut walked = Walked::default();
-        let mut nested = Vec::new();
-        let mut excluded = Vec::new();
         let relative = |p: &Path| {
             p.strip_prefix(root)
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/")
         };
-        let walker = walkdir::WalkDir::new(root)
+        // The `ignore` walker (the one ripgrep ships, also used by the document
+        // ingest) honors `.gitignore` files at every level below the root and
+        // the root's `.git/info/exclude`. Choices:
+        // - `hidden(false)`: dot folders such as `.github` are source; only
+        //   `.git` is dropped, by name, in the filter below.
+        // - `require_git(false)`: a project folder that is not a git checkout
+        //   still honors its `.gitignore`.
+        // - `parents(false)`: a rule in a folder above the root never hides the
+        //   project (a linked worktree can sit under an ignored folder).
+        // - `git_global(false)` and `ignore(false)`: the user's global excludes
+        //   and ripgrep's `.ignore` files are per machine or per tool, so they
+        //   would make the same repository index differently on two machines.
+        // The filter closure must be `'static`, so it owns copies of what it
+        // reads and reports the directories it drops through shared vectors.
+        let nested = Shared::default();
+        let excluded = Shared::default();
+        let rules = self.excluded_dirs.clone();
+        let include_nested = self.include_nested;
+        let base = root.to_path_buf();
+        let (nested_sink, excluded_sink) = (nested.clone(), excluded.clone());
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
             .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
+            .hidden(false)
+            .require_git(false)
+            .parents(false)
+            .git_global(false)
+            .ignore(false)
+            .filter_entry(move |entry| {
                 if entry.depth() == 0 {
                     return true;
                 }
                 let name = entry.file_name().to_string_lossy();
-                if entry.file_type().is_dir() {
-                    let rel = relative(entry.path());
-                    if self.is_excluded(&rel, name.as_ref(), entry.depth()) {
-                        excluded.push(rel);
+                if name == ".git" {
+                    // Repository metadata, whatever the exclusion list says.
+                    return false;
+                }
+                if entry.file_type().is_some_and(|t| t.is_dir()) {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&base)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if is_excluded_by(&rules, &rel, name.as_ref(), entry.depth()) {
+                        push_shared(&excluded_sink, rel);
                         return false;
                     }
                     // A Python virtual environment, whatever it is named, holds
@@ -986,18 +1044,19 @@ impl<'store> Indexer<'store> {
                     // `pyvenv.cfg` (written by `venv`, `virtualenv` and `uv`).
                     // It is named in the report like any excluded directory.
                     if entry.path().join(VENV_MARKER).is_file() {
-                        excluded.push(rel);
+                        push_shared(&excluded_sink, rel);
                         return false;
                     }
                     // A directory with its own `.git` (a directory in a nested
                     // clone, a file in a git worktree) is another checkout.
-                    if !self.include_nested && entry.path().join(".git").exists() {
-                        nested.push(rel);
+                    if !include_nested && entry.path().join(".git").exists() {
+                        push_shared(&nested_sink, rel);
                         return false;
                     }
                 }
                 true
             });
+        let walker = builder.build();
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1007,11 +1066,12 @@ impl<'store> Indexer<'store> {
                     // reading as "nothing yet" is one of the founding failures.
                     // The path is stored relative, like every indexed path, and
                     // the directory's indexed files are kept.
-                    let path = error
-                        .path()
-                        .map(&relative)
+                    let failed = failing_path(&error);
+                    let path = failed
+                        .as_deref()
+                        .map(relative)
                         .unwrap_or_else(|| "<unknown>".to_owned());
-                    if error.path().is_some() {
+                    if failed.is_some() {
                         walked.unreadable_dirs.push(path.clone());
                     }
                     walked.files.push(Err(GraphError::Io {
@@ -1036,7 +1096,7 @@ impl<'store> Indexer<'store> {
                 }
                 continue;
             }
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
             // Only files in a known language, plus nothing else. An index of
@@ -1071,6 +1131,8 @@ impl<'store> Indexer<'store> {
                 .unwrap_or(0);
             walked.files.push(Ok((rel, bytes, mtime_ns)));
         }
+        let mut nested = take_shared(&nested);
+        let mut excluded = take_shared(&excluded);
         nested.sort();
         excluded.sort();
         walked.nested = nested;

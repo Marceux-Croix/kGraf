@@ -261,6 +261,7 @@ impl InterfaceReviewer for RoutedInterfaceReviewer {
     ) -> Option<Result<(ReviewOutcome, CallId), PlanError>> {
         let (provider, model, max_output_tokens) = self.routes.get(route)?;
         let caller = ModelCaller {
+            reasoning_effort: None,
             provider: provider.clone(),
             ledger: self.ledger.clone(),
             model: model.clone(),

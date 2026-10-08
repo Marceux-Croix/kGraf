@@ -306,6 +306,15 @@ impl ExecPolicy {
         &self.build
     }
 
+    /// The live permission mode's own program grants, as one sentence
+    /// ([`crate::permissions::PermissionControl::mode_program_grants`]).
+    /// `None` without a live mode or when the mode grants no program. In
+    /// Bypass, or with the shell unrestricted, nothing is asked, so no
+    /// question carries it.
+    pub fn mode_program_grants(&self) -> Option<String> {
+        self.live.as_ref().and_then(|l| l.0.mode_program_grants())
+    }
+
     /// Add a rule, tried after every rule already added.
     pub fn with_rule(mut self, rule: CommandRule) -> Self {
         self.rules.push(rule);
@@ -1129,6 +1138,55 @@ mod tests {
             crate::approval::HookDecision::Ask { question } => question,
             other => panic!("expected an ask for {argv:?}, got {other:?}"),
         }
+    }
+
+    /// A question asked in Accept edits names the file programs the mode
+    /// grants, so a worker refused `python3` in a script with `cp` learns
+    /// that `cp` alone runs unasked; the refused program is still the one
+    /// the question names. In Auto it names the allow set; in Manual,
+    /// nothing is granted by the mode and no sentence is added.
+    #[test]
+    fn a_shell_question_names_the_programs_the_mode_grants() {
+        use crate::permissions::{PermissionMode, RefusedSubject, refused_subject};
+        let script = sh("mkdir -p out && cp a out/a && python3 -c 'print(1)' > out/sha.txt");
+        let edits = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control_in(PermissionMode::AcceptEdits, &[]));
+        let q = question(&edits, &script);
+        assert!(
+            q.contains(
+                "The Accept edits permission mode runs these file programs without approval: \
+                 cp, mkdir, mv, touch"
+            ),
+            "{q}"
+        );
+        assert_eq!(
+            refused_subject(
+                "shell",
+                &serde_json::json!({ "command": script }),
+                "user",
+                &q
+            ),
+            Some(RefusedSubject::Program("python3".into())),
+            "the added sentence must not change which program the refusal names: {q}"
+        );
+        let q = question(&edits, &argv(&["python3", "-c", "print(1)"]));
+        assert!(q.contains("cp, mkdir, mv, touch"), "{q}");
+
+        let auto = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control_in(PermissionMode::Auto, &["rsync"]));
+        let q = question(&auto, &argv(&["python3", "-c", "print(1)"]));
+        assert!(
+            q.contains(
+                "The Auto permission mode's allow set runs these programs without approval: rsync"
+            ),
+            "{q}"
+        );
+
+        let manual = ExecPolicy::default_kgraf_policy()
+            .with_permissions(control_in(PermissionMode::Manual, &[]));
+        let q = question(&manual, &argv(&["python3", "-c", "print(1)"]));
+        assert!(!q.contains("without approval: cp"), "{q}");
+        assert!(!q.contains("permission mode runs"), "{q}");
     }
 
     /// Decision 0094, amended 2026-10-02: in Auto, a script is granted when

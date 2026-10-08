@@ -3707,6 +3707,7 @@ version = "0.7.8"
 dependencies = [
  "blake3",
  "criterion",
+ "ignore",
  "kgraf-core",
  "kgraf-diag",
  "kgraf-secrets",
@@ -3728,7 +3729,6 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-typescript",
- "walkdir",
 ]
 
 [[package]]
@@ -4038,6 +4038,7 @@ version = "0.7.8"
 dependencies = [
  "cap-primitives",
  "criterion",
+ "getrandom 0.4.3",
  "junction",
  "kgraf-core",
  "kgraf-diag",
@@ -4048,7 +4049,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
+ "windows",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

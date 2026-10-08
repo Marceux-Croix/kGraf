@@ -1092,7 +1092,7 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
     let mut supplied: BTreeSet<&str> = ancestors(specs, c.id());
     supplied.insert(c.id());
     let by_supplied = |ids: &Vec<&str>| ids.iter().any(|id| supplied.contains(id));
-    let reachable = |path: &str| repo.exists(path) || written.get(path).is_some_and(&by_supplied);
+    let reachable = |path: &str| repo.exists(path) || written.get(path).is_some_and(by_supplied);
     let writers = |path: &str| -> String {
         match written.get(path) {
             None => "by no contract".to_owned(),

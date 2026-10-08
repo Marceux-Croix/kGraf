@@ -81,7 +81,9 @@ fn render(g: &mut Galaxy, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8>
 
 /// Pixels that differ from the background.
 fn lit_pixels(img: &[u8]) -> usize {
-    img.chunks_exact(4)
+    img.as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[..3] != BACKGROUND_SRGB)
         .count()
 }

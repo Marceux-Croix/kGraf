@@ -620,9 +620,13 @@ mod nt_data {
             else {
                 return Err(bad_record("has a name that overran its buffer"));
             };
+            // The length is a whole number of UTF-16 units; a stray odd byte
+            // is dropped, as `chunks_exact` dropped it.
             let name: Vec<u16> = name
-                .chunks_exact(2)
-                .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_ne_bytes(*b))
                 .collect();
             let dot = u16::from(b'.');
             if name != [dot] && name != [dot, dot] {
@@ -1941,8 +1945,10 @@ mod nt_data_tests {
                 bytes[o..o + 2].copy_from_slice(&u.to_ne_bytes());
             }
             self.words = bytes
-                .chunks_exact(8)
-                .map(|c| u64::from_ne_bytes(c.try_into().expect("8 bytes")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_ne_bytes(*c))
                 .collect();
         }
 

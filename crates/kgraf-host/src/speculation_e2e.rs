@@ -251,6 +251,7 @@ async fn run_pair(
         },
     );
     let caller = |p: Arc<Script>| ModelCaller {
+        reasoning_effort: None,
         provider: p,
         ledger: ledger.clone(),
         model: MODEL.into(),

@@ -1,0 +1,333 @@
+//! The owner's stored passwords: one file in kGraf's per-user configuration
+//! folder, each password protected by DPAPI for the current user.
+//!
+//! The elevated step may run as another administrator account, so it does
+//! not protect the passwords itself: a blob protected for that account would
+//! not open for the owner. It sends them over the setup pipe and the owner's
+//! own, unelevated process protects them ([`Protector`]; on Windows,
+//! `CryptProtectData` without `CRYPTPROTECT_LOCAL_MACHINE`, so no other
+//! account on the machine can open them).
+//!
+//! The names and SIDs stay readable, so `kgraf sandbox status` can report
+//! what is stored without opening a password.
+//!
+//! ```text
+//! "KGSBCRED" | version u8 = 1 | count u8
+//! per user: role u8 (0 offline, 1 online)
+//!           name length u16 LE | name (UTF-8)
+//!           SID length u16 LE  | SID (UTF-8)
+//!           blob length u32 LE | protected password
+//! ```
+
+use zeroize::Zeroizing;
+
+use super::names::{MAX_USER_NAME, Role, is_sid_string};
+use super::password::Password;
+
+pub const MAGIC: &[u8; 8] = b"KGSBCRED";
+pub const VERSION: u8 = 1;
+
+/// The largest protected password accepted (a DPAPI blob of a 40-character
+/// password is a few hundred bytes).
+const MAX_BLOB: usize = 64 * 1024;
+
+/// Seals and opens a password. On Windows, DPAPI for the current user.
+pub trait Protector {
+    fn protect(&self, plain: &[u8]) -> Result<Vec<u8>, String>;
+    fn unprotect(&self, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredUser {
+    pub role: Role,
+    pub name: String,
+    pub sid: String,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BlobError {
+    #[error("the stored passwords file is not one kGraf wrote")]
+    Magic,
+    #[error("the stored passwords file has version {0}, which this kGraf does not read")]
+    Version(u8),
+    #[error("the stored passwords file is cut short or damaged")]
+    Truncated,
+    #[error("the stored passwords file holds a malformed entry")]
+    Entry,
+    #[error("the stored passwords file holds bytes after its last entry")]
+    Trailing,
+    #[error("protecting a password failed: {0}")]
+    Protect(String),
+    #[error("opening a stored password failed: {0}")]
+    Unprotect(String),
+}
+
+fn role_byte(r: Role) -> u8 {
+    match r {
+        Role::Offline => 0,
+        Role::Online => 1,
+    }
+}
+
+/// The file's bytes for these users and passwords.
+pub fn encode_credentials(
+    entries: &[(StoredUser, &Password)],
+    protector: &dyn Protector,
+) -> Result<Vec<u8>, BlobError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.push(u8::try_from(entries.len()).map_err(|_| BlobError::Entry)?);
+    for (user, password) in entries {
+        if user.name.is_empty() || user.name.len() > MAX_USER_NAME || !is_sid_string(&user.sid) {
+            return Err(BlobError::Entry);
+        }
+        let sealed = protector
+            .protect(password.expose().as_bytes())
+            .map_err(BlobError::Protect)?;
+        if sealed.len() > MAX_BLOB {
+            return Err(BlobError::Entry);
+        }
+        out.push(role_byte(user.role));
+        for field in [user.name.as_bytes(), user.sid.as_bytes()] {
+            out.extend_from_slice(&(field.len() as u16).to_le_bytes());
+            out.extend_from_slice(field);
+        }
+        out.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&sealed);
+    }
+    Ok(out)
+}
+
+struct Cursor<'a>(&'a [u8]);
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], BlobError> {
+        if self.0.len() < n {
+            return Err(BlobError::Truncated);
+        }
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, BlobError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<usize, BlobError> {
+        let b = self.take(2)?;
+        Ok(usize::from(u16::from_le_bytes([b[0], b[1]])))
+    }
+
+    fn u32(&mut self) -> Result<usize, BlobError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    }
+
+    fn text(&mut self) -> Result<String, BlobError> {
+        let n = self.u16()?;
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| BlobError::Entry)
+    }
+}
+
+/// The users the file holds and their sealed passwords, without opening any.
+pub fn decode_users(bytes: &[u8]) -> Result<Vec<(StoredUser, Vec<u8>)>, BlobError> {
+    let mut c = Cursor(bytes);
+    if c.take(MAGIC.len()).map_err(|_| BlobError::Magic)? != MAGIC {
+        return Err(BlobError::Magic);
+    }
+    let version = c.u8()?;
+    if version != VERSION {
+        return Err(BlobError::Version(version));
+    }
+    let count = c.u8()?;
+    let mut out = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let role = match c.u8()? {
+            0 => Role::Offline,
+            1 => Role::Online,
+            _ => return Err(BlobError::Entry),
+        };
+        let name = c.text()?;
+        let sid = c.text()?;
+        if name.is_empty() || name.len() > MAX_USER_NAME || !is_sid_string(&sid) {
+            return Err(BlobError::Entry);
+        }
+        let n = c.u32()?;
+        if n > MAX_BLOB {
+            return Err(BlobError::Entry);
+        }
+        let sealed = c.take(n)?.to_vec();
+        out.push((StoredUser { role, name, sid }, sealed));
+    }
+    if !c.0.is_empty() {
+        return Err(BlobError::Trailing);
+    }
+    Ok(out)
+}
+
+/// The users and their opened passwords.
+pub fn decode_credentials(
+    bytes: &[u8],
+    protector: &dyn Protector,
+) -> Result<Vec<(StoredUser, Password)>, BlobError> {
+    decode_users(bytes)?
+        .into_iter()
+        .map(|(user, sealed)| {
+            let plain = protector.unprotect(&sealed).map_err(BlobError::Unprotect)?;
+            let text = String::from_utf8(plain.to_vec()).map_err(|_| BlobError::Entry)?;
+            let password = Password::from_received(text).map_err(|_| BlobError::Entry)?;
+            Ok((user, password))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for DPAPI: XOR with a key byte and a 4-byte tag, so a
+    /// sealed password does not hold the plain text and a damaged one fails.
+    struct FakeProtector(u8);
+
+    impl Protector for FakeProtector {
+        fn protect(&self, plain: &[u8]) -> Result<Vec<u8>, String> {
+            let mut out = b"SEAL".to_vec();
+            out.extend(plain.iter().map(|b| b ^ self.0));
+            Ok(out)
+        }
+        fn unprotect(&self, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+            let body = sealed
+                .strip_prefix(b"SEAL")
+                .ok_or("not sealed by this key")?;
+            Ok(Zeroizing::new(body.iter().map(|b| b ^ self.0).collect()))
+        }
+    }
+
+    struct FailingProtector;
+
+    impl Protector for FailingProtector {
+        fn protect(&self, _: &[u8]) -> Result<Vec<u8>, String> {
+            Err("CryptProtectData failed: 5".into())
+        }
+        fn unprotect(&self, _: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+            Err("CryptUnprotectData failed: 13".into())
+        }
+    }
+
+    fn users() -> Vec<StoredUser> {
+        vec![
+            StoredUser {
+                role: Role::Offline,
+                name: "kgraf-off-1a2b3c4d".into(),
+                sid: "S-1-5-21-1-2-3-1010".into(),
+            },
+            StoredUser {
+                role: Role::Online,
+                name: "kgraf-on-1a2b3c4d".into(),
+                sid: "S-1-5-21-1-2-3-1011".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn credentials_round_trip_and_hold_no_plain_password() {
+        let pws = [
+            Password::generate(&[]).unwrap(),
+            Password::generate(&[]).unwrap(),
+        ];
+        let entries: Vec<(StoredUser, &Password)> = users().into_iter().zip(pws.iter()).collect();
+        let p = FakeProtector(0x5a);
+        let bytes = encode_credentials(&entries, &p).unwrap();
+        assert!(bytes.starts_with(MAGIC));
+        for pw in &pws {
+            let plain = pw.expose().as_bytes();
+            assert!(
+                !bytes.windows(plain.len()).any(|w| w == plain),
+                "a password is in the file in plain text"
+            );
+        }
+        let back = decode_credentials(&bytes, &p).unwrap();
+        assert_eq!(back.len(), 2);
+        for ((u, pw), (want_u, want_pw)) in back.iter().zip(entries.iter()) {
+            assert_eq!(u, want_u);
+            assert_eq!(pw.expose(), want_pw.expose());
+        }
+        let listed: Vec<StoredUser> = decode_users(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        assert_eq!(listed, users());
+    }
+
+    #[test]
+    fn another_key_cannot_open_the_passwords() {
+        let pw = Password::generate(&[]).unwrap();
+        let bytes = encode_credentials(&[(users()[0].clone(), &pw)], &FakeProtector(1)).unwrap();
+        // Same tag, other key: opens to bytes that are not a valid password
+        // (every byte gains the high bit, so it is not even UTF-8).
+        assert_eq!(
+            decode_credentials(&bytes, &FakeProtector(0x81)).unwrap_err(),
+            BlobError::Entry
+        );
+        assert!(matches!(
+            decode_credentials(&bytes, &FailingProtector),
+            Err(BlobError::Unprotect(_))
+        ));
+        assert!(matches!(
+            encode_credentials(&[(users()[0].clone(), &pw)], &FailingProtector),
+            Err(BlobError::Protect(_))
+        ));
+    }
+
+    #[test]
+    fn damaged_files_are_refused() {
+        let pw = Password::generate(&[]).unwrap();
+        let p = FakeProtector(7);
+        let good = encode_credentials(&[(users()[0].clone(), &pw)], &p).unwrap();
+        assert_eq!(decode_users(b"").unwrap_err(), BlobError::Magic);
+        assert_eq!(
+            decode_users(b"NOTKGRAF\x01\x00").unwrap_err(),
+            BlobError::Magic
+        );
+        let mut v2 = good.clone();
+        v2[8] = 2;
+        assert_eq!(decode_users(&v2).unwrap_err(), BlobError::Version(2));
+        for cut in [9, 10, 12, good.len() - 1] {
+            assert_eq!(
+                decode_users(&good[..cut]).unwrap_err(),
+                BlobError::Truncated,
+                "cut at {cut}"
+            );
+        }
+        let mut extra = good.clone();
+        extra.push(0);
+        assert_eq!(decode_users(&extra).unwrap_err(), BlobError::Trailing);
+        let mut bad_role = good.clone();
+        bad_role[10] = 9;
+        assert_eq!(decode_users(&bad_role).unwrap_err(), BlobError::Entry);
+        // A count larger than the entries present.
+        let mut more = good.clone();
+        more[9] = 2;
+        assert_eq!(decode_users(&more).unwrap_err(), BlobError::Truncated);
+    }
+
+    #[test]
+    fn malformed_users_are_not_written() {
+        let pw = Password::generate(&[]).unwrap();
+        let mut u = users()[0].clone();
+        u.sid = "not a sid".into();
+        assert_eq!(
+            encode_credentials(&[(u, &pw)], &FakeProtector(1)).unwrap_err(),
+            BlobError::Entry
+        );
+        let mut u = users()[0].clone();
+        u.name = "x".repeat(21);
+        assert_eq!(
+            encode_credentials(&[(u, &pw)], &FakeProtector(1)).unwrap_err(),
+            BlobError::Entry
+        );
+    }
+}

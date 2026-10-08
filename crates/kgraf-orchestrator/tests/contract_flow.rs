@@ -202,6 +202,7 @@ impl Rig {
 
     fn caller(&self, p: Arc<ScriptFake>) -> ModelCaller {
         ModelCaller {
+            reasoning_effort: None,
             provider: p,
             ledger: self.parts.ledger.clone(),
             model: PLAN_MODEL.into(),

@@ -26,8 +26,8 @@ use futures_util::StreamExt;
 use kgraf_core::{Protocol, TokenUsage};
 use kgraf_provider::capability::{Capabilities, Reasoning, StreamEvent, Streaming};
 use kgraf_provider::{
-    CallToken, Content, ProviderConfig, ProviderError, Request, Response, Role, StopReason,
-    StreamGuard,
+    CallToken, Content, ProviderConfig, ProviderError, ReasoningEffort, Request, Response, Role,
+    StopReason, StreamGuard,
 };
 
 /// Rate-limit header capture (decision 0067). Recorded whether or
@@ -217,6 +217,17 @@ fn has_nonzero_number(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(map) => map.values().any(has_nonzero_number),
         serde_json::Value::Array(items) => items.iter().any(has_nonzero_number),
         _ => false,
+    }
+}
+
+/// The `reasoning_effort` value this protocol carries for a kGraf level.
+/// kGraf's "off" is `none` on this wire.
+fn chat_reasoning_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
     }
 }
 
@@ -799,11 +810,14 @@ impl ChatCompletionsAdapter {
             );
         }
         if let Some(effort) = request.reasoning_effort {
-            // Spelled as OpenAI spells it. A vendor that does not support it will
-            // ignore it, which is the silent-parameter class the model echo and the
-            // capability flags exist to bound; nothing about correctness depends on
-            // it being honored.
-            body["reasoning_effort"] = serde_json::json!(effort);
+            // Spelled as OpenAI spells it. A vendor that does not support a
+            // graded level ignores it, and no answer shows whether it was
+            // honored; docs/MODEL-SUPPORT.md records what was measured. "Off"
+            // goes out as `none`, the one value measured to turn reasoning off
+            // on Ollama's endpoint (`think: false`, a `/no_think` prompt and
+            // `chat_template_kwargs` were not honored there), and its answer
+            // is checked: reasoning in it raises `ReasoningNotOff`.
+            body["reasoning_effort"] = serde_json::json!(chat_reasoning_effort(effort));
         }
         body
     }
@@ -1170,6 +1184,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
                         stop_reason: stop_reason.to_owned(),
                     });
                 }
+                kgraf_provider::check_reasoning_off(self.adapter_name(), request, &response)?;
                 Ok(response)
             }
             Err(error) => {
@@ -1718,14 +1733,16 @@ impl Streaming for ChatCompletionsAdapter {
                 stop_reason: stop_reason.to_owned(),
             });
         }
-        Ok(Response {
+        let response = Response {
             finish_reason: raw_finish,
             model,
             content,
             stop_reason,
             usage,
             request_id: stream_request_id,
-        })
+        };
+        kgraf_provider::check_reasoning_off(self.adapter_name(), request, &response)?;
+        Ok(response)
     }
 }
 
@@ -3279,6 +3296,18 @@ mod tests {
         Settlement,
         Vec<StreamEvent>,
     ) {
+        probe_with(sse, &Request::new("compatible-model", "hi", 100)).await
+    }
+
+    /// [`probe`] for a request of the test's own.
+    async fn probe_with(
+        sse: &str,
+        request: &Request,
+    ) -> (
+        Result<Response, ProviderError>,
+        Settlement,
+        Vec<StreamEvent>,
+    ) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(sse.to_owned()))
@@ -3291,17 +3320,39 @@ mod tests {
             .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
             .expect("begin");
         let mut events = Vec::new();
-        let r = Streaming::stream(
-            &adapter,
-            &Request::new("compatible-model", "hi", 100),
-            &token,
-            &mut |e| events.push(e),
-        )
-        .await;
+        let r = Streaming::stream(&adapter, request, &token, &mut |e| events.push(e)).await;
         let id = token.id().clone();
         drop(token);
         let rec = ledger.call(&id).expect("r").expect("p").settlement;
         (r, rec, events)
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_that_reasons_despite_off_raises_after_it_is_settled() {
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"reasoning\":\"think\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"compatible-model\",\"choices\":\
+             [{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\
+             \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let mut off = Request::new("compatible-model", "hi", 100);
+        off.reasoning_effort = Some(ReasoningEffort::Off);
+        let (r, settlement, _) = probe_with(sse, &off).await;
+        assert!(
+            matches!(
+                r,
+                Err(ProviderError::ReasoningNotOff {
+                    reasoning_chars: 5,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert_eq!(settlement, Settlement::Counted);
+        // The same stream without the setting is an ordinary answer.
+        let (r, _, _) = probe(sse).await;
+        assert_eq!(r.expect("no setting, no check").text(), "hi");
     }
 
     #[tokio::test]
@@ -3695,6 +3746,90 @@ mod tests {
             "message.reasoning must be carried: {:?}",
             response.content
         );
+    }
+
+    #[test]
+    fn reasoning_off_goes_out_as_none_and_no_setting_sends_no_field() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut request = Request::new("compatible-model", "hi", 100);
+        // No setting: the body is what it was before the setting existed.
+        assert!(adapter.to_wire(&request).get("reasoning_effort").is_none());
+        for (effort, wire) in [
+            (ReasoningEffort::Off, "none"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            request.reasoning_effort = Some(effort);
+            assert_eq!(adapter.to_wire(&request)["reasoning_effort"], json!(wire));
+        }
+    }
+
+    /// Serve one recorded Ollama answer and ask for it with reasoning off.
+    /// Returns the outcome and the ledger row's settlement.
+    async fn ask_off_against(fixture: &str) -> (Result<Response, ProviderError>, Settlement) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"reasoning_effort": "none"})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fixture))
+            .mount(&server)
+            .await;
+        let config = ProviderConfig::new(
+            ADAPTER,
+            server.uri(),
+            "test-key",
+            vec!["qwen3.6:35b".into()],
+            Protocol::Inclusive,
+        )
+        .expect("config");
+        let adapter = ChatCompletionsAdapter::new(config, UsageDialect::Details).expect("adapter");
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "qwen3.6:35b", "w", "t")
+            .expect("begin");
+        let mut request = Request::new("qwen3.6:35b", "What is 17 * 23?", 4096);
+        request.reasoning_effort = Some(ReasoningEffort::Off);
+        let outcome = adapter.complete(&request, &token).await;
+        drop(token);
+        (outcome, ledger.calls().expect("calls")[0].settlement)
+    }
+
+    #[tokio::test]
+    async fn an_ollama_answer_recorded_with_reasoning_none_passes_the_off_check() {
+        // `tests/fixtures/2026-10-08-ollama-qwen3.6-chat-reasoning-none.json`:
+        // Ollama 0.34.4, qwen3.6:35b, asked with `reasoning_effort: "none"`.
+        // No `reasoning` field, 4 completion tokens.
+        let (outcome, settlement) = ask_off_against(include_str!(
+            "../tests/fixtures/2026-10-08-ollama-qwen3.6-chat-reasoning-none.json"
+        ))
+        .await;
+        let response = outcome.expect("an answer without reasoning is returned");
+        assert_eq!(response.text(), "391");
+        assert!(response.reasoning().is_empty());
+        assert_eq!(settlement, Settlement::Counted);
+    }
+
+    #[tokio::test]
+    async fn an_ollama_answer_that_reasoned_anyway_raises_after_it_is_settled() {
+        // `tests/fixtures/2026-10-08-ollama-qwen3.6-chat-think-false-ignored.json`:
+        // the same server and model asked with `think: false`, which the
+        // endpoint ignores; it answered with 866 characters of reasoning. A
+        // server that ignores the off control answers the same way.
+        let (outcome, settlement) = ask_off_against(include_str!(
+            "../tests/fixtures/2026-10-08-ollama-qwen3.6-chat-think-false-ignored.json"
+        ))
+        .await;
+        match outcome {
+            Err(ProviderError::ReasoningNotOff {
+                reasoning_chars, ..
+            }) => assert_eq!(reasoning_chars, 866),
+            other => panic!("expected ReasoningNotOff, got {other:?}"),
+        }
+        // The tokens were spent, so the row is counted, not failed.
+        assert_eq!(settlement, Settlement::Counted);
     }
 
     #[test]

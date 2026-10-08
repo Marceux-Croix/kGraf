@@ -247,3 +247,18 @@ crates/kgraf-sandbox/src/sandbox/linux/namespaces.rs, its own code, so no
 helper binary is shipped or looked up on PATH. Also not taken: the proxy
 routing and managed-network modes (proxy_routing.rs, proxy_lifecycle.rs),
 WSL and daemon-socket mounts.
+
+Followed in design, not copied (2026-10-08), for the Windows sandbox user
+(decision 0097; crates/kgraf-sandbox/src/sandbox_user/): read at commit
+9b738582b13c2cdbeff54af0afd04c50c3e7ba09, codex-rs/windows-sandbox-rs (Apache-2.0).
+Taken as design: an offline and an online sandbox user; a password reset on every
+setup; hiding the users from the sign-in screen; firewall block rules scoped by
+LocalUserAuthorizedList to the offline user's SID, with its non-loopback address
+literals and loopback blocks that cut out the proxy ports; the check that local
+firewall rules take effect; a runner that starts as the sandbox user.
+Deliberately different: passwords come from the system random source (upstream uses
+a non-cryptographic generator); the elevated step does not seal them, the user's own
+unelevated process does (DPAPI for the current user; upstream uses machine-scope
+DPAPI); the setup pipe is created by the user's own process, and each end checks the
+other's process ID; the user's token carries no restricting SIDs (upstream keeps
+them, and Schannel TLS fails there, openai/codex#17459).

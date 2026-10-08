@@ -53,7 +53,7 @@ use kgraf_orchestrator::{
     interpret_corpus, process_machine_gate,
 };
 use kgraf_provider::{Ledger, Provider, RateLimit};
-use kgraf_runtime::{AskResolver, ContextConfig, PointSource, PrefixRegistry};
+use kgraf_runtime::{AskResolver, ContextConfig, PrefixRegistry};
 use kgraf_sandbox::{MergeBack, WorkspaceManager};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +146,10 @@ pub enum Notice {
         which: &'static str,
         clamp: crate::limits::OutputClamp,
     },
+    /// The planner's route asks for a reasoning level on every orchestrator
+    /// call (`--planner-reasoning`), and what kGraf checks of it. The
+    /// sentence is the whole notice. Said at each run's start.
+    PlannerReasoning(String),
     /// The user's verify or gate command runs a program the user's own rules
     /// refuse to workers, and the `warn_rule_conflicts` setting is on. The
     /// sentence is the whole notice; the run is not changed.
@@ -217,6 +221,26 @@ fn output_caps(
         .filter_map(|(which, c)| c.map(|clamp| Notice::OutputCapClamped { which, clamp }))
         .collect();
     (worker_cap, planner_cap, notices)
+}
+
+/// The run-start sentence for a planner reasoning level: what is sent, and
+/// what kGraf can check of it.
+pub(crate) fn planner_reasoning_sentence(
+    route: &str,
+    level: kgraf_provider::ReasoningEffort,
+) -> String {
+    match level {
+        kgraf_provider::ReasoningEffort::Off => format!(
+            "the planner route `{route}` asks for no reasoning on every orchestrator call; \
+             an answer that still carries reasoning fails its call, and a provider with no \
+             verified off control refuses the call before sending it"
+        ),
+        graded => format!(
+            "the planner route `{route}` asks for reasoning level `{graded}` on every \
+             orchestrator call; no answer shows whether the server honors a graded level, so \
+             kGraf does not check it"
+        ),
+    }
 }
 
 /// How a prepared run begins.
@@ -531,10 +555,7 @@ impl Host {
             .map_err(|_| Error::failed("graph lock poisoned"))?
             .node_count()
             .lift()?;
-        let mut context = ContextConfig::for_model(config.window).lift()?;
-        if let Some(point) = config.point {
-            context = context.with_point(point, PointSource::User).lift()?;
-        }
+        let context = config.context().lift()?;
         let (planner, used) = config.planner_and_used()?;
         let limiters = limiters(&config.rate_limits, &used, store_path)?;
         config.check_bounds()?;
@@ -1367,6 +1388,9 @@ impl Host {
     /// their place.
     pub fn planner_caller(&self, agent: &str, task: &str) -> Result<ModelCaller> {
         Ok(ModelCaller {
+            // The planner route's own level; the handshake and consumer-test
+            // callers below are other routes' models and keep the default.
+            reasoning_effort: self.config.planner_reasoning,
             provider: self.provider(&self.planner.route, &self.planner.model)?,
             ledger: self.ledger.clone(),
             model: self.planner.model.clone(),
@@ -1440,6 +1464,7 @@ impl Host {
                     (
                         name.clone(),
                         ModelCaller {
+                            reasoning_effort: None,
                             provider: provider.clone(),
                             ledger: self.ledger.clone(),
                             model: model.clone(),
@@ -1550,6 +1575,12 @@ impl Host {
         // A lowered output cap is said at every run's start, never silently.
         for clamp in &self.clamp_notices {
             notices(clamp.clone());
+        }
+        if let Some(level) = self.config.planner_reasoning {
+            notices(Notice::PlannerReasoning(planner_reasoning_sentence(
+                &format!("{}:{}", self.planner.route, self.planner.model),
+                level,
+            )));
         }
         for removed in clean_stale_worktrees(
             &manager,
@@ -2574,13 +2605,10 @@ const REACHABLE_TIMEOUT: Duration = Duration::from_secs(3);
 /// The `host:port` of an `http://` or `https://` base URL, the scheme's
 /// default port when none is given; `None` for anything else.
 fn endpoint_of(base_url: &str) -> Option<(String, u16)> {
-    let (rest, default) = if let Some(r) = base_url.strip_prefix("http://") {
-        (r, 80)
-    } else if let Some(r) = base_url.strip_prefix("https://") {
-        (r, 443)
-    } else {
-        return None;
-    };
+    let (rest, default) = base_url
+        .strip_prefix("http://")
+        .map(|r| (r, 80))
+        .or_else(|| base_url.strip_prefix("https://").map(|r| (r, 443)))?;
     let authority = rest.split('/').next().unwrap_or(rest);
     if authority.is_empty() {
         return None;

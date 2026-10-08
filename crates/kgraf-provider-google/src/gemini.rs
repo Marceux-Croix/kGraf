@@ -137,9 +137,17 @@ impl ThinkingStyle {
         max_output_tokens: u32,
         overridden: bool,
     ) -> Result<serde_json::Value, ProviderError> {
+        // Some models in these families cannot turn thinking off at all, and
+        // no off form has been exchanged with the running service, so none is
+        // sent on a guess.
+        let off_refused = ProviderError::CapabilityNotHonored {
+            adapter,
+            capability: "reasoning off (no off form is verified on this protocol)",
+        };
         match self {
             ThinkingStyle::Budget => {
                 let fixed: u64 = match effort {
+                    ReasoningEffort::Off => return Err(off_refused),
                     ReasoningEffort::Low => 1024,
                     ReasoningEffort::Medium => 8192,
                     ReasoningEffort::High => 24576,
@@ -163,6 +171,7 @@ impl ThinkingStyle {
             }
             ThinkingStyle::Level => {
                 let level = match effort {
+                    ReasoningEffort::Off => return Err(off_refused),
                     ReasoningEffort::Low => "low",
                     ReasoningEffort::Medium => "medium",
                     ReasoningEffort::High => "high",

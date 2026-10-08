@@ -409,6 +409,25 @@ Test this on a machine (or a fresh Windows 11 virtual machine) with the built `.
 
 Report, for each case, what the window or terminal said and whether kGraf started.
 
+## 6b. The sandbox user setup
+
+Run in a normal (not administrator) PowerShell:
+
+```
+kgraf sandbox status    # before: expect the users and rules to be missing
+kgraf sandbox setup     # click Yes in the UAC prompt; each step prints its outcome
+kgraf sandbox status    # after: every line present, "logon works" for both users
+kgraf sandbox setup     # again: users updated (passwords reset), rules refreshed
+kgraf sandbox remove    # UAC again; every item removed
+kgraf sandbox status    # everything missing again
+```
+
+Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users, they are
+not on the sign-in screen, and `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"`
+lists four block rules. Send back the output of every command. Note: until the
+runner unit lands, sandboxed commands still use the token sandbox; this step tests
+only the setup.
+
 ## 7. A dependency install in the sandbox
 
 This checks that kGraf runs a project's missing install in its sandbox with the network

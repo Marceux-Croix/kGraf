@@ -26,9 +26,7 @@ use kgraf_cli::worker::workspace;
 use kgraf_core::NodeId;
 use kgraf_graph::GraphStore;
 use kgraf_provider::Ledger;
-use kgraf_runtime::{
-    CallMode, ContextConfig, PointSource, WorkerBrief, WorkerEvent, WorkerOutcome,
-};
+use kgraf_runtime::{CallMode, ContextConfig, WorkerBrief, WorkerEvent, WorkerOutcome};
 use kgraf_sandbox::{MergeBack, WorkspaceManager};
 use kgraf_session::approval_store::PersistedAllowStore;
 use kgraf_tools::execpolicy::ExecPolicy;
@@ -196,10 +194,7 @@ pub fn run(root: &Path, mut args: WorkerArgs) -> Result<()> {
             (None, Vec::new())
         }
     };
-    let mut context = ContextConfig::for_model(args.window)?;
-    if let Some(point) = args.point {
-        context = context.with_point(point, PointSource::User)?;
-    }
+    let context = ContextConfig::for_model_with_user_point(args.window, args.point)?;
     let transcript_path = args
         .resume
         .clone()

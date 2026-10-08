@@ -143,6 +143,21 @@ impl ContextConfig {
         .try_into()
     }
 
+    /// [`ContextConfig::for_model`], then the user's compaction point when one
+    /// is set (the desktop slider, `--point`, the run file's `point`). Every
+    /// place that turns a run's settings into thresholds goes through here, so
+    /// the point a user sets is the point a worker's stop check reads.
+    pub fn for_model_with_user_point(
+        model_window_tokens: u64,
+        point: Option<u8>,
+    ) -> Result<Self, ThresholdError> {
+        let context = Self::for_model(model_window_tokens)?;
+        match point {
+            Some(percent) => context.with_point(percent, PointSource::User),
+            None => Ok(context),
+        }
+    }
+
     fn validate(&self) -> Result<(), ThresholdError> {
         if self.model_window_tokens == 0 {
             return Err(ThresholdError::ZeroWindow);

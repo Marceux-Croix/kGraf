@@ -209,6 +209,14 @@ impl OpenAiAdapter {
         self.config
             .check_model(self.adapter_name(), &request.model)?;
         self.echo_target(&request.model)?;
+        if request.reasoning_effort == Some(kgraf_provider::ReasoningEffort::Off) {
+            // No off form of `reasoning.effort` has been exchanged with a
+            // running server on this protocol, so none is sent on a guess.
+            return Err(ProviderError::CapabilityNotHonored {
+                adapter: self.adapter_name(),
+                capability: "reasoning off (no off form is verified on this protocol)",
+            });
+        }
         if self.refuses_temperature_with_reasoning
             && request.temperature.is_some()
             && request.reasoning_effort.is_some()
@@ -1304,6 +1312,42 @@ mod tests {
             .expect_err("must refuse");
         assert!(
             matches!(err, ProviderError::CapabilityNotHonored { .. }),
+            "{err:?}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty()
+        );
+        drop(token);
+        assert_eq!(
+            ledger.calls().expect("calls")[0].settlement,
+            Settlement::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_off_is_refused_before_sending_on_this_protocol() {
+        let server = MockServer::start().await;
+        let adapter = OpenAiAdapter::new(config(&server.uri())).expect("adapter");
+        let mut request = Request::new("model-x", "hi", 100);
+        request.reasoning_effort = Some(kgraf_provider::ReasoningEffort::Off);
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "model-x", "w", "t")
+            .expect("begin");
+        let err = adapter
+            .complete(&request, &token)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                ProviderError::CapabilityNotHonored { capability, .. }
+                    if capability.starts_with("reasoning off")
+            ),
             "{err:?}"
         );
         assert!(

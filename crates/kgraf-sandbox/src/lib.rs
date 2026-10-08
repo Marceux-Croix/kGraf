@@ -29,6 +29,7 @@ mod package_stores;
 /// it without depending on this crate; re-exported under its old path.
 pub use kgraf_core::repo_lock;
 mod sandbox;
+pub mod sandbox_user;
 #[cfg(unix)]
 pub mod trust;
 mod win_command_line;

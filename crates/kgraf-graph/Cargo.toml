@@ -33,7 +33,7 @@ tree-sitter-cpp.workspace = true
 tree-sitter-ruby.workspace = true
 tree-sitter-c-sharp.workspace = true
 tree-sitter-php.workspace = true
-walkdir.workspace = true
+ignore.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

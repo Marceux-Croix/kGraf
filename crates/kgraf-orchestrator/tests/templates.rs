@@ -70,6 +70,7 @@ fn parser_plan() -> String {
 fn services_for(p: &Parts, id: &str) -> kgraf_orchestrator::Services {
     let mut services = p.services(WINDOW);
     services.decomposer = Arc::new(ModelDecomposer(ModelCaller {
+        reasoning_effort: None,
         provider: p.planner.clone(),
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),
@@ -301,6 +302,7 @@ async fn the_decomposition_hold_covers_a_large_offered_template() {
     }
     let mut services = p.services(WINDOW);
     services.decomposer = Arc::new(ModelDecomposer(ModelCaller {
+        reasoning_effort: None,
         provider: Arc::new(BillsPrompt(parser_plan())),
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),

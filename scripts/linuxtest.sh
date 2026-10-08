@@ -185,6 +185,16 @@ step_prepare() {
     d="$(dirname "$d")"
   done
   sudo chmod -R o+rX "$REPO"
+  # The test user runs cargo for the real-build tests: make the pinned
+  # toolchain readable and every folder above it searchable.
+  local sysroot d2
+  sysroot="$(dirname "$(toolchain_bin)")"
+  sudo chmod -R o+rX "$sysroot"
+  d2="$sysroot"
+  while [[ "$d2" != "/" ]]; do
+    d2="$(dirname "$d2")"
+    sudo chmod o+x "$d2"
+  done
   local npm_dir
   npm_dir="$(dirname "$(command -v npm 2>/dev/null || echo /usr/bin/npm)")"
   case "$npm_dir" in /usr/bin | /usr/local/bin | /bin) ;; *) sudo chmod o+x "$npm_dir" ;; esac
@@ -198,8 +208,15 @@ step_prepare() {
 }
 
 # The npm folder, when it is not on the clean PATH already.
+# The pinned toolchain's own bin folder (the real cargo and rustc, not the
+# rustup proxies, which would need the runner's rustup home).
+toolchain_bin() {
+  (cd "$REPO" && echo "$(rustc --print sysroot)/bin")
+}
+
 user_path_extra() {
   local npm_dir
+  echo -n "$(toolchain_bin):"
   npm_dir="$(dirname "$(command -v npm 2>/dev/null || echo /usr/bin/npm)")"
   case "$npm_dir" in /usr/bin | /usr/local/bin | /bin) ;; *) echo "$npm_dir:" ;; esac
 }

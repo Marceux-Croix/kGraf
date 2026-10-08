@@ -974,3 +974,16 @@ replaced. Decision 0083's helpers now work on Windows (its 2026-10-07 amendment)
 `MergeBack::remove_ignored` removes through the same removal on every platform: each name is
 opened relative to its folder's handle without following a reparse point, and deleted through
 that handle. It no longer relies on no writer being left.
+
+## Amendment (2026-10-08): a shell question also names what the permission mode grants
+
+The question a worker reads for a command that needs approval named only this allowlist. In
+Accept edits, a worker that ran `mkdir`, `cp` and `python3 -c` in one `sh -c` script was
+refused for `python3`; it read the allowlist, took `cp` for a refused program too, and wrote
+the copy by hand. The mode's own grant of `cp` was never used. The question now says, before
+the allowlist, which programs the live mode runs without approval: Accept edits' file
+programs (`cp`, `mkdir`, `mv`, `touch`), or the programs in Auto's allow set. Manual, and a
+mode that grants no program by name, add nothing. The program the refusal names is still the
+uncovered one.
+
+Tests: `a_shell_question_names_the_programs_the_mode_grants` (fails without the sentence).

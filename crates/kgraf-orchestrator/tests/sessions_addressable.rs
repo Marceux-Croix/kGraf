@@ -350,7 +350,14 @@ async fn a_question_the_orchestrator_can_answer_never_reaches_the_user() {
         )
         .await
         .expect("answered");
-    assert_eq!(answer, "use src/config.toml");
+    // The worker reads who answered (the orchestrator, not the user, and no
+    // grant), then the answer.
+    let (lead, body) = answer.split_once("\n\n").expect("a lead, then the answer");
+    assert_eq!(body, "use src/config.toml");
+    assert!(
+        lead.contains("not by the user") && lead.contains("grants no permission"),
+        "{lead}"
+    );
     assert_eq!(
         *answerer.calls.lock().expect("lock"),
         1,

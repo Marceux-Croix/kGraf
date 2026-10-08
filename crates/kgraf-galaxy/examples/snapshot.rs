@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(&args[3])?);
     writeln!(out, "P6 {w} {h} 255")?;
-    for px in pixels.chunks_exact(4) {
+    for px in pixels.as_chunks::<4>().0 {
         out.write_all(&px[..3])?;
     }
     Ok(())

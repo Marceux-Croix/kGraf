@@ -1022,6 +1022,7 @@ impl Parts {
     /// [`Parts::services`] with `extra` tools on both worker routes.
     pub fn services_with(&self, window: u64, extra: &[Arc<dyn Tool>]) -> Services {
         let caller = |p: Arc<ScriptFake>, run: &str| ModelCaller {
+            reasoning_effort: None,
             provider: p,
             ledger: self.ledger.clone(),
             model: PLAN_MODEL.into(),

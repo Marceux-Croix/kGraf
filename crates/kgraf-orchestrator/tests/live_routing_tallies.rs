@@ -72,6 +72,7 @@ async fn a_stalled_attempt_leaves_a_live_tally_with_nothing_satisfied() {
     );
     let stall = Arc::new(StallFake::default());
     let caller = |provider: Arc<ScriptFake>| ModelCaller {
+        reasoning_effort: None,
         provider,
         ledger: p.ledger.clone(),
         model: PLAN_MODEL.into(),

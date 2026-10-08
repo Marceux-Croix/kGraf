@@ -185,7 +185,8 @@ pub fn conversation_for(
                 sources.push((r.run.to_string(), w.to_string()));
             }
         }
-    } else if let Some(key) = work {
+    } else {
+        let key = work?;
         let (run, contract) = key.split_once('/')?;
         title = format!("work {key}");
         if let Some(brief) = brief_of(runs, run, contract) {
@@ -198,8 +199,6 @@ pub fn conversation_for(
                 sources.push((r.clone(), w.clone()));
             }
         }
-    } else {
-        return None;
     }
     Some(Conversation {
         title,

@@ -1,0 +1,8 @@
+# The Rust release every local check, the Linux container and CI build with,
+# so a new compiler's lints arrive in one deliberate change, not as a red CI
+# run on an unrelated commit. Bump it on purpose and fix new lints with it.
+# The minimum supported version stays `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-msvc"]

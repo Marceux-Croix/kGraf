@@ -489,3 +489,14 @@ message.
 container, and the maintainer scripts pass `sh -n` and `shellcheck`. Loading the profile and the
 real grant need a host kernel with AppArmor, so they are checked on an Ubuntu 24.04 machine:
 `aa-status | grep kgraf`, then a proxy-limited install.
+
+## Note (2026-10-08): superseded on Windows by 0097
+
+Decision 0097 replaces this record's Windows token design (a WRITE_RESTRICTED token
+whose restricting SIDs are the write boundary) with a dedicated local sandbox user,
+set up once with administrator rights, whose own token carries no restricting SIDs;
+writes and reads are confined by access-control entries, and the offline user's
+network is blocked by firewall rules scoped to its SID. The reasons are the two
+failures recorded in this record's 2026-10-07 amendments (Schannel TLS and the MSYS2
+runtime). Until 0097's runner and launch units land, the token sandbox described here
+stays in use on Windows. macOS and Linux are unchanged.

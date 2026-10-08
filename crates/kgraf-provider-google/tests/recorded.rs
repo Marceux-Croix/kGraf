@@ -1541,6 +1541,24 @@ async fn a_level_the_model_does_not_document_is_refused_not_substituted() {
 }
 
 #[tokio::test]
+async fn reasoning_off_is_refused_on_both_thinking_styles() {
+    // One model of each style: a budget model and a level model.
+    for model in [MODEL, "gemini-3-flash-preview"] {
+        let error = thinking_outcome(model, ReasoningEffort::Off, 4000)
+            .await
+            .expect_err("no off form is verified");
+        assert!(
+            matches!(
+                error,
+                ProviderError::CapabilityNotHonored { capability, .. }
+                    if capability.starts_with("reasoning off")
+            ),
+            "{model}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_unknown_model_family_is_not_assumed_to_take_a_budget() {
     let error = thinking_outcome("gemini-9-ultra", ReasoningEffort::Low, 4000)
         .await

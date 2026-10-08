@@ -598,8 +598,19 @@ async fn check_scratch_is_private_removed_on_drop_and_swept_when_its_owner_is_de
     let live_dir = root.join("kept-1-abc123");
     std::fs::create_dir_all(&dead_dir).expect("mkdir");
     std::fs::create_dir_all(&live_dir).expect("mkdir");
+    // The scratch root is shared by every run in the process, and each run's
+    // startup sweeps it. A sweep that runs at the same moment (another test's
+    // `prepare`) may remove the dead owner's directory first, and the sweep
+    // that lost the race does not report it. So the test runs a rival sweep
+    // first, which is that interleaving on purpose, and asks that exactly one
+    // of the two sweeps reports the directory and that it is gone.
+    let rival = crate::host::sweep_check_scratch();
     let swept = crate::host::sweep_check_scratch();
-    assert!(swept.contains(&dead_dir), "{swept:?}");
+    let reported = [&rival, &swept]
+        .iter()
+        .filter(|found| found.contains(&dead_dir))
+        .count();
+    assert_eq!(reported, 1, "rival {rival:?}, own {swept:?}");
     assert!(!dead_dir.exists());
     assert!(live_dir.exists(), "PID 1 is alive: its directory stays");
     std::fs::remove_dir_all(&live_dir).expect("cleanup");

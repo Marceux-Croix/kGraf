@@ -148,6 +148,14 @@ pub struct RunConfig {
     /// need more than the default.
     #[serde(default = "defaults::planner_max_tokens")]
     pub planner_max_tokens: u32,
+    /// Reasoning level of every orchestrator call on the planner's route
+    /// (`--planner-reasoning`). `None`, the default, sends no reasoning field,
+    /// so the call is the same as before the setting existed. `off` is
+    /// checked on every answer: an answer that still carries reasoning fails
+    /// the call (`ProviderError::ReasoningNotOff`). A graded level cannot be
+    /// checked from an answer; the run says so when it opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_reasoning: Option<kgraf_provider::ReasoningEffort>,
     /// Cross-vendor review at the interface (decision 0079,
     /// `--interface-review`): before a producer attempt is counted verified,
     /// one review call goes to a model on a cross-vendor consumer's route.
@@ -342,6 +350,14 @@ mod opt_seconds {
 }
 
 impl RunConfig {
+    /// The context thresholds this run's workers stop and compact by: the
+    /// window and the compaction point, wherever the point came from (the
+    /// desktop slider, `--point`, the run file). The one place a run's
+    /// settings become thresholds.
+    pub fn context(&self) -> Result<kgraf_runtime::ContextConfig, kgraf_runtime::ThresholdError> {
+        kgraf_runtime::ContextConfig::for_model_with_user_point(self.window, self.point)
+    }
+
     /// A configuration with the command's defaults for everything but what the
     /// command requires.
     pub fn new(root: impl Into<PathBuf>, routes: Vec<String>, prices: impl Into<PathBuf>) -> Self {
@@ -373,6 +389,7 @@ impl RunConfig {
             shell_timeout: None,
             sessions: defaults::sessions(),
             planner_max_tokens: defaults::planner_max_tokens(),
+            planner_reasoning: None,
             interface_review: defaults::interface_review(),
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
@@ -564,13 +581,8 @@ impl RunConfig {
         }
         let invalid = |e: Error| NotReady::Invalid(e.to_string());
         let (_, used) = self.planner_and_used().map_err(invalid)?;
-        let context = kgraf_runtime::ContextConfig::for_model(self.window)
+        self.context()
             .map_err(|e| NotReady::Invalid(e.to_string()))?;
-        if let Some(point) = self.point {
-            context
-                .with_point(point, kgraf_runtime::PointSource::User)
-                .map_err(|e| NotReady::Invalid(e.to_string()))?;
-        }
         kgraf_orchestrator::Limits::new(self.max_items, self.max_agents)
             .map_err(|e| NotReady::Invalid(e.to_string()))?;
         limiters(&self.rate_limits, &used, store_path).map_err(invalid)?;

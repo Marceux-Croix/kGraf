@@ -660,7 +660,9 @@ fn the_real_scene_renders_headlessly() {
         let mut g = Galaxy::new(&device, scene.clone(), budget);
         let img = render(&mut g, &device, &queue);
         let lit = img
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[..3] != BACKGROUND_SRGB)
             .count();
         assert!(

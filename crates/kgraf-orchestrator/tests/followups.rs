@@ -205,7 +205,7 @@ impl AttemptEnvs for Factory {
     ) -> Result<AttemptEnv, String> {
         if self
             .fail
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err("MCP server `x` did not answer".into());

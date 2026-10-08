@@ -88,6 +88,7 @@ fn parts(dir: &std::path::Path) -> Parts {
 fn asker_with(provider: Arc<dyn Provider>, p: &Parts, max_output_tokens: u32) -> ModelAsker {
     ModelAsker {
         caller: ModelCaller {
+            reasoning_effort: None,
             provider,
             ledger: p.ledger.clone(),
             model: PLAN_MODEL.into(),

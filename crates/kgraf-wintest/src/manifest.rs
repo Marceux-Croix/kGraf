@@ -207,6 +207,9 @@ pub const CORE: &[(&str, &[&str], f64)] = &[
     // HTTPS inside the sandbox: the curl of Git for Windows (OpenSSL) works,
     // and System32 curl.exe (Schannel) is asserted to fail as documented.
     ("kgraf-sandbox/test/tls_windows", &[], 2.0),
+    // The sandbox user setup end to end; runs only elevated with
+    // KGRAF_SANDBOX_SETUP_TEST=1 (a hosted runner), else it says why.
+    ("kgraf-cli/test/sandbox_setup_windows", &[], 1.0),
     ("kgraf-sandbox/test/workspace", &[], 0.5),
     ("kgraf-sandbox/test/merge", &[], 0.3),
     ("kgraf-sandbox/test/reopen", &[], 0.5),

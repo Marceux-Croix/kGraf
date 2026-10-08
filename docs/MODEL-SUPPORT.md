@@ -18,8 +18,8 @@ The state of each route in your own build is also shown by `kgraf providers`.
   replies. No live exchange is recorded. Twenty-six rows have this status.
 - The table has 32 rows: one per route and model kind.
 - `kgraf providers` prints a confidence word for each route (`verified`, `documented`,
-  `unverified`). In four places it differs from this page. See "Where the catalog and the
-  record differ".
+  `unverified`). A generative route is `verified` there only where this page
+  marks it VERIFIED. See "The catalog agrees with the record".
 - A route moves to VERIFIED by one recorded live exchange. See "How a route becomes VERIFIED".
 
 ## Model kinds
@@ -149,18 +149,18 @@ stays open in the ledger until you settle it with `kgraf unreconciled`.
 A route that fails this check stays BUILT, UNTESTED. The failure is recorded and the adapter
 is fixed first.
 
-## Where the catalog and the record differ
+## The catalog agrees with the record
 
-The catalog (`crates/kgraf-fleet/src/lib.rs`) and the recorded exchanges disagree in these
-places. This page follows the record: it marks VERIFIED only where a live exchange is
-recorded.
+The catalog (`crates/kgraf-fleet/src/lib.rs`) marks a generative route `Verified` only where
+this page marks it VERIFIED. A test in `kgraf-fleet` reads the table above and fails if a
+catalog value and a status disagree. The evidence behind the routes that were checked:
 
-| Route | Catalog says | The record says | This page |
-|---|---|---|---|
-| `deepseek` | `Verified` | No recorded live exchange. An early implementation record lists it as verified without one. | BUILT, UNTESTED |
-| `kimi` | `Documented`. The note says the cache-read field is not yet seen on a warm call. | Live calls on 2026-09-26 (plain, then streamed) and a later run on 2026-09-28. The 2026-09-28 run shows a cache read of 256 tokens on a second call. | VERIFIED |
-| `kimi-anthropic` | `Documented` | Live calls on 2026-09-26 and 2026-09-28. Model echoed. The `/v1` root is correct. | VERIFIED |
-| `ollama` | `Documented` | Live exchanges with a local Ollama server on 2026-09-28, in a benchmark run and a direct check of the request shape. | VERIFIED |
+| Route | Live exchange recorded |
+|---|---|
+| `deepseek` | None. The catalog says `Documented` and this page says BUILT, UNTESTED. |
+| `kimi` | Live calls on 2026-09-26 (plain, then streamed) and a later run on 2026-09-28. The 2026-09-28 run shows a cache read of 256 tokens on a second call. |
+| `kimi-anthropic` | Live calls on 2026-09-26 and 2026-09-28. Model echoed. The `/v1` root is correct. |
+| `ollama` | Live exchanges with a local Ollama server on 2026-09-28, in a benchmark run and a direct check of the request shape. |
 
 Three more generative entries carry `Documented` with no live record: `grok`, `google` and
 `llama-cpp`. `Documented` means vendor pages describe the endpoint and protocol, and no more.
@@ -241,6 +241,42 @@ otherwise.
   reasoning count of zero. No token count is derived from the characters, because kGraf has
   no tokenizer for the served model. The `llama-cpp` route uses the same adapter and the
   same rule; its usage shape has not been recorded.
+- **Reasoning level (`reasoning_effort`) by route.** `kgraf orchestrate --planner-reasoning
+  <off|low|medium|high>` sets the level of every orchestrator call on the planner's route.
+  Without it, no reasoning field is sent. What each adapter does with a level:
+
+  | Adapter | `off` | `low`, `medium`, `high` |
+  |---|---|---|
+  | Chat Completions (`ollama`, `llama-cpp`, `openai` chat routes and the other vendors on this protocol) | Sent as `reasoning_effort: "none"`. An answer that carries reasoning text or reasoning tokens fails the call with `ReasoningNotOff`, after the call is recorded in the ledger. | Sent as is. Not checked: no answer shows whether a graded level was honored. |
+  | Responses (`openai` Responses routes) | Refused before sending: no off form is verified on this protocol. | Sent as `reasoning.effort`. |
+  | Gemini | Refused before sending: no off form is verified. | Mapped to a thinking budget or level by model family. |
+  | Anthropic, Bedrock | Refused before sending, as every level is. | Refused before sending. |
+
+  Measured on `ollama` (Ollama 0.34.4, `qwen3.6:35b`, digest
+  `a7eb95c53bcf96b4bdd008d0fab4a5dac88047d9c1a7a9ab88ed453423fbd87c`, 2026-10-08, three
+  requests per form on `/v1/chat/completions`, prompt "What is 17 * 23? Answer with the number
+  only."):
+
+  | Request form | Completion tokens | `reasoning` characters |
+  |---|---|---|
+  | no field | 282, 298, 413 | 634, 694, 1150 |
+  | `reasoning_effort: "high"` | 239, 246, 509 | 600, 531, 1326 |
+  | `reasoning_effort: "medium"` | 426, 238, 488 | 1117, 599, 1239 |
+  | `reasoning_effort: "low"` | 252, 392, 403 | 616, 1091, 973 |
+  | `reasoning_effort: "none"` | 4, 4, 4 | 0, 0, 0 |
+  | `reasoning: {"effort": "none"}` | 4, 4, 4 | 0, 0, 0 |
+  | `think: false` | 239, 225, 277 | 577, 544, 646 |
+  | ` /no_think` at the end of the prompt | 268, 290, 308 | 685, 782, 775 |
+  | `chat_template_kwargs: {"enable_thinking": false}` | 294, 251, 712 | 672, 510, 1621 |
+
+  Only `none` changed the reasoning length; every answer was correct (`391`). On a short
+  planning prompt (three requests each), no field gave 6,673 to 7,247 reasoning characters,
+  `low` 5,460 to 7,264, `high` 4,468 to 5,965, and `none` 0 (93 to 146 completion tokens).
+  The graded levels are therefore not honored on this server and model. The recorded `none`
+  answer and an answer that reasoned in spite of an off request are fixtures of the chat
+  adapter's tests (`2026-10-08-ollama-qwen3.6-chat-reasoning-none.json`,
+  `2026-10-08-ollama-qwen3.6-chat-think-false-ignored.json`). Another model on the same server
+  can behave differently.
 - **A model name is not a verified model.** A VERIFIED row covers the models named in its
   record. A different model on the same route can behave differently. DeepSeek is known to
   replace an unsupported model name with a cheaper one and return HTTP 200. The model echo
@@ -268,3 +304,7 @@ otherwise.
   Known limits). No route status changes.
 - 2026-10-08: a response with thinking text and no reasoning token count is marked in the
   ledger (`unsplit_reasoning_chars`) instead of reading as zero reasoning tokens.
+- 2026-10-08: reasoning level `off` (`--planner-reasoning`). The chat adapter sends it as
+  `reasoning_effort: "none"`, measured on `ollama` with `qwen3.6:35b`, and fails an answer
+  that still reasons; the Responses and Gemini adapters refuse it (see Known limits). No
+  route status changes.
