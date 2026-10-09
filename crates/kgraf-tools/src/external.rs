@@ -42,6 +42,10 @@ pub struct ExternalOutcome {
     pub timed_out: bool,
 }
 
+/// How long past a command's own timeout the host waits, by default, for an
+/// external executor to report ([`ExternalExecutor::report_grace`]).
+pub const DEFAULT_REPORT_GRACE: Duration = Duration::from_secs(30);
+
 /// One command, run somewhere that is not this process's own host: a task
 /// container reached through another harness, or any other out-of-process
 /// runner. The trait carries no assumption about *how* the command reaches
@@ -75,6 +79,15 @@ pub trait ExternalExecutor: Send + Sync {
     /// right after the drop, and bounded by the host; the default does
     /// nothing, for an executor whose `exec` holds no state past a drop.
     async fn abandon(&self) {}
+
+    /// How long past a command's own timeout the host waits for
+    /// [`Self::exec`] to report before it abandons the call. An executor
+    /// whose report takes longer than the command (a tree sync after it, its
+    /// own bound on a remote that does not answer) says so here, so the host
+    /// does not give up on a report the executor is still allowed to make.
+    fn report_grace(&self) -> Duration {
+        DEFAULT_REPORT_GRACE
+    }
 
     /// Make the remote tree equal to the host tree, byte for byte, and return
     /// only when it is. Called after a host-side file write, so that the next

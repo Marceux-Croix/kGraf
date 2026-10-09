@@ -136,9 +136,9 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | Step | Command | What it checks |
 |---|---|---|
 | (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
-| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the three DNS filters, with no tag. The output lists a received password for every one of these users. A DNS filter Windows refuses does not stop setup: a `refused` line names it with Windows' error and a `probe:` reading, the DNS step's line says `partial`, and setup exits 0 with a closing notice that DNS is not confined on this machine. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines included, except a DNS filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
-| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. If the probe did not run on the sandbox user at all (selfcheck names that backend in its error but printed no result line, for example because Git Bash did not start as that user), step (e) still runs so its tests show which programs start as the sandbox user, and the summary says `GATE FAILED`. Any other failure stops the phase: step (e) does not run. |
+| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and seven WFP filters (three DNS filters and four loopback filters), with no tag. The output lists a received password for every one of these users. A filter Windows refuses does not stop setup: a `refused` line names it with Windows' error and a `probe:` reading, the WFP step's line says `partial`, and setup exits 0 with a closing notice that DNS, loopback connections, or both are not confined on this machine. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines and the four loopback filter lines included, except a filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" (or "loopback connections are", or both) and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
+| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. If selfcheck failed on the sandbox user and printed no result lines (its error names that backend and stops at the probe), step (e) still runs so its tests show which programs start as the sandbox user, and the summary says `GATE FAILED: selfcheck failed on the sandbox user and printed no result lines`. The report then says which of two cases the error line shows: the probe ran and failed the step the line names (an earlier run: "a direct connection to the origin worked"), or the probe did not finish its steps (the line gives only an exit status, for example because Git Bash did not start as that user). Any other failure stops the phase: step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
 
@@ -217,6 +217,50 @@ The longest logon call is what every other spawn may wait for. `runner_windows` 
 `stdio_windows` are not among the binaries the phase re-runs; run them by hand (3b, 3c)
 to collect their lines.
 
+What the phase collects about the loopback filters, the jobserver and git, and what to read
+in the report (each came from the first self-test run whose re-run ran as the sandbox user):
+
+- Loopback. That run had the firewall rule `block-loopback-tcp` present, and the offline slot
+  user still reached a listener on 127.0.0.1 outside kGraf's proxy ports: selfcheck (d)
+  failed with "a direct connection to the origin worked", and
+  `a_command_without_the_network_reaches_the_proxy_ports_and_nothing_else` failed with
+  "reached a local listener ... connected". Windows Firewall rules do not act on that
+  loopback traffic. Setup now adds four filters at the connect layers
+  (`FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `_V6`): one per IP version for every port outside
+  the proxy ports, one per IP version for UDP. Expect in (b) a `created` WFP step line and no
+  `refused` line for a loopback filter; in (c) four lines `present  loopback filter on the
+  connect layer, IPv4 ...` and `..., IPv6 ...`; in (d) the line `network: only the egress
+  proxy was reachable`; and in (e) that escape test passing. A `refused` line or a `FAILED`
+  loopback line means Windows refused that filter shape: send the line whole with its
+  `probe:` reading.
+- The jobserver. That run stopped every cargo build as the sandbox user at rustc's start
+  ("failed to create jobserver: Os { code: 5 }", exit 0xC0000409): rustc could not create
+  its named semaphore in the session. kGraf now makes one per command and names it in
+  `CARGO_MAKEFLAGS`. Expect in (d) a launch line `made jobserver semaphore kgraf-jobserver-...
+  with N tokens for a command of sandbox user ...`; in (e)
+  `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` passing, with one
+  `measurement: a named semaphore in the session ...` line per kind (exit 5 there means the
+  session refuses the sandbox user's own named objects, as expected; exit 0 means it does
+  not); and `a_real_cargo_build_runs_inside_the_sandbox`, the bench-briefs checks and the
+  contract checks passing. The cargo test now prints cargo's own lines. A line
+  `warn: could not canonicalize path C:\Users\<user>` from rustup is expected: rustup looks for
+  a toolchain override in each folder above the command's folder, and the owner's profile
+  folder is not readable to the sandbox user. It is a warning, not a failure.
+- Git. That run's `git status` as the sandbox user failed with "detected dubious ownership":
+  the worktree belongs to the account that runs kGraf. A command that runs as the sandbox user now gets
+  `safe.directory` entries for its roots through `GIT_CONFIG_COUNT`. Expect the end-to-end
+  check `shell.git` and `a_worker_runs_end_to_end_on_the_real_tools_transcript_masking_mcp_and_ledger`
+  to pass in (e).
+- The read grant on a repository's `.git`. That run's notes said "the read grant on
+  ...\.git reached N of its files and folders; ... could not be opened or written",
+  each an object file git writes read-only. Such a file now gets a second, minimal open and a
+  lone write. Expect no such note in (e); a note that remains names the step that failed
+  (`open:`, `read:`, `write (SetSecurityInfo):` or `write (lone):`), which decides the next
+  change.
+- The worktree hold. `a_worktree_the_worker_still_writes_is_not_snapshotted` must fail the
+  verification with "still runs": kGraf now lists each command it started in a worktree by
+  its job, and quiesce is busy while one still holds a process.
+
 What the phase collects about the DNS filter, and what to read in the report:
 
 - The `dns:` line of selfcheck before setup (b0) and after it (d). Before: `dns: not
@@ -237,13 +281,19 @@ What the phase collects about the DNS filter, and what to read in the report:
   tells whether the layer refuses any static filter, the user condition, or the block
   action. Send the line whole; it decides what the next change to the DNS filter is.
 - The test binary `dns_windows`, in the baseline (each test returns at once, because no
-  sandbox user is set up) and in the re-run (e). In the re-run it checks each filter's
-  `netsh wfp show filters` entry (name, layer `FWPM_LAYER_RPC_UM`,
-  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` or `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`, block),
-  and the cache
-  check: after `Clear-DnsClientCache`, a lookup by the offline user fails and
-  `Get-DnsClientCache` does not list its name, while the online user and the owner still
-  resolve. A failure message carries the netsh entry or the lookup status.
+  sandbox user is set up) and in the re-run (e). In the re-run it checks the
+  `netsh wfp show filters` entry of each filter that exists (name, layer
+  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4`, `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`,
+  `FWPM_LAYER_ALE_AUTH_CONNECT_V4` or `FWPM_LAYER_ALE_AUTH_CONNECT_V6`, block), with a
+  `measurement:` line for each filter it does not look for: one Windows refused at setup,
+  and the filter on `FWPM_LAYER_RPC_UM`, which netsh does not list (an earlier run: present by
+  kGraf's own reading, absent from the netsh list). Then the cache check: after
+  `Clear-DnsClientCache`, a lookup by the offline user fails and `Get-DnsClientCache` does
+  not list its name, while the online user and the owner still resolve. That test prints a
+  `measurement:` line per DNS filter (present, absent or disabled) and judges by the lookup
+  alone: on a machine that refused the name resolution cache filters (Windows Server 2025)
+  the lookup leaves the machine and the test fails on it, which is the recorded gap. A
+  failure message carries the netsh entry or the lookup status.
 - Read the failed tests of `dns_windows` in the re-run table before the selfcheck verdict:
   they say which part did not hold (the filter's listing, the offline lookup, or the
   online one).
@@ -473,9 +523,10 @@ process environment.
 
    - `the_command_runs_on_its_own_desktop_without_a_console` and
      `user_interface_objects_are_shared_the_way_the_backend_shares_them`: the window station
-     name of each command. As a sandbox user each command gets its own station,
-     `kgraf-sandbox-<hex>`, with one desktop called `Default` on it, and no two commands
-     share a station.
+     name of each command. As a sandbox user kGraf's process makes one station for the
+     commands of each sandbox user, `kgraf-cmd-<hex>`, with one desktop called `Default` on
+     it: two commands in one worktree run as one user and share it, two worktrees run as two
+     users on two stations.
    - `send_input_reaches_nothing_of_the_owners`: how many events `SendInput` injected, and
      the station it ran on, in one line from one command. A count above zero on a private
      station reaches nothing, so the count is a measurement there, not a failure.
@@ -487,7 +538,13 @@ process environment.
      `a_junction_inside_the_root_cannot_escape` and
      `the_owner_cannot_rewrite_the_dacl_of_an_outside_file`: each runs a second phase
      against an Everyone-writable folder under ProgramData, where the target's own access
-     list decides and not the owner's profile, and prints a `measurement:` line.
+     list decides and not the owner's profile, and prints a `measurement:` line. The
+     junction test also checks, as a sandbox user, that the next command in a worktree
+     holding the planted junction is refused before any access entry is written ("holds
+     the link ... nothing was written"), then removes the junction before the next kind.
+   - `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured`: a sandbox user
+     opens the jobserver kGraf made for its command, and a `measurement:` line per kind
+     says whether it may create a named semaphore of its own in the session.
 
    In a manual run, add `--show-output` to the command above (libtest prints the output of
    a passing test only then) and copy every line that starts with `measurement:` into the
@@ -594,8 +651,9 @@ process environment.
    children, with their age); send that output too.
 
 4. The worker's shell tool on Windows (a plain program and a `sh -c` line run and return
-   their output, the network notice comes once, an exit status comes back, a timeout and
-   a cancel end the whole process tree), and its pure decisions:
+   their output, the network notice comes once under the token sandbox and never under the
+   sandbox user, an exit status comes back, a timeout and a cancel end the whole process
+   tree), and its pure decisions:
 
    ```powershell
    cargo test -p kgraf-tools --lib windows -- --test-threads=1 2>&1 | Tee-Object "$r\4-tools-windows.txt"
@@ -782,8 +840,9 @@ sandbox selfcheck: passed with a gap
   tree: writable
 ```
 
-Expected after `setup` (sandbox user). The direct connection to the local origin is blocked,
-the DNS filters refuse the sandbox user's lookup, and the exit code is 0:
+Expected after `setup` (sandbox user). The direct connection to the local origin is blocked
+(the loopback filters), the DNS filters refuse the sandbox user's lookup, and the exit code
+is 0:
 
 ```
 sandbox selfcheck: ok
@@ -909,7 +968,11 @@ How to read the three files:
 ### The DNS filter
 
 `kgraf sandbox setup` adds three Windows Filtering Platform (WFP) filters that are meant
-to make the DNS Client service refuse name lookups from the users the firewall rules block:
+to make the DNS Client service refuse name lookups from the users the firewall rules block,
+and four more at the connect layers that block those users' loopback connections outside
+kGraf's egress proxy ports (one per IP version for every other port, one per IP version
+for UDP); the four have their own status lines (`loopback filter on the connect layer,
+IPv4 ...`), and selfcheck's `network:` line proves them. All seven name
 `kgraf-off-` and every slot user without the network (`kgraf-sNN-`). They never name
 `kgraf-on-`, a `kgraf-oNN-` user or the owner. Two sit on the name resolution cache layers
 (IPv4 and IPv6), which see the local caller; the third sits on the user-mode RPC layer,
@@ -951,7 +1014,7 @@ What to expect:
    does not run. A line that says `FAILED` names a filter Windows refused at setup, with
    its error and the probe reading: DNS is not confined on that machine, and step 3 and
    the offline lookup of `dns_windows` are expected to fail there. The filter's netsh
-   check in `dns_windows` fails too, with "netsh does not list the DNS filter".
+   check in `dns_windows` does not look for it, and says so in a `measurement:` line.
 3. `dns-cache.txt` lists one `kgraf-probe-...` name: the one your own process looked up.
    A second name means the DNS Client service looked the sandbox user's name up: the
    filter does not work. No name at all means the cache does not keep "does not exist"

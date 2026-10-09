@@ -99,8 +99,10 @@ pub enum StepId {
     /// Deny the sandbox group the right to create or change entries in the
     /// folders every local user may write ([`super::acl::closed_folders`]).
     CloseFolders,
-    /// Add or refresh the WFP filter that keeps the blocked users from the
-    /// DNS Client service ([`super::wfp`]).
+    /// Add or refresh the WFP filters that keep the blocked users from the
+    /// DNS Client service and from loopback ports other than kGraf's egress
+    /// proxy ([`super::wfp`]). The key stays `dns-filter`, the step's name
+    /// before the loopback filters joined it.
     DnsFilter,
     /// Write the undo record.
     Record,
@@ -164,7 +166,8 @@ impl StepId {
                                      ProgramData, Public and the Windows temporary folders"
                 .into(),
             StepId::DnsFilter => format!(
-                "WFP filters meant to refuse the offline users' DNS lookups ({})",
+                "WFP filters meant to refuse the offline users' DNS lookups and loopback \
+                 connections outside kGraf's egress proxy ports ({})",
                 WfpKeys::derive(names)
                     .filters()
                     .iter()
@@ -180,7 +183,7 @@ impl StepId {
 /// What a failure of `id` leaves on the machine, as a clause the setup's
 /// error carries. Empty where the failure leaves nothing that matters.
 ///
-/// A DNS filter that Windows refuses is not a failure of the step
+/// A filter that Windows refuses is not a failure of the step
 /// ([`dns_step_report`]); the step fails only when kGraf cannot name the
 /// users the filters match.
 ///
@@ -195,8 +198,9 @@ pub fn failure_leaves(id: StepId) -> &'static str {
     match id {
         StepId::DnsFilter => {
             "the sandbox users and the stored passwords of an earlier setup stay in place, so \
-             commands still run as a sandbox user without this filter and a name lookup can \
-             leave the machine; run `kgraf sandbox status` for the DNS filter lines, \
+             commands still run as a sandbox user without these filters: a name lookup can \
+             leave the machine and a loopback port outside kGraf's egress proxy can be \
+             reached; run `kgraf sandbox status` for the filter lines, \
              `kgraf sandbox selfcheck` for the effect, and `kgraf sandbox remove` to take the \
              users off the machine"
         }
@@ -204,7 +208,7 @@ pub fn failure_leaves(id: StepId) -> &'static str {
     }
 }
 
-/// What the DNS filter step did with one filter.
+/// What the WFP filter step did with one filter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilterOutcome {
     Added,
@@ -213,7 +217,7 @@ pub enum FilterOutcome {
     NotAdded(String),
 }
 
-/// What the DNS filter step reports: the step's outcome, and each filter
+/// What the WFP filter step reports: the step's outcome, and each filter
 /// that was not added, with why, in the order the filters are added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DnsStepReport {
@@ -221,16 +225,18 @@ pub struct DnsStepReport {
     pub refused: Vec<(WfpObject, String)>,
 }
 
-/// The DNS filter step's report from what happened to each filter.
+/// The WFP filter step's report from what happened to each filter.
 ///
-/// A filter Windows refuses does not fail setup (owner's ruling: keep the
-/// gap, and report it as a failed line, never a pass). The users, the
-/// firewall rules and the folder denies are the main confinement, and a
-/// setup that stopped at the DNS step stored no passwords, so no command ran
-/// as a sandbox user at all. The step's outcome is then `partial`, each
-/// refused filter is listed with why, and setup ends with
-/// [`dns_notice`]. A filter missing from `results` is listed as not tried,
-/// so a result list that lost one never reads as a full set.
+/// A filter Windows refuses does not fail setup: the gap is kept and
+/// reported as a failed line, never a pass. The users, the firewall rules
+/// and the folder denies are the main confinement, and a setup that stopped
+/// at this step stored no passwords, so no command ran as a sandbox user at
+/// all. The step's outcome is then `partial`, each refused filter is listed
+/// with why, and setup ends with [`dns_notice`]. A filter missing from
+/// `results` is listed as not tried, so a result list that lost one never
+/// reads as a full set. A refused loopback filter is a gap the same way: the
+/// selfcheck's direct connection to its loopback origin then fails the
+/// check, so the gap is never silent.
 pub fn dns_step_report(action: Action, results: &[(WfpObject, FilterOutcome)]) -> DnsStepReport {
     let refused: Vec<(WfpObject, String)> = WfpObject::FILTERS
         .into_iter()
@@ -260,9 +266,50 @@ fn leaves_local_lookups_open(object: WfpObject) -> bool {
     )
 }
 
-/// The notice setup ends with when a DNS filter was not added, or `None`
-/// when every filter was.
+/// The notice setup ends with when a WFP filter was not added, or `None`
+/// when every filter was: one paragraph for the loopback filters and one for
+/// the DNS filters, each only when one of its kind was refused.
 pub fn dns_notice(refused: &[(WfpObject, String)]) -> Option<String> {
+    let loopback: Vec<&(WfpObject, String)> = refused
+        .iter()
+        .filter(|(o, _)| o.is_loopback_filter())
+        .collect();
+    let dns: Vec<(WfpObject, String)> = refused
+        .iter()
+        .filter(|(o, _)| !o.is_loopback_filter())
+        .cloned()
+        .collect();
+    let loopback_notice = (!loopback.is_empty()).then(|| {
+        let list = loopback
+            .iter()
+            .map(|(object, why)| {
+                format!(
+                    "the filter blocking {} on {} ({why})",
+                    object.loopback_words(),
+                    object.layer_words()
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("; ");
+        format!(
+            "Loopback connections are not confined on this machine. Windows did not add \
+             {list}. Windows Firewall rules do not act on loopback traffic, so a sandbox user \
+             without the network can reach a service listening on this machine. \
+             `kgraf sandbox status` shows the gap as FAILED, and `kgraf sandbox selfcheck` \
+             fails on its direct connection."
+        )
+    });
+    let dns_notice = dns_only_notice(&dns);
+    match (loopback_notice, dns_notice) {
+        (None, None) => None,
+        (Some(l), None) => Some(l),
+        (None, Some(d)) => Some(d),
+        (Some(l), Some(d)) => Some(format!("{l}\n{d}")),
+    }
+}
+
+/// [`dns_notice`] for the DNS filters alone.
+fn dns_only_notice(refused: &[(WfpObject, String)]) -> Option<String> {
     if refused.is_empty() {
         return None;
     }
@@ -797,9 +844,9 @@ pub fn plan_remove(
         // Each filter before the sublayer and the provider it names: a
         // provider or sublayer an object still names cannot be deleted.
         UndoEntry::Wfp { object, .. } => match object {
-            WfpObject::RpcFilter | WfpObject::NameCacheFilterV4 | WfpObject::NameCacheFilterV6 => 5,
             WfpObject::Sublayer => 6,
             WfpObject::Provider => 7,
+            _ => 5,
         },
     };
     let mut entries = record.entries.clone();
@@ -910,8 +957,26 @@ pub struct StatusReport {
 }
 
 impl StatusReport {
+    /// What the failed lines leave open, in words: DNS, loopback connections,
+    /// or both. Empty when no line failed.
+    pub fn refused_gaps(&self) -> String {
+        let failed = |prefix: &str| {
+            self.lines
+                .iter()
+                .any(|l| matches!(l.state, ItemState::Failed(_)) && l.item.starts_with(prefix))
+        };
+        let mut gaps = Vec::new();
+        if failed(DNS_FILTER_ITEM) {
+            gaps.push("DNS");
+        }
+        if failed(LOOPBACK_FILTER_ITEM) {
+            gaps.push("loopback connections");
+        }
+        gaps.join(" and ")
+    }
+
     /// Not ready, and only because of lines Windows refused at setup (the
-    /// DNS filters): running setup again would not change it.
+    /// WFP filters): running setup again would not change it.
     pub fn only_refused_gaps(&self) -> bool {
         !self.ready
             && self.lines.iter().all(|l| {
@@ -939,9 +1004,10 @@ impl fmt::Display for StatusReport {
         } else if self.only_refused_gaps() {
             write!(
                 f,
-                "The Windows sandbox user is set up, but DNS is not confined on this machine: \
-                 Windows refused a DNS filter at setup, and running setup again does not \
-                 change that."
+                "The Windows sandbox user is set up, but {} not confined on this machine: \
+                 Windows refused a WFP filter at setup, and running setup again does not \
+                 change that.",
+                refused_subject(&self.refused_gaps())
             )
         } else {
             write!(
@@ -949,6 +1015,21 @@ impl fmt::Display for StatusReport {
                 "The Windows sandbox user is not fully set up: run `kgraf sandbox setup`."
             )
         }
+    }
+}
+
+/// The item of a DNS filter's status line starts with this.
+const DNS_FILTER_ITEM: &str = "DNS filter on ";
+/// The item of a loopback filter's status line starts with this.
+const LOOPBACK_FILTER_ITEM: &str = "loopback filter on ";
+
+/// `gaps` ([`StatusReport::refused_gaps`]) as the subject of a sentence:
+/// "DNS is", "loopback connections are", "DNS and loopback connections are".
+pub fn refused_subject(gaps: &str) -> String {
+    match gaps {
+        "" => "a filtered path is".to_owned(),
+        "DNS" => "DNS is".to_owned(),
+        other => format!("{other} are"),
     }
 }
 
@@ -1101,21 +1182,29 @@ pub fn status_report(
         };
         // Present is not proved: only `kgraf sandbox selfcheck` shows the
         // effect.
-        let what = if leaves_local_lookups_open(object) {
-            "meant to refuse the offline users' lookups; `kgraf sandbox selfcheck` proves the \
-             effect"
-        } else {
-            "remote callers of the DNS Client service only; a lookup on this machine does not \
-             pass this layer"
-        };
-        push(
+        let item = if object.is_loopback_filter() {
             format!(
-                "DNS filter on {} {} ({what})",
+                "{LOOPBACK_FILTER_ITEM}{} {} (blocks {}; `kgraf sandbox selfcheck` proves the \
+                 effect)",
+                object.layer_words(),
+                guid_text(key),
+                object.loopback_words()
+            )
+        } else {
+            let what = if leaves_local_lookups_open(object) {
+                "meant to refuse the offline users' lookups; `kgraf sandbox selfcheck` proves \
+                 the effect"
+            } else {
+                "remote callers of the DNS Client service only; a lookup on this machine does \
+                 not pass this layer"
+            };
+            format!(
+                "{DNS_FILTER_ITEM}{} {} ({what})",
                 object.layer_words(),
                 guid_text(key)
-            ),
-            state,
-        );
+            )
+        };
+        push(item, state);
     }
     let state = match record {
         Ok(None) => ItemState::Missing,
@@ -1154,7 +1243,10 @@ pub fn status_report(
 
 /// What a refused filter leaves open, for its status line.
 fn gap_words(object: WfpObject) -> &'static str {
-    if leaves_local_lookups_open(object) {
+    if object.is_loopback_filter() {
+        "loopback connections are not confined on this machine: a sandbox user without the \
+         network can reach a local service outside kGraf's egress proxy ports"
+    } else if leaves_local_lookups_open(object) {
         "DNS is not confined on this machine: a name lookup by a sandbox user without the \
          network can leave it"
     } else {
@@ -1426,11 +1518,10 @@ mod tests {
         assert!(steps.iter().all(|s| s.action == RemoveAction::Remove));
         let rank = |e: &UndoEntry| match e {
             UndoEntry::Wfp { object, .. } => match object {
-                WfpObject::RpcFilter
-                | WfpObject::NameCacheFilterV4
-                | WfpObject::NameCacheFilterV6 => 5,
+                o if o.is_filter() => 5,
                 WfpObject::Sublayer => 6,
                 WfpObject::Provider => 7,
+                o => panic!("{o:?} has no rank"),
             },
             UndoEntry::Rule(_) => 0,
             UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
@@ -1457,11 +1548,7 @@ mod tests {
         };
         assert_eq!(object_of(&steps[steps.len() - 1]), WfpObject::Provider);
         assert_eq!(object_of(&steps[steps.len() - 2]), WfpObject::Sublayer);
-        for object in [
-            WfpObject::RpcFilter,
-            WfpObject::NameCacheFilterV4,
-            WfpObject::NameCacheFilterV6,
-        ] {
+        for object in WfpObject::FILTERS {
             let at = steps
                 .iter()
                 .position(|s| matches!(s.entry, UndoEntry::Wfp { object: o, .. } if o == object))
@@ -2021,13 +2108,15 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_every_dns_filter() {
+    fn status_reports_every_wfp_filter() {
         let n = names();
         let lines = |o: &Observed| -> Vec<StatusLine> {
             status_report(&n, o, Ok(None), &Credentials::Missing)
                 .lines
                 .into_iter()
-                .filter(|l| l.item.contains("DNS filter"))
+                .filter(|l| {
+                    l.item.starts_with(DNS_FILTER_ITEM) || l.item.starts_with(LOOPBACK_FILTER_ITEM)
+                })
                 .collect()
         };
         let o = full(&n);
@@ -2042,6 +2131,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("no line for {object}: {got:?}"));
             assert_eq!(line.state, ItemState::Present);
             assert!(line.item.contains(object.layer_words()), "{line:?}");
+            // A loopback filter's line says so and what it blocks; a DNS
+            // filter's line says DNS.
+            if object.is_loopback_filter() {
+                assert!(line.item.starts_with(LOOPBACK_FILTER_ITEM), "{line:?}");
+                assert!(line.item.contains(object.loopback_words()), "{line:?}");
+            } else {
+                assert!(line.item.starts_with(DNS_FILTER_ITEM), "{line:?}");
+            }
         }
         // One missing filter is reported, and makes the setup not ready.
         let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
@@ -2086,11 +2183,16 @@ mod tests {
             StepOutcome::Updated
         );
         // The run on Windows Server 2025: the RPC filter taken, the IPv4
-        // name resolution cache filter refused, and so on.
+        // name resolution cache filter refused, and so on; the loopback
+        // filters taken.
         let server_2025 = vec![
             added(WfpObject::RpcFilter),
             refused(WfpObject::NameCacheFilterV4),
             refused(WfpObject::NameCacheFilterV6),
+            added(WfpObject::LoopbackFilterV4),
+            added(WfpObject::LoopbackFilterV6),
+            added(WfpObject::LoopbackUdpFilterV4),
+            added(WfpObject::LoopbackUdpFilterV6),
         ];
         let r = dns_step_report(Action::Create, &server_2025);
         assert_eq!(r.outcome, StepOutcome::Partial);
@@ -2106,6 +2208,7 @@ mod tests {
             notice.starts_with("DNS is not confined on this machine."),
             "{notice}"
         );
+        assert!(!notice.contains("Loopback"), "{notice}");
         for needle in [
             "the name resolution cache layer, IPv4",
             "FWP_E_OUT_OF_BOUNDS",
@@ -2124,6 +2227,10 @@ mod tests {
                 refused(WfpObject::RpcFilter),
                 added(WfpObject::NameCacheFilterV4),
                 added(WfpObject::NameCacheFilterV6),
+                added(WfpObject::LoopbackFilterV4),
+                added(WfpObject::LoopbackFilterV6),
+                added(WfpObject::LoopbackUdpFilterV4),
+                added(WfpObject::LoopbackUdpFilterV6),
             ],
         );
         assert_eq!(rpc_only.outcome, StepOutcome::Partial);
@@ -2131,10 +2238,107 @@ mod tests {
         assert!(!notice.contains("not confined"), "{notice}");
         assert!(notice.contains("remote callers"), "{notice}");
         // A filter the result list lost counts as not added, never as added.
-        let lost = dns_step_report(Action::Create, &all[..2]);
+        let lost = dns_step_report(Action::Create, &all[..all.len() - 1]);
         assert_eq!(lost.outcome, StepOutcome::Partial);
         assert_eq!(lost.refused.len(), 1);
-        assert_eq!(lost.refused[0].0, WfpObject::NameCacheFilterV6);
+        assert_eq!(lost.refused[0].0, WfpObject::LoopbackUdpFilterV6);
+    }
+
+    /// A loopback filter Windows refuses is a gap of its own: the step is
+    /// `partial`, the notice says loopback connections are not confined and
+    /// that selfcheck fails, and a DNS refusal beside it keeps its own
+    /// paragraph.
+    #[test]
+    fn a_refused_loopback_filter_is_a_gap_the_notice_names() {
+        let added = |o: WfpObject| (o, FilterOutcome::Added);
+        let refused = |o: WfpObject| (o, FilterOutcome::NotAdded(OUT_OF_BOUNDS.into()));
+        let results: Vec<_> = WfpObject::FILTERS
+            .into_iter()
+            .map(|o| {
+                if o == WfpObject::LoopbackFilterV4 {
+                    refused(o)
+                } else {
+                    added(o)
+                }
+            })
+            .collect();
+        let r = dns_step_report(Action::Create, &results);
+        assert_eq!(r.outcome, StepOutcome::Partial);
+        assert_eq!(
+            r.refused,
+            vec![(WfpObject::LoopbackFilterV4, OUT_OF_BOUNDS.to_owned())]
+        );
+        let notice = dns_notice(&r.refused).expect("a notice");
+        assert!(
+            notice.starts_with("Loopback connections are not confined on this machine."),
+            "{notice}"
+        );
+        for needle in [
+            "the connect layer, IPv4",
+            "egress proxy ports",
+            "FWP_E_OUT_OF_BOUNDS",
+            "FAILED",
+            "selfcheck` fails",
+        ] {
+            assert!(notice.contains(needle), "{needle:?}: {notice}");
+        }
+        assert!(!notice.contains("DNS"), "{notice}");
+        // Both kinds refused: one paragraph each, loopback first.
+        let both = dns_notice(&[
+            (WfpObject::NameCacheFilterV4, OUT_OF_BOUNDS.into()),
+            (WfpObject::LoopbackUdpFilterV6, OUT_OF_BOUNDS.into()),
+        ])
+        .unwrap();
+        let paragraphs: Vec<&str> = both.lines().collect();
+        assert_eq!(paragraphs.len(), 2, "{both}");
+        assert!(paragraphs[0].starts_with("Loopback"), "{both}");
+        assert!(paragraphs[1].starts_with("DNS is not confined"), "{both}");
+    }
+
+    /// A loopback filter the last setup recorded as refused is a FAILED line
+    /// that says loopback connections are not confined, and the closing
+    /// sentence and the summary say the same, not DNS.
+    #[test]
+    fn status_shows_a_refused_loopback_filter_as_failed() {
+        let n = names();
+        let mut o = full(&n);
+        let keys = WfpKeys::derive(&n);
+        o.wfp.remove(&keys.loopback_v6);
+        let mut r = record_from(&plan_setup(&n, &full(&n)).unwrap(), &n);
+        r.dns_refused = vec![(WfpObject::LoopbackFilterV6, OUT_OF_BOUNDS.into())];
+        let report = status_report(&n, &o, Ok(Some(&r)), &all_stored(&n));
+        let line = report
+            .lines
+            .iter()
+            .find(|l| l.item.contains(&guid_text(keys.loopback_v6)))
+            .unwrap();
+        assert!(line.item.starts_with(LOOPBACK_FILTER_ITEM), "{line:?}");
+        let ItemState::Failed(why) = &line.state else {
+            panic!("{line:?}");
+        };
+        assert!(why.contains(OUT_OF_BOUNDS), "{why}");
+        assert!(
+            why.contains("loopback connections are not confined"),
+            "{why}"
+        );
+        assert!(report.only_refused_gaps());
+        assert_eq!(report.refused_gaps(), "loopback connections");
+        assert_eq!(
+            refused_subject(&report.refused_gaps()),
+            "loopback connections are"
+        );
+        let text = report.to_string();
+        assert!(
+            text.contains("but loopback connections are not confined on this machine"),
+            "{text}"
+        );
+        // Both kinds refused.
+        r.dns_refused
+            .push((WfpObject::NameCacheFilterV4, OUT_OF_BOUNDS.into()));
+        o.wfp.remove(&keys.name_cache_v4);
+        let report = status_report(&n, &o, Ok(Some(&r)), &all_stored(&n));
+        assert_eq!(report.refused_gaps(), "DNS and loopback connections");
+        assert_eq!(refused_subject("DNS"), "DNS is");
     }
 
     /// A filter the last setup recorded as refused is a FAILED status line
@@ -2243,6 +2447,10 @@ mod tests {
                 (WfpObject::RpcFilter, RemoveAction::Remove),
                 (WfpObject::NameCacheFilterV4, RemoveAction::AlreadyGone),
                 (WfpObject::NameCacheFilterV6, RemoveAction::AlreadyGone),
+                (WfpObject::LoopbackFilterV4, RemoveAction::Remove),
+                (WfpObject::LoopbackFilterV6, RemoveAction::Remove),
+                (WfpObject::LoopbackUdpFilterV4, RemoveAction::Remove),
+                (WfpObject::LoopbackUdpFilterV6, RemoveAction::Remove),
                 (WfpObject::Sublayer, RemoveAction::Remove),
                 (WfpObject::Provider, RemoveAction::Remove),
             ]

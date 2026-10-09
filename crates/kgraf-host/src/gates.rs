@@ -745,8 +745,9 @@ pub(crate) fn run_confined_on(
             )?;
             #[cfg(unix)]
             kill_group_until_hold_free(child.id(), ws.hold_file());
-            // The tree has ended, so this only collects the status.
-            match child.try_wait() {
+            // The tree has ended, so this only collects the status, waiting
+            // a moment for it ([`status_after_tree_ended`]).
+            match status_after_tree_ended(&mut || child.try_wait(), STATUS_AFTER_TREE_BOUND) {
                 Ok(Some(_)) => {}
                 Ok(None) => return Err(format!("`{command}` still runs after its tree ended")),
                 Err(e) => return Err(format!("waiting for `{command}`: {e}")),
@@ -886,6 +887,39 @@ fn stop_tree(
     }
 }
 
+/// How long the status of a command whose tree has ended may take to arrive.
+/// A process is signaled as exited at the end of its teardown; a few
+/// milliseconds after the tree empties is usual, and this is a bound, not a
+/// wait: the call returns as soon as the status is there.
+const STATUS_AFTER_TREE_BOUND: Duration = Duration::from_secs(5);
+
+/// The exit status `poll` (a `try_wait`) gives once the tree has ended,
+/// polled every 10 ms for at most `bound`. `Ok(None)` when it never came.
+///
+/// On Windows a job's process count (`ActiveProcesses`, which
+/// [`stop_tree`] waits on) drops when a process leaves the job during its
+/// teardown, which can be before its process object is signaled, and a
+/// single `try_wait` right after the tree ended could find the command still
+/// running. A hosted Windows self-test failed a gate that way under the
+/// sandbox user, where the process waited on is the runner: "`sleep 30`
+/// still runs after its tree ended". The order of the two is not documented,
+/// so the status is waited for, bounded, instead of read once.
+fn status_after_tree_ended(
+    poll: &mut dyn FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    bound: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if let Some(status) = poll()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// End `tree`, waiting at most `bound` ([`stop_tree`]), and only then run
 /// `read`, which reads what the tree wrote.
 #[cfg(any(windows, test))]
@@ -987,8 +1021,53 @@ impl GateRunner for CommandGateRunner {
 
 #[cfg(test)]
 mod stop_tree_tests {
-    use super::{Tree, read_after_tree_ended, stop_tree};
+    use super::{Tree, read_after_tree_ended, status_after_tree_ended, stop_tree};
     use std::time::{Duration, Instant};
+
+    /// An exit status of a process that exited with 0, for the poll fakes.
+    fn exited() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            std::os::unix::process::ExitStatusExt::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::process::ExitStatusExt::from_raw(0)
+        }
+    }
+
+    /// The status that arrives a few polls after the tree ended is taken; a
+    /// single read would have reported the command still running.
+    #[test]
+    fn a_status_that_arrives_after_the_tree_ended_is_collected() {
+        let mut polls = 0;
+        let got = status_after_tree_ended(
+            &mut || {
+                polls += 1;
+                Ok((polls >= 3).then(exited))
+            },
+            Duration::from_secs(5),
+        )
+        .expect("polled");
+        assert_eq!(got, Some(exited()));
+        assert_eq!(polls, 3);
+    }
+
+    /// A status that never arrives is `None` at the bound, not a wait
+    /// without end; an error of the poll is returned at once.
+    #[test]
+    fn a_status_that_never_arrives_is_none_at_the_bound() {
+        let started = Instant::now();
+        let got = status_after_tree_ended(&mut || Ok(None), Duration::from_millis(100));
+        assert_eq!(got.expect("polled"), None);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(100) && took < Duration::from_secs(5));
+        let err = status_after_tree_ended(
+            &mut || Err(std::io::Error::other("gone")),
+            Duration::from_secs(5),
+        );
+        assert!(err.is_err());
+    }
 
     struct Fake {
         kill: Option<std::io::ErrorKind>,

@@ -626,11 +626,20 @@ fn a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_swept(
             fx.assert_completed(&report);
 
             let seen = fx.seen();
+            // The refusal names the path in the platform's own form
+            // (`src\c.rs` on Windows), so the check reads it with `/`.
+            let early: Vec<String> = seen
+                .iter()
+                .filter(|t| t.contains("<result early:"))
+                .map(|t| t.replace("\\\\", "/").replace('\\', "/"))
+                .collect();
             assert!(
-                seen.iter()
+                early
+                    .iter()
                     .any(|t| t.contains("<result early: ERROR: refused: ")
                         && t.contains("The refusal: src/c.rs is fenced")),
-                "the parent's write to the child's path was refused while it lived"
+                "the parent's write to the child's path was refused while it lived; the \
+                 parent saw: {early:?}"
             );
             let report = seen
                 .iter()

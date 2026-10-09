@@ -26,12 +26,26 @@
 //! | request | response |
 //! |---|---|
 //! | `{"op":"hello","host_root":P}` | `{"ok":bool,"error":str or null}` |
+//! | `{"op":"hello","host_root":P,"resume":true}` | the same |
 //! | `{"op":"exec","cmd":[..],"timeout_sec":f}` | stdout and stderr base64, `exit_code`, `timed_out`, `error` |
 //! | `{"op":"push"}` | `{"ok":bool,"error":str or null}` |
 //!
 //! The shim keeps at most 8 MiB of each of stdout and stderr, the last bytes,
 //! with a first line saying how many were cut, so an `exec` response always
 //! fits the line bound ([`MAX_LINE_BYTES`]).
+//!
+//! The shim ends a command in the container at its `timeout_sec`, process
+//! group and all, and stops a running command when its connection closes.
+//!
+//! # A broken connection
+//!
+//! A request whose answer was not read (it timed out, or its caller stopped
+//! waiting) leaves the connection out of step: a late answer would be read as
+//! the answer to the next request. That connection is closed, never read
+//! again, and the next request opens a new one with `hello` and
+//! `"resume": true`, which continues the same session on the shim (its sync
+//! state for `host_root` is kept). If that fails, the request fails with both
+//! the first failure and the reconnect's, and the next request tries again.
 //!
 //! # File sync
 //!
@@ -71,6 +85,10 @@ pub enum BridgeError {
 pub const EXEC_SLACK: Duration = Duration::from_secs(120);
 /// How long the shim gets to answer `hello` and `push`.
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long past [`Limits::exec_slack`] the host waits for an `exec` (see
+/// [`kgraf_tools::external::ExternalExecutor::report_grace`]), so the bridge's
+/// own bound, with its clearer error, ends a request first.
+pub const REPORT_MARGIN: Duration = Duration::from_secs(5);
 /// The longest response line accepted. A response carries a command's stdout
 /// and stderr in base64, so the bound is generous, and it exists so a shim
 /// that never sends a newline cannot grow this process without limit.
@@ -105,7 +123,7 @@ mod transport {
     use kgraf_tools::external::{ExternalExecutor, ExternalOutcome};
     use serde::{Deserialize, Serialize};
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -116,6 +134,9 @@ mod transport {
     struct HelloRequest<'a> {
         op: &'static str,
         host_root: &'a str,
+        /// Continue the session of an earlier connection for `host_root`.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        resume: bool,
     }
 
     #[derive(Serialize)]
@@ -148,19 +169,25 @@ mod transport {
     }
 
     /// The concrete, subprocess-bridged [`ExternalExecutor`]. One instance is bound
-    /// to one Unix socket (one Python shim, one live task container).
+    /// to one Unix socket (one Python shim, one live task container) and one host
+    /// tree.
     ///
     /// A request that times out, or whose caller stops waiting for it, leaves the
     /// stream out of step (a late response would be read as the answer to the
-    /// next request), so the connection is
-    /// marked broken and every later request fails at once, naming the first
-    /// failure. A response line over the bound is read to its end and dropped: that
-    /// request fails and the connection stays usable. If the stream ends inside
-    /// such a line, the connection is broken.
+    /// next request), so that connection is closed and never read again; the
+    /// next request connects again and resumes the session (see the crate
+    /// docs). A response line over the bound is read to its end and dropped:
+    /// that request fails and the connection stays usable. If the stream ends
+    /// inside such a line, the connection is broken.
     pub struct ProcessExecutor {
-        stream: Mutex<BufReader<UnixStream>>,
+        socket_path: PathBuf,
+        host_root: PathBuf,
+        /// `None` once a broken connection was closed.
+        stream: Mutex<Option<BufReader<UnixStream>>>,
         limits: Limits,
         broken: AtomicBool,
+        /// What broke the connection, named if connecting again fails.
+        why_broken: std::sync::Mutex<String>,
     }
 
     impl ProcessExecutor {
@@ -179,68 +206,67 @@ mod transport {
             host_root: &Path,
             limits: Limits,
         ) -> Result<Self, BridgeError> {
-            let connect_err = |source| BridgeError::Connect {
-                path: socket_path.to_path_buf(),
-                source,
-            };
-            let stream = UnixStream::connect(socket_path)
-                .await
-                .map_err(connect_err)?;
-            let mut stream = BufReader::new(stream);
-            let hello = HelloRequest {
-                op: "hello",
-                host_root: &host_root.to_string_lossy(),
-            };
-            let line = serde_json::to_string(&hello).expect("HelloRequest always serializes");
-            write_line(&mut stream, &line).await.map_err(connect_err)?;
-            let response =
-                read_json_line_within(&mut stream, limits.control_timeout, limits.max_line_bytes)
-                    .await
-                    .map_err(connect_err)?;
-            let ack: Ack = serde_json::from_str(&response).map_err(|e| {
-                connect_err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bad hello response: {e}"),
-                ))
-            })?;
-            if !ack.ok {
-                return Err(BridgeError::Refused {
-                    path: socket_path.to_path_buf(),
-                    reason: ack.error.unwrap_or_else(|| "no reason given".into()),
-                });
-            }
+            let stream = open(socket_path, host_root, limits, false).await?;
             Ok(Self {
-                stream: Mutex::new(stream),
+                socket_path: socket_path.to_path_buf(),
+                host_root: host_root.to_path_buf(),
+                stream: Mutex::new(Some(stream)),
                 limits,
                 broken: AtomicBool::new(false),
+                why_broken: std::sync::Mutex::new(String::new()),
             })
         }
 
+        fn mark_broken(&self, why: &str) {
+            mark_broken(&self.broken, &self.why_broken, why);
+        }
+
         /// One request, one response line, under the connection lock, with the
-        /// response due within `within`.
+        /// response due within `within`. A broken connection is replaced first.
         async fn round_trip(&self, line: &str, within: Duration) -> Result<String, String> {
-            let mut stream = self.stream.lock().await;
-            if self.broken.load(Ordering::Acquire) {
-                return Err("the bridge connection is broken by an earlier timeout or \
-                            oversized response"
-                    .to_owned());
+            let mut slot = self.stream.lock().await;
+            if self.broken.load(Ordering::Acquire) || slot.is_none() {
+                // Closed, never read: a late answer on it belongs to a request
+                // nobody waits for, and the shim stops that request's command
+                // when it sees the close.
+                *slot = None;
+                let why = self
+                    .why_broken
+                    .lock()
+                    .map(|w| w.clone())
+                    .unwrap_or_default();
+                match open(&self.socket_path, &self.host_root, self.limits, true).await {
+                    Ok(stream) => {
+                        *slot = Some(stream);
+                        self.broken.store(false, Ordering::Release);
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "the bridge connection broke ({why}), and connecting again failed: {e}"
+                        ));
+                    }
+                }
             }
-            // A caller that stops waiting (a cancel, the host's own bound, which
-            // is shorter than `exec_slack`) drops this future between the request
-            // and its response. The late response would then be read as the answer
-            // to the next request, so a drop before the end breaks the connection.
+            let Some(stream) = slot.as_mut() else {
+                return Err("the bridge connection is closed".to_owned());
+            };
+            // A caller that stops waiting (a cancel, the host's own bound)
+            // drops this future between the request and its response. The
+            // late response would then be read as the answer to the next
+            // request, so a drop before the end breaks the connection.
             let pending = BreakOnDrop {
                 broken: &self.broken,
+                why_broken: &self.why_broken,
                 armed: true,
             };
             let outcome = async {
-                write_line(&mut stream, line).await.map_err(|e| {
+                write_line(stream, line).await.map_err(|e| {
                     (
                         format!("writing the request to the bridge socket: {e}"),
                         false,
                     )
                 })?;
-                read_json_line_within(&mut stream, within, self.limits.max_line_bytes)
+                read_json_line_within(stream, within, self.limits.max_line_bytes)
                     .await
                     .map_err(|e| {
                         (
@@ -257,7 +283,8 @@ mod transport {
                 Ok(line) => Ok(line),
                 Err((message, in_step)) => {
                     if !in_step {
-                        self.broken.store(true, Ordering::Release);
+                        self.mark_broken(&message);
+                        *slot = None;
                     }
                     Err(message)
                 }
@@ -265,10 +292,60 @@ mod transport {
         }
     }
 
+    /// Connect to the shim at `socket_path` and say `hello` for `host_root`;
+    /// `resume` continues the session of an earlier connection.
+    async fn open(
+        socket_path: &Path,
+        host_root: &Path,
+        limits: Limits,
+        resume: bool,
+    ) -> Result<BufReader<UnixStream>, BridgeError> {
+        let connect_err = |source| BridgeError::Connect {
+            path: socket_path.to_path_buf(),
+            source,
+        };
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .map_err(connect_err)?;
+        let mut stream = BufReader::new(stream);
+        let hello = HelloRequest {
+            op: "hello",
+            host_root: &host_root.to_string_lossy(),
+            resume,
+        };
+        let line = serde_json::to_string(&hello).expect("HelloRequest always serializes");
+        write_line(&mut stream, &line).await.map_err(connect_err)?;
+        let response =
+            read_json_line_within(&mut stream, limits.control_timeout, limits.max_line_bytes)
+                .await
+                .map_err(connect_err)?;
+        let ack: Ack = serde_json::from_str(&response).map_err(|e| {
+            connect_err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad hello response: {e}"),
+            ))
+        })?;
+        if !ack.ok {
+            return Err(BridgeError::Refused {
+                path: socket_path.to_path_buf(),
+                reason: ack.error.unwrap_or_else(|| "no reason given".into()),
+            });
+        }
+        Ok(stream)
+    }
+
+    fn mark_broken(broken: &AtomicBool, why_broken: &std::sync::Mutex<String>, why: &str) {
+        if let Ok(mut w) = why_broken.lock() {
+            why.clone_into(&mut w);
+        }
+        broken.store(true, Ordering::Release);
+    }
+
     /// Marks a connection broken when dropped while armed: a request whose
     /// response was never read.
     struct BreakOnDrop<'a> {
         broken: &'a AtomicBool,
+        why_broken: &'a std::sync::Mutex<String>,
         armed: bool,
     }
 
@@ -281,7 +358,11 @@ mod transport {
     impl Drop for BreakOnDrop<'_> {
         fn drop(&mut self) {
             if self.armed {
-                self.broken.store(true, Ordering::Release);
+                mark_broken(
+                    self.broken,
+                    self.why_broken,
+                    "an earlier request was given up before its answer arrived",
+                );
             }
         }
     }
@@ -289,14 +370,23 @@ mod transport {
     #[async_trait]
     impl ExternalExecutor for ProcessExecutor {
         /// The connection is broken already (the dropped request marked it).
-        /// Closing the write side ends the shim's session once the abandoned
-        /// command returns; the shim enforces the command's own timeout, and the
-        /// protocol has no request that stops a command early.
+        /// Closing it now makes the shim stop the abandoned command at once;
+        /// the next request connects again.
         async fn abandon(&self) {
-            self.broken.store(true, Ordering::Release);
-            if let Ok(mut stream) = self.stream.try_lock() {
+            if !self.broken.load(Ordering::Acquire) {
+                self.mark_broken("an earlier request was abandoned");
+            }
+            if let Ok(mut slot) = self.stream.try_lock()
+                && let Some(mut stream) = slot.take()
+            {
                 let _ = stream.get_mut().shutdown().await;
             }
+        }
+
+        /// The shim may take its own slack past the command's timeout to sync
+        /// the tree and answer; the host waits a little longer than that.
+        fn report_grace(&self) -> Duration {
+            self.limits.exec_slack.saturating_add(super::REPORT_MARGIN)
         }
 
         async fn exec(&self, cmd: &[String], timeout: Duration) -> Result<ExternalOutcome, String> {
@@ -582,53 +672,132 @@ mod tests {
         }
     }
 
-    /// A shim that reads a request and never answers: the call ends at the
-    /// bound, and the connection then refuses further requests at once.
+    /// One connection of a fake shim that serves several in turn.
+    type Conn = Box<
+        dyn FnOnce(
+                BufReader<UnixStream>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send,
+    >;
+
+    /// A fake shim that hands its `n`th accepted connection to `conns[n]`,
+    /// hello included, and stops listening (the socket file removed) after
+    /// the last one.
+    async fn shim_conns(conns: Vec<Conn>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("bridge.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let socket = path.clone();
+        tokio::spawn(async move {
+            for conn in conns {
+                let (stream, _) = listener.accept().await.expect("accept");
+                tokio::spawn(conn(BufReader::new(stream)));
+            }
+            drop(listener);
+            let _ = std::fs::remove_file(&socket);
+        });
+        (dir, path)
+    }
+
+    /// Read the hello line and answer it with `ack`; the hello as sent.
+    async fn hello(stream: &mut BufReader<UnixStream>, ack: &[u8]) -> serde_json::Value {
+        let mut line = String::new();
+        stream.read_line(&mut line).await.expect("hello");
+        stream.get_mut().write_all(ack).await.expect("ack");
+        serde_json::from_str(&line).expect("hello is JSON")
+    }
+
+    fn exec_answer(stdout: &str) -> Vec<u8> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(stdout);
+        format!(
+            "{{\"stdout_b64\":\"{b64}\",\"stderr_b64\":\"\",\"exit_code\":0,\"timed_out\":false,\"error\":null}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// The first connection reads an `exec` and answers it only after the
+    /// client gave up; it reports whether the client then closed it. The
+    /// second must be a `resume` hello and answers an `exec` with `second`.
+    fn late_then_resumed(
+        closed: tokio::sync::oneshot::Sender<bool>,
+        resumed: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) -> Vec<Conn> {
+        vec![
+            Box::new(move |mut stream| {
+                Box::pin(async move {
+                    hello(&mut stream, OK).await;
+                    let mut line = String::new();
+                    let _ = stream.read_line(&mut line).await;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = stream.get_mut().write_all(&exec_answer("late")).await;
+                    line.clear();
+                    let eof =
+                        tokio::time::timeout(Duration::from_secs(5), stream.read_line(&mut line))
+                            .await
+                            .is_ok_and(|n| n.is_ok_and(|n| n == 0));
+                    let _ = closed.send(eof);
+                })
+            }),
+            Box::new(move |mut stream| {
+                Box::pin(async move {
+                    let sent = hello(&mut stream, OK).await;
+                    let _ = resumed.send(sent);
+                    let mut line = String::new();
+                    while stream.read_line(&mut line).await.is_ok_and(|n| n > 0) {
+                        let _ = stream.get_mut().write_all(&exec_answer("second")).await;
+                        line.clear();
+                    }
+                })
+            }),
+        ]
+    }
+
+    /// A request that times out breaks its connection, and the next request
+    /// is served on a new one: it connects again with a `resume` hello, gets
+    /// its own answer (never the first request's late one), and the first
+    /// connection is closed, so the shim can stop the command it still runs.
     #[tokio::test]
-    async fn a_silent_shim_times_out_and_breaks_the_connection() {
-        let (_dir, path) = shim(|mut stream| async move {
-            let mut line = String::new();
-            let _ = stream.read_line(&mut line).await;
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        })
-        .await;
+    async fn after_a_timed_out_request_the_next_one_reconnects_and_is_answered() {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel();
+        let (_dir, path) = shim_conns(late_then_resumed(closed_tx, resumed_tx)).await;
         let exec =
             ProcessExecutor::connect_with_limits(&path, Path::new("/x"), small(150, 1 << 20))
                 .await
                 .expect("connect");
         let started = std::time::Instant::now();
         let err = exec
-            .exec(&["true".to_owned()], Duration::from_millis(50))
+            .exec(
+                &["sleep".to_owned(), "60".to_owned()],
+                Duration::from_millis(50),
+            )
             .await
-            .expect_err("no answer");
+            .expect_err("no answer in time");
         assert!(err.contains("no response line"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
-        let again = exec.sync_to_remote().await.expect_err("broken");
-        assert!(again.contains("broken"), "{again}");
+        let next = exec
+            .exec(&["true".to_owned()], Duration::from_secs(5))
+            .await
+            .expect("the next request is served on a new connection");
+        assert_eq!(next.stdout, b"second");
+        let sent = resumed_rx.await.expect("a second connection");
+        assert_eq!(sent["resume"], serde_json::json!(true), "{sent}");
+        assert_eq!(sent["host_root"], serde_json::json!("/x"), "{sent}");
+        assert!(
+            closed_rx.await.expect("first connection"),
+            "the broken connection was not closed"
+        );
     }
 
     /// A caller that stops waiting drops an `exec` before its response. The
-    /// late response must not answer the next request: the connection is
-    /// broken, and `abandon` closes it.
+    /// late response must not answer the next request: `abandon` closes the
+    /// connection, and the next request is answered on a new one.
     #[tokio::test]
-    async fn a_dropped_request_breaks_the_connection() {
-        let (_dir, path) = shim(|mut stream| async move {
-            let mut line = String::new();
-            let _ = stream.read_line(&mut line).await;
-            // Answers the exec late, then answers anything after it at once.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = stream.get_mut().write_all(OK).await;
-            loop {
-                line.clear();
-                match stream.read_line(&mut line).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {
-                        let _ = stream.get_mut().write_all(OK).await;
-                    }
-                }
-            }
-        })
-        .await;
+    async fn a_dropped_request_is_never_answered_by_its_late_response() {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let (resumed_tx, _resumed_rx) = tokio::sync::oneshot::channel();
+        let (_dir, path) = shim_conns(late_then_resumed(closed_tx, resumed_tx)).await;
         let exec = ProcessExecutor::connect(&path, Path::new("/x"))
             .await
             .expect("connect");
@@ -638,11 +807,63 @@ mod tests {
         )
         .await;
         assert!(dropped.is_err(), "the exec must still be waiting");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let err = exec.sync_to_remote().await.expect_err("broken");
-        assert!(err.contains("broken"), "{err}");
         exec.abandon().await;
-        assert!(exec.sync_to_remote().await.is_err());
+        assert!(
+            closed_rx.await.expect("first connection"),
+            "abandon did not close it"
+        );
+        let next = exec
+            .exec(&["true".to_owned()], Duration::from_secs(5))
+            .await
+            .expect("served on a new connection");
+        assert_eq!(
+            next.stdout, b"second",
+            "a late answer was read as this one's"
+        );
+    }
+
+    /// When connecting again fails, the error names the first failure and
+    /// the reconnect's, and a later request tries again.
+    #[tokio::test]
+    async fn a_failed_reconnect_names_both_failures() {
+        let silent: Conn = Box::new(|mut stream| {
+            Box::pin(async move {
+                hello(&mut stream, OK).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+        });
+        let refusing: Conn = Box::new(|mut stream| {
+            Box::pin(async move {
+                hello(
+                    &mut stream,
+                    b"{\"ok\":false,\"error\":\"no earlier session for '/x' on this server to resume\"}\n",
+                )
+                .await;
+            })
+        });
+        let (_dir, path) = shim_conns(vec![silent, refusing]).await;
+        let exec =
+            ProcessExecutor::connect_with_limits(&path, Path::new("/x"), small(150, 1 << 20))
+                .await
+                .expect("connect");
+        let first = exec
+            .exec(&["true".to_owned()], Duration::from_millis(50))
+            .await
+            .expect_err("no answer");
+        assert!(first.contains("no response line"), "{first}");
+        let refused = exec.sync_to_remote().await.expect_err("resume refused");
+        assert!(
+            refused.contains("no response line")
+                && refused.contains("connecting again failed")
+                && refused.contains("no earlier session"),
+            "{refused}"
+        );
+        // The shim is gone now: the next request tries again and says so.
+        let gone = exec.sync_to_remote().await.expect_err("no shim");
+        assert!(
+            gone.contains("no response line") && gone.contains("cannot connect"),
+            "{gone}"
+        );
     }
 
     /// A shim that streams bytes with no newline is cut off at the bound.

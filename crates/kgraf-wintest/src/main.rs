@@ -67,6 +67,11 @@ fn e2e_only(kgraf: std::path::PathBuf) -> i32 {
         dir: layout.e2e.clone(),
         env,
         git_bash_found: true,
+        // The kgraf under test runs on this machine with the backend this
+        // process would pick, so this process's answer is its answer.
+        network_open: kgraf_sandbox::CheckNetwork::current()
+            .shell_notice()
+            .is_some(),
         cancel: &cancel,
     };
     let checks = e2e::run_all(&ctx, cfg!(windows));

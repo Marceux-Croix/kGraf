@@ -61,9 +61,28 @@
 //! names recently resolved by the system". `kgraf sandbox selfcheck` judges
 //! the filters by their effect, never by their presence.
 //!
+//! **The loopback filters.** Setup also adds four filters at the connect
+//! layers (`FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `..._V6`), with the same user
+//! condition and the loopback flag (`FWPM_CONDITION_FLAGS` with
+//! `FWP_CONDITION_FLAG_IS_LOOPBACK`): per IP version, one blocks a loopback
+//! connection to any remote port outside kGraf's egress proxy ports
+//! ([`super::firewall::PROXY_PORTS`]), and one blocks loopback UDP to any
+//! port. Together they are the loopback half of the firewall rules
+//! ([`super::firewall`]) in a form Windows applies to loopback traffic:
+//! A hosted Windows self-test had the rule `block-loopback-tcp` in place for
+//! the offline slot user, and that user still opened a TCP connection to a
+//! listener on 127.0.0.1 outside those ports. The firewall rule was present
+//! and did not act, so the firewall does not filter this loopback traffic;
+//! the connect layers see every connection a process opens, loopback
+//! included, with its user. openai/codex `windows-sandbox-rs` blocks at the
+//! same layers with the user and the remote port. Whether the block takes
+//! effect is proved by `kgraf sandbox selfcheck` (its direct connection to a
+//! loopback origin must fail), never by the filter's presence.
+//!
 //! Everything here is platform-neutral: the keys, the names, the matching
-//! security descriptor, the interface identifier and the reading of a
-//! refusal are tested on every host. The WFP calls are in `windows::wfp`.
+//! security descriptor, the interface identifier, the blocked port ranges
+//! and the reading of a refusal are tested on every host. The WFP calls are
+//! in `windows::wfp`.
 //!
 //! **Keys.** WFP names its objects by GUID. The provider, sublayer and the
 //! three filter keys are each derived from the owner's SID and the tag, as
@@ -127,28 +146,50 @@ pub enum WfpObject {
     NameCacheFilterV4,
     /// The same on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`.
     NameCacheFilterV6,
+    /// The filter on `FWPM_LAYER_ALE_AUTH_CONNECT_V4` that blocks a loopback
+    /// connection of a blocked user to a remote port outside kGraf's egress
+    /// proxy ports, whatever the protocol.
+    LoopbackFilterV4,
+    /// The same on `FWPM_LAYER_ALE_AUTH_CONNECT_V6`.
+    LoopbackFilterV6,
+    /// The filter on `FWPM_LAYER_ALE_AUTH_CONNECT_V4` that blocks loopback
+    /// UDP of a blocked user to any port, the proxy ports included: the
+    /// proxy speaks TCP only.
+    LoopbackUdpFilterV4,
+    /// The same on `FWPM_LAYER_ALE_AUTH_CONNECT_V6`.
+    LoopbackUdpFilterV6,
 }
 
 impl WfpObject {
     /// In the order they must be added. Removal runs in the reverse order:
     /// a provider or sublayer that an object still names cannot be deleted.
-    pub const ALL: [WfpObject; 5] = [
+    pub const ALL: [WfpObject; 9] = [
         WfpObject::Provider,
         WfpObject::Sublayer,
         WfpObject::RpcFilter,
         WfpObject::NameCacheFilterV4,
         WfpObject::NameCacheFilterV6,
+        WfpObject::LoopbackFilterV4,
+        WfpObject::LoopbackFilterV6,
+        WfpObject::LoopbackUdpFilterV4,
+        WfpObject::LoopbackUdpFilterV6,
     ];
 
     /// Just the filters, in the order they are added.
-    pub const FILTERS: [WfpObject; 3] = [
+    pub const FILTERS: [WfpObject; 7] = [
         WfpObject::RpcFilter,
         WfpObject::NameCacheFilterV4,
         WfpObject::NameCacheFilterV6,
+        WfpObject::LoopbackFilterV4,
+        WfpObject::LoopbackFilterV6,
+        WfpObject::LoopbackUdpFilterV4,
+        WfpObject::LoopbackUdpFilterV6,
     ];
 
     /// The word in the undo record: `wfp-provider`, `wfp-sublayer`,
-    /// `wfp-filter`, `wfp-filter-name-cache-v4`, `wfp-filter-name-cache-v6`.
+    /// `wfp-filter`, `wfp-filter-name-cache-v4`, `wfp-filter-name-cache-v6`,
+    /// `wfp-filter-loopback-v4`, `wfp-filter-loopback-v6`,
+    /// `wfp-filter-loopback-udp-v4`, `wfp-filter-loopback-udp-v6`.
     ///
     /// The RPC filter keeps the plain `wfp-filter` word it had when it was
     /// the only filter, so a record an earlier setup wrote still parses and
@@ -160,7 +201,30 @@ impl WfpObject {
             WfpObject::RpcFilter => "wfp-filter",
             WfpObject::NameCacheFilterV4 => "wfp-filter-name-cache-v4",
             WfpObject::NameCacheFilterV6 => "wfp-filter-name-cache-v6",
+            WfpObject::LoopbackFilterV4 => "wfp-filter-loopback-v4",
+            WfpObject::LoopbackFilterV6 => "wfp-filter-loopback-v6",
+            WfpObject::LoopbackUdpFilterV4 => "wfp-filter-loopback-udp-v4",
+            WfpObject::LoopbackUdpFilterV6 => "wfp-filter-loopback-udp-v6",
         }
+    }
+
+    /// Whether the object is one of the DNS filters.
+    pub fn is_dns_filter(self) -> bool {
+        matches!(
+            self,
+            WfpObject::RpcFilter | WfpObject::NameCacheFilterV4 | WfpObject::NameCacheFilterV6
+        )
+    }
+
+    /// Whether the object is one of the loopback filters.
+    pub fn is_loopback_filter(self) -> bool {
+        matches!(
+            self,
+            WfpObject::LoopbackFilterV4
+                | WfpObject::LoopbackFilterV6
+                | WfpObject::LoopbackUdpFilterV4
+                | WfpObject::LoopbackUdpFilterV6
+        )
     }
 
     pub fn from_key(s: &str) -> Option<WfpObject> {
@@ -180,6 +244,12 @@ impl WfpObject {
             WfpObject::RpcFilter => "the user-mode RPC layer",
             WfpObject::NameCacheFilterV4 => "the name resolution cache layer, IPv4",
             WfpObject::NameCacheFilterV6 => "the name resolution cache layer, IPv6",
+            WfpObject::LoopbackFilterV4 | WfpObject::LoopbackUdpFilterV4 => {
+                "the connect layer, IPv4"
+            }
+            WfpObject::LoopbackFilterV6 | WfpObject::LoopbackUdpFilterV6 => {
+                "the connect layer, IPv6"
+            }
         }
     }
 
@@ -191,8 +261,44 @@ impl WfpObject {
             WfpObject::RpcFilter => "WFP filter (user-mode RPC layer)",
             WfpObject::NameCacheFilterV4 => "WFP filter (name resolution cache, IPv4)",
             WfpObject::NameCacheFilterV6 => "WFP filter (name resolution cache, IPv6)",
+            WfpObject::LoopbackFilterV4 => "WFP filter (loopback outside the proxy ports, IPv4)",
+            WfpObject::LoopbackFilterV6 => "WFP filter (loopback outside the proxy ports, IPv6)",
+            WfpObject::LoopbackUdpFilterV4 => "WFP filter (loopback UDP, IPv4)",
+            WfpObject::LoopbackUdpFilterV6 => "WFP filter (loopback UDP, IPv6)",
         }
     }
+
+    /// What a loopback filter blocks, in words for its status line. Empty
+    /// for every other object.
+    pub fn loopback_words(self) -> &'static str {
+        match self {
+            WfpObject::LoopbackFilterV4 | WfpObject::LoopbackFilterV6 => {
+                "loopback connections of the offline users to any port outside kGraf's egress \
+                 proxy ports"
+            }
+            WfpObject::LoopbackUdpFilterV4 | WfpObject::LoopbackUdpFilterV6 => {
+                "loopback UDP of the offline users"
+            }
+            _ => "",
+        }
+    }
+}
+
+/// The remote port ranges a loopback filter of kind
+/// [`WfpObject::LoopbackFilterV4`] or `..V6` blocks: every port below and
+/// every port above `proxy`, kGraf's egress proxy ports, as inclusive
+/// ranges. Both bounds of `proxy` must leave a port on their side; the fixed
+/// range does ([`super::firewall::PROXY_PORTS`]).
+///
+/// WFP joins two conditions on the same field with OR and conditions on
+/// different fields with AND, so the filter carries both ranges as two
+/// `FWPM_CONDITION_IP_REMOTE_PORT` conditions beside its user and loopback
+/// conditions.
+pub fn blocked_loopback_ports(proxy: &std::ops::RangeInclusive<u16>) -> [(u16, u16); 2] {
+    [
+        (0, proxy.start().saturating_sub(1)),
+        (proxy.end().saturating_add(1), u16::MAX),
+    ]
 }
 
 impl fmt::Display for WfpObject {
@@ -209,6 +315,10 @@ pub struct WfpKeys {
     pub rpc_filter: u128,
     pub name_cache_v4: u128,
     pub name_cache_v6: u128,
+    pub loopback_v4: u128,
+    pub loopback_v6: u128,
+    pub loopback_udp_v4: u128,
+    pub loopback_udp_v6: u128,
 }
 
 impl WfpKeys {
@@ -223,6 +333,10 @@ impl WfpKeys {
             rpc_filter: key(WfpObject::RpcFilter),
             name_cache_v4: key(WfpObject::NameCacheFilterV4),
             name_cache_v6: key(WfpObject::NameCacheFilterV6),
+            loopback_v4: key(WfpObject::LoopbackFilterV4),
+            loopback_v6: key(WfpObject::LoopbackFilterV6),
+            loopback_udp_v4: key(WfpObject::LoopbackUdpFilterV4),
+            loopback_udp_v6: key(WfpObject::LoopbackUdpFilterV6),
         }
     }
 
@@ -233,16 +347,20 @@ impl WfpKeys {
             WfpObject::RpcFilter => self.rpc_filter,
             WfpObject::NameCacheFilterV4 => self.name_cache_v4,
             WfpObject::NameCacheFilterV6 => self.name_cache_v6,
+            WfpObject::LoopbackFilterV4 => self.loopback_v4,
+            WfpObject::LoopbackFilterV6 => self.loopback_v6,
+            WfpObject::LoopbackUdpFilterV4 => self.loopback_udp_v4,
+            WfpObject::LoopbackUdpFilterV6 => self.loopback_udp_v6,
         }
     }
 
     /// Each object with its key, in the order they must be added.
-    pub fn all(&self) -> [(WfpObject, u128); 5] {
+    pub fn all(&self) -> [(WfpObject, u128); 9] {
         WfpObject::ALL.map(|o| (o, self.get(o)))
     }
 
     /// Each filter with its key, in the order they are added.
-    pub fn filters(&self) -> [(WfpObject, u128); 3] {
+    pub fn filters(&self) -> [(WfpObject, u128); 7] {
         WfpObject::FILTERS.map(|o| (o, self.get(o)))
     }
 }
@@ -419,10 +537,10 @@ pub fn filter_users(names: &OwnerNames) -> Vec<String> {
 /// resolve names as before.
 ///
 /// One descriptor serves every filter. `FWPM_CONDITION_ALE_USER_ID` (the name
-/// resolution cache layers) and `FWPM_CONDITION_REMOTE_USER_TOKEN` (the
-/// user-mode RPC layer) both take `FWP_SECURITY_DESCRIPTOR_TYPE`, so the same
-/// bytes match the local caller on one layer and the remote caller on the
-/// other.
+/// resolution cache layers and the connect layers) and
+/// `FWPM_CONDITION_REMOTE_USER_TOKEN` (the user-mode RPC layer) both take
+/// `FWP_SECURITY_DESCRIPTOR_TYPE`, so the same bytes match the local caller
+/// on one layer and the remote caller on the other.
 ///
 /// One entry per user SID, never the sandbox group's SID: the group also
 /// holds the online users, which need lookups for dependency installs.
@@ -460,6 +578,22 @@ pub fn display_name(names: &OwnerNames, object: WfpObject) -> String {
             "kGraf sandbox: no DNS lookups for offline users, IPv6 ({})",
             names.group()
         ),
+        WfpObject::LoopbackFilterV4 => format!(
+            "kGraf sandbox: offline users reach only the proxy ports on loopback, IPv4 ({})",
+            names.group()
+        ),
+        WfpObject::LoopbackFilterV6 => format!(
+            "kGraf sandbox: offline users reach only the proxy ports on loopback, IPv6 ({})",
+            names.group()
+        ),
+        WfpObject::LoopbackUdpFilterV4 => format!(
+            "kGraf sandbox: no loopback UDP for offline users, IPv4 ({})",
+            names.group()
+        ),
+        WfpObject::LoopbackUdpFilterV6 => format!(
+            "kGraf sandbox: no loopback UDP for offline users, IPv6 ({})",
+            names.group()
+        ),
     }
 }
 
@@ -468,7 +602,8 @@ pub fn description(object: WfpObject) -> &'static str {
     match object {
         WfpObject::Provider => {
             "Made by kgraf sandbox setup; kgraf sandbox remove deletes it. Owns the filters \
-             that keep kGraf's offline sandbox users from name lookups."
+             that keep kGraf's offline sandbox users from name lookups and from loopback \
+             ports other than kGraf's egress proxy."
         }
         WfpObject::Sublayer => "Holds kGraf's sandbox filters.",
         WfpObject::RpcFilter => {
@@ -483,6 +618,14 @@ pub fn description(object: WfpObject) -> &'static str {
         WfpObject::NameCacheFilterV6 => {
             "Blocks IPv6 name resolution for kGraf's offline and worker slot sandbox users, \
              so their name lookups cannot leave the machine."
+        }
+        WfpObject::LoopbackFilterV4 | WfpObject::LoopbackFilterV6 => {
+            "Blocks loopback connections of kGraf's offline and worker slot sandbox users to \
+             any port outside kGraf's egress proxy ports. Windows Firewall rules do not act \
+             on this loopback traffic."
+        }
+        WfpObject::LoopbackUdpFilterV4 | WfpObject::LoopbackUdpFilterV6 => {
+            "Blocks loopback UDP of kGraf's offline and worker slot sandbox users."
         }
     }
 }
@@ -538,10 +681,10 @@ mod tests {
         assert_eq!(k, WfpKeys::derive(&n));
         assert_eq!(k, WfpKeys::derive(&n.clone().with_slots(9)));
         let all: std::collections::BTreeSet<u128> = k.all().iter().map(|(_, v)| *v).collect();
-        assert_eq!(all.len(), 5, "five distinct keys");
+        assert_eq!(all.len(), 9, "nine distinct keys");
         // Every filter has its own key, so one layer's filter can be read,
         // replaced or removed without touching another's.
-        assert_eq!(k.filters().len(), 3);
+        assert_eq!(k.filters().len(), 7);
         assert!(k.filters().iter().all(|(o, _)| o.is_filter()));
         assert!(!WfpObject::Provider.is_filter() && !WfpObject::Sublayer.is_filter());
         let other = WfpKeys::derive(&OwnerNames::derive("S-1-5-21-1-2-3-1002", None).unwrap());
@@ -629,6 +772,56 @@ mod tests {
         assert!(action.contains("block action"), "{action}");
         assert_ne!(layer, condition);
         assert_ne!(condition, action);
+    }
+
+    /// The loopback filter blocks every remote port but kGraf's egress proxy
+    /// ports, and nothing more: each port from 0 to 65535 is either in one of
+    /// the two blocked ranges or a proxy port, never both.
+    #[test]
+    fn the_loopback_filter_blocks_every_port_but_the_proxy_ports() {
+        use super::super::firewall::PROXY_PORTS;
+        let ranges = blocked_loopback_ports(&PROXY_PORTS);
+        assert_eq!(ranges, [(0, 47099), (47132, u16::MAX)]);
+        for port in 0..=u16::MAX {
+            let blocked = ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&port));
+            assert_ne!(blocked, PROXY_PORTS.contains(&port), "port {port}");
+        }
+    }
+
+    /// Every filter is a DNS filter or a loopback filter, never both, and
+    /// the four loopback filters cover both IP versions and both kinds.
+    #[test]
+    fn filters_are_dns_or_loopback_and_say_which_layer() {
+        for o in WfpObject::FILTERS {
+            assert_ne!(o.is_dns_filter(), o.is_loopback_filter(), "{o}");
+            assert!(!o.layer_words().is_empty(), "{o}");
+            assert_eq!(
+                o.is_loopback_filter(),
+                !o.loopback_words().is_empty(),
+                "{o}"
+            );
+        }
+        for o in [WfpObject::Provider, WfpObject::Sublayer] {
+            assert!(!o.is_dns_filter() && !o.is_loopback_filter());
+        }
+        let loopback: Vec<WfpObject> = WfpObject::FILTERS
+            .into_iter()
+            .filter(|o| o.is_loopback_filter())
+            .collect();
+        assert_eq!(loopback.len(), 4);
+        for words in ["the connect layer, IPv4", "the connect layer, IPv6"] {
+            assert_eq!(
+                loopback.iter().filter(|o| o.layer_words() == words).count(),
+                2,
+                "{words}"
+            );
+        }
+        // The added filters keep the earlier record words parseable, and add
+        // new ones a record line names.
+        assert_eq!(
+            WfpObject::from_key("wfp-filter-loopback-udp-v6"),
+            Some(WfpObject::LoopbackUdpFilterV6)
+        );
     }
 
     #[test]

@@ -1020,3 +1020,61 @@ Tests: `the_toolchain_variables_grant_rustup_whole_and_cargo_by_subfolder`,
 `RUSTUP_HOME` and a `CARGO_HOME` outside the home runs in the sandbox; the credentials file does
 not read; fails without the grant), and on macOS
 `a_cargo_home_outside_the_home_folder_has_its_secret_files_denied` and `cargo_home_reads_macos`.
+
+## Amendment (2026-10-09): a command off the allowlist gets 120 s unless its call asks for more
+
+Point 6 gave every command the one shell timeout. A worker that ran a server in the foreground
+(`python -m pypiserver run -p 8080 dist/`) with a 1800 s shell timeout was held for 1830 s
+(the timeout plus the host's grace) before anything reacted. A server does not end; the model
+needed to be told sooner to start it in the background.
+
+The rule now:
+
+- The shell timeout (`shell_timeout_secs`, `--shell-timeout`, 600 s by default) is the longest
+  any command may run. A build or test command on the allowlist gets all of it, as before.
+- Any other command gets 120 s (`DEFAULT_UNLISTED_TIMEOUT`, or the longest, if that is
+  shorter), unless the call sets the new `timeout_secs` input, which may ask for up to the
+  longest. A larger value is cut to the longest, and the result says so. A value that is not a
+  whole number of seconds, at least 1, is refused, not ignored.
+- The kill result says that the command was still running at its limit, and what to do next:
+  run a slow command again with a larger `timeout_secs` (with the most it may ask for), or start
+  a command that does not end by itself in the background, with its output sent to a file, and
+  check on it. A command whose words read like a server or a watcher gets the background advice
+  first. That reading only picks the advice; it never sets a limit.
+- The tool's description states both limits and the background advice. Both are configuration,
+  so the definition stays the same for every worker of a run (decision 0043).
+
+Why 120 s, and why the allowlist keeps the longest limit: Claude Code's Bash tool stops a
+command after 120 s by default and lets a call ask for up to 600 s. A cold install of a large
+Python package set took 399 to 920 s, and a warm one 66 to 72 s, and a cold `cargo test` of a
+real workspace takes minutes (point 6), so a flat short default would kill correct builds. The
+allowlisted builds and tests keep the longest limit without asking; an install or a build off
+the allowlist that runs longer than 120 s is killed once, and its result tells the model to ask
+for more.
+
+Rejected: a shorter limit for commands that look like servers only (many servers do not look
+like one: `python app.py`); a limit on time with no new output (a quiet test suite prints
+nothing for minutes); a command kept running across calls and polled (a larger change through
+the bridge and the sandbox, left for later).
+
+The Terminal-Bench bridge ended such a command badly too. The timed-out request marked the
+bridge connection broken for the rest of the process, and the bridge server kept running the
+command, holding its lock, so a new connection could not start. The server now runs each
+command as a bash job in its own process group with a watchdog: TERM at the timeout, KILL 5 s
+later, in the container itself, because ending the `docker exec` client does not end the
+command. It bounds its own wait on the backend, and stops a command whose client closed the
+connection. A broken client connection is closed, and the next request connects again with a
+`resume` hello that keeps the session's sync state. The host waits for the bridge's own slack
+plus 5 s (`ExternalExecutor::report_grace`), not a fixed 30 s.
+
+Tests: `an_unlisted_command_without_timeout_secs_gets_the_short_default`,
+`an_allowlisted_build_command_gets_the_longest_limit`,
+`timeout_secs_sets_the_limit_up_to_the_longest`, `a_timeout_secs_that_is_not_seconds_is_refused`,
+`a_timed_out_command_says_what_to_do_next`, `the_description_states_the_time_limits`,
+`server_like_commands_are_recognized_by_their_words`,
+`a_local_unlisted_command_gets_the_short_default_unless_it_asks`,
+`the_host_waits_for_the_executors_own_report_grace` (kgraf-tools);
+`after_a_timed_out_request_the_next_one_reconnects_and_is_answered`,
+`a_dropped_request_is_never_answered_by_its_late_response`,
+`a_failed_reconnect_names_both_failures` (kgraf-tbench-bridge); `test_bridge_timeout.py` (the
+bridge server). Each fails with its part of the change reverted.

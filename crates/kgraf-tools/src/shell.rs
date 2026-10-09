@@ -67,8 +67,18 @@
 //!
 //! **A timed-out command keeps its output (decision 0084).** Its process group
 //! is killed and what it wrote so far comes back, under the status line
-//! `[killed after N s]`, as an error result. A cancel stays
-//! [`ToolError::Cancelled`].
+//! `[killed after N s]`, as an error result, with what to do next: run a slow
+//! command again with a larger `timeout_secs`, or start one that does not end
+//! by itself (a server, a watcher) in the background and check on it. A cancel
+//! stays [`ToolError::Cancelled`].
+//!
+//! **How long a command may run (decision 0084, amended 2026-10-09).** The
+//! tool's timeout ([`ShellTool::with_timeout`], `shell_timeout_secs`) is the
+//! longest any command may run. A command on the build and test allowlist gets
+//! all of it. Any other command gets [`DEFAULT_UNLISTED_TIMEOUT`] (or the
+//! longest, when that is shorter), unless its call sets `timeout_secs`, which
+//! may ask for up to the longest; a larger value is cut to it, and the result
+//! says so.
 //!
 //! **`Decision::Prompt` requires [`ShellApprovalHook`].** [`Tool::access`] can only allow or refuse a call; it cannot
 //! pause one for a user's answer, so it used to let a `Prompt`-classified
@@ -114,11 +124,20 @@ use kgraf_sandbox::{CheckNetwork, Network, SandboxPolicy, Workspace};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// A command still running after this long is killed, its output so far kept
-/// (see [`ShellTool::with_timeout`]). 600 s, the contract checks' own bound
-/// (`check_timeout`), since decision 0084: a cold `cargo test` of a real
-/// workspace takes minutes, and the earlier 30 s killed every one.
+/// The longest a command may run unless configured otherwise: what a build or
+/// test command on the allowlist gets, and the most a call's `timeout_secs`
+/// may ask for (see [`ShellTool::with_timeout`]). 600 s, the contract checks'
+/// own bound (`check_timeout`), since decision 0084: a cold `cargo test` of a
+/// real workspace takes minutes, and the earlier 30 s killed every one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a command off the build and test allowlist runs when its call sets
+/// no `timeout_secs` (or the tool's timeout, when that is shorter). A command
+/// that never ends, such as a server started in the foreground, held a worker
+/// for the whole tool timeout before anything reacted; this bounds that wait,
+/// and the kill result says how to run such a command. A slow command that
+/// does end asks for more with `timeout_secs`. 120 s is the default of
+/// Claude Code's Bash tool, which a call may raise the same way.
+pub const DEFAULT_UNLISTED_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bytes kept per stream (stdout, stderr) before truncation.
 pub const DEFAULT_OUTPUT_CAP: usize = 64 * 1024;
 /// How long a stream reader gets, after the direct child has exited, to flush
@@ -202,7 +221,11 @@ pub trait ExecGate: Send + Sync {
 
 pub struct ShellTool {
     policy: ExecPolicy,
+    /// The longest any command may run (see the module docs).
     timeout: Duration,
+    /// What a command off the build allowlist gets when its call sets no
+    /// `timeout_secs`, if shorter than `timeout`.
+    unlisted_timeout: Duration,
     output_cap: usize,
     hook_bound: HookBinding,
     /// The worker's workspace, when the tool is bound to one.
@@ -264,6 +287,7 @@ impl ShellTool {
         let tool = Self {
             policy: policy.clone(),
             timeout: DEFAULT_TIMEOUT,
+            unlisted_timeout: DEFAULT_UNLISTED_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
             hook_bound: HookBinding::bound(),
             workspace: None,
@@ -291,6 +315,7 @@ impl ShellTool {
         Self {
             policy,
             timeout: DEFAULT_TIMEOUT,
+            unlisted_timeout: DEFAULT_UNLISTED_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
             hook_bound: HookBinding::unbound(),
             workspace: None,
@@ -307,13 +332,43 @@ impl ShellTool {
         }
     }
 
-    /// Kill a command still running after `timeout`. A killed command is not
-    /// an error of the tool: its output up to the kill comes back, marked
+    /// The longest any command may run: a build or test command on the
+    /// allowlist gets all of it, and a call's `timeout_secs` may ask for up to
+    /// it. A command still running at its limit is killed. A killed command is
+    /// not an error of the tool: its output up to the kill comes back, marked
     /// `[killed after N s]` and `is_error` (decision 0084). A cancel is still
     /// [`ToolError::Cancelled`].
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// What a command off the build allowlist gets when its call sets no
+    /// `timeout_secs` ([`DEFAULT_UNLISTED_TIMEOUT`] unless set here); never
+    /// more than [`Self::with_timeout`]'s.
+    pub fn with_unlisted_timeout(mut self, timeout: Duration) -> Self {
+        self.unlisted_timeout = timeout;
+        self
+    }
+
+    /// The limit of one call: its `timeout_secs`, at most the tool's timeout,
+    /// or, without one, the tool's timeout for an allowlisted build or test
+    /// command and the shorter unlisted default for any other.
+    fn time_limit(&self, input: &Value, cmd: &[String], build: bool) -> Result<TimeLimit, String> {
+        let max = self.timeout;
+        let asked = requested_timeout(input)?;
+        let (timeout, cut_from) = match asked {
+            Some(asked) if asked > max => (max, Some(asked)),
+            Some(asked) => (asked, None),
+            None if build => (max, None),
+            None => (self.unlisted_timeout.min(max), None),
+        };
+        Ok(TimeLimit {
+            timeout,
+            max,
+            cut_from,
+            server_like: looks_like_a_server(cmd),
+        })
     }
 
     pub fn with_output_cap(mut self, cap: usize) -> Self {
@@ -1087,6 +1142,13 @@ impl Tool for ShellTool {
                  [\"sh\", \"-c\", \"<line>\"] takes POSIX shell syntax.",
             );
         }
+        // Decision 0084, amended 2026-10-09: the limits are configuration, so
+        // the definition stays byte-identical across the run's workers (0043).
+        description.push_str(&time_limit_sentence(
+            self.unlisted_timeout.min(self.timeout),
+            self.timeout,
+            cfg!(any(unix, windows)) && !build.is_empty(),
+        ));
         // Decision 0093: a run-wide operator setting, so the definition is
         // still byte-identical across the run's workers (0043). A grant to one
         // contract is not named here; the contract's brief names it.
@@ -1106,6 +1168,12 @@ impl Tool for ShellTool {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.timeout.as_secs().max(1),
+                        "description": "Seconds the command may run before it is stopped.",
                     }
                 },
                 "required": ["command"],
@@ -1216,12 +1284,16 @@ impl Tool for ShellTool {
             });
         }
         let (cmd, form) = parse_command(&input)?;
+        let verdict = self.policy.evaluate(&cmd);
+        // Refused after the policy's own checks below, so a forbidden command
+        // is refused as forbidden whatever its `timeout_secs`.
+        let limit = self.time_limit(&input, &cmd, verdict.build);
+        let cut_note = limit.as_ref().ok().and_then(TimeLimit::cut_note);
         // The body runs in a block so every path, early returns included,
         // comes back here, where a split command line gets its note.
         let result: Result<ToolOutput, ToolError> = async {
         // Checked again: `call` must never run what `access` would have
         // refused, even if a future caller invokes it directly (fail loud).
-        let verdict = self.policy.evaluate(&cmd);
         if verdict.decision == Decision::Forbidden {
             return Err(forbidden(verdict.reason.as_deref()));
         }
@@ -1258,6 +1330,10 @@ impl Tool for ShellTool {
                 self.build_config.as_ref(),
             )?;
         }
+        let limit = limit.as_ref().map_err(|reason| ToolError::InvalidInput {
+            tool: "shell".into(),
+            reason: reason.clone(),
+        })?;
         // External executor: every check above this line already
         // ran unconditionally (forbidden, prompt-without-hook, read-only
         // confinement). Only the execution step itself is routed elsewhere
@@ -1267,7 +1343,7 @@ impl Tool for ShellTool {
         // seam existed.
         if let Some(executor) = &self.external {
             let output =
-                run_external(&cmd, ctx, executor.as_ref(), self.timeout, self.output_cap).await?;
+                run_external(&cmd, ctx, executor.as_ref(), limit, self.output_cap).await?;
             // Same scrub as the local path: a container's build log can hold
             // a credential just as a local one can.
             return Ok(if verdict.build {
@@ -1387,7 +1463,7 @@ impl Tool for ShellTool {
             &policy,
             &env,
             &notes,
-            self.timeout,
+            limit,
             self.output_cap,
         )
         .await;
@@ -1465,6 +1541,15 @@ impl Tool for ShellTool {
         Ok(scrub_build_output(output))
         }
         .await;
+        let result = match (result, cut_note) {
+            (Ok(mut out), Some(note)) => {
+                out.parts.push(crate::OutputPart::Text {
+                    text: crate::UntrustedText::new(note),
+                });
+                Ok(out)
+            }
+            (other, _) => other,
+        };
         match result {
             Ok(mut out) if form != ArgvForm::Plain => {
                 let note = match form {
@@ -1995,9 +2080,10 @@ async fn run_sandboxed(
     policy: &SandboxPolicy,
     env: &ExtraEnv,
     notes: &[String],
-    timeout: Duration,
+    limit: &TimeLimit,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
+    let timeout = limit.timeout;
     let mut sandboxed = sandboxed_command(policy, &cmd[0], &ctx.workspace_root)
         .map_err(|e| internal(format!("cannot build sandbox: {e}")))?;
     // Set after the sandbox's own environment scrub, so it survives it.
@@ -2165,7 +2251,7 @@ async fn run_sandboxed(
                 output_cap,
             );
             output.parts[0] = OutputPart::Text {
-                text: UntrustedText::new(killed_marker(timeout)),
+                text: UntrustedText::new(killed_marker(limit)),
             };
             Ok(output)
         }
@@ -2308,11 +2394,137 @@ fn with_dependency_hint(output: ToolOutput) -> ToolOutput {
     output
 }
 
-/// The status line of a command killed at its timeout: `[killed after N s]`.
-fn killed_marker(timeout: Duration) -> String {
+/// How long one call's command may run, and what its result says about it.
+#[derive(Clone, Debug)]
+struct TimeLimit {
+    /// The command is killed after this long.
+    timeout: Duration,
+    /// The longest any call may ask for.
+    max: Duration,
+    /// The call's `timeout_secs`, when it was above `max` and cut to it.
+    cut_from: Option<Duration>,
+    /// The command reads like one that does not end by itself.
+    server_like: bool,
+}
+
+impl TimeLimit {
+    /// The note a result carries when the call asked for more than `max`.
+    fn cut_note(&self) -> Option<String> {
+        self.cut_from.map(|asked| {
+            format!(
+                "\n[timeout_secs {} is above the longest a command may run here, {} s; {} s \
+                 was used]",
+                asked.as_secs_f64(),
+                self.max.as_secs_f64(),
+                self.max.as_secs_f64()
+            )
+        })
+    }
+}
+
+/// The call's `timeout_secs`: a whole number of seconds, at least 1, or a
+/// string holding one (some models quote numbers). `None` when absent. Any
+/// other value is refused with what is expected, never ignored.
+fn requested_timeout(input: &Value) -> Result<Option<Duration>, String> {
+    let Some(value) = input.get("timeout_secs") else {
+        return Ok(None);
+    };
+    let secs = match value {
+        Value::Null => return Ok(None),
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match secs {
+        Some(s) if s.is_finite() && s >= 1.0 => Ok(Some(Duration::from_secs(s.ceil() as u64))),
+        _ => Err(format!(
+            "`timeout_secs` must be a whole number of seconds, at least 1; got {value}"
+        )),
+    }
+}
+
+/// Whether `cmd` reads like a command that does not end by itself: a server,
+/// a watcher or a follow. Only chooses the advice a kill result gives; it
+/// never sets a limit.
+fn looks_like_a_server(cmd: &[String]) -> bool {
+    let line = cmd.join(" ").to_ascii_lowercase();
+    let words: Vec<&str> = line
+        .split(|c: char| !(c.is_ascii_alphanumeric() || "._-:".contains(c)))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.contains(&w);
+    // An install of a server package (`pip install pypiserver`) ends.
+    if has("install") || has("download") {
+        return false;
+    }
+    words.iter().any(|w| {
+        *w == "serve"
+            || w.ends_with("server")
+            || matches!(
+                *w,
+                "uvicorn"
+                    | "gunicorn"
+                    | "hypercorn"
+                    | "daphne"
+                    | "nodemon"
+                    | "watch"
+                    | "--watch"
+                    | "--reload"
+                    | "--follow"
+                    | "--port"
+            )
+    }) || (has("tail") && has("-f"))
+        || (has("flask") && has("run"))
+        || (has("sleep") && has("infinity"))
+        || (["npm", "yarn", "pnpm"].iter().any(|p| has(p)) && (has("start") || has("dev")))
+}
+
+/// The status line of a command killed at its limit, `[killed after N s]`,
+/// and what to do next.
+fn killed_marker(limit: &TimeLimit) -> String {
+    let secs = limit.timeout.as_secs_f64();
+    let background = "start it in the background with its output sent to a file, for example \
+         [\"sh\", \"-c\", \"<command> > /tmp/<name>.log 2>&1 &\"], then check on it with later \
+         commands (read the log, or connect to it)";
+    let advice = if limit.server_like {
+        format!(
+            "It looks like a server or a watcher, which does not end by itself and holds the call \
+             until its limit: {background}."
+        )
+    } else if limit.timeout < limit.max {
+        format!(
+            "If it ends by itself but needs longer, run it again with `timeout_secs` set higher (at \
+             most {} s). If it does not end by itself (a server, a watcher), {background}.",
+            limit.max.as_secs_f64()
+        )
+    } else {
+        format!(
+            "This is the longest a command may run here. If it does not end by itself (a server, \
+             a watcher), {background}."
+        )
+    };
     format!(
-        "exit status: [killed after {} s] (the shell timeout; output up to the kill follows)",
-        timeout.as_secs_f64()
+        "exit status: [killed after {secs} s] (the command was still running at its time limit; \
+         output up to the kill follows)\n{advice}"
+    )
+}
+
+/// The description's sentence on time limits.
+fn time_limit_sentence(unlisted: Duration, max: Duration, build_listed: bool) -> String {
+    let build = if build_listed && unlisted < max {
+        format!(
+            " (the build and test commands above get {} s)",
+            max.as_secs_f64()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        " A command is stopped after {} s{build} unless the call sets `timeout_secs`, up to {} s. \
+         A command that does not end by itself, such as a server or a watcher, holds the call \
+         until then: start it in the background with its output sent to a file, then check on it.",
+        unlisted.as_secs_f64(),
+        max.as_secs_f64()
     )
 }
 
@@ -2331,10 +2543,11 @@ async fn run_sandboxed(
     policy: &SandboxPolicy,
     env: &ExtraEnv,
     notes: &[String],
-    timeout: Duration,
+    limit: &TimeLimit,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
     use kgraf_sandbox::Redirect;
+    let timeout = limit.timeout;
     let mut sandboxed = sandboxed_command(policy, &cmd[0], &ctx.workspace_root)
         .map_err(|e| internal(format!("cannot build sandbox: {e}")))?;
     for (key, value) in env {
@@ -2457,7 +2670,7 @@ async fn run_sandboxed(
                 output_cap,
             );
             output.parts[0] = OutputPart::Text {
-                text: UntrustedText::new(killed_marker(timeout)),
+                text: UntrustedText::new(killed_marker(limit)),
             };
             Ok(output)
         }
@@ -2471,7 +2684,7 @@ async fn run_sandboxed(
     _policy: &SandboxPolicy,
     _env: &ExtraEnv,
     _notes: &[String],
-    _timeout: Duration,
+    _limit: &TimeLimit,
     _output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
     Err(internal(
@@ -2503,17 +2716,15 @@ async fn run_external(
     cmd: &[String],
     ctx: &ToolContext,
     executor: &dyn ExternalExecutor,
-    timeout: Duration,
+    limit: &TimeLimit,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
-    run_external_bounded(cmd, ctx, executor, timeout, EXTERNAL_GRACE, output_cap).await
+    // The executor enforces the timeout remotely; the grace is the host's
+    // own bound for one that does not (a hung container runtime, a lost
+    // connection), and the executor says how long its own reporting may take.
+    let grace = executor.report_grace();
+    run_external_bounded(cmd, ctx, executor, limit, grace, output_cap).await
 }
-
-/// How long past the command's own timeout the host waits for an external
-/// executor to report. The executor enforces the timeout remotely; this is
-/// the host's own bound for one that does not (a hung container runtime, a
-/// lost connection), and leaves room for its teardown.
-const EXTERNAL_GRACE: Duration = Duration::from_secs(30);
 
 /// [`run_external`] with the host-side grace as a parameter. An executor that
 /// has not reported by `timeout + grace` is dropped and the call fails with
@@ -2522,10 +2733,11 @@ async fn run_external_bounded(
     cmd: &[String],
     ctx: &ToolContext,
     executor: &dyn ExternalExecutor,
-    timeout: Duration,
+    limit: &TimeLimit,
     grace: Duration,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
+    let timeout = limit.timeout;
     let bound = timeout.saturating_add(grace);
     let stopped = tokio::select! {
         _ = ctx.cancel.cancelled() => ToolError::Cancelled { tool: "shell".into() },
@@ -2534,7 +2746,7 @@ async fn run_external_bounded(
             after_ms: u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
         },
         result = executor.exec(cmd, timeout) => {
-            return render_external(result, timeout, output_cap);
+            return render_external(result, limit, output_cap);
         }
     };
     // The exec future is dropped by now. The executor is told, so it can stop
@@ -2551,7 +2763,7 @@ const ABANDON_BOUND: Duration = Duration::from_secs(5);
 /// One external command's result, rendered the way a local run is.
 fn render_external(
     outcome: Result<crate::external::ExternalOutcome, String>,
-    timeout: Duration,
+    limit: &TimeLimit,
     output_cap: usize,
 ) -> Result<ToolOutput, ToolError> {
     let outcome = outcome.map_err(|e| internal(format!("external executor failed: {e}")))?;
@@ -2570,7 +2782,7 @@ fn render_external(
             output_cap,
         );
         output.parts[0] = OutputPart::Text {
-            text: UntrustedText::new(killed_marker(timeout)),
+            text: UntrustedText::new(killed_marker(limit)),
         };
         return Ok(output);
     }
@@ -2828,9 +3040,14 @@ mod windows_tests {
     }
 
     /// A plain program and a POSIX shell line both run, their output comes
-    /// back, and the open-network notice comes with the first result only.
+    /// back, and the first result says the network is open exactly where the
+    /// backend in use leaves it open (`CheckNetwork::current`): the token
+    /// sandbox cannot deny the network and says so with the first result
+    /// only; the sandbox user denies it and says nothing. Windows self-test
+    /// self-test ran this as the sandbox user, where the notice is rightly
+    /// absent, while the test still asked for it.
     #[tokio::test]
-    async fn commands_run_and_the_first_result_says_the_network_is_open() {
+    async fn commands_run_and_the_first_result_says_whether_the_network_is_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let c = ctx(dir.path().to_path_buf());
         let tool = tool();
@@ -2844,9 +3061,13 @@ mod windows_tests {
             .expect("call")
             .render();
         assert!(first.contains("plain-program"), "{first}");
-        assert!(
+        let open = kgraf_sandbox::CheckNetwork::current()
+            .shell_notice()
+            .is_some();
+        assert_eq!(
             first.contains(kgraf_sandbox::SHELL_NETWORK_OPEN_NOTICE),
-            "{first}"
+            open,
+            "the backend leaves the network open: {open}; {first}"
         );
         let second = tool
             .call(
@@ -3193,6 +3414,42 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the child was not killed promptly"
         );
+    }
+
+    /// A local command off the build allowlist whose call names no
+    /// `timeout_secs` is killed at the unlisted default, not at the tool's
+    /// longer timeout; a call that asks for more runs to its end.
+    #[tokio::test]
+    async fn a_local_unlisted_command_gets_the_short_default_unless_it_asks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tool, _hook) = ShellTool::new(policy());
+        let tool = tool
+            .with_timeout(Duration::from_secs(30))
+            .with_unlisted_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let out = tool
+            .call(
+                json!({"command": ["/bin/sleep", "30"]}),
+                &ctx(dir.path().to_path_buf()),
+                &CallPermit::new(),
+            )
+            .await
+            .expect("a timeout returns the output so far");
+        let rendered = out.render();
+        assert!(rendered.contains("[killed after 0.3 s]"), "{rendered}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let out = tool
+            .call(
+                json!({"command": ["/bin/sh", "-c", "sleep 1; echo finished"], "timeout_secs": 10}),
+                &ctx(dir.path().to_path_buf()),
+                &CallPermit::new(),
+            )
+            .await
+            .expect("ran");
+        let failed = out.is_error;
+        let rendered = out.render();
+        assert!(!failed, "{rendered}");
+        assert!(rendered.contains("finished"), "{rendered}");
     }
 
     /// Decision 0084, item C: what a command wrote before its timeout comes
@@ -6216,7 +6473,7 @@ fn main() {
                 &["true".to_string()],
                 &ctx(dir.path().to_path_buf()),
                 &hung,
-                Duration::from_millis(50),
+                &fixed_limit(Duration::from_millis(50)),
                 Duration::from_millis(50),
                 1024,
             )
@@ -6242,7 +6499,7 @@ fn main() {
                 &["true".to_string()],
                 &context,
                 &hung,
-                Duration::from_secs(60),
+                &fixed_limit(Duration::from_secs(60)),
                 Duration::from_secs(60),
                 1024,
             )
@@ -6250,6 +6507,298 @@ fn main() {
             .expect_err("cancelled");
             assert!(matches!(err, ToolError::Cancelled { .. }), "{err:?}");
             assert_eq!(hung.abandoned.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// A limit of exactly `timeout`, with no cut and no server advice.
+        fn fixed_limit(timeout: Duration) -> TimeLimit {
+            TimeLimit {
+                timeout,
+                max: timeout,
+                cut_from: None,
+                server_like: false,
+            }
+        }
+
+        /// Records the timeout each command was given, and answers with a
+        /// timed-out result when `timed_out` is set.
+        #[derive(Default)]
+        struct TimeoutRecorder {
+            timeouts: Mutex<Vec<Duration>>,
+            timed_out: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl ExternalExecutor for TimeoutRecorder {
+            async fn exec(
+                &self,
+                _cmd: &[String],
+                timeout: Duration,
+            ) -> Result<ExternalOutcome, String> {
+                self.timeouts.lock().expect("lock").push(timeout);
+                Ok(ExternalOutcome {
+                    stdout: b"listening on 8080\n".to_vec(),
+                    stderr: Vec::new(),
+                    exit_code: if self.timed_out { None } else { Some(0) },
+                    timed_out: self.timed_out,
+                })
+            }
+
+            async fn sync_to_remote(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        /// One routed call of `input` on a tool whose longest limit is 1800 s;
+        /// the timeout the executor got, and the rendered result.
+        async fn routed(
+            policy: ExecPolicy,
+            input: Value,
+            timed_out: bool,
+        ) -> Result<(Duration, String), ToolError> {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let executor = std::sync::Arc::new(TimeoutRecorder {
+                timed_out,
+                ..Default::default()
+            });
+            let (tool, _hook) = ShellTool::new(policy);
+            let tool = tool
+                .with_timeout(Duration::from_secs(1800))
+                .with_external_executor(executor.clone());
+            let out = tool
+                .call(input, &ctx(dir.path().to_path_buf()), &CallPermit::new())
+                .await?;
+            let timeouts = executor.timeouts.lock().expect("lock");
+            assert_eq!(timeouts.len(), 1);
+            Ok((timeouts[0], out.render()))
+        }
+
+        /// A command that never ends (a server run in the foreground) held a
+        /// worker for the whole 1800 s tool timeout. A command off the build
+        /// allowlist whose call names no `timeout_secs` now gets the unlisted
+        /// default, not the longest limit.
+        #[tokio::test]
+        async fn an_unlisted_command_without_timeout_secs_gets_the_short_default() {
+            let (timeout, _) = routed(
+                policy(),
+                json!({"command": ["python", "-m", "pypiserver", "run", "-p", "8080", "dist/"]}),
+                false,
+            )
+            .await
+            .expect("call");
+            assert_eq!(timeout, DEFAULT_UNLISTED_TIMEOUT);
+        }
+
+        /// A build or test command on the allowlist keeps the longest limit
+        /// without asking: a cold build takes minutes (decision 0084).
+        #[tokio::test]
+        async fn an_allowlisted_build_command_gets_the_longest_limit() {
+            let policy = ExecPolicy::default_kgraf_policy().with_build_allowlist(
+                crate::execpolicy::BuildAllowlist::empty().with_configured("echo built"),
+            );
+            let (timeout, _) = routed(policy, json!({"command": ["echo", "built"]}), false)
+                .await
+                .expect("call");
+            assert_eq!(timeout, Duration::from_secs(1800));
+        }
+
+        /// `timeout_secs` sets the limit, up to the longest; above it, the
+        /// longest is used and the result says so.
+        #[tokio::test]
+        async fn timeout_secs_sets_the_limit_up_to_the_longest() {
+            let (timeout, out) = routed(
+                policy(),
+                json!({"command": ["make", "all"], "timeout_secs": 900}),
+                false,
+            )
+            .await
+            .expect("call");
+            assert_eq!(timeout, Duration::from_secs(900));
+            assert!(!out.contains("timeout_secs 900"), "{out}");
+            let (timeout, out) = routed(
+                policy(),
+                json!({"command": ["make", "all"], "timeout_secs": "4000"}),
+                false,
+            )
+            .await
+            .expect("call");
+            assert_eq!(timeout, Duration::from_secs(1800));
+            assert!(
+                out.contains(
+                    "timeout_secs 4000 is above the longest a command may run here, 1800 s"
+                ),
+                "{out}"
+            );
+        }
+
+        /// A `timeout_secs` that is not a number of seconds is refused with
+        /// what is expected, never ignored.
+        #[tokio::test]
+        async fn a_timeout_secs_that_is_not_seconds_is_refused() {
+            for bad in [json!("soon"), json!(0), json!(-5), json!([30])] {
+                let err = routed(
+                    policy(),
+                    json!({"command": ["true"], "timeout_secs": bad}),
+                    false,
+                )
+                .await
+                .expect_err("refused");
+                assert!(
+                    matches!(err, ToolError::InvalidInput { .. })
+                        && err.to_string().contains("timeout_secs"),
+                    "{err}"
+                );
+            }
+        }
+
+        /// A forbidden command is refused as forbidden, whatever its
+        /// `timeout_secs`: the policy speaks first.
+        #[tokio::test]
+        async fn a_forbidden_command_is_refused_before_its_timeout_secs_is_read() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let policy = ExecPolicy::new(Decision::Allow).forbid(&["rm", "-rf", "/"], "no");
+            let (tool, _hook) = ShellTool::new(policy);
+            let tool = tool.with_external_executor(std::sync::Arc::new(TimeoutRecorder::default()));
+            let err = tool
+                .call(
+                    json!({"command": ["rm", "-rf", "/"], "timeout_secs": "soon"}),
+                    &ctx(dir.path().to_path_buf()),
+                    &CallPermit::new(),
+                )
+                .await
+                .expect_err("refused");
+            assert!(err.to_string().contains("forbidden"), "{err}");
+        }
+
+        /// A timed-out command's result says it was still running, and what
+        /// to do: a server goes to the background; a slow command may ask
+        /// for more time.
+        #[tokio::test]
+        async fn a_timed_out_command_says_what_to_do_next() {
+            let (_, server) = routed(
+                policy(),
+                json!({"command": ["python", "-m", "pypiserver", "run", "-p", "8080", "dist/"]}),
+                true,
+            )
+            .await
+            .expect("call");
+            assert!(server.contains("[killed after 120 s]"), "{server}");
+            assert!(
+                server.contains("still running at its time limit"),
+                "{server}"
+            );
+            assert!(server.contains("looks like a server"), "{server}");
+            assert!(server.contains("in the background"), "{server}");
+            assert!(server.contains("listening on 8080"), "{server}");
+            let (_, slow) = routed(policy(), json!({"command": ["make", "all"]}), true)
+                .await
+                .expect("call");
+            assert!(
+                slow.contains("run it again with `timeout_secs` set higher (at most 1800 s)"),
+                "{slow}"
+            );
+            let (_, longest) = routed(
+                policy(),
+                json!({"command": ["make", "all"], "timeout_secs": 1800}),
+                true,
+            )
+            .await
+            .expect("call");
+            assert!(
+                longest.contains("the longest a command may run here"),
+                "{longest}"
+            );
+            assert!(!longest.contains("set higher"), "{longest}");
+        }
+
+        /// The description states both limits and how to run a server.
+        #[test]
+        fn the_description_states_the_time_limits() {
+            let (tool, _hook) = ShellTool::new(policy());
+            let tool = tool.with_timeout(Duration::from_secs(1800));
+            let definition = tool.definition();
+            assert!(
+                definition.description.contains(
+                    "A command is stopped after 120 s unless the call sets `timeout_secs`, up to \
+                     1800 s."
+                ),
+                "{}",
+                definition.description
+            );
+            assert!(definition.description.contains("in the background"));
+            assert_eq!(
+                definition.input_schema["properties"]["timeout_secs"]["maximum"],
+                json!(1800)
+            );
+        }
+
+        /// The server reading only picks the advice; it is checked on the
+        /// words of the command, so `mkdir -p` or `preserve` do not count.
+        #[test]
+        fn server_like_commands_are_recognized_by_their_words() {
+            let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+            for yes in [
+                "python -m pypiserver run -p 8080 dist/",
+                "python3 -m http.server 8000",
+                "uvicorn app:app --port 8000",
+                "sh -c flask run",
+                "tail -f log.txt",
+                "npm run dev",
+                "python manage.py runserver",
+            ] {
+                assert!(looks_like_a_server(&words(yes)), "{yes}");
+            }
+            for no in [
+                "cargo test --workspace",
+                "mkdir -p dist",
+                "rsync --preserve x y",
+                "pip install pypiserver",
+                "python train.py",
+            ] {
+                assert!(!looks_like_a_server(&words(no)), "{no}");
+            }
+        }
+
+        /// The host waits for an executor's own report grace past the
+        /// command's timeout, not a fixed one: an executor that syncs a tree
+        /// after its command is not abandoned while it may still answer.
+        #[tokio::test]
+        async fn the_host_waits_for_the_executors_own_report_grace() {
+            struct SlowReporter(Hung);
+
+            #[async_trait::async_trait]
+            impl ExternalExecutor for SlowReporter {
+                async fn exec(
+                    &self,
+                    cmd: &[String],
+                    timeout: Duration,
+                ) -> Result<ExternalOutcome, String> {
+                    self.0.exec(cmd, timeout).await
+                }
+
+                fn report_grace(&self) -> Duration {
+                    Duration::from_millis(150)
+                }
+
+                async fn sync_to_remote(&self) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+
+            let slow = SlowReporter(Hung::default());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let err = run_external(
+                &["true".to_string()],
+                &ctx(dir.path().to_path_buf()),
+                &slow,
+                &fixed_limit(Duration::from_millis(50)),
+                1024,
+            )
+            .await
+            .expect_err("a hung executor must time out");
+            assert!(
+                matches!(err, ToolError::Timeout { after_ms: 200, .. }),
+                "{err:?}"
+            );
         }
 
         /// Forbidden and prompt-without-hook gating still run for a routed

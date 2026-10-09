@@ -88,8 +88,15 @@ fn result(results: &BTreeMap<String, String>, n: usize) -> Option<&str> {
     results.get(&format!("call_{n}")).map(String::as_str)
 }
 
-/// Judge the Git Bash worker run.
-pub fn judge_shell(results: &BTreeMap<String, String>, windows: bool) -> Vec<Check> {
+/// Judge the Git Bash worker run. `network_open` says whether the backend
+/// the worker ran under leaves the network open: the token sandbox does, and
+/// its first shell result carries the notice; the sandbox user denies the
+/// network, and no result may carry it.
+pub fn judge_shell(
+    results: &BTreeMap<String, String>,
+    windows: bool,
+    network_open: bool,
+) -> Vec<Check> {
     let mut out = Vec::new();
     let r1 = result(results, 1);
     let r2 = result(results, 2);
@@ -162,11 +169,22 @@ pub fn judge_shell(results: &BTreeMap<String, String>, windows: bool) -> Vec<Che
             .flatten()
             .filter(|t| t.contains(NOTICE))
             .count();
+        let (title, expects) = if network_open {
+            (
+                "the network notice comes with the first shell result only",
+                "expects it on the first result only (the backend leaves the network open)",
+            )
+        } else {
+            (
+                "no result says the network is open (the backend denies it)",
+                "expects it on no result (the backend denies the network)",
+            )
+        };
         out.push(check(
             "notice.once",
-            "the network notice comes with the first shell result only",
-            first && later == 0,
-            format!("first result has it: {first}; later results with it: {later}"),
+            title,
+            first == network_open && later == 0,
+            format!("{expects}; first result has it: {first}; later results with it: {later}"),
             r1.unwrap_or_default(),
         ));
     }
@@ -323,6 +341,10 @@ pub struct Ctx<'a> {
     pub env: Vec<(String, String)>,
     /// Git Bash was found on this machine.
     pub git_bash_found: bool,
+    /// Whether the backend kGraf runs these checks under leaves the network
+    /// open: the token sandbox (the baseline) does, the sandbox user (the
+    /// sandbox user phase) does not. Decides what `notice.once` expects.
+    pub network_open: bool,
     pub cancel: &'a AtomicBool,
 }
 
@@ -461,7 +483,7 @@ pub fn run_all(ctx: &Ctx, windows: bool) -> Vec<Check> {
     match scripted_worker(ctx, "shell", shell_script(windows), "mode = \"bypass\"\n") {
         Ok((results, f)) => {
             out.push(worker_check("shell", &f, !results.is_empty()));
-            out.extend(judge_shell(&results, windows));
+            out.extend(judge_shell(&results, windows, ctx.network_open));
         }
         Err(e) => out.push(check("shell.setup", "worker shell run setup", false, e, "")),
     }
@@ -598,7 +620,7 @@ mod tests {
             ("call_2", ""),
             ("call_3", "second-call\r\n"),
         ]);
-        let checks = judge_shell(&good, true);
+        let checks = judge_shell(&good, true, true);
         assert!(
             checks.iter().all(|c| c.status == Status::Pass),
             "{checks:#?}"
@@ -611,15 +633,40 @@ mod tests {
             ("call_2", notice),
             ("call_3", "second-call"),
         ]);
-        let c = judge_shell(&repeated, true);
+        let c = judge_shell(&repeated, true, true);
         let once = c
             .iter()
             .find(|c| c.id == "notice.once")
             .expect("notice check");
         assert_eq!(once.status, Status::Fail);
         let wsl = results(&[("call_1", "hello from git bash\nLinux\na b|c|")]);
-        let c = judge_shell(&wsl, true);
+        let c = judge_shell(&wsl, true, true);
         assert_eq!(c[0].status, Status::Fail, "a WSL bash is not Git Bash");
+        // Under a backend that denies the network (the sandbox user) no
+        // result may carry the notice: the run without it passes, and the
+        // run with it fails. A hosted Windows self-test judged the sandbox user
+        // by the token sandbox's rule and failed a correct run.
+        let quiet = results(&[
+            (
+                "call_1",
+                "hello from git bash\nMINGW64_NT-10.0-26100\na b|c|\n",
+            ),
+            ("call_2", ""),
+            ("call_3", "second-call\r\n"),
+        ]);
+        let checks = judge_shell(&quiet, true, false);
+        assert!(
+            checks.iter().all(|c| c.status == Status::Pass),
+            "{checks:#?}"
+        );
+        let once = |c: &[Check]| {
+            c.iter()
+                .find(|c| c.id == "notice.once")
+                .map(|c| c.status)
+                .expect("notice check")
+        };
+        assert_eq!(once(&judge_shell(&good, true, false)), Status::Fail);
+        assert_eq!(once(&judge_shell(&quiet, true, true)), Status::Fail);
         assert_eq!(c[1].status, Status::Fail, "a missing result fails");
     }
 

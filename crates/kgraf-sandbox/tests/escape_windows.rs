@@ -103,12 +103,14 @@ enum Act {
     UncList,
     Ui,
     Console,
+    NamedSemaphore,
+    OpenJobserver,
 }
 
 impl Act {
     /// Every action, so a name coming back from the environment finds its
     /// value. A variant left out here fails loudly in the probe.
-    const ALL: [Act; 23] = [
+    const ALL: [Act; 25] = [
         Act::Write,
         Act::Delete,
         Act::Rename,
@@ -132,6 +134,8 @@ impl Act {
         Act::UncList,
         Act::Ui,
         Act::Console,
+        Act::NamedSemaphore,
+        Act::OpenJobserver,
     ];
 
     fn name(self) -> &'static str {
@@ -159,6 +163,8 @@ impl Act {
             Act::UncList => "unc_list",
             Act::Ui => "ui",
             Act::Console => "console",
+            Act::NamedSemaphore => "named_semaphore",
+            Act::OpenJobserver => "open_jobserver",
         }
     }
 
@@ -213,8 +219,50 @@ fn probe_entry() {
         Act::Ui => ui_objects(),
         Act::SendInputHere => send_input_here(),
         Act::Console => Ok(console_window().to_string()),
+        Act::NamedSemaphore => named_semaphore(),
+        Act::OpenJobserver => open_jobserver(),
     };
     exit_with(result)
+}
+
+/// Create a named semaphore with no namespace prefix, in the session's
+/// `BaseNamedObjects`, as the `jobserver` crate does when cargo or rustc
+/// finds no jobserver to join.
+fn named_semaphore() -> std::io::Result<String> {
+    use windows_sys::Win32::System::Threading::CreateSemaphoreW;
+    let name = format!("kgraf-escape-probe-{}", std::process::id());
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated name and no security attributes.
+    let h = unsafe { CreateSemaphoreW(std::ptr::null(), 1, 1, wide.as_ptr()) };
+    if h.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh handle, closed once.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+    Ok(format!("created {name}"))
+}
+
+/// Open the jobserver `CARGO_MAKEFLAGS` names, with the rights the
+/// `jobserver` crate asks for (`SYNCHRONIZE | SEMAPHORE_MODIFY_STATE`).
+fn open_jobserver() -> std::io::Result<String> {
+    use windows_sys::Win32::System::Threading::{OpenSemaphoreW, SEMAPHORE_MODIFY_STATE};
+    let flags = std::env::var("CARGO_MAKEFLAGS").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "CARGO_MAKEFLAGS is not set")
+    })?;
+    let name = flags
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("--jobserver-auth="))
+        .ok_or_else(|| std::io::Error::other(format!("no jobserver in {flags:?}")))?
+        .to_owned();
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated name; SYNCHRONIZE is 0x00100000.
+    let h = unsafe { OpenSemaphoreW(0x0010_0000 | SEMAPHORE_MODIFY_STATE, 0, wide.as_ptr()) };
+    if h.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh handle, closed once.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+    Ok(format!("opened {name}"))
 }
 
 fn spawn_self(action: Act, arg: &str, flags: u32) -> std::io::Result<std::process::Child> {
@@ -474,9 +522,10 @@ fn desktop_name() -> std::io::Result<String> {
 }
 
 /// The name of the window station this process runs on. On the sandbox user
-/// path the runner creates one station per command, named
-/// `kgraf-sandbox-<hex>`, with one desktop called `Default` on it, so the
-/// desktop name alone cannot tell a private desktop from the owner's.
+/// path kGraf's process makes one station for the commands of each sandbox
+/// user, named `kgraf-cmd-<hex>`, with one desktop called `Default` on it
+/// (`sandbox_user::windows::launch`), so the desktop name alone cannot tell
+/// a private desktop from the owner's.
 fn station_name() -> std::io::Result<String> {
     use windows_sys::Win32::System::StationsAndDesktops::{
         GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME,
@@ -503,8 +552,7 @@ fn station_name() -> std::io::Result<String> {
 
 /// The window station and the desktop of this process, as
 /// `<station>\<desktop>`. Read in one probe: a station read in one command
-/// and a desktop read in another say nothing about either process, because
-/// each command gets its own station on the sandbox user path.
+/// and a desktop read in another say nothing about either process.
 fn ui_objects() -> std::io::Result<String> {
     Ok(format!("{}\\{}", station_name()?, desktop_name()?))
 }
@@ -1336,6 +1384,27 @@ fn a_junction_inside_the_root_cannot_escape() {
         let (code, line) = probe2(&e.ws, kind, Act::JunctionWrite, &link, &outside);
         assert_ne!(code, 0, "junction write succeeded {}: {line}", kind.word());
         assert!(!outside.join("planted.txt").exists(), "{line}");
+        // The junction the probe planted stays in the tree, and the next
+        // command there is refused before any access entry is written: the
+        // grant would reach through the link. A hosted Windows self-test met
+        // this refusal as the second kind's probe failing to start. The link
+        // is then taken out, so the next kind measures its own write.
+        if std::fs::symlink_metadata(&link).is_ok() {
+            let refused = sandboxed_command(&policy_as(&e.ws, kind), self_exe(), e.ws.root())
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            if sandbox_user_mode() {
+                assert!(
+                    refused.contains("holds the link") && refused.contains("nothing was written"),
+                    "a tree holding a junction out of it was granted on {}: {refused:?}",
+                    kind.word()
+                );
+            } else {
+                println!("measurement: the next command beside the planted junction: {refused:?}");
+            }
+            std::fs::remove_dir(&link).expect("remove the planted junction");
+        }
     }
     // As in the hard-link test: a target whose own access list decides, so
     // the junction itself is what the result measures.
@@ -1352,7 +1421,10 @@ fn a_junction_inside_the_root_cannot_escape() {
             target.display(),
             kind.word()
         );
-        let _ = std::fs::remove_dir_all(&link);
+        // The link alone, never what it points at.
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_dir(&link).expect("remove the planted junction");
+        }
     }
 }
 
@@ -2244,7 +2316,7 @@ fn send_input_reaches_nothing_of_the_owners() {
         assert_eq!(code, 0, "{} {line}", kind.word());
         if sandbox_user_mode() {
             assert!(
-                line.contains(" on kgraf-sandbox-"),
+                line.contains(&format!(" on {COMMAND_STATION}")),
                 "the command sent input on a window station kGraf did not make for it {}: \
                  {line}",
                 kind.word()
@@ -2260,23 +2332,26 @@ fn send_input_reaches_nothing_of_the_owners() {
     }
 }
 
+/// The prefix of the window station kGraf's process makes for the commands
+/// of one sandbox user (`sandbox_user::windows::launch`, `Role::Command`).
+const COMMAND_STATION: &str = "kgraf-cmd-";
+
 /// The command has no console, and its user interface is its own, in the way
 /// its backend makes it private. The token sandbox keeps the owner's window
 /// station and gives the command a desktop of its own, named
 /// `kGrafSandbox-<hex>`. The sandbox user cannot share the owner's station at
-/// all, so the runner creates a station per command, named
-/// `kgraf-sandbox-<hex>`, with one desktop called `Default` on it: there the
-/// station name is what says the command is isolated, and a test that read
-/// the desktop name alone would have failed on a working machine.
+/// all, so kGraf's process makes a station for the commands of each sandbox
+/// user, named `kgraf-cmd-<hex>`, with one desktop called `Default` on it:
+/// there the station name is what says the command is isolated, and a test
+/// that read the desktop name alone would have failed on a working machine.
 #[test]
 fn the_command_runs_on_its_own_desktop_without_a_console() {
     let e = env();
-    // Station and desktop of one process: each command gets its own station
-    // on the sandbox user path, so two probes would name two of them.
+    // Station and desktop of one process.
     let (_, ui) = probe(&e.ws, Kind::Online, Act::Ui, Path::new(""));
     if sandbox_user_mode() {
         assert!(
-            ui.starts_with("kgraf-sandbox-") && ui.ends_with(r"\Default"),
+            ui.starts_with(COMMAND_STATION) && ui.ends_with(r"\Default"),
             "the command runs on {ui:?}, not on a window station kGraf made for it"
         );
     } else {
@@ -2289,9 +2364,12 @@ fn the_command_runs_on_its_own_desktop_without_a_console() {
 
 /// How the user interface objects are shared, per backend. Under the token
 /// sandbox two spawns in one workspace reuse one desktop and two workspaces
-/// do not. Under the sandbox user each runner process makes its own window
-/// station, so no two commands share one, in one workspace or in two: a test
-/// that asked for reuse there asserted the opposite of what the code does.
+/// do not. Under the sandbox user kGraf's process makes one station for the
+/// commands of each sandbox user: two commands in one workspace run as one
+/// slot user and share it, and two workspaces hold two slots, two users and
+/// two stations. A hosted Windows self-test measured the first half: two
+/// commands of one user ran on `kgraf-cmd-<hex>\Default` stations this
+/// process made.
 #[test]
 fn user_interface_objects_are_shared_the_way_the_backend_shares_them() {
     let e = env();
@@ -2301,15 +2379,18 @@ fn user_interface_objects_are_shared_the_way_the_backend_shares_them() {
     if sandbox_user_mode() {
         for ui in [&a, &b, &c] {
             assert!(
-                ui.starts_with("kgraf-sandbox-"),
+                ui.starts_with(COMMAND_STATION),
                 "a command ran on {ui:?}, not on a window station kGraf made for it"
             );
         }
-        assert_ne!(
+        assert_eq!(
             a, b,
-            "two commands in one workspace shared a window station"
+            "two commands of one sandbox user ran on two window stations"
         );
-        assert_ne!(a, c, "two workspaces shared a window station");
+        assert_ne!(
+            a, c,
+            "two workspaces, two slot users, shared a window station"
+        );
     } else {
         assert_eq!(a, b, "same workspace should reuse one desktop");
         assert_ne!(a, c, "different workspaces should differ");
@@ -2411,7 +2492,9 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
     .unwrap();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut cmd = sandboxed_command(&policy(&e.ws), &cargo, root).unwrap();
-    cmd.args(["run", "--offline", "-q"])
+    // Not quiet: cargo's own lines say which step stopped, where a hosted Windows self-test had
+    // only the exit status 0xC0000409.
+    cmd.args(["run", "--offline"])
         .env_remove("CARGO_TARGET_DIR");
     let out = output_within(&mut cmd, Duration::from_secs(300));
     assert!(out.status.success(), "{out:?}");
@@ -2419,6 +2502,37 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
         String::from_utf8_lossy(&out.stdout).trim_end(),
         "cargo built"
     );
+}
+
+/// A command that runs as the sandbox user opens the jobserver kGraf made
+/// for it, by the name `CARGO_MAKEFLAGS` gives, with the rights cargo and
+/// rustc ask for (`sandbox_user::jobserver`): without it rustc stopped at its
+/// start in a hosted Windows self-test ("failed to create jobserver ...
+/// Access is denied"). Whether the session also lets the sandbox user create
+/// a named object of its own, which the runner's deny-only logon SID is
+/// expected to refuse, is a measurement, so a run shows what other programs
+/// that create one meet.
+#[test]
+fn the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured() {
+    let e = env();
+    for &kind in kinds() {
+        let (code, line) = probe(&e.ws, kind, Act::NamedSemaphore, Path::new(""));
+        println!(
+            "measurement: a named semaphore in the session {}: exit {code}, {line}",
+            kind.word()
+        );
+        if !sandbox_user_mode() {
+            continue;
+        }
+        let (code, line) = probe(&e.ws, kind, Act::OpenJobserver, Path::new(""));
+        assert_eq!(
+            code,
+            0,
+            "the command could not open the jobserver kGraf made for it {}: {line}",
+            kind.word()
+        );
+        assert!(line.starts_with("opened kgraf-jobserver-"), "{line}");
+    }
 }
 
 #[test]

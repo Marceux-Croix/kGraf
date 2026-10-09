@@ -1729,17 +1729,34 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // the shell tool description names (measured: with the cargo-only list
     // the digest is the previous one).
     //
-    // One pin per platform: on Windows the shell tool's description adds two
-    // sentences on purpose (the sandbox there cannot deny the network, and
-    // `sh` and `bash` run with Git Bash), so its prefix differs. Within one
-    // platform the definition is still byte-identical across a run's workers
-    // (0043). The Windows value is the one the hosted Windows self-test
-    // reported; nothing that builds the prefix has changed since but the
+    // One pin per platform and Windows backend: on Windows the shell tool's
+    // description says on purpose that `sh` and `bash` run with Git Bash,
+    // and under the token sandbox also that the network is open (it cannot
+    // deny it), so its prefix differs; under the sandbox user the network is
+    // denied and that sentence is absent. Within one machine the definition
+    // is still byte-identical across a run's workers (0043). The Windows
+    // values are the ones the hosted Windows self-test reported, the token
+    // sandbox's in its baseline and the sandbox user's in the self-test's re-run as
+    // that user; nothing that builds the prefix has changed since but the
     // platform-independent parts this test also pins on Unix.
+    //
+    // Re-pinned (decision 0084, amended 2026-10-09) when the shell tool's
+    // description took its sentence on time limits and its input schema took
+    // `timeout_secs`. Both Windows values were measured on macOS with the
+    // Windows sentences forced on (the Git Bash sentence; and, for the token
+    // sandbox, the network left open); the same forcing on the previous code
+    // gave both values the hosted Windows self-test reported, exactly.
     let pinned = if cfg!(windows) {
-        "fac04d9f15e4d6952e30aadbac7d78068bdfad4383843ddb4ae2e093f019e222"
+        if kgraf_sandbox::CheckNetwork::current()
+            .shell_notice()
+            .is_some()
+        {
+            "3d88dcbcfbccc735823aaa813d36ed51dadc073ef3d8367053bceec83d031e62"
+        } else {
+            "198847af609672a89da0055b8ea2a9b50cec6a2e5e7b687faec836a577a9f5f2"
+        }
     } else {
-        "a54601d72355ff810e5f5791ff5dcd94f25c3a94622f75a9d97f4753a0f3805f"
+        "26149e46a9ccaab01e78221b2438cd764f25de4fbee7c70b6c3cf72b92a844d7"
     };
     assert_eq!(
         digest, pinned,
@@ -2695,13 +2712,20 @@ async fn a_check_that_changes_a_committed_file_fails_naming_it() {
 /// (the link goes, not its target), a nested repository (git lists it as
 /// `nested/` and does not enter it), and a new `.gitignore` that ignores
 /// everything, itself included, with a file it would hide.
+///
+/// The link's target is outside the worktree in the repository's shared git
+/// folder, which every backend lets the check read (git in the worktree
+/// needs it), and not in a folder outside the repository: the Windows
+/// sandbox user cannot read such a folder, and Git Bash's `ln -s` then
+/// fails before the link exists ("Not a directory", Windows self-test run
+/// 11), so the test measured the read confinement instead of the cleanup.
 #[tokio::test]
 async fn everything_a_check_creates_is_removed_and_nothing_outside() {
     let r = repo();
     let c = named("b.txt", "w-shapes");
     let ws = prepared(&r, &c, "w-shapes").await;
     std::fs::write(ws.join("b.txt"), "worker\n").expect("write");
-    let target = r.outside.join("keep.txt");
+    let target = r.root.join(".git").join("kgraf-test-keep.txt");
     std::fs::write(&target, "keep\n").expect("write");
     let check = format!(
         "mkdir -p cache/deep && echo c > cache/deep/c.bin && ln -s '{}' link && \

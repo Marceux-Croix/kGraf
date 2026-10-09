@@ -258,6 +258,16 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            need administrator rights and a launch is a standard user's, so commands run as \
            the sandbox user with whatever filters the machine has, and only \
            `kgraf sandbox status` and `kgraf sandbox selfcheck` show which; \
+           loopback is closed by WFP filters, not by the firewall rules, which do not act \
+           on it: a command without the network reaches no loopback port outside kGraf's \
+           egress proxy ports, a listener it started itself included, so a test that starts \
+           a local server and connects to it fails there; where Windows refuses a loopback \
+           filter at setup, loopback is not confined on this machine and \
+           `kgraf sandbox status` shows the filter as FAILED; \
+           a program that creates a named object in the session is refused, because the \
+           session admits its logon SID, which the command holds deny-only: cargo and \
+           rustc get a jobserver kGraf makes for each command instead, other programs \
+           get nothing; \
            traffic Windows sends on the user's behalf \
            is not proved blocked: a UNC path (\\\\host\\share) makes the kernel's SMB \
            client connect, the WebClient service carries WebDAV, and ICMP \
@@ -317,6 +327,11 @@ mod user_gaps_tests {
             "FWP_E_OUT_OF_BOUNDS",
             "shows the filter as FAILED",
             "does not check that the filters are still on the machine",
+            "loopback is closed by WFP filters",
+            "a listener it started itself included",
+            "loopback is not confined on this machine",
+            "named object in the session is refused",
+            "jobserver",
             "UNC path",
             "WebDAV",
             "ICMP",
@@ -354,22 +369,71 @@ pub(super) const CURL_SSL_BACKEND_VAR: &str = "CURL_SSL_BACKEND";
 /// With the network open, a second selects OpenSSL for git's HTTPS
 /// (`http.sslBackend`), because Schannel cannot run under the sandbox token.
 /// Then come the line-ending settings kGraf's own git uses
-/// (`kgraf_core::host_git::LINE_ENDINGS`). None touches
-/// `GIT_CONFIG_NOSYSTEM` or `GIT_CONFIG_GLOBAL`, which keep their effect.
-pub(super) fn git_config_pairs(network_open: bool) -> Vec<(&'static str, &'static str)> {
+/// (`kgraf_core::host_git::LINE_ENDINGS`). Last, for a command that runs as
+/// the sandbox user, one `safe.directory` entry per value of `safe`
+/// ([`safe_directories`]). None touches `GIT_CONFIG_NOSYSTEM` or
+/// `GIT_CONFIG_GLOBAL`, which keep their effect.
+pub(super) fn git_config_pairs(network_open: bool, safe: &[String]) -> Vec<(&str, &str)> {
     let mut pairs: Vec<(&str, &str)> = vec![("credential.helper", "")];
     if network_open {
         pairs.push(("http.sslBackend", TLS_BACKEND));
     }
     pairs.extend_from_slice(kgraf_core::host_git::LINE_ENDINGS);
+    pairs.extend(safe.iter().map(|v| ("safe.directory", v.as_str())));
     pairs
+}
+
+/// The `safe.directory` values a command that runs as the sandbox user gets:
+/// each writable root, and every repository below it (`<root>/*`), and each
+/// read root, in the form git compares (forward slashes, no `\\?\` prefix).
+///
+/// Git refuses a repository whose folders another user owns ("detected
+/// dubious ownership in repository"), unless `safe.directory` names it in a
+/// protected scope; entries given through `GIT_CONFIG_COUNT` are the command
+/// scope, which is protected. The worktrees belong to the account kGraf runs as,
+/// and the sandbox user is another user, so without these git refuses every
+/// command in them: a hosted Windows self-test showed `git status` failing so
+/// in the worker's worktree, as the slot user. A repository in a writable
+/// root is one the command can rewrite already, its configuration included,
+/// so trusting it gives the command nothing it did not have; a read root
+/// (the repository's shared git folder) is named alone.
+///
+/// The token sandbox runs commands as the owner, who owns the folders, so it
+/// gets none.
+pub(super) fn safe_directories(
+    writable: &[std::path::PathBuf],
+    readable: &[std::path::PathBuf],
+) -> Vec<String> {
+    let git_form = |p: &std::path::Path| {
+        kgraf_core::plain_path::simplify(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    for root in writable {
+        let root = git_form(root);
+        let root = root.trim_end_matches('/').to_owned();
+        push(root.clone());
+        push(format!("{root}/*"));
+    }
+    for dir in readable {
+        push(git_form(dir).trim_end_matches('/').to_owned());
+    }
+    out
 }
 
 /// Every variable the sandbox sets for the tools on Windows: the
 /// [`git_config_pairs`] as `GIT_CONFIG_*` entries from index zero and their
 /// `GIT_CONFIG_COUNT`, and, with the network open, [`CURL_SSL_BACKEND_VAR`].
-pub(super) fn tool_env(network_open: bool) -> Vec<(String, String)> {
-    let mut vars = super::git_config_vars(&git_config_pairs(network_open));
+/// `safe` is [`safe_directories`] for a command that runs as the sandbox
+/// user, and empty otherwise.
+pub(super) fn tool_env(network_open: bool, safe: &[String]) -> Vec<(String, String)> {
+    let mut vars = super::git_config_vars(&git_config_pairs(network_open, safe));
     if network_open {
         vars.push((CURL_SSL_BACKEND_VAR.to_owned(), TLS_BACKEND.to_owned()));
     }
@@ -383,8 +447,9 @@ pub(super) fn tool_env(network_open: bool) -> Vec<(String, String)> {
 pub(super) fn kept_on_clear(
     network_open: bool,
     tmp: Option<&std::path::Path>,
+    safe: &[String],
 ) -> Vec<(String, std::ffi::OsString)> {
-    let mut kept: Vec<(String, std::ffi::OsString)> = tool_env(network_open)
+    let mut kept: Vec<(String, std::ffi::OsString)> = tool_env(network_open, safe)
         .into_iter()
         .map(|(k, v)| (k, v.into()))
         .collect();
@@ -1062,16 +1127,28 @@ pub(super) enum ListWrite {
 
 /// `ERROR_SHARING_VIOLATION`.
 const ERROR_SHARING_VIOLATION: u32 = 32;
+/// `ERROR_ACCESS_DENIED`.
+const ERROR_ACCESS_DENIED_CODE: u32 = 5;
 
 /// Whether a `MAXIMUM_ALLOWED` open that failed with the Win32 error `code`
 /// is opened a second time for a lone write ([`ListWrite::KernelObjectAlone`]).
-/// Only a sharing violation is: a smaller mask answers exactly that refusal.
-/// Every other error stands, as it did before this second open existed: a
-/// missing object, a refused one (a `MAXIMUM_ALLOWED` open is refused only
-/// when the caller has no right at all) and a bad path would fail the second
-/// open the same way.
+///
+/// A sharing violation is: a smaller mask answers exactly that refusal. A
+/// refusal is too. A hosted Windows self-test refused the `MAXIMUM_ALLOWED`
+/// open of git's loose objects in the owner's own repository with error 5
+/// ("the read grant on ...\.git reached 84 of its files and folders; ... 14
+/// because they could not be opened or written", each an object file),
+/// where the owner holds every right: git writes those files read-only, and
+/// a `MAXIMUM_ALLOWED` open of a read-only file is refused although the
+/// list grants the caller everything (inferred from which files failed; not
+/// documented). The second open asks only for `READ_CONTROL`, `WRITE_DAC`
+/// and `FILE_READ_ATTRIBUTES`, none of which the read-only attribute
+/// refuses; where the caller truly has no right, it is refused the same way
+/// and the refusal stands. Every other error stands, as it did before this
+/// second open existed: a missing object and a bad path would fail the
+/// second open the same way.
 pub(super) fn lone_write_after(code: u32) -> bool {
-    code == ERROR_SHARING_VIOLATION
+    code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED_CODE
 }
 
 /// One entry of a child's access list, as a removal judges it.
@@ -1142,11 +1219,16 @@ mod list_write_tests {
         }
     }
 
+    /// A sharing violation and a refusal open the object again for a lone
+    /// write; nothing else does. The refusal is the read-only loose objects
+    /// of git that a hosted Windows self-test's read grant on a repository's `.git` could not
+    /// open with `MAXIMUM_ALLOWED`.
     #[test]
-    fn only_a_sharing_violation_opens_the_object_again_for_a_lone_write() {
+    fn a_sharing_violation_or_a_refusal_opens_the_object_again_for_a_lone_write() {
         assert!(lone_write_after(32));
-        // Access denied, file and path not found, a bad name, a lock.
-        for code in [5, 2, 3, 123, 33, 0] {
+        assert!(lone_write_after(5));
+        // File and path not found, a bad name, a lock, no error.
+        for code in [2, 3, 123, 33, 0] {
             assert!(!lone_write_after(code), "error {code}");
         }
     }
@@ -2066,7 +2148,7 @@ pub(super) fn hidden_denials<'a, S>(
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
-pub(crate) use imp::{AttributeList, InheritWindow, revoke};
+pub(crate) use imp::{AttributeList, InheritWindow, live_jobs_holding, revoke};
 #[cfg(windows)]
 pub(super) use imp::{
     Prepared, default_stdio, is_partial, output, prepare, prepare_root, spawn, status, strength,
@@ -2164,9 +2246,11 @@ mod imp {
     use crate::sandbox_user::PROXY_PORTS;
     use crate::sandbox_user::acl;
     use crate::sandbox_user::acl::{Locations, closed_folder_of};
+    use crate::sandbox_user::jobserver::JOBSERVER_VAR;
     use crate::sandbox_user::runner::Request;
     use crate::sandbox_user::slots::{AclLock, COMMAND_WAIT, Lease, Pool};
     use crate::sandbox_user::store::{credentials_path, slots_dir};
+    use crate::sandbox_user::windows::jobserver::{self, Jobserver};
     use crate::sandbox_user::windows::state::{self, LoadedUser, Users};
     use crate::sandbox_user::windows::{accounts, launch, secure};
     use std::sync::Arc;
@@ -2959,10 +3043,12 @@ mod imp {
             }
             Ok(children)
         };
+        // Each reason names the step that failed (the open, its reading, the
+        // write), so a note that lists a child says which call refused it.
         let mut probe = |path: &Path| -> Result<super::ChildFacts<ListHandle>, String> {
-            let handle = open_for_security(path).map_err(|e| e.to_string())?;
+            let handle = open_for_security(path).map_err(|e| format!("open: {e}"))?;
             let (attributes, links) =
-                handle_info(&handle.handle, path).map_err(|e| e.to_string())?;
+                handle_info(&handle.handle, path).map_err(|e| format!("read: {e}"))?;
             Ok(super::ChildFacts {
                 is_reparse: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
@@ -2971,7 +3057,11 @@ mod imp {
             })
         };
         let mut write_one = |handle: &ListHandle, path: &Path, is_dir: bool| {
-            write(handle, path, is_dir).map_err(|e| e.to_string())
+            let how = match handle.write {
+                super::ListWrite::SetSecurityInfo => "write (SetSecurityInfo)",
+                super::ListWrite::KernelObjectAlone => "write (lone)",
+            };
+            write(handle, path, is_dir).map_err(|e| format!("{how}: {e}"))
         };
         super::propagation_plan(root, denied, &mut list, &mut probe, &mut write_one).map_err(
             |why| SandboxError::PlatformSetup {
@@ -4406,6 +4496,79 @@ mod imp {
         /// When set, the command starts as this sandbox user through the
         /// runner (decision 0097) instead of under the restricted token.
         user: Option<SandboxUser>,
+        /// The `safe.directory` values git gets in the command
+        /// ([`super::safe_directories`]): the roots, for the sandbox user;
+        /// none for the restricted token, which runs as the owner.
+        pub(in crate::sandbox) safe_directories: Vec<String>,
+        /// The worktree hold of the policy (`SandboxPolicy::holding`): each
+        /// command started with it is listed under it while its job holds a
+        /// process ([`live_jobs_holding`]).
+        pub(in crate::sandbox) hold: Option<PathBuf>,
+    }
+
+    /// The job of every command this process started with a worktree hold,
+    /// by hold file. On Unix every process a command starts holds a shared
+    /// lock on the hold file, which `WorkspaceManager::quiesce` cannot take
+    /// while any of them runs. Windows has no such lock here, and before
+    /// this list `quiesce` found nothing on Windows: a verifier committed a
+    /// worktree a background process still wrote (a hosted Windows self-test,
+    /// `a_worktree_the_worker_still_writes_is_not_snapshotted`, "expected a
+    /// busy failure, got Pass").
+    ///
+    /// Weak references only: the job is closed, which ends its processes,
+    /// when the [`SandboxedChild`] that owns it is dropped, and this list
+    /// must never keep it open. A command started by another process is not
+    /// listed: kGraf runs its workers' commands in its own process.
+    static HELD_JOBS: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<OwnedHandle>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// List `job` under `hold`, when there is one, and return it shared.
+    fn held_job(hold: Option<&Path>, job: OwnedHandle) -> Arc<OwnedHandle> {
+        let job = Arc::new(job);
+        if let Some(hold) = hold {
+            let mut held = HELD_JOBS.lock().unwrap_or_else(|p| p.into_inner());
+            // Entries whose job is closed are dropped here, so the list
+            // stays as long as the commands that still run.
+            held.retain(|(_, j)| j.strong_count() > 0);
+            held.push((hold.to_path_buf(), Arc::downgrade(&job)));
+        }
+        job
+    }
+
+    /// How many commands this process started with the worktree hold `hold`
+    /// still have a process in their job.
+    pub(crate) fn live_jobs_holding(hold: &Path) -> usize {
+        let jobs: Vec<Arc<OwnedHandle>> = {
+            let mut held = HELD_JOBS.lock().unwrap_or_else(|p| p.into_inner());
+            held.retain(|(_, j)| j.strong_count() > 0);
+            held.iter()
+                .filter(|(h, _)| h == hold)
+                .filter_map(|(_, j)| j.upgrade())
+                .collect()
+        };
+        // A job that cannot be read counts as live: a quiesce that is wrong
+        // waits, one that is wrong the other way commits a tree in motion.
+        jobs.iter()
+            .filter(|job| job_processes(job).is_none_or(|n| n > 0))
+            .count()
+    }
+
+    /// How many processes `job` holds, or `None` when that cannot be read.
+    fn job_processes(job: &OwnedHandle) -> Option<u32> {
+        // SAFETY: zeroed is a valid value for this plain C struct.
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid job handle with query access, and a struct of the
+        // stated size and class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of_val(&info) as u32,
+                ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info.ActiveProcesses)
     }
 
     /// The sandbox user a command starts as, and the runner that starts it.
@@ -4544,6 +4707,8 @@ mod imp {
             notes,
             desktop_key,
             user: None,
+            safe_directories: Vec::new(),
+            hold: None,
         })
     }
 
@@ -4715,10 +4880,13 @@ mod imp {
                 }
             }
         }
+        let readable: Vec<PathBuf> = policy.readable.iter().map(|r| strip_verbatim(r)).collect();
         Ok(Prepared {
             caps: Vec::new(),
             notes,
             desktop_key: String::new(),
+            safe_directories: super::safe_directories(&roots, &readable),
+            hold: None,
             user: Some(SandboxUser {
                 user,
                 runner: &users.runner,
@@ -5887,13 +6055,14 @@ mod imp {
     // ---- program and command line --------------------------------------------
 
     /// The child's environment block and its `PATH`. `extra` is set last,
-    /// over everything else (a POSIX shell's [`SHELL_COMMAND_VAR`]). With
+    /// over everything else (a POSIX shell's [`SHELL_COMMAND_VAR`], the
+    /// sandbox user's jobserver). With
     /// `inherit_all` false (the command's environment was cleared) only
     /// [`super::super::WINDOWS_BASE_VARS`] come from this process; `PATH` is one of
     /// them, so the lookup below stays right.
     fn final_env(
         cmd: &Command,
-        extra: Option<(&str, &str)>,
+        extra: &[(&str, &str)],
         defaults: &[(String, OsString)],
         inherit_all: bool,
     ) -> (Vec<u16>, Option<OsString>) {
@@ -5910,7 +6079,7 @@ mod imp {
                 )
             })
             .collect();
-        if let Some((name, value)) = extra {
+        for (name, value) in extra {
             overrides.push((
                 name.encode_utf16().collect(),
                 Some(value.encode_utf16().collect()),
@@ -6003,7 +6172,7 @@ mod imp {
         pub stderr: Option<ChildStderr>,
         process: OwnedHandle,
         pid: u32,
-        job: OwnedHandle,
+        job: Arc<OwnedHandle>,
         /// The console relay threads of the command's inherited standard
         /// streams, waited for (bounded) when the child is dropped.
         relays: Vec<RelayDone>,
@@ -6014,6 +6183,9 @@ mod imp {
         /// process keeps that user's window station and desktop for its whole
         /// life (`sandbox_user::windows::launch`).
         _desktop: Option<DesktopGuard>,
+        /// The jobserver semaphore of a command that runs as a sandbox user
+        /// (`sandbox_user::jobserver`), kept while the command runs.
+        _jobserver: Option<Jobserver>,
         /// The worker slot of a command that runs as a sandbox user. Last, so
         /// it is released after the job handle is closed, which ends the
         /// command.
@@ -6332,11 +6504,30 @@ mod imp {
             Some(shell) => Some(git_bash_launch(shell, cmd)?),
             None => None,
         };
+        // A command that runs as the sandbox user cannot create a named
+        // object in the session, so cargo and rustc could not make their
+        // jobserver: this process makes one the user may use, and names it
+        // in the variable they read first (`sandbox_user::jobserver`). Set
+        // over the command's own value and an inherited one: a jobserver of
+        // this process's own cargo admits this process's session, not the
+        // sandbox user.
+        let jobserver = match &prepared.user {
+            Some(user) => Some(jobserver::create(
+                &accounts::current_user_sid()?,
+                &user.user.sid,
+            )?),
+            None => None,
+        };
+        let mut extra: Vec<(&str, &str)> = Vec::new();
+        if let Some(l) = &launch {
+            extra.push((SHELL_COMMAND_VAR, l.command.as_str()));
+        }
+        if let Some(j) = &jobserver {
+            extra.push((JOBSERVER_VAR, j.makeflags.as_str()));
+        }
         let (env, path) = final_env(
             cmd,
-            launch
-                .as_ref()
-                .map(|l| (SHELL_COMMAND_VAR, l.command.as_str())),
+            &extra,
             prepared.user.as_ref().map_or(&[][..], |u| &u.env[..]),
             inherit_env,
         );
@@ -6370,7 +6561,18 @@ mod imp {
             ),
         };
         if let Some(user) = &prepared.user {
-            return spawn_as_user(user, &program, line, cwd, env, stdio);
+            return spawn_as_user(
+                user,
+                &program,
+                line,
+                cwd,
+                env,
+                stdio,
+                UserChildParts {
+                    jobserver,
+                    hold: prepared.hold.as_deref(),
+                },
+            );
         }
         line.push(0);
 
@@ -6481,10 +6683,11 @@ mod imp {
             stderr: stderr.parent.map(ChildStderr::from),
             process,
             pid: pi.dwProcessId,
-            job,
+            job: held_job(prepared.hold.as_deref(), job),
             relays: Vec::new(),
             runner_protection: None,
             _desktop: Some(DesktopGuard(desktop)),
+            _jobserver: None,
             _slot: None,
         })
     }
@@ -6569,6 +6772,14 @@ mod imp {
         })
     }
 
+    /// What a command that runs as the sandbox user keeps beside its process:
+    /// the jobserver made for it, and the worktree hold its job is listed
+    /// under ([`held_job`]).
+    struct UserChildParts<'a> {
+        jobserver: Option<Jobserver>,
+        hold: Option<&'a Path>,
+    }
+
     /// Start a command as the sandbox user: the runner starts as that user
     /// in a new job and starts the command (see `sandbox_user::windows::launch`).
     /// `line` is the command line without its terminating NUL; `env` is a
@@ -6580,6 +6791,7 @@ mod imp {
         cwd: &Path,
         env: Vec<u16>,
         stdio: [Redirect; 3],
+        parts: UserChildParts<'_>,
     ) -> Result<SandboxedChild, SandboxError> {
         let request = Request {
             application: program.as_os_str().encode_wide().collect(),
@@ -6624,10 +6836,11 @@ mod imp {
             stderr: stderr.parent.map(ChildStderr::from),
             process: started.runner,
             pid: started.command_pid,
-            job,
+            job: held_job(parts.hold, job),
             relays: [stdout.relay, stderr.relay].into_iter().flatten().collect(),
             runner_protection: Some(started.protected_before_resume),
             _desktop: None,
+            _jobserver: parts.jobserver,
             _slot: Some(user.slot.clone()),
         })
     }
@@ -7333,7 +7546,7 @@ mod tests {
     /// the OpenSSL selection and the line-ending settings, from index zero.
     #[test]
     fn git_config_entries_start_at_zero_with_the_network_open() {
-        let (entries, count) = super::super::git_config_entries(&git_config_pairs(true));
+        let (entries, count) = super::super::git_config_entries(&git_config_pairs(true, &[]));
         assert_eq!(count, 5);
         assert_eq!(
             lookup(&entries, "GIT_CONFIG_KEY_0"),
@@ -7377,7 +7590,7 @@ mod tests {
         ];
         let changes = super::super::worker_git_config_env(
             host.iter().map(|(k, _)| std::ffi::OsString::from(k)),
-            tool_env(true),
+            tool_env(true, &[]),
         );
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
         let inherited = host.iter().map(|(k, v)| (wide(k), wide(v))).collect();
@@ -7414,7 +7627,7 @@ mod tests {
     /// line-ending settings are given, and no TLS backend.
     #[test]
     fn git_config_entries_keep_the_tls_backend_out_without_open_network() {
-        let (entries, count) = super::super::git_config_entries(&git_config_pairs(false));
+        let (entries, count) = super::super::git_config_entries(&git_config_pairs(false, &[]));
         assert_eq!(count, 4);
         assert_eq!(lookup(&entries, "GIT_CONFIG_KEY_1"), Some("core.autocrlf"));
         assert_eq!(
@@ -7428,7 +7641,7 @@ mod tests {
     /// configuration, so their effect is intact.
     #[test]
     fn git_config_entries_leave_the_frozen_config_variables_alone() {
-        let (entries, _) = super::super::git_config_entries(&git_config_pairs(true));
+        let (entries, _) = super::super::git_config_entries(&git_config_pairs(true, &[]));
         assert!(entries.iter().all(|(k, _)| {
             k.starts_with("GIT_CONFIG_KEY_") || k.starts_with("GIT_CONFIG_VALUE_")
         }));
@@ -7472,14 +7685,68 @@ mod tests {
     /// network open.
     #[test]
     fn tool_env_is_the_git_entries_the_count_and_the_curl_backend() {
-        let open = tool_env(true);
+        let open = tool_env(true, &[]);
         assert_eq!(lookup(&open, "GIT_CONFIG_KEY_0"), Some("credential.helper"));
         assert_eq!(lookup(&open, "GIT_CONFIG_KEY_1"), Some("http.sslBackend"));
         assert_eq!(lookup(&open, "GIT_CONFIG_COUNT"), Some("5"));
         assert_eq!(lookup(&open, CURL_SSL_BACKEND_VAR), Some(TLS_BACKEND));
-        let closed = tool_env(false);
+        let closed = tool_env(false, &[]);
         assert_eq!(lookup(&closed, "GIT_CONFIG_COUNT"), Some("4"));
         assert_eq!(lookup(&closed, CURL_SSL_BACKEND_VAR), None);
+    }
+
+    /// A command that runs as the sandbox user trusts, through git's
+    /// command-scope configuration, each writable root and every repository
+    /// below it, and each read root alone, in the form git compares; the
+    /// entries follow kGraf's others, so the count covers them, and they
+    /// survive a clear. Run 11 found `git status` refused with "detected
+    /// dubious ownership" in the worker's worktree without them.
+    #[test]
+    fn the_sandbox_user_gets_safe_directory_entries_for_its_roots() {
+        let writable = [
+            std::path::PathBuf::from(r"C:\work\repo\.kgraf\workspaces\w1-1"),
+            std::path::PathBuf::from(r"C:\work\repo\.kgraf\.scratch\w1-1\"),
+        ];
+        let readable = [std::path::PathBuf::from(r"C:\work\repo\.git")];
+        let safe = safe_directories(&writable, &readable);
+        assert_eq!(
+            safe,
+            [
+                "C:/work/repo/.kgraf/workspaces/w1-1",
+                "C:/work/repo/.kgraf/workspaces/w1-1/*",
+                "C:/work/repo/.kgraf/.scratch/w1-1",
+                "C:/work/repo/.kgraf/.scratch/w1-1/*",
+                "C:/work/repo/.git",
+            ]
+        );
+        // A read root is trusted alone, never what lies below it.
+        assert!(!safe.iter().any(|v| v.starts_with("C:/work/repo/.git/")));
+        // No backslash and no wildcard for everything.
+        assert!(safe.iter().all(|v| !v.contains('\\') && v != "*"));
+        let env = tool_env(false, &safe);
+        assert_eq!(lookup(&env, "GIT_CONFIG_COUNT"), Some("9"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_KEY_4"), Some("safe.directory"));
+        assert_eq!(
+            lookup(&env, "GIT_CONFIG_VALUE_4"),
+            Some("C:/work/repo/.kgraf/workspaces/w1-1")
+        );
+        assert_eq!(
+            lookup(&env, "GIT_CONFIG_VALUE_8"),
+            Some("C:/work/repo/.git")
+        );
+        // The same entries after a clear.
+        let kept: Vec<(String, String)> = kept_on_clear(false, None, &safe)
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(lookup(&kept, "GIT_CONFIG_COUNT"), Some("9"));
+        assert_eq!(lookup(&kept, "GIT_CONFIG_KEY_8"), Some("safe.directory"));
+        // The token sandbox, which runs as the owner, gets none.
+        assert!(
+            !tool_env(false, &[])
+                .iter()
+                .any(|(_, v)| v == "safe.directory")
+        );
     }
 
     /// After a clear the git entries start at zero, as without one, the
@@ -7487,7 +7754,7 @@ mod tests {
     #[test]
     fn a_clear_keeps_the_sandbox_settings_numbered_from_zero() {
         let tmp = std::path::Path::new(r"C:\ws\scratch");
-        let kept: Vec<(String, String)> = kept_on_clear(true, Some(tmp))
+        let kept: Vec<(String, String)> = kept_on_clear(true, Some(tmp), &[])
             .into_iter()
             .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
             .collect();
@@ -7499,7 +7766,7 @@ mod tests {
         assert_eq!(lookup(&kept, CURL_SSL_BACKEND_VAR), Some("openssl"));
         assert_eq!(lookup(&kept, "TMP"), Some(r"C:\ws\scratch"));
         assert_eq!(lookup(&kept, "TEMP"), Some(r"C:\ws\scratch"));
-        let bare: Vec<String> = kept_on_clear(false, None)
+        let bare: Vec<String> = kept_on_clear(false, None, &[])
             .into_iter()
             .map(|(k, _)| k)
             .collect();

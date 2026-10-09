@@ -1485,6 +1485,22 @@ impl WorkspaceManager {
                     .into(),
             })
         })?;
+        // Windows: no process holds the hold file, so the commands this
+        // process started in the worktree are asked instead, through their
+        // jobs (`crate::sandbox::live_jobs_holding`).
+        #[cfg(windows)]
+        {
+            let live = crate::sandbox::live_jobs_holding(hold);
+            if live > 0 {
+                return Err(WorkspaceError::Busy {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "a process started in this worktree is still running ({live} \
+                         command(s) whose job still holds a process)"
+                    ),
+                });
+            }
+        }
         let sessions = Self::live_sessions(hold)?;
         if !sessions.live.is_empty() {
             return Err(WorkspaceError::Busy {

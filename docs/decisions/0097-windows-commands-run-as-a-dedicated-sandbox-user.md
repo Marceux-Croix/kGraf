@@ -46,7 +46,9 @@ contributor asks "why does kGraf create Windows user accounts," the reasoning is
    TCP except kGraf's egress proxy ports (`47100` to `47131` on Windows), and
    loopback UDP. Block rules win over allow rules in Windows Firewall, so the offline
    user reaches nothing but kGraf's proxy. Setup refuses when the firewall is off or
-   a group policy makes local rules ineffective.
+   a group policy makes local rules ineffective. (Note, 2026-10-09: the loopback rules do
+   not act on loopback traffic; WFP filters at the connect layers block it instead, see
+   the amendment on the first re-run as the sandbox user.)
 8. **A runner program (later unit)** starts first as the sandbox user and makes the
    caller's logon SID deny-only before it starts the real command:
    `CreateProcessWithLogonW`, the only call a standard user can use to start a
@@ -1619,3 +1621,131 @@ What the next Windows run must show:
 - `tests::shortfall::auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow`
   and `a_hosted_run_fits_in_half_a_test_threads_stack` pass, and no `kgraf_host` binary ends
   with "has overflowed its stack".
+
+## Amendment (2026-10-09): what the first re-run as the sandbox user found
+
+A hosted Windows Server 2025 run (Datacenter 24H2, build 26100.33438). It ran the self-test's re-run (e) as the sandbox user for the first time. As that user
+Git Bash, Git's curl over TLS (Schannel), programs that load `user32.dll` and the stdio pipe
+test passed, the reasons this decision exists. Nothing below has run on Windows since; each
+bullet says what is proved on the host and what a run must show. Each bullet is one behavior
+change.
+
+- **Loopback is blocked by WFP filters, not by the firewall rules.** The rule
+  `block-loopback-tcp` was present for the offline slot user, and that user still opened a
+  TCP connection to a listener on 127.0.0.1 outside the proxy ports: selfcheck failed with
+  "a direct connection to the origin worked; only the proxy should be reachable", and
+  `a_command_without_the_network_reaches_the_proxy_ports_and_nothing_else` with "reached a
+  local listener ... connected". The rule existed and did not act, so Windows Firewall does
+  not filter this loopback traffic. Setup now adds four filters in kGraf's WFP sublayer at
+  `FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `..._V6`, with the same user match descriptor as the
+  DNS filters and `FWPM_CONDITION_FLAGS` with `FWP_CONDITION_FLAG_IS_LOOPBACK`: per IP
+  version, one blocks any remote port outside the proxy ports (two `FWP_MATCH_RANGE`
+  conditions on `FWPM_CONDITION_IP_REMOTE_PORT`, 0 to 47099 and 47132 to 65535, which WFP
+  joins with OR), and one blocks UDP (`FWPM_CONDITION_IP_PROTOCOL` 17). openai/codex filters
+  at the same layers with the user ID and the remote port. They are WFP objects like the DNS
+  filters (`wfp-filter-loopback-v4`, `-v6`, `wfp-filter-loopback-udp-v4`, `-v6` in the undo
+  record), so setup, status, remove and the refusal path cover them: a filter Windows
+  refuses is a `refused` line with a `probe:` reading, a `FAILED` status line that says
+  loopback connections are not confined, and a setup notice of its own; status then ends
+  with "loopback connections are not confined on this machine". The firewall rules stay:
+  they block traffic off the machine. Host tests:
+  `the_loopback_filter_blocks_every_port_but_the_proxy_ports`,
+  `filters_are_dns_or_loopback_and_say_which_layer`,
+  `a_refused_loopback_filter_is_a_gap_the_notice_names`,
+  `status_shows_a_refused_loopback_filter_as_failed`; with the four filters left out of the
+  set, six tests fail. Whether Windows takes these filter shapes, and whether the block takes
+  effect beside the firewall's own loopback handling, is not measured; selfcheck's `network:`
+  line decides. Consequence: a command without the network can no longer reach a listener
+  on loopback outside the proxy ports, its own included, which is what the loopback rules
+  meant from the start. A project test that starts a local server and connects to it fails
+  as the offline user, where Linux, which gives each command a loopback of its own, passes
+  it. No condition found at the connect layers names the listener's user, so the block
+  cannot tell the command's own listener from another program's.
+- **A jobserver per command.** Every cargo build as the sandbox user stopped at rustc's
+  start: "failed to create jobserver: Os { code: 5, kind: PermissionDenied }"
+  (rustc_data_structures `jobserver.rs`), exit 0xC0000409, and cargo's "failed to run
+  `rustc` to learn about target-specific information". With no jobserver to join, the
+  `jobserver` crate creates a named semaphore with no prefix, in the session's
+  `BaseNamedObjects`, and the command cannot create objects there: the session's directory
+  admits the session's logon SID, which the runner makes deny-only. The same tests failed in
+  the baseline under the token sandbox, whose restricting SIDs refuse it the same way.
+  kGraf's process now makes a semaphore for each command run as the sandbox user,
+  `kgraf-jobserver-<16 hex>`, protected, admitting SYSTEM and the owner fully and the
+  command's sandbox user to `SYNCHRONIZE | SEMAPHORE_MODIFY_STATE` only, with as many tokens
+  as the machine's parallelism, never a name that already exists, and names it in
+  `CARGO_MAKEFLAGS` the way cargo does (`-j --jobserver-fds=<name> --jobserver-auth=<name>`),
+  over an inherited value. The started child holds it. The launch record has a line per
+  process. That the directory refuses the creation is inferred from the error and the
+  directory's usual access list, not measured; the new escape test
+  `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` measures a creation
+  by the sandbox user and asserts the open of the jobserver. Other programs that create a
+  named object in the session are still refused (a gap the measurement shows). rustup also
+  printed "warn: could not canonicalize path C:\Users\<user>": it canonicalizes each folder
+  above the command's folder to look for a toolchain override, and the owner's profile
+  folder is not readable. It is a warning; the profile stays unreadable.
+- **safe.directory for the sandbox user's own roots.** `git status` in the worker's
+  worktree failed with "detected dubious ownership in repository" (the end-to-end check
+  `shell.git` and the worker end-to-end test): the worktree belongs to the owner and the
+  command runs as another user. A command run as the sandbox user now gets `safe.directory`
+  entries through `GIT_CONFIG_COUNT`, which git reads as the command scope, a protected
+  scope: each writable root, each repository below it (`<root>/*`), and each read root
+  alone, in the form git compares. A repository in a writable root is one the command can
+  rewrite already; trusting it gives the command nothing. Host test
+  `the_sandbox_user_gets_safe_directory_entries_for_its_roots`; fails with the entries left
+  out.
+- **A refused `MAXIMUM_ALLOWED` open gets the minimal open and the lone write.** The read
+  grant on a repository's `.git` reached most of it and left git's loose objects with
+  "Access is denied", in the owner's own repository, which then failed the gate and
+  speculation tests. Git writes loose objects read-only; a `MAXIMUM_ALLOWED` open of a
+  read-only file is refused although the list grants everything (inferred from which files
+  failed, not documented). Error 5 now takes the same second open (`READ_CONTROL`,
+  `WRITE_DAC`, `FILE_READ_ATTRIBUTES`) and lone write as error 32; a caller with no right is
+  refused the second time too. The pass's reasons now name the failing step (`open:`,
+  `read:`, `write (SetSecurityInfo):`, `write (lone):`). Host test
+  `a_sharing_violation_or_a_refusal_opens_the_object_again_for_a_lone_write`.
+- **quiesce sees the commands kGraf started in a worktree on Windows.** On Unix every
+  process of a command holds a shared lock on the worktree's hold file; Windows had no hold,
+  and `a_worktree_the_worker_still_writes_is_not_snapshotted` ended "expected a busy
+  failure, got Pass": the verifier committed a tree a background process still wrote. Each
+  command started with a hold is now listed under it by a weak reference to its job, and
+  `WorkspaceManager::quiesce` is busy while one of those jobs holds a process (or cannot be
+  read). The list never keeps a job open, so dropping the child still ends its tree. A
+  command started by another process is not seen; kGraf runs its workers' commands in its
+  own process.
+- **A gate's status after its tree ended is waited for.** `a_gate_command_past_its_timeout_is_killed_and_fails`
+  failed with "`sleep 30` still runs after its tree ended": the job held no process, and
+  one `try_wait` on the runner's handle found it not yet signaled. The order of the two is
+  not documented; the gate now polls the status for up to 5 seconds. Host tests
+  `a_status_that_arrives_after_the_tree_ended_is_collected`,
+  `a_status_that_never_arrives_is_none_at_the_bound`.
+- **Tests that assumed the token sandbox or an earlier design.** The window station tests
+  expected `kgraf-sandbox-<hex>` and a station per command; kGraf makes `kgraf-cmd-<hex>`
+  per sandbox user and process, so two commands of one user share it. The junction test
+  ran its second kind beside the junction the first planted, and the next command was
+  refused by the link walk before any entry was written, as designed; the test now pins
+  that refusal and removes the junction. The cleared environment allows the sandbox user's
+  toolchain variables (`WINDOWS_SANDBOX_USER_VARS`). The shell tool test, the self-test's
+  `notice.once` check and the prefix digest pin expect the network notice only where the
+  backend leaves the network open. Windows paths in Git Bash's `pwd` and in traces are
+  compared in one form. The check-cleanup test links to a file in the repository's shared
+  git folder, which every backend lets the check read. The DNS tests judge the lookup, not
+  the filters' presence, and print each filter's state; netsh does not list the RPC layer's
+  filter (kGraf's own reading found it, netsh did not), so that filter is not looked for
+  there. The self-test calls a selfcheck that stopped at its probe a failure on the sandbox
+  user that printed no result lines, and says whether the probe ran and failed a step or
+  did not finish.
+
+What the next Windows run must show:
+
+- Setup (b): the WFP step's line `created` or `partial` with no `refused` line for a
+  loopback filter. Status (c): four `present  loopback filter on the connect layer` lines.
+- Selfcheck (d): `network: only the egress proxy was reachable`, a launch line `made
+  jobserver semaphore`, and every line but `dns:` a pass.
+- Re-run (e): the proxy-port escape test, the cargo escape test, the bench-briefs checks,
+  the contract checks, the worker end-to-end tests, the end-to-end `shell.git` and
+  `notice.once` checks, the escape window station tests, the junction test, the startup
+  environment test, and the twelve kgraf_host tests pass; the named-semaphore measurement
+  lines are present; no "could not be opened or written" note for a `.git` read grant.
+- A failure of any of these carries its evidence: a `refused` loopback line with its probe
+  reading, cargo's own lines, the parent's view of the fence refusal, a note naming the
+  failing step.

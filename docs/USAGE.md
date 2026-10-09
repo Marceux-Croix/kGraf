@@ -1297,10 +1297,15 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
 - The sandbox cannot download or unpack crates. A run checks that the dependencies are in
   the local cargo cache before it starts, and fetches them outside the sandbox only with the
   project's consent (see [Set up a project](#set-up-a-project)).
-- `--shell-timeout` (on `worker`, `orchestrate` and `schedule run-now`) bounds one worker
-  shell command, in seconds; `shell_timeout_secs` in `.kgraf/worker.json` sets it for the
-  project; without either it is 600. A command killed at the timeout returns its output so
-  far, marked `[killed after N s]`.
+- `--shell-timeout` (on `worker`, `orchestrate` and `schedule run-now`) is the longest one
+  worker shell command may run, in seconds; `shell_timeout_secs` in `.kgraf/worker.json` sets
+  it for the project; without either it is 600. A build or test command on the allowlist gets
+  all of it. Any other command is stopped after 120 s (or the longest, if shorter) unless the
+  model's call sets `timeout_secs`, which may ask for up to the longest; a larger value is cut
+  to it, and the result says so. A command killed at its limit returns its output so far,
+  marked `[killed after N s]`, with what to do next: run a slow command again with a larger
+  `timeout_secs`, or start a command that does not end by itself (a server, a watcher) in
+  the background with its output sent to a file, and check on it.
 - `--resume <run-id>` continues a killed run from its record without repeating a paid call.
   Each worker's rounds are in its transcript before its next request leaves, so only a
   request that was in flight at the kill is sent again.
@@ -1727,6 +1732,13 @@ What `setup` creates, for the Windows user who runs it:
 - four Windows Firewall block rules for the offline user: everything off this
   machine, inbound from off this machine, local TCP except kGraf's proxy ports
   47100 to 47131, and local UDP;
+- four loopback filters for the same users: Windows Filtering Platform (WFP) filters at
+  the connect layers (IPv4 and IPv6) that block a connection on this machine to any port
+  outside kGraf's proxy ports, and local UDP. Windows Firewall rules do not act on this
+  loopback traffic, so without these filters a command without the network could reach
+  any service listening on this machine. If Windows refuses one, setup goes on without it,
+  names it with Windows' error, and ends with a notice that loopback connections are not
+  confined on this machine;
 - DNS filters for the users the firewall rules block (the offline user and each worker
   slot's user without the network, below): Windows Filtering Platform (WFP) filters
   meant to make the DNS Client service refuse their name lookups. A lookup goes through
@@ -1743,8 +1755,8 @@ What `setup` creates, for the Windows user who runs it:
 
 The users' passwords are random, 40 characters long, and stored only for your
 Windows user, sealed with Windows' data protection (DPAPI), in kGraf's configuration
-folder. Running `setup` again resets the passwords and refreshes the rules and the DNS
-filter. Setup
+folder. Running `setup` again resets the passwords and refreshes the rules and the WFP
+filters. Setup
 stops with a message if Windows Firewall is off or a group policy makes local rules
 ineffective, and it never takes over an account it did not create.
 
@@ -1762,22 +1774,31 @@ After `setup`, every sandboxed command runs as the sandbox user, through the
 `kgraf-sandbox-runner` program installed beside `kgraf`. Checks and ordinary shell
 commands run as the offline user. Dependency installs reach the network through kGraf's
 proxy. A command can write only where kGraf allows. It cannot read your Windows profile, apart
-from the toolchain and program folders kGraf grants it inside that profile.
+from the toolchain and program folders kGraf grants it inside that profile. Each command
+also gets a jobserver kGraf makes for it, named in `CARGO_MAKEFLAGS`, which its cargo and
+rustc use: the sandbox user cannot create the one they would otherwise make. Git in the
+command trusts the command's own folders (`safe.directory`, given through
+`GIT_CONFIG_COUNT`): they belong to your account, and git refuses a repository another
+user owns. rustup may print `warn: could not canonicalize path C:\Users\<you>`: it looks
+for a toolchain setting in each folder above the command's folder, and your profile folder
+is not readable to the sandbox user. The warning changes nothing.
 Without `setup`, the token sandbox described below stays in use. If the users exist but
 the runner is missing, every sandboxed command stops with an error. `kgraf sandbox remove`
 also revokes the folder permissions that kGraf added for the users, and deletes the DNS
-filter, its sublayer and its provider by the keys the undo record lists. It does not touch
-other WFP filters.
+and loopback filters, their sublayer and their provider by the keys the undo record lists.
+It does not touch other WFP filters.
 
-`kgraf sandbox status` shows each DNS filter on its own line, with its layer and key:
+`kgraf sandbox status` shows each WFP filter on its own line, with its layer and key:
 
 ```
   present  DNS filter on the user-mode RPC layer <key> (remote callers of the DNS Client service only; a lookup on this machine does not pass this layer)
   FAILED   DNS filter on the name resolution cache layer, IPv4 <key> (meant to refuse the offline users' lookups; `kgraf sandbox selfcheck` proves the effect): Windows refused it at setup: WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS); ...
+  present  loopback filter on the connect layer, IPv4 <key> (blocks loopback connections of the offline users to any port outside kGraf's egress proxy ports; `kgraf sandbox selfcheck` proves the effect)
 ```
 
-`FAILED` means Windows refused that filter at setup: DNS is not confined on this machine,
-and running setup again does not change that; status then ends with a non-zero exit.
+`FAILED` means Windows refused that filter at setup: DNS (for a DNS filter) or loopback
+connections (for a loopback filter) are not confined on this machine, and running setup
+again does not change that; status then ends with a non-zero exit.
 `MISSING` means setup has not added it; run `kgraf sandbox setup` again. `unknown`
 means Windows did not let your account read WFP filters; run `status` as an administrator
 to see it. `present` says only that the filter exists. Only `kgraf sandbox selfcheck`
@@ -1802,8 +1823,8 @@ is not, the check stops and says how to get it (`winget install Git.Git`, or set
 `KGRAF_GIT_BASH_PATH`). The check never skips in silence.
 
 The output names the backend that ran. With the Windows sandbox user (after
-`kgraf sandbox setup`), the direct connection must fail, because the offline user's firewall
-rules block it:
+`kgraf sandbox setup`), the direct connection must fail, because the offline user's
+loopback filters block it:
 
 ```
 sandbox selfcheck: ok

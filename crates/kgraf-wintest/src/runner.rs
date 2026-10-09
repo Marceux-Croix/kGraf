@@ -1221,6 +1221,9 @@ fn run_e2e_step(
         dir: layout.e2e.clone(),
         env: env.vars.clone(),
         git_bash_found: machine.git_bash_path.is_some(),
+        // The baseline runs before setup, under the token sandbox, which
+        // leaves the network open.
+        network_open: true,
         cancel: &CANCEL,
     };
     let checks = e2e::run_all(&ctx, cfg!(windows));
@@ -1372,6 +1375,9 @@ impl Exec for PhaseExec<'_> {
             dir,
             env: self.env.vars.clone(),
             git_bash_found: self.machine.git_bash_path.is_some(),
+            // The re-run's checks run as the sandbox user, which denies the
+            // network: no shell result may say it is open.
+            network_open: false,
             cancel: &CANCEL,
         };
         e2e::run_all(&ctx, cfg!(windows))

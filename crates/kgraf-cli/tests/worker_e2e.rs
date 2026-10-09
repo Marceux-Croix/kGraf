@@ -219,6 +219,29 @@ impl Streaming for Fake {
 
 // ------------------------------------------------------------- fixtures
 
+/// `path` as Git Bash prints it: `C:\a\b` as `/c/a/b`. A path without a
+/// drive letter keeps its form, with `/` for `\`.
+fn posix_form(path: &Path) -> String {
+    let text = path.display().to_string().replace('\\', "/");
+    match text.as_bytes() {
+        [drive, b':', rest @ ..] if drive.is_ascii_alphabetic() => format!(
+            "/{}{}",
+            char::from(*drive).to_ascii_lowercase(),
+            String::from_utf8_lossy(rest)
+        ),
+        _ => text,
+    }
+}
+
+#[test]
+fn a_windows_path_takes_git_bashs_posix_form() {
+    assert_eq!(
+        posix_form(Path::new(r"C:\work\temp\w3-1")),
+        "/c/work/temp/w3-1"
+    );
+    assert_eq!(posix_form(Path::new("/tmp/w3-1")), "/tmp/w3-1");
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -1372,7 +1395,18 @@ async fn a_shell_tool_bound_to_a_workspace_refuses_another_root() {
         let result = registry.execute(approved, &ctx).await;
         if expect_ok {
             let out = result.expect("runs in its own workspace").render();
-            assert!(out.contains(&ws.root().display().to_string()), "{out}");
+            // `pwd` is Git Bash's on Windows, which prints the folder in its
+            // POSIX form (`/c/...`); a hosted Windows self-test met that
+            // as a failure of a check for `C:\Users\...`.
+            let want = if cfg!(windows) {
+                posix_form(ws.root())
+            } else {
+                ws.root().display().to_string()
+            };
+            assert!(
+                out.to_lowercase().contains(&want.to_lowercase()),
+                "{want}: {out}"
+            );
         } else {
             let err = result.expect_err("another root is refused").to_string();
             assert!(err.contains("bound to workspace"), "{err}");

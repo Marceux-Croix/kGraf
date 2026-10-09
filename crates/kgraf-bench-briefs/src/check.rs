@@ -1628,7 +1628,9 @@ mod tests {
     /// shows the process environment as given, with no shell runtime adding
     /// its own names, and the allowance also holds the variables a Windows
     /// program needs to start (`WINDOWS_BASE_VARS`), the sandbox's git and
-    /// TLS settings, and the `PROMPT` that `cmd.exe` sets for itself.
+    /// TLS settings, the `PROMPT` that `cmd.exe` sets for itself, and what
+    /// the sandbox user backend sets for the toolchain
+    /// (`WINDOWS_SANDBOX_USER_VARS`).
     #[test]
     fn only_the_build_variables_are_passed() {
         // A plain name no scrub would match: only clearing hides it.
@@ -1679,6 +1681,7 @@ mod tests {
             cfg!(windows)
                 && (kgraf_sandbox::WINDOWS_BASE_VARS
                     .iter()
+                    .chain(kgraf_sandbox::WINDOWS_SANDBOX_USER_VARS)
                     .any(|b| b.eq_ignore_ascii_case(n))
                     || ["GIT_CONFIG_COUNT", "CURL_SSL_BACKEND", "PROMPT"]
                         .iter()

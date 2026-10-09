@@ -30,6 +30,8 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -185,19 +187,50 @@ fn a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only() {
         Some("credential.helper"),
         "{listing}"
     );
+    // kGraf's five entries, and under the sandbox user one `safe.directory`
+    // entry per root after them; the count always matches the entries.
+    let keys = listing
+        .lines()
+        .filter(|l| l.starts_with("GIT_CONFIG_KEY_"))
+        .count();
     assert_eq!(
         value_of(&listing, "GIT_CONFIG_COUNT"),
-        Some("5"),
+        Some(keys.to_string().as_str()),
         "{listing}"
     );
+    let as_user = common::sandbox_user_mode();
+    let safe = listing
+        .lines()
+        .filter(|l| l.starts_with("GIT_CONFIG_KEY_") && l.trim_end().ends_with("=safe.directory"))
+        .count();
+    if as_user {
+        assert!(safe > 0, "no safe.directory entry: {listing}");
+        assert_eq!(keys, 5 + safe, "{listing}");
+        // The jobserver kGraf made for this command.
+        assert!(
+            value_of(&listing, "CARGO_MAKEFLAGS")
+                .is_some_and(|v| v.contains("--jobserver-auth=kgraf-jobserver-")),
+            "{listing}"
+        );
+    } else {
+        assert_eq!((keys, safe), (5, 0), "{listing}");
+    }
     let tmp = value_of(&listing, "TMP").map(Path::new);
     assert_eq!(tmp, Some(d.scratch.as_path()), "{listing}");
     for line in listing.lines() {
         let Some((name, _)) = line.split_once('=') else {
             continue;
         };
+        // Under the sandbox user, also what that backend sets for the
+        // toolchain: a hosted Windows self-test listed CARGO_HOME and RUSTUP_HOME there.
+        let backend_vars: &[&str] = if as_user {
+            kgraf_sandbox::WINDOWS_SANDBOX_USER_VARS
+        } else {
+            &[]
+        };
         let known = kgraf_sandbox::WINDOWS_BASE_VARS
             .iter()
+            .chain(backend_vars)
             .any(|b| b.eq_ignore_ascii_case(name))
             || [
                 "TMP",

@@ -266,8 +266,21 @@ async fn bypass_writes_to_git_and_settings_land_and_are_recorded() {
     );
     let lines = protected_lines(&r.trace);
     assert_eq!(lines.len(), 2, "{}", r.trace);
-    assert!(lines[0].contains(".git/info/exclude") && lines[0].contains("kept"));
-    assert!(lines[1].contains(".kgraf/worker.json") && lines[1].contains("kept"));
+    // The trace names each path in the platform's own form, JSON-escaped:
+    // `.git\\info\\exclude` on Windows, which a hosted Windows self-test
+    // met as a failure of this assertion.
+    let slashed: Vec<String> = lines
+        .iter()
+        .map(|l| l.replace("\\\\", "/").replace('\\', "/"))
+        .collect();
+    assert!(
+        slashed[0].contains(".git/info/exclude") && slashed[0].contains("kept"),
+        "{lines:?}"
+    );
+    assert!(
+        slashed[1].contains(".kgraf/worker.json") && slashed[1].contains("kept"),
+        "{lines:?}"
+    );
     assert!(lines.iter().all(|l| l.contains("Bypass")), "{lines:?}");
     assert!(git_ok(
         &r.root,

@@ -1,5 +1,6 @@
 //! What the Windows launch path did in this process, for a person reading a
-//! test run: each window station and desktop it made, how long each
+//! test run: each window station and desktop it made, the jobserver
+//! semaphores it made for the commands' cargo and rustc, how long each
 //! `CreateProcessWithLogonW` call took, how long it waited for the spawn lock
 //! first, and how the spawn lock was used by every spawn in the process.
 //! `kgraf sandbox selfcheck` prints [`lines`], so a Windows run collects them
@@ -58,6 +59,9 @@ impl Timings {
 
 struct Record {
     stations: Vec<String>,
+    /// The first jobserver semaphore made, and how many were made.
+    jobserver: Option<String>,
+    jobservers: u64,
     /// Each `CreateProcessWithLogonW` call, from its start to its return.
     logon: Timings,
     /// How many of those calls failed.
@@ -69,6 +73,8 @@ struct Record {
 
 static RECORD: Mutex<Record> = Mutex::new(Record {
     stations: Vec::new(),
+    jobserver: None,
+    jobservers: 0,
     logon: Timings::ZERO,
     logon_failed: 0,
     lock_wait: Timings::ZERO,
@@ -95,6 +101,25 @@ pub fn note_station(role: &str, station: &str, desktop: &str, user_sid: &str, ad
     if r.stations.len() < MAX_STATION_LINES {
         r.stations.push(line);
     }
+}
+
+/// Record that this process made the jobserver semaphore `name` with `tokens`
+/// tokens for a command of the sandbox user `user_sid`
+/// (`sandbox_user::jobserver`). The first is kept whole; later ones are
+/// counted.
+pub fn note_jobserver(name: &str, tokens: i32, user_sid: &str) {
+    let mut r = record();
+    r.jobservers += 1;
+    if r.jobserver.is_none() {
+        r.jobserver = Some(jobserver_line(now(), name, tokens, user_sid));
+    }
+}
+
+fn jobserver_line(at: u64, name: &str, tokens: i32, user_sid: &str) -> String {
+    format!(
+        "launch: made jobserver semaphore {name} with {tokens} tokens for a command of \
+         sandbox user {user_sid}, named in CARGO_MAKEFLAGS (at {at})"
+    )
 }
 
 /// Record one `CreateProcessWithLogonW` call: `lock_wait` before it (the
@@ -167,6 +192,13 @@ pub fn lines() -> Vec<String> {
     let mut out = {
         let r = record();
         let mut out = r.stations.clone();
+        out.extend(r.jobserver.clone());
+        if r.jobservers > 1 {
+            out.push(format!(
+                "launch: jobserver semaphores made in this process: {}",
+                r.jobservers
+            ));
+        }
         out.extend(logon_line(&r.logon, r.logon_failed, &r.lock_wait));
         out
     };
@@ -204,6 +236,22 @@ mod tests {
         let run = all.iter().position(|l| l.contains("kgraf-run-test-a"));
         let cmd = all.iter().position(|l| l.contains("kgraf-cmd-test-a"));
         assert!(run.is_some() && cmd.is_some() && run < cmd, "{all:?}");
+    }
+
+    #[test]
+    fn a_noted_jobserver_is_in_the_lines_with_its_name_tokens_and_user() {
+        assert_eq!(
+            jobserver_line(1_700_000_000, "kgraf-jobserver-00ff", 4, "S-1-5-21-9"),
+            "launch: made jobserver semaphore kgraf-jobserver-00ff with 4 tokens for a command \
+             of sandbox user S-1-5-21-9, named in CARGO_MAKEFLAGS (at 1700000000)"
+        );
+        note_jobserver("kgraf-jobserver-test", 2, "S-1-5-21-9");
+        let all = lines();
+        assert!(
+            all.iter()
+                .any(|l| l.starts_with("launch: made jobserver semaphore ")),
+            "{all:?}"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod dns;
 pub mod dpapi;
 pub mod elevate;
 pub mod firewall;
+pub(crate) mod jobserver;
 pub(crate) mod launch;
 pub mod pipe;
 pub mod runner;

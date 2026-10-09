@@ -1,9 +1,11 @@
-//! The DNS filter's Windows Filtering Platform calls ([`super::super::wfp`]
-//! holds the keys, names and descriptor, tested on every host).
+//! The Windows Filtering Platform calls of the DNS and loopback filters
+//! ([`super::super::wfp`] holds the keys, names, port ranges and descriptor,
+//! tested on every host).
 //!
-//! Setup adds up to five persistent objects: kGraf's provider, its sublayer
-//! and three filters (the name resolution cache layers for IPv4 and IPv6, and
-//! the user-mode RPC layer). The provider and the sublayer go in one
+//! Setup adds up to nine persistent objects: kGraf's provider, its sublayer
+//! and seven filters (the name resolution cache layers for IPv4 and IPv6, the
+//! user-mode RPC layer, and four loopback filters at the connect layers for
+//! IPv4 and IPv6). The provider and the sublayer go in one
 //! transaction, which also deletes every earlier copy of the filters; each
 //! filter then goes in a transaction of its own. A filter Windows refuses is
 //! reported with its status and does not take the others with it: on Windows
@@ -40,15 +42,29 @@
 //! and "Filtering condition identifiers" gives it as "The identification of
 //! the local user. **Data type:** FWP_SECURITY_DESCRIPTOR_TYPE", the same
 //! type as `FWPM_CONDITION_REMOTE_USER_TOKEN` on the RPC layer. One
-//! descriptor from [`match_sddl`] therefore serves all three filters.
+//! descriptor from [`match_sddl`] therefore serves every filter.
+//!
+//! The loopback filters sit on `FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `..._V6`,
+//! the layers where WFP authorizes each outbound connection (and the first
+//! datagram to each remote endpoint) with the connecting process's user. The
+//! same page lists `FWPM_CONDITION_ALE_USER_ID`, `FWPM_CONDITION_FLAGS`,
+//! `FWPM_CONDITION_IP_PROTOCOL` and `FWPM_CONDITION_IP_REMOTE_PORT` there;
+//! the loopback test is the flag `FWP_CONDITION_FLAG_IS_LOOPBACK` with
+//! `FWP_MATCH_FLAGS_ALL_SET`, and the ports outside kGraf's egress proxy are
+//! two `FWP_MATCH_RANGE` conditions on the remote port, which WFP joins with
+//! OR because they name the same field. Whether Windows takes these shapes is
+//! measured by setup itself: a refusal is a recorded gap, as for the DNS
+//! filters, and `kgraf sandbox selfcheck` proves the effect.
 //!
 //! **Reuse.** The engine and transaction guards, the provider and sublayer
 //! setup and the filter layout are ported from openai/codex
 //! `codex-rs/windows-sandbox-rs/src/wfp.rs` (Apache-2.0, read at commit
-//! 665e5f45ab91d43ec3a49487fb9be90109dd2875). Differences: the layers are the
-//! name resolution cache layers and the user-mode RPC layer, not the connect
-//! layers; the conditions are the local user, and the RPC interface with the
-//! remote token, not the user ID and remote port; the keys are per owner, not
+//! 665e5f45ab91d43ec3a49487fb9be90109dd2875), which filters at the connect
+//! layers with the user ID and the remote port, as the loopback filters
+//! here do. Differences: the DNS filters sit on the name resolution cache
+//! layers and the user-mode RPC layer, with the RPC interface and the remote
+//! token there; the loopback filters add the loopback flag and leave kGraf's
+//! proxy ports open; the keys are per owner, not
 //! fixed; the block clears the action right, so a lower-weight sublayer
 //! cannot permit over it; the user match descriptor is built from SDDL with
 //! one entry per user, not from one account name. The `wfp` crate
@@ -63,34 +79,43 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
-    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL,
-    FWP_SECURITY_DESCRIPTOR_TYPE, FWP_VALUE0, FWPM_ACTION0, FWPM_ACTION0_0,
-    FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_REMOTE_USER_TOKEN, FWPM_CONDITION_RPC_IF_UUID,
-    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
-    FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0, FWPM_LAYER_NAME_RESOLUTION_CACHE_V4,
-    FWPM_LAYER_NAME_RESOLUTION_CACHE_V6, FWPM_LAYER_RPC_UM, FWPM_PROVIDER_FLAG_PERSISTENT,
-    FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
-    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFilterGetByKey0, FwpmFreeMemory0,
-    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmProviderGetByKey0, FwpmSubLayerAdd0,
-    FwpmSubLayerDeleteByKey0, FwpmSubLayerGetByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0,
+    FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY,
+    FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ALL_SET, FWP_MATCH_RANGE, FWP_RANGE_TYPE, FWP_RANGE0,
+    FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT8, FWP_UINT16, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_FLAGS,
+    FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_CONDITION_REMOTE_USER_TOKEN,
+    FWPM_CONDITION_RPC_IF_UUID, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
+    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_NAME_RESOLUTION_CACHE_V4, FWPM_LAYER_NAME_RESOLUTION_CACHE_V6, FWPM_LAYER_RPC_UM,
+    FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+    FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
+    FwpmFilterGetByKey0, FwpmFreeMemory0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
+    FwpmProviderGetByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmSubLayerGetByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::core::GUID;
 
+use super::super::firewall::PROXY_PORTS;
 use super::super::names::OwnerNames;
 use super::super::plan::FilterOutcome;
 use super::super::wfp::{
-    DNS_RESOLVER_INTERFACE, LayerProbe, SUBLAYER_WEIGHT, WfpKeys, WfpObject, WfpState, description,
-    display_name, filter_is_disabled, guid_bytes, match_sddl, probe_reading, wfp_code_text,
+    DNS_RESOLVER_INTERFACE, LayerProbe, SUBLAYER_WEIGHT, WfpKeys, WfpObject, WfpState,
+    blocked_loopback_ports, description, display_name, filter_is_disabled, guid_bytes, match_sddl,
+    probe_reading, wfp_code_text,
 };
 use super::wide;
 use crate::error::SandboxError;
 
 /// `E_ACCESSDENIED`, the form the WFP calls use for a refused access.
 const E_ACCESSDENIED: u32 = 0x8007_0005;
+
+/// The IP protocol number of UDP (`IPPROTO_UDP`), the value of an
+/// `FWPM_CONDITION_IP_PROTOCOL` condition.
+const IPPROTO_UDP_NUMBER: u8 = 17;
 
 /// How long a call waits for another program's WFP transaction to end.
 ///
@@ -345,6 +370,12 @@ fn layer_of(object: WfpObject) -> GUID {
     match object {
         WfpObject::NameCacheFilterV4 => FWPM_LAYER_NAME_RESOLUTION_CACHE_V4,
         WfpObject::NameCacheFilterV6 => FWPM_LAYER_NAME_RESOLUTION_CACHE_V6,
+        WfpObject::LoopbackFilterV4 | WfpObject::LoopbackUdpFilterV4 => {
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4
+        }
+        WfpObject::LoopbackFilterV6 | WfpObject::LoopbackUdpFilterV6 => {
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6
+        }
         // The provider and the sublayer are not filters; `put` only ever
         // passes a filter here, and the RPC layer is the safe fallback
         // because its two conditions never match a local lookup.
@@ -394,11 +425,66 @@ fn add_filter(
             Anonymous: FWP_CONDITION_VALUE0_0 { sd: value },
         },
     };
+    // The connect layers' loopback filters: the remote ports outside kGraf's
+    // egress proxy ports, as two ranges (WFP joins conditions on one field
+    // with OR), and the loopback flag. Locals of this function, so the
+    // pointers below stay valid until `FwpmFilterAdd0` has copied them.
+    let port = |p: u16| FWP_VALUE0 {
+        r#type: FWP_UINT16,
+        Anonymous: FWP_VALUE0_0 { uint16: p },
+    };
+    let mut ranges = blocked_loopback_ports(&PROXY_PORTS).map(|(lo, hi)| FWP_RANGE0 {
+        valueLow: port(lo),
+        valueHigh: port(hi),
+    });
+    let loopback_flag = FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_FLAGS,
+        matchType: FWP_MATCH_FLAGS_ALL_SET,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                uint32: FWP_CONDITION_FLAG_IS_LOOPBACK,
+            },
+        },
+    };
     // The RPC layer needs the interface as well, so that the filter does not
     // block every remote RPC call by a blocked user; the name resolution
-    // cache layers have no interface and take the local user alone.
+    // cache layers have no interface and take the local user alone. The
+    // loopback filters take the user, the loopback flag, and either the
+    // ports outside the proxy's or the UDP protocol.
     let mut conditions: Vec<FWPM_FILTER_CONDITION0> = match (shape, object) {
         (Shape::BarePermit, _) => Vec::new(),
+        (Shape::Block, WfpObject::LoopbackFilterV4 | WfpObject::LoopbackFilterV6) => {
+            let [low, high] = &mut ranges;
+            let range = |r: &mut FWP_RANGE0| FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_RANGE,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_RANGE_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { rangeValue: r },
+                },
+            };
+            vec![
+                user(FWPM_CONDITION_ALE_USER_ID, &mut token),
+                loopback_flag,
+                range(low),
+                range(high),
+            ]
+        }
+        (Shape::Block, WfpObject::LoopbackUdpFilterV4 | WfpObject::LoopbackUdpFilterV6) => vec![
+            user(FWPM_CONDITION_ALE_USER_ID, &mut token),
+            loopback_flag,
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_PROTOCOL,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT8,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint8: IPPROTO_UDP_NUMBER,
+                    },
+                },
+            },
+        ],
         (_, WfpObject::RpcFilter) => vec![
             FWPM_FILTER_CONDITION0 {
                 fieldKey: FWPM_CONDITION_RPC_IF_UUID,

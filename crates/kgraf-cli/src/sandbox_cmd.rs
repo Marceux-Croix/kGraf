@@ -474,7 +474,7 @@ pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
         let store = credentials_path(tag)?;
         let exe = launch_exe()?;
         println!(
-            "kGraf asks Windows for administrator rights once, to create its sandbox users, firewall rules and DNS filter."
+            "kGraf asks Windows for administrator rights once, to create its sandbox users, firewall rules and network filters."
         );
         let refused = setup(
             &names,
@@ -535,7 +535,9 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
             &store,
             &mut |e| print_event(&names, e),
         )?;
-        println!("The Windows sandbox user, its firewall rules and its DNS filter are removed.");
+        println!(
+            "The Windows sandbox user, its firewall rules and its network filters are removed."
+        );
         if !left.is_empty() {
             // The users are gone, so these entries name a SID no account
             // has and grant nothing; they are reported so the owner can
@@ -569,7 +571,10 @@ pub fn status(tag: Option<&str>) -> Result<()> {
         let report = kgraf_sandbox::sandbox_user::windows::setup::status(&names, &store)?;
         println!("{report}");
         if report.only_refused_gaps() {
-            bail!("DNS is not confined on this machine: Windows refused a DNS filter at setup");
+            bail!(
+                "{} not confined on this machine: Windows refused a WFP filter at setup",
+                kgraf_sandbox::sandbox_user::plan::refused_subject(&report.refused_gaps())
+            );
         }
         if !report.ready {
             bail!("the Windows sandbox user is not fully set up");

@@ -77,16 +77,20 @@ fn dns_only_failure(step: &StepRun) -> Option<String> {
         && has("  tree: writable"))
     .then(|| dns.trim().to_owned())
 }
-/// The error line of a selfcheck whose probe did not run on the sandbox
-/// user: the backend is the sandbox user, but the probe failed before it
-/// printed any result line (for example, Git Bash did not start as that
-/// user). `None` for any other output.
+/// The error line of a selfcheck that failed on the sandbox user and printed
+/// no result lines: the backend is the sandbox user, and selfcheck stopped at
+/// its probe with one error line and none of its `network:`, `dns:`, folder
+/// or tree lines. The probe may have run and failed one of its steps (in
+/// a hosted Windows self-test it reached the origin directly, "a direct
+/// connection to the origin worked"), or may not have finished at all (Git
+/// Bash stopped at its start); [`probe_words`] says which the line shows.
+/// `None` for any other output.
 ///
 /// The re-run (e) still runs then. Its tests start cargo, Git Bash and curl
 /// as the sandbox user one by one, which is the only evidence of which of
 /// them fail there; stopping at the gate would throw that away and leave
 /// only the probe's one error. The phase reports the gate as failed.
-fn probe_failure_under_user(step: &StepRun) -> Option<String> {
+fn failure_under_user(step: &StepRun) -> Option<String> {
     const PREFIX: &str = "sandbox selfcheck failed (backend: Windows sandbox user): ";
     let lines: Vec<&str> = step.output.lines().map(str::trim_end).collect();
     if step.ok() || lines.iter().any(|l| l.starts_with("  network: ")) {
@@ -96,6 +100,25 @@ fn probe_failure_under_user(step: &StepRun) -> Option<String> {
         let l = l.strip_prefix("Error: ").unwrap_or(l);
         l.starts_with(PREFIX).then(|| l.to_owned())
     })
+}
+
+/// What a [`failure_under_user`] line says about the probe, in a sentence
+/// for the report. Each of the probe's steps has its own error text in
+/// selfcheck (`explain` in crates/kgraf-cli/src/sandbox_cmd.rs): a line that
+/// names one says the probe ran and failed that step; a line that gives only
+/// an exit status says the probe did not finish its steps.
+fn probe_words(line: &str) -> &'static str {
+    const STEPS: [&str; 4] = [
+        "the command could not write in its tree",
+        "the hidden folder was writable",
+        "the command did not reach the allowed origin through the proxy",
+        "a direct connection to the origin worked",
+    ];
+    if STEPS.iter().any(|step| line.contains(step)) {
+        "The probe ran as the sandbox user and failed the step the line names."
+    } else {
+        "The probe did not finish its steps: the line gives its exit status, not a step."
+    }
 }
 
 pub const REMOVE_LIMIT: Duration = Duration::from_secs(300);
@@ -375,9 +398,9 @@ pub struct SandboxPhase {
     pub stopped_at_gate: bool,
     /// (d) failed on its `dns:` line alone (that line); (e) ran anyway.
     pub dns_failed: Option<String>,
-    /// (d) failed because its probe did not run on the sandbox user (the
-    /// error line); (e) ran anyway.
-    pub probe_failed: Option<String>,
+    /// (d) failed on the sandbox user and printed no result lines (the
+    /// error line, [`failure_under_user`]); (e) ran anyway.
+    pub failed_under_user: Option<String>,
     pub cancelled: bool,
     pub reruns: Vec<Rerun>,
     pub e2e: Vec<Check>,
@@ -414,8 +437,9 @@ impl SandboxPhase {
         } else {
             ""
         };
-        let probe = if self.probe_failed.is_some() {
-            "; GATE FAILED: the selfcheck probe did not run on the sandbox user (see the gate)"
+        let probe = if self.failed_under_user.is_some() {
+            "; GATE FAILED: selfcheck failed on the sandbox user and printed no result lines \
+             (see the gate)"
         } else {
             ""
         };
@@ -474,13 +498,13 @@ pub fn run_phase(
     } else {
         dns_only_failure(&gate)
     };
-    p.probe_failed = if passed {
+    p.failed_under_user = if passed {
         None
     } else {
-        probe_failure_under_user(&gate)
+        failure_under_user(&gate)
     };
     p.selfcheck = Some(gate);
-    if !passed && p.dns_failed.is_none() && p.probe_failed.is_none() {
+    if !passed && p.dns_failed.is_none() && p.failed_under_user.is_none() {
         p.stopped_at_gate = true;
     } else {
         for s in select(first) {
@@ -690,11 +714,13 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
              this machine.\n\n"
         ));
     }
-    if let Some(line) = &p.probe_failed {
+    if let Some(line) = &p.failed_under_user {
         md.push_str(&format!(
-            "**GATE FAILED:** `{line}`. The selfcheck probe did not run on the sandbox user, so \
-             nothing about its network, DNS or folders is proved. The re-run (e) ran anyway, so \
-             each program its tests start shows whether it runs as the sandbox user.\n\n"
+            "**GATE FAILED:** `{line}`. Selfcheck failed on the sandbox user before it printed \
+             its result lines, so its network, DNS and folder steps are not proved. {} The \
+             re-run (e) ran anyway, so each program its tests start shows whether it runs as \
+             the sandbox user.\n\n",
+            probe_words(line)
         ));
     }
 
@@ -1002,9 +1028,10 @@ mod tests {
     }
 
     /// A probe that did not start as the sandbox user fails the gate, but the
-    /// re-run still runs and the summary and report say the gate failed.
+    /// re-run still runs and the summary and report say the gate failed, and
+    /// that the probe did not finish its steps.
     #[test]
-    fn a_probe_that_did_not_run_on_the_sandbox_user_still_reruns() {
+    fn a_probe_that_did_not_finish_on_the_sandbox_user_still_reruns() {
         let out = "  launch: spawn lock, every spawn in this process: taken 1\nError: sandbox selfcheck failed (backend: Windows sandbox user): the probe exited with status -1073741502\n      0 [main] bash (492) C:\\Program Files\\Git\\usr\\bin\\bash.exe: *** fatal error";
         let mut ex = Fake {
             selfcheck_code: 1,
@@ -1014,15 +1041,51 @@ mod tests {
         let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
         assert!(!p.stopped_at_gate);
         assert!(ex.calls.iter().any(|c| c.starts_with("rerun")));
-        let line = p.probe_failed.clone().expect("the error line is kept");
+        let line = p.failed_under_user.clone().expect("the error line is kept");
         assert!(
             line.contains("the probe exited with status -1073741502"),
             "{line}"
         );
         assert!(p.summary().contains("GATE FAILED"), "{}", p.summary());
+        assert!(
+            p.summary().contains("printed no result lines"),
+            "{}",
+            p.summary()
+        );
         let md = render(&baseline(), &[], &p);
         assert!(md.contains("**GATE FAILED:**"), "{md}");
+        assert!(md.contains("The probe did not finish its steps"), "{md}");
+        assert!(!md.contains("did not run on the sandbox user"), "{md}");
         assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
+    }
+
+    /// A hosted Windows self-test: the probe ran as the sandbox user and failed
+    /// its direct-connection step, and selfcheck stopped with that one line.
+    /// The re-run still runs, and the report says the probe ran and which
+    /// step failed, never that it did not run.
+    #[test]
+    fn a_probe_step_that_failed_on_the_sandbox_user_is_said_as_such() {
+        let out = "  launch: CreateProcessWithLogonW calls 1 (0 failed): last 137.8 ms\nError: sandbox selfcheck failed (backend: Windows sandbox user): a direct connection to the origin worked; only the proxy should be reachable\n";
+        let mut ex = Fake {
+            selfcheck_code: 1,
+            selfcheck_out: Some(out),
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(!p.stopped_at_gate);
+        assert!(ex.calls.iter().any(|c| c.starts_with("rerun")));
+        let line = p.failed_under_user.clone().expect("the error line is kept");
+        assert!(
+            line.contains("a direct connection to the origin worked"),
+            "{line}"
+        );
+        let md = render(&baseline(), &[], &p);
+        assert!(
+            md.contains("The probe ran as the sandbox user and failed the step the line names."),
+            "{md}"
+        );
+        assert!(!md.contains("did not run on the sandbox user"), "{md}");
+        assert!(!md.contains("did not finish"), "{md}");
     }
 
     /// The same probe failure under the token sandbox, or a probe that ran
@@ -1040,7 +1103,7 @@ mod tests {
             };
             let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
             assert!(p.stopped_at_gate, "{out}");
-            assert_eq!(p.probe_failed, None, "{out}");
+            assert_eq!(p.failed_under_user, None, "{out}");
         }
     }
 

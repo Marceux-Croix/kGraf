@@ -1275,6 +1275,14 @@ pub const WINDOWS_BASE_VARS: &[&str] = &[
     "windir",
 ];
 
+/// The variables a command that runs as the Windows sandbox user gets beside
+/// [`WINDOWS_BASE_VARS`] and the sandbox's git and TLS settings, also after
+/// a clear: where the owner's toolchain is (`CARGO_HOME` and `RUSTUP_HOME`,
+/// set when the folder exists: the sandbox user's own profile has no
+/// toolchain), and the jobserver kGraf made for its cargo and rustc
+/// (`CARGO_MAKEFLAGS`, `sandbox_user::jobserver`). None holds a credential.
+pub const WINDOWS_SANDBOX_USER_VARS: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "CARGO_MAKEFLAGS"];
+
 /// Inherited variables naming an agent or daemon socket. Removing them does
 /// not stop a process that already knows the path; the socket rules do that.
 /// It stops tools from finding the agent by default.
@@ -1463,6 +1471,10 @@ impl From<Redirect> for Stdio {
 /// (std cannot spawn under another token).
 #[cfg(windows)]
 pub use windows::SandboxedChild;
+/// How many commands this process started in a worktree still run
+/// (`WorkspaceManager::quiesce` on Windows).
+#[cfg(windows)]
+pub(crate) use windows::live_jobs_holding;
 /// Remove the sandbox users' entries from one of the owner's folders
 /// (`kgraf sandbox remove`).
 #[cfg(windows)]
@@ -1781,6 +1793,9 @@ pub fn sandboxed_command(
                 });
             }
             let mut prepared = windows::prepare(&resolved)?;
+            // Each command started with the worktree hold is listed under it
+            // while it runs, so `WorkspaceManager::quiesce` sees it.
+            prepared.hold = policy.hold.clone();
             // Read roots the backend could not grant: the command runs and
             // the reason goes out with its output ([`Self::refused_reads`]).
             let notes = std::mem::take(&mut prepared.notes);
@@ -1988,7 +2003,7 @@ pub fn sandboxed_command(
         // Windows ships OpenSSL beside it. `CURL_SSL_BACKEND=openssl` does
         // the same for the multi-backend curl of Git for Windows.
         #[cfg(windows)]
-        let ours = windows::tool_env(network_open(policy.network));
+        let ours = windows::tool_env(network_open(policy.network), &prepared.safe_directories);
         #[cfg(not(windows))]
         let ours = git_config_vars(kgraf_core::host_git::LINE_ENDINGS);
         for (name, value) in worker_git_config_env(std::env::vars_os().map(|(k, _)| k), ours) {
@@ -2000,6 +2015,12 @@ pub fn sandboxed_command(
         // The stores kGraf filled for this project, read-only, used in place
         // of the user's own (`crate::PackageStores`).
         package_stores_env(&mut cmd, &policy.package_stores);
+        #[cfg(windows)]
+        let kept_on_clear = windows::kept_on_clear(
+            network_open(policy.network),
+            policy.tmp_dir.as_deref(),
+            &prepared.safe_directories,
+        );
         Ok(SandboxedCommand {
             cmd,
             refused_reads,
@@ -2016,10 +2037,7 @@ pub fn sandboxed_command(
             #[cfg(windows)]
             inherit_env: true,
             #[cfg(windows)]
-            kept_on_clear: windows::kept_on_clear(
-                network_open(policy.network),
-                policy.tmp_dir.as_deref(),
-            ),
+            kept_on_clear,
         })
     }
 }
