@@ -429,6 +429,31 @@ fn a_command_can_still_open_its_own_token() {
     }
 }
 
+/// kGraf writes the lists of the runner's process and main thread while the
+/// runner is suspended and reads them back. An `Err` here is the measured
+/// Win32 error of that write on this machine: the launch then fell back to
+/// the runner protecting itself, a gap the backend's gaps text states.
+#[test]
+fn the_runners_lists_are_written_before_it_runs_and_read_back() {
+    if !sandbox_user_mode("pre_resume") {
+        return;
+    }
+    let e = env();
+    let mut cmd = sandboxed_command(&policy(&e.ws), "cmd.exe", e.ws.root()).unwrap();
+    cmd.args(["/d", "/c", "exit", "0"])
+        .stdin(Redirect::Null)
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped);
+    let child = cmd.spawn().unwrap();
+    let outcome = child
+        .runner_lists_before_resume()
+        .map(|r| r.map_err(str::to_owned));
+    let out = child.wait_with_output().unwrap();
+    println!("runner lists before resume: {outcome:?}");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(outcome, Some(Ok(())));
+}
+
 #[test]
 fn standard_input_and_output_pass_through_a_runner_without_a_console() {
     if sandbox_user_mode("stdio") {

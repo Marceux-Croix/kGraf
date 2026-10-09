@@ -161,6 +161,22 @@ fn default_lock_dir() -> Option<PathBuf> {
 /// nothing). A process of the former version takes no such lock; that mixed
 /// case keeps only the re-read before the copy.
 fn hold_server_lock(dir: &Path, server: &str) -> Result<HeldLock, String> {
+    hold_server_lock_within(dir, server, SERVER_LOCK_WAIT)
+}
+
+/// The longest a process waits for a server's keychain lock. A holder reads
+/// or writes one keychain entry, and the operating system may ask the person
+/// first (macOS asks whether kGraf may use the item); 10 minutes covers a
+/// person answering that prompt, so a wait this long means a holder that is
+/// stuck.
+const SERVER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// [`hold_server_lock`] with another bound on the wait.
+fn hold_server_lock_within(
+    dir: &Path,
+    server: &str,
+    bound: std::time::Duration,
+) -> Result<HeldLock, String> {
     std::fs::create_dir_all(dir).map_err(|e| {
         format!(
             "cannot create the keychain lock directory {}: {e}",
@@ -188,8 +204,13 @@ fn hold_server_lock(dir: &Path, server: &str) -> Result<HeldLock, String> {
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("cannot open the keychain lock {}: {e}", path.display()))?;
-    file.lock()
-        .map_err(|e| format!("cannot take the keychain lock {}: {e}", path.display()))?;
+    kgraf_core::waits::lock_file(
+        &file,
+        kgraf_core::waits::FileLockMode::Exclusive,
+        &format!("the keychain lock {}", path.display()),
+        bound,
+    )
+    .map_err(|e| format!("cannot take the keychain lock {}: {e}", path.display()))?;
     Ok(HeldLock::new(file))
 }
 
@@ -564,6 +585,31 @@ mod tests {
     use oauth2::TokenResponse as _;
     use rmcp::transport::auth::OAuthTokenResponse;
     use serde_json::json;
+
+    #[test]
+    fn a_held_keychain_lock_times_out_naming_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = hold_server_lock(dir.path(), "probe").expect("free");
+        let waiter = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got =
+                hold_server_lock_within(&waiter, "probe", std::time::Duration::from_millis(200))
+                    .map(drop);
+            let _ = tx.send(got);
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the wait ended")
+            .expect_err("held");
+        assert!(err.contains("mcp-oauth-probe.lock"), "{err}");
+        assert!(err.contains("gave up"), "{err}");
+        drop(first);
+        drop(
+            hold_server_lock_within(dir.path(), "probe", std::time::Duration::from_secs(5))
+                .expect("free"),
+        );
+    }
     use std::sync::Mutex;
 
     /// An in-memory keychain slot whose writes and deletes can be made to fail.

@@ -26,6 +26,9 @@
 //! (TIOCSTI). A Windows child gets no console (`CREATE_NO_WINDOW`) and may not
 //! inherit a console input handle, for the same reason.
 
+// Used by the Windows backend; its logic is unit-tested on every host.
+#[cfg(any(windows, test))]
+mod bounded_wait;
 #[cfg(unix)]
 mod cargo_home;
 #[cfg(unix)]
@@ -1373,9 +1376,6 @@ impl From<Redirect> for Stdio {
     }
 }
 
-/// The handle list for a process start, shared with the sandbox user's runner.
-#[cfg(windows)]
-pub(crate) use windows::AttributeList;
 /// On Windows, `spawn` returns this instead of `std::process::Child`
 /// (std cannot spawn under another token).
 #[cfg(windows)]
@@ -1384,6 +1384,10 @@ pub use windows::SandboxedChild;
 /// (`kgraf sandbox remove`).
 #[cfg(windows)]
 pub(crate) use windows::revoke as revoke_sandbox_grant;
+/// The handle list for a process start, and the window in which its handles
+/// are inheritable, shared with the sandbox user's launch and runner.
+#[cfg(windows)]
+pub(crate) use windows::{AttributeList, InheritWindow};
 
 /// Set the write ACL and Low label of the writable root `root` before a
 /// dependency junction is made in it (`crate::dependencies`).
@@ -1718,6 +1722,7 @@ pub fn sandboxed_command(
                         )
                         .into_bytes()
                     },
+                    wait: child::HOLD_WAIT,
                 })
             }
             None => None,

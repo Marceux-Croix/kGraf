@@ -250,6 +250,11 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            folder) can write each other's writable folders and open each other's \
            processes, so a command without the network can read the egress proxy's secret \
            from a proxied command of that user and use the proxy while that command runs; \
+           each command's runner holds the owner's logon SID until it protects itself: kGraf \
+           writes the lists of the runner's process and main thread while it is suspended and \
+           reads them back, but a program of the same sandbox user can still open the runner \
+           in the moment between its creation and that write, open a thread the runner starts \
+           before it protects itself, or open the whole runner where that write fails; \
            unix-domain sockets are confined only by their own ACLs; write confinement, the \
            gitlink deny and the network block are unverified on Windows",
 };
@@ -274,6 +279,8 @@ mod user_gaps_tests {
             "WebDAV",
             "ICMP",
             "proxy's secret",
+            "runner holds the owner's logon SID",
+            "where that write fails",
             "unverified on Windows",
         ] {
             assert!(gaps.contains(needle), "{needle:?} is missing: {gaps}");
@@ -720,7 +727,7 @@ pub(super) fn hidden_denials<'a, S>(
 #[cfg(windows)]
 pub use imp::SandboxedChild;
 #[cfg(windows)]
-pub(crate) use imp::{AttributeList, revoke};
+pub(crate) use imp::{AttributeList, InheritWindow, revoke};
 #[cfg(windows)]
 pub(super) use imp::{
     Prepared, default_stdio, is_partial, output, prepare, prepare_root, spawn, status, strength,
@@ -767,9 +774,9 @@ mod imp {
         CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD,
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE,
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-        GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
-        READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+        GetFileType, GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+        PIPE_ACCESS_OUTBOUND, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
@@ -2509,7 +2516,8 @@ mod imp {
         parent: Option<OwnedHandle>,
     }
 
-    fn inheritable(h: HANDLE, step: &'static str) -> Result<OwnedHandle, SandboxError> {
+    /// A copy of `h` this process owns, not inheritable (see [`stream`]).
+    fn duplicate(h: HANDLE, step: &'static str) -> Result<OwnedHandle, SandboxError> {
         let mut dup: HANDLE = ptr::null_mut();
         // SAFETY: duplicates a valid handle within this process.
         let ok = unsafe {
@@ -2519,7 +2527,7 @@ mod imp {
                 GetCurrentProcess(),
                 &mut dup,
                 0,
-                1,
+                0,
                 DUPLICATE_SAME_ACCESS,
             )
         };
@@ -2529,16 +2537,41 @@ mod imp {
         owned(dup, step)
     }
 
+    /// Whether `h` is a console or another character device. A console
+    /// handle answers `GetConsoleMode`; the device type also catches one
+    /// opened without the read access that call needs.
+    fn is_console_or_device(h: HANDLE) -> bool {
+        let mut mode = 0;
+        // SAFETY: probes a valid handle; neither call changes it.
+        unsafe { GetConsoleMode(h, &mut mode) != 0 || GetFileType(h) == FILE_TYPE_CHAR }
+    }
+
+    /// The refusal of an inherited standard input that is a console: a
+    /// handle given to a child is admitted with no access check, and
+    /// `WriteConsoleInput` through it injects keystrokes into the owner's
+    /// console. A command never gets an interactive console.
+    const CONSOLE_INPUT_REFUSED: &str = "an inherited console input handle or other character \
+                                         device as standard input (WriteConsoleInput through a \
+                                         console injects keystrokes into the user's console); \
+                                         use Redirect::Null or Redirect::Piped";
+
+    /// One standard stream of a command. Every handle made here is **not
+    /// inheritable**: kGraf's other spawns (std's, which pass every
+    /// inheritable handle of this process to their child) must not copy the
+    /// command's pipe ends, or the command's reader would wait for that
+    /// unrelated process. The handles are marked inheritable only for the one
+    /// creation call that passes them, under the process-wide spawn lock
+    /// ([`InheritWindow`]).
     fn stream(which: STD_HANDLE, redirect: Redirect) -> Result<Stream, SandboxError> {
         match redirect {
             Redirect::Null => {
                 let sa = SECURITY_ATTRIBUTES {
                     nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                     lpSecurityDescriptor: ptr::null_mut(),
-                    bInheritHandle: 1,
+                    bInheritHandle: 0,
                 };
                 let nul = wide(OsStr::new("NUL"));
-                // SAFETY: NUL-terminated device name, inheritable handle.
+                // SAFETY: NUL-terminated device name, handle not inheritable.
                 let h = unsafe {
                     CreateFileW(
                         nul.as_ptr(),
@@ -2556,9 +2589,10 @@ mod imp {
                 })
             }
             Redirect::Piped => {
+                // Both ends are made without inheritance (`child_pipe`).
                 let (parent, child) = child_pipe(which != STD_INPUT_HANDLE)?;
                 Ok(Stream {
-                    child: Some(inheritable(child.as_raw_handle(), "DuplicateHandle(pipe)")?),
+                    child: Some(child),
                     parent: Some(parent),
                 })
             }
@@ -2573,20 +2607,85 @@ mod imp {
                         parent: None,
                     });
                 }
-                let mut mode = 0;
-                // SAFETY: probes whether `h` is a console handle.
-                if which == STD_INPUT_HANDLE && unsafe { GetConsoleMode(h, &mut mode) } != 0 {
+                if which == STD_INPUT_HANDLE && is_console_or_device(h) {
                     return Err(SandboxError::PolicyNotEnforceable {
                         backend: BACKEND_NAME,
-                        what: "an inherited console input handle (WriteConsoleInput through it \
-                               injects keystrokes into the user's console); use Redirect::Null \
-                               or Redirect::Piped",
+                        what: CONSOLE_INPUT_REFUSED,
                     });
                 }
                 Ok(Stream {
-                    child: Some(inheritable(h, "DuplicateHandle(std handle)")?),
+                    child: Some(duplicate(h, "DuplicateHandle(std handle)")?),
                     parent: None,
                 })
+            }
+        }
+    }
+
+    /// Handles marked inheritable for one process creation call. Taken under
+    /// the process-wide spawn lock (`kgraf_core::child_run::spawn_lock`),
+    /// which `kgraf_core::child_run::run` also takes around its spawn, and
+    /// cleared before the lock is released ([`Self::close`], or on drop on an
+    /// error path).
+    ///
+    /// The creation calls need the flag: `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+    /// accepts only inheritable handles, and `CreateProcessWithLogonW`'s
+    /// handling of non-inheritable standard handles is not documented. The
+    /// handle list keeps the sandboxed command from inheriting anything else;
+    /// the lock keeps a spawn that takes it from inheriting these. A spawn
+    /// through std or tokio that does not take the lock can still copy them,
+    /// but only during the creation call.
+    pub(crate) struct InheritWindow {
+        marked: Vec<HANDLE>,
+        // Declared last: released after `Drop::drop` has cleared the flags.
+        _lock: kgraf_core::child_run::SpawnLock,
+    }
+
+    impl InheritWindow {
+        /// Take the spawn lock, then mark each non-null handle inheritable.
+        pub(crate) fn open(handles: &[HANDLE]) -> Result<Self, SandboxError> {
+            let lock = kgraf_core::child_run::spawn_lock(kgraf_core::child_run::SPAWN_LOCK_WAIT)
+                .map_err(|timeout| {
+                    SandboxError::Spawn(io::Error::new(io::ErrorKind::TimedOut, timeout))
+                })?;
+            let mut window = Self {
+                marked: Vec::with_capacity(handles.len()),
+                _lock: lock,
+            };
+            for &h in handles.iter().filter(|h| !h.is_null()) {
+                // SAFETY: a valid handle the caller owns.
+                if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
+                {
+                    // Drop clears the handles marked so far.
+                    return Err(last_error("mark a standard handle inheritable"));
+                }
+                window.marked.push(h);
+            }
+            Ok(window)
+        }
+
+        /// Clear the flag on every marked handle, then release the lock. An
+        /// error names the step; the caller ends what it created, since a
+        /// handle left inheritable could pass to an unrelated child.
+        pub(crate) fn close(mut self) -> Result<(), SandboxError> {
+            let mut first = None;
+            for h in std::mem::take(&mut self.marked) {
+                // SAFETY: a valid handle the caller owns.
+                if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } == 0
+                    && first.is_none()
+                {
+                    first = Some(last_error("clear a standard handle's inheritance"));
+                }
+            }
+            first.map_or(Ok(()), Err)
+        }
+    }
+
+    impl Drop for InheritWindow {
+        fn drop(&mut self) {
+            for h in self.marked.drain(..) {
+                // SAFETY: a valid handle the caller owns. Reached only on an
+                // error path; the caller closes the handle right after.
+                unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
             }
         }
     }
@@ -2816,6 +2915,8 @@ mod imp {
         process: OwnedHandle,
         pid: u32,
         job: OwnedHandle,
+        /// See [`Self::runner_lists_before_resume`].
+        runner_protection: Option<Result<(), String>>,
         /// Keeps the (shared, per-workspace) desktop alive while the child
         /// runs. `None` for a command that runs as the sandbox user: its
         /// runner holds the command's own window station.
@@ -2840,6 +2941,19 @@ mod imp {
             self.pid
         }
 
+        /// For a command that runs as the sandbox user: whether kGraf wrote
+        /// the protected access lists on its runner's process and main
+        /// thread while the runner was still suspended, and read them back.
+        /// `Some(Err)` names the step and the Win32 error: the runner then
+        /// protected itself as its first step, and a program of the same
+        /// sandbox user could open it until then. `None` on the token path,
+        /// which has no runner.
+        pub fn runner_lists_before_resume(&self) -> Option<Result<(), &str>> {
+            self.runner_protection
+                .as_ref()
+                .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str))
+        }
+
         /// The process handle, for waiting from an async runtime.
         pub fn process_handle(&self) -> BorrowedHandle<'_> {
             // SAFETY: the handle is owned by `self` and outlives the borrow.
@@ -2855,14 +2969,54 @@ mod imp {
             Ok(ExitStatus::from_raw(code))
         }
 
-        /// Wait for the process to exit. Closes stdin first, as std does.
-        pub fn wait(&mut self) -> io::Result<ExitStatus> {
-            drop(self.stdin.take());
-            // SAFETY: a valid process handle.
-            match unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) } {
-                WAIT_OBJECT_0 => self.exit_status(),
-                _ => Err(io::Error::last_os_error()),
+        /// The exit status once the process has exited, `None` if it still
+        /// runs after `bound`. Does not close stdin (a caller that polls may
+        /// still write to it) and ends nothing.
+        pub fn wait_timeout(
+            &mut self,
+            bound: std::time::Duration,
+        ) -> io::Result<Option<ExitStatus>> {
+            let deadline = std::time::Instant::now() + bound;
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                // Below INFINITE (u32::MAX ms), which would never return; a
+                // longer bound waits in several steps.
+                let ms = u32::try_from(left.as_millis())
+                    .unwrap_or(INFINITE - 1)
+                    .min(INFINITE - 1);
+                // SAFETY: a valid process handle.
+                match unsafe { WaitForSingleObject(self.process.as_raw_handle(), ms) } {
+                    WAIT_OBJECT_0 => return self.exit_status().map(Some),
+                    WAIT_TIMEOUT if left.is_zero() || ms == 0 => return Ok(None),
+                    WAIT_TIMEOUT => {}
+                    _ => return Err(io::Error::last_os_error()),
+                }
             }
+        }
+
+        /// What this command is called in a wait's error.
+        fn wait_name(&self) -> String {
+            format!("the sandboxed command (process {})", self.pid)
+        }
+
+        /// Wait for the process to exit, at most [`WAIT_BOUND`]. Closes stdin
+        /// first, as std does. See [`Self::wait_within`].
+        pub fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.wait_within(WAIT_BOUND)
+        }
+
+        /// Wait for the process to exit, at most `bound`. Closes stdin first,
+        /// as std does. At the bound the whole tree is ended and the result
+        /// is a [`io::ErrorKind::TimedOut`] error naming the process and the
+        /// bound.
+        pub fn wait_within(&mut self, bound: std::time::Duration) -> io::Result<ExitStatus> {
+            drop(self.stdin.take());
+            let what = self.wait_name();
+            crate::sandbox::bounded_wait::wait_exit(
+                self,
+                &what,
+                crate::sandbox::bounded_wait::Bounds::new(bound),
+            )
         }
 
         pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -2924,43 +3078,65 @@ mod imp {
             Ok(info.ActiveProcesses)
         }
 
-        /// Collect stdout and stderr, wait, then kill any descendant still
-        /// running so a background process holding a pipe cannot block the
-        /// read forever.
-        pub fn wait_with_output(mut self) -> io::Result<Output> {
+        /// [`Self::wait_with_output_within`] with [`WAIT_BOUND`].
+        pub fn wait_with_output(self) -> io::Result<Output> {
+            self.wait_with_output_within(WAIT_BOUND)
+        }
+
+        /// Collect stdout and stderr, wait for the exit at most `bound`, end
+        /// what the command left running, and return what it wrote. Every
+        /// step is bounded (`crate::sandbox::bounded_wait`): a command still
+        /// running at `bound` is ended with its tree and is a
+        /// [`io::ErrorKind::TimedOut`] error; a pipe a process outside the
+        /// job keeps open does not hold the call past
+        /// [`kgraf_core::child_run::DRAIN_GRACE`], and the case is recorded
+        /// (`kgraf_core::waits::pipes_held_count`).
+        pub fn wait_with_output_within(mut self, bound: std::time::Duration) -> io::Result<Output> {
             drop(self.stdin.take());
-            let reader = |pipe: Option<Box<dyn Read + Send>>| {
-                std::thread::spawn(move || -> io::Result<Vec<u8>> {
-                    let mut buf = Vec::new();
-                    if let Some(mut pipe) = pipe {
-                        pipe.read_to_end(&mut buf)?;
-                    }
-                    Ok(buf)
-                })
-            };
-            let out = reader(
-                self.stdout
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn Read + Send>),
-            );
-            let err = reader(
-                self.stderr
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn Read + Send>),
-            );
-            let status = self.wait()?;
-            self.kill()?;
-            let join = |h: std::thread::JoinHandle<io::Result<Vec<u8>>>| {
-                h.join()
-                    .map_err(|_| io::Error::other("pipe reader thread panicked"))?
-            };
+            let what = self.wait_name();
+            let stdout = self
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>);
+            let stderr = self
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>);
+            let got = crate::sandbox::bounded_wait::collect(
+                &mut self,
+                stdout,
+                stderr,
+                &what,
+                crate::sandbox::bounded_wait::Bounds::new(bound),
+            )?;
             Ok(Output {
-                status,
-                stdout: join(out)?,
-                stderr: join(err)?,
+                status: got.status,
+                stdout: got.stdout,
+                stderr: got.stderr,
             })
         }
     }
+
+    impl crate::sandbox::bounded_wait::Exits for SandboxedChild {
+        type Status = ExitStatus;
+        fn wait_timeout(&mut self, bound: std::time::Duration) -> io::Result<Option<ExitStatus>> {
+            SandboxedChild::wait_timeout(self, bound)
+        }
+        fn end_tree(&mut self, bound: std::time::Duration) -> io::Result<bool> {
+            self.kill_tree_and_wait(bound)
+        }
+    }
+
+    /// The bound of [`SandboxedChild::wait`], [`SandboxedChild::wait_with_output`]
+    /// and the `status` and `output` of a sandboxed command on Windows, which
+    /// take no bound of their own. Their longest legitimate use is a person's
+    /// command through `kgraf-wintest sandbox-run`, such as a cold build and
+    /// test of a large workspace on a slow machine, which runs for most of an
+    /// hour; two hours leave room for that, so a wait this long is a command
+    /// that does not end. A caller with a bound of its own uses
+    /// [`SandboxedChild::wait_within`] or
+    /// [`SandboxedChild::wait_with_output_within`].
+    pub const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
     /// Owns a PROC_THREAD_ATTRIBUTE_LIST and the handle array it points to.
     /// Also used by the sandbox user's runner (`sandbox_user::windows::runner`).
@@ -3099,11 +3275,9 @@ mod imp {
             .collect();
         // Inherit exactly the intended handles through the handle list, and
         // never rely on global inheritance: bInheritHandles is TRUE only with a
-        // handle list present, and FALSE otherwise. The listed handles
-        // must be marked inheritable, so a concurrent CreateProcess elsewhere
-        // in this process that passes bInheritHandles=TRUE without a list could
-        // still inherit them during the brief window they are open; std has the
-        // same race, and the handle list is the accepted mitigation.
+        // handle list present, and FALSE otherwise. The listed handles must be
+        // marked inheritable, which they are only for the creation call below,
+        // under the spawn lock (`InheritWindow`).
         let inherit = !handles.is_empty();
         let mut attrs = if inherit {
             Some(AttributeList::with_handles(handles)?)
@@ -3137,6 +3311,7 @@ mod imp {
             } else {
                 0
             };
+        let window = InheritWindow::open(&[raw(&stdin), raw(&stdout), raw(&stderr)])?;
         // SAFETY: every pointer is NUL-terminated or a valid struct that
         // outlives the call; `line` is mutable as the API requires.
         let ok = unsafe {
@@ -3155,10 +3330,17 @@ mod imp {
             )
         };
         if ok == 0 {
-            return Err(SandboxError::Spawn(io::Error::last_os_error()));
+            let err = io::Error::last_os_error();
+            drop(window);
+            return Err(SandboxError::Spawn(err));
         }
         let process = owned(pi.hProcess, "CreateProcessAsUserW process")?;
         let thread = owned(pi.hThread, "CreateProcessAsUserW thread")?;
+        if let Err(e) = window.close() {
+            // SAFETY: the suspended process never ran; terminate it.
+            unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+            return Err(e);
+        }
         // SAFETY: valid job and process handles.
         if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
             let err = last_error("AssignProcessToJobObject");
@@ -3181,6 +3363,7 @@ mod imp {
             process,
             pid: pi.dwProcessId,
             job,
+            runner_protection: None,
             _desktop: Some(DesktopGuard(desktop)),
             _slot: None,
         })
@@ -3199,23 +3382,42 @@ mod imp {
         ok != 0
     }
 
-    /// A stream for a command that runs as the sandbox user, with one
-    /// difference from [`stream`]: an inherited console handle is not given
-    /// to the command. The command writes to a pipe, and a thread of this
-    /// process copies what arrives to this process's own stream.
+    /// A stream for a command that runs as the sandbox user. No handle to
+    /// the owner's console is ever given to the command:
+    ///
+    /// - Standard input: [`Redirect::Null`] (the default) is the NUL device,
+    ///   [`Redirect::Piped`] a pipe, as on the token path. An inherited
+    ///   standard input that is a console, or any other character device, is
+    ///   refused (a command never gets an interactive console); one that is a
+    ///   pipe or a file is passed as a copy.
+    /// - Standard output and error inherited from a console: the command
+    ///   writes to a pipe, and a thread of this process copies what arrives to
+    ///   this process's own stream.
     ///
     /// A console handle carries more than writing text. Its holder can read
     /// what the window shows and add to its input, and a handle passed to a
     /// child is admitted without any access check, so neither the sandbox
     /// user's own list nor the deny-only logon SID would stop it.
     fn user_stream(which: STD_HANDLE, redirect: Redirect) -> Result<Stream, SandboxError> {
+        if which == STD_INPUT_HANDLE && redirect == Redirect::Inherit {
+            // SAFETY: plain call; the handle is borrowed, not owned.
+            let h = unsafe { GetStdHandle(which) };
+            if !h.is_null() && h != INVALID_HANDLE_VALUE && is_console_or_device(h) {
+                return Err(SandboxError::PolicyNotEnforceable {
+                    backend: USER_BACKEND_NAME,
+                    what: CONSOLE_INPUT_REFUSED,
+                });
+            }
+        }
         if redirect != Redirect::Inherit || which == STD_INPUT_HANDLE || !is_console(which) {
             return stream(which, redirect);
         }
         let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: ptr::null_mut(),
-            bInheritHandle: 1,
+            // Neither end is inheritable: the writing end is marked so only
+            // for the runner's creation call (`InheritWindow`).
+            bInheritHandle: 0,
         };
         let (mut read, mut write): (HANDLE, HANDLE) = (ptr::null_mut(), ptr::null_mut());
         // SAFETY: both outputs are written on success; `sa` lives across the
@@ -3226,11 +3428,6 @@ mod imp {
         }
         let read = owned(read, "CreatePipe(console relay) read")?;
         let write = owned(write, "CreatePipe(console relay) write")?;
-        // The command inherits the writing end only.
-        // SAFETY: a valid handle of this process.
-        if unsafe { SetHandleInformation(read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
-            return Err(last_error("SetHandleInformation(console relay)"));
-        }
         let mut from = std::fs::File::from(read);
         std::thread::spawn(move || {
             // Ends when the command's last copy of the writing end closes.
@@ -3299,6 +3496,7 @@ mod imp {
             process: started.runner,
             pid: started.command_pid,
             job,
+            runner_protection: Some(started.protected_before_resume),
             _desktop: None,
             _slot: Some(user.slot.clone()),
         })

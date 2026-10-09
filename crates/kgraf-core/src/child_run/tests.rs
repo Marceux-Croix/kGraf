@@ -216,3 +216,31 @@ fn a_missing_program_is_a_spawn_error() {
     .expect_err("missing");
     assert!(matches!(err, RunError::Spawn { .. }), "{err}");
 }
+
+#[test]
+fn a_spawn_waits_for_the_spawn_lock_and_fails_named_when_it_stays_held() {
+    let _serial = spawn_lock::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let holder = spawn_lock(Duration::from_secs(5)).expect("free");
+    let mut limits = Limits::new(Duration::from_secs(30));
+    limits.spawn_lock_wait = Duration::from_millis(300);
+    let err = bounded(Duration::from_secs(60), move || {
+        run(sh("echo ran"), "lock probe", None, limits)
+    })
+    .expect_err("the spawn lock is held");
+    match &err {
+        RunError::Spawn { command, source } => {
+            assert_eq!(command, "lock probe");
+            assert_eq!(source.kind(), std::io::ErrorKind::TimedOut, "{err}");
+            assert!(source.to_string().contains(SPAWN_LOCK_NAME), "{err}");
+        }
+        other => panic!("{other}"),
+    }
+    drop(holder);
+    let got = bounded(Duration::from_secs(60), move || {
+        run(sh("echo ran"), "lock probe", None, limits)
+    })
+    .expect("the lock is free");
+    assert!(String::from_utf8_lossy(&got.stdout).contains("ran"));
+}

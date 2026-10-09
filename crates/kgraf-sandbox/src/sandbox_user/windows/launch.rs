@@ -30,6 +30,15 @@
 //! when seclogon has put it in a job of its own. A failure of either is
 //! reported with what the next run needs: the Win32 error, whether the runner
 //! was in a job, and the runner's exit code, named where it is known.
+//!
+//! **Runner lists before resume.** While the runner is suspended, this side
+//! writes protected access lists on its process and main thread and reads
+//! them back (`runner::protect_before_resume`), so no program of the same
+//! sandbox user can open them while the runner starts. Whether the handles
+//! the logon call returns carry the rights for that write is not measured;
+//! a failed write is kept on the started command
+//! (`SandboxedChild::runner_lists_before_resume`) and added to any later
+//! launch error, and the runner's own protection is then its first step.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -75,8 +84,10 @@ use super::super::password::Password;
 use super::super::runner::{
     MAX_REPLY, Reply, Request, RunnerArgs, describe_runner_exit, logon_error_hint,
 };
+use super::runner as runner_side;
 use super::{accounts, last_error, pipe, wide, wide_secret};
 use crate::error::SandboxError;
+use crate::sandbox::InheritWindow;
 use crate::win_command_line::command_line;
 
 /// How long the whole handshake may take: the runner must start, connect,
@@ -98,6 +109,11 @@ pub(crate) struct Credential<'a> {
 pub(crate) struct Started {
     pub runner: OwnedHandle,
     pub command_pid: u32,
+    /// Whether the runner's process and main thread got their protected
+    /// access lists before it ran, read back
+    /// ([`runner_side::protect_before_resume`]); the error names the step and
+    /// the Win32 error.
+    pub protected_before_resume: Result<(), String>,
 }
 
 /// Whether `process` is in any job, as text for an error: `true`, `false`,
@@ -431,6 +447,10 @@ pub(crate) fn start(
     // No profile is loaded (logon flags 0); the runner's environment is built
     // from the sandbox user's, and the command gets its own from the request.
     // CREATE_SUSPENDED: the runner joins the job before it runs any code.
+    // The standard handles are inheritable only for this call, under the
+    // spawn lock (`InheritWindow`): the call's handling of non-inheritable
+    // standard handles is not documented.
+    let window = InheritWindow::open(&std)?;
     // SAFETY: every pointer is NUL-terminated or a valid struct that outlives
     // the call; `line` is mutable as the API requires.
     let ok = unsafe {
@@ -451,12 +471,18 @@ pub(crate) fn start(
     let err = std::io::Error::last_os_error();
     drop(password);
     if ok == 0 {
+        drop(window);
         return Err(logon_failed(user.name, err));
     }
     // SAFETY: fresh handles this code now owns.
     let runner = unsafe { OwnedHandle::from_raw_handle(pi.hProcess) };
     // SAFETY: as above.
     let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread) };
+    if let Err(e) = window.close() {
+        // SAFETY: the suspended runner never ran; end it.
+        unsafe { TerminateProcess(runner.as_raw_handle(), 1) };
+        return Err(e);
+    }
     // SAFETY: valid job and process handles.
     if unsafe { AssignProcessToJobObject(job.as_raw_handle(), runner.as_raw_handle()) } == 0 {
         let err = std::io::Error::last_os_error();
@@ -468,10 +494,32 @@ pub(crate) fn start(
             format!("{err}; IsProcessInJob(runner) = {in_job}"),
         ));
     }
+    // The runner's process and main thread get their protected lists before
+    // it runs any code, read back here. The rights of the handles the logon
+    // call returns are not documented; a failed write falls back to the
+    // runner's own protection as its first step, and the error is kept for
+    // the caller (`Started::protected_before_resume`) and for any later
+    // launch error.
+    let protected = runner_side::protect_before_resume(
+        runner.as_raw_handle(),
+        thread.as_raw_handle(),
+        user.sid,
+    );
+    let note = protected.as_ref().err().map(|e| {
+        format!("also, the runner's access lists could not be written before it ran: {e}")
+    });
     let end_job = |e: SandboxError| {
         // SAFETY: a valid job handle; ends the runner and anything it started.
         unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
-        e
+        match (&note, e) {
+            (Some(note), SandboxError::PlatformSetup { step, source }) => {
+                SandboxError::PlatformSetup {
+                    step,
+                    source: std::io::Error::new(source.kind(), format!("{source}; {note}")),
+                }
+            }
+            (_, e) => e,
+        }
     };
     // SAFETY: the primary thread of the suspended runner.
     if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
@@ -528,6 +576,7 @@ pub(crate) fn start(
         Ok(Reply::Started { pid }) => Ok(Started {
             runner,
             command_pid: pid,
+            protected_before_resume: protected,
         }),
         Ok(failure) => Err(end_job(failed(
             "start the command as the sandbox user",

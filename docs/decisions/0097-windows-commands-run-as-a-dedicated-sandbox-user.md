@@ -484,3 +484,79 @@ Not yet confirmed on Windows:
   selfcheck says `dns: not proved`;
 - the `netsh wfp show filters` text of the filter (name, layer, action), which a Windows
   test checks.
+
+**Amendment (2026-10-08): bounded waits, pipe ends inheritable for one call, no console
+input, the runner protected before it runs.** The Windows self-test hung in the
+kgraf-host tests. A fix outside the backend bounded every child wait and lock
+(`kgraf_core::child_run`, `kgraf_core::waits`); this one closes what remained in it.
+None of it has run on Windows yet.
+
+- **Every wait for a sandboxed command ends.** `SandboxedChild::wait_timeout(bound)`
+  waits with `WaitForSingleObject` and the bound. `wait`, `wait_with_output`, and so
+  the Windows `status` and `output`, are bounded by `WAIT_BOUND` (2 hours); callers
+  with their own bound use `wait_within` and `wait_with_output_within`. At the bound
+  the command's tree is ended and the error is `TimedOut`, naming the process and the
+  bound. After a normal exit the tree is ended within `child_run::KILL_BOUND`, and the
+  readers get `child_run::DRAIN_GRACE`; a pipe still open is recorded
+  (`waits::note_pipes_held`) and the output returned. The steps sit behind a small
+  trait, unit-tested on every host.
+- **A command's pipe ends are inheritable only for its own creation call.** Every
+  handle the backend makes for a command's standard streams is created
+  non-inheritable. They are marked inheritable only around `CreateProcessAsUserW`
+  and `CreateProcessWithLogonW`, under one process-wide spawn lock
+  (`kgraf_core::child_run::spawn_lock`, bounded at 60 s) that `child_run::run` also
+  takes around its spawn, and cleared before the lock is released. Before, they were
+  inheritable from their creation, and on the sandbox-user path through the whole
+  runner handshake: any spawn of std or tokio in kGraf could copy them, and the
+  command's reader then waited for that unrelated process. The flag is still needed
+  for the call: the handle list accepts only inheritable handles, and the logon call's
+  handling of non-inheritable standard handles is not documented. **Not closed:** a
+  spawn through std, tokio or process-wrap that does not take the lock can still copy
+  the handles during the one creation call.
+- **Standard input is never a console.** An inherited standard input that is a
+  console, or any other character device, is refused on both paths (the sandbox-user
+  path checks first and names its backend). The default stays the NUL device.
+- **The runner is protected before it runs.** The runner starts suspended
+  (`CREATE_SUSPENDED` is a documented flag of `CreateProcessWithLogonW`). After it joins
+  the job and before it is resumed, kGraf writes protected lists on its process (the
+  sandbox user may only wait, so no program of that user can open the runner's token,
+  whose list is still the default) and on its main thread, and reads each back with the
+  runner's own check. The runner's `protect_self` is unchanged and compatible. The
+  rights of the handles the logon call returns are not measured: a failed write does
+  not stop the launch, its error (step and Win32 code) is kept on the child
+  (`SandboxedChild::runner_lists_before_resume`) and added to any later launch error,
+  and the runner's own protection is then its first step. **Not closed, and stated in
+  the backend's gaps text:** the moment between the runner's creation and kGraf's
+  write, threads the runner starts before it protects itself (the loader's), and the
+  whole runner where the write fails.
+- **The remaining unbounded locks are bounded** with `kgraf_core::waits::lock_file`,
+  each failing with a named timeout. In the forked child on Unix, where only
+  async-signal-safe calls are allowed, the worktree hold is taken with
+  `LOCK_SH | LOCK_NB` in a loop using `clock_gettime` and `select` as the pause.
+
+Choices made with this amendment (each bound is chosen for its longest legitimate
+holder; the reasoning is in a comment beside each constant):
+
+- (i) `WAIT_BOUND`, 2 hours: a person's build and test through `kgraf-wintest
+  sandbox-run`, which runs for most of an hour.
+- (j) `SPAWN_LOCK_WAIT`, 60 s: one creation call per holder, a logon at worst a few
+  seconds.
+- (k) `HOLD_WAIT`, 1 hour, the worktree hold in the forked child: an exclusive holder
+  may wait 30 minutes for the worktree-admin lock, then run git commands of up to 10
+  minutes or delete a large build folder.
+- (l) The migration lock, 30 minutes: a rename and a few bounded git repairs.
+- (m) The diagnostics lock, 60 s: one append and at most one trim of a capped file.
+- (n) The MCP keychain lock, 10 minutes: a person answering the operating system's
+  keychain prompt.
+- (o) The desktop settings lock, 5 s: another window's write of one small file, waited
+  for on the window's own thread.
+- (p) A failed write of the runner's lists before resume falls back to the runner's
+  own protection rather than refusing the command, because the rights of the logon
+  call's handles are not measured; the next Windows run measures them.
+
+**Not closed, found while bounding the hold:** a Unix child that waits for its
+worktree hold before exec holds copies of every descriptor open in kGraf at its fork,
+the close-on-exec status pipes of other spawns in flight among them, so a spawn that
+was in flight at that fork waits for that child as well (now at most `HOLD_WAIT`).
+Taking the shared hold in the parent before the fork would remove the wait from the
+child, but the async spawn path builds its own process in another crate.

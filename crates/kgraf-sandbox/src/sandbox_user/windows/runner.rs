@@ -51,6 +51,10 @@
 //! to one that admits the sandbox user only to wait, so every thread made
 //! from then on is protected, then writes protected lists on its process,
 //! on every thread it already has, and on its token, and reads each back.
+//! Before that, while the runner is still suspended, the owner's process has
+//! already written lists on the runner's process and main thread and read
+//! them back ([`protect_before_resume`]); where that write fails, the runner's
+//! own step is the first protection, as before.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -96,9 +100,9 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
     INFINITE, OpenProcessToken, OpenThread, PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     THREAD_DIRECT_IMPERSONATION, THREAD_GET_CONTEXT, THREAD_IMPERSONATE,
     THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_CONTEXT, THREAD_SET_INFORMATION,
     THREAD_SET_LIMITED_INFORMATION, THREAD_SET_THREAD_TOKEN, THREAD_SUSPEND_RESUME,
@@ -647,6 +651,43 @@ fn protect_self() -> Result<OwnedHandle, Failure> {
     write_self_dacl(token.as_raw_handle(), &user, SELF_TOKEN_MASK, "token")?;
     verify_self_dacl(token.as_raw_handle(), TOKEN_FORBIDDEN, "token")?;
     Ok(command)
+}
+
+/// What the sandbox user may do to the runner's process from its creation
+/// until its own [`protect_self`] has run: wait for it, nothing else. Without
+/// `PROCESS_QUERY_LIMITED_INFORMATION` no program of that user can open the
+/// runner's token either (`OpenProcessToken` needs it), while the token's own
+/// list is still the default. [`protect_self`] then writes
+/// [`SELF_PROCESS_MASK`], after the token is protected.
+const PRE_RESUME_PROCESS_MASK: u32 = SYNCHRONIZE;
+
+/// Write the protected lists on the suspended runner's process and main
+/// thread from the owner's side, before it runs any code, and read each
+/// back: the process admits the sandbox user `user_sid` only to wait
+/// ([`PRE_RESUME_PROCESS_MASK`]), the thread as [`protect_self`] would
+/// ([`SELF_THREAD_MASK`]). An error names the step and the Win32 error.
+///
+/// Compatible with the runner's own [`protect_self`]: the runner writes its
+/// process list through the pseudo-handle, which needs no access check; it
+/// can no longer open its main thread to write, and reads that list back
+/// instead, as it does for a thread made after its default list changed.
+/// Its token is not touched here: the runner must still open it with every
+/// right it uses, which a list written now would refuse.
+pub(crate) fn protect_before_resume(
+    process: HANDLE,
+    thread: HANDLE,
+    user_sid: &str,
+) -> Result<(), String> {
+    let describe = |f: Failure| format!("{}: {} (Win32 error {})", f.step, f.message, f.code);
+    write_self_dacl(process, user_sid, PRE_RESUME_PROCESS_MASK, "process").map_err(describe)?;
+    verify_self_dacl(
+        process,
+        SELF_FORBIDDEN | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+        "process",
+    )
+    .map_err(describe)?;
+    write_self_dacl(thread, user_sid, SELF_THREAD_MASK, "thread").map_err(describe)?;
+    verify_self_dacl(thread, THREAD_FORBIDDEN, "thread").map_err(describe)
 }
 
 /// The runner token's default access list: SYSTEM fully, the sandbox user

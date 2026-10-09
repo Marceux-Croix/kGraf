@@ -33,6 +33,13 @@
 //! waiter on a process the kernel will not end) is left behind rather than
 //! joined: it holds nothing but its pipe or its child.
 //!
+//! The spawn itself is made under the process-wide spawn lock
+//! ([`spawn_lock`]): on Windows std's spawn copies every inheritable handle
+//! in this process into the child, and kGraf's sandbox marks its children's
+//! pipe ends inheritable only while it holds that lock. Taken on every
+//! platform so the behavior is one; on Unix nothing else takes it, and an
+//! uncontended take is one mutex round next to a process creation.
+//!
 //! Known limit (Windows): the child is placed in its job just after it
 //! starts, so a process it starts in the first instant would escape the job.
 //! Git starts nothing before it has read its configuration.
@@ -41,6 +48,9 @@ use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+
+mod spawn_lock;
+pub use spawn_lock::{SPAWN_LOCK_NAME, SPAWN_LOCK_WAIT, SpawnLock, spawn_lock};
 
 /// How long a killed tree has to end before [`RunError::Stuck`]. A killed
 /// process ends in milliseconds; 10 s covers a loaded machine flushing a
@@ -62,6 +72,8 @@ pub struct Limits {
     pub kill_bound: Duration,
     /// See [`DRAIN_GRACE`].
     pub drain_grace: Duration,
+    /// See [`SPAWN_LOCK_WAIT`].
+    pub spawn_lock_wait: Duration,
 }
 
 impl Limits {
@@ -71,6 +83,7 @@ impl Limits {
             timeout,
             kill_bound: KILL_BOUND,
             drain_grace: DRAIN_GRACE,
+            spawn_lock_wait: SPAWN_LOCK_WAIT,
         }
     }
 }
@@ -147,7 +160,13 @@ pub fn run(
         source,
     };
     let tree = tree::Tree::prepare(&mut cmd).map_err(spawn_err)?;
-    let mut child = cmd.spawn().map_err(spawn_err)?;
+    let spawning = spawn_lock(limits.spawn_lock_wait).map_err(|timeout| RunError::Spawn {
+        command: command.to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::TimedOut, timeout),
+    })?;
+    let spawned = cmd.spawn();
+    drop(spawning);
+    let mut child = spawned.map_err(spawn_err)?;
     let tree = tree.adopt(&mut child).map_err(spawn_err)?;
     let registration = crate::waits::child_running(child.id(), command);
     let (tx, rx) = mpsc::channel();

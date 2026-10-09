@@ -27,6 +27,72 @@ pub(super) struct Hold {
     /// cannot check, and the time namespace tells when start times compare.
     /// The child logs before it enters any namespace, so these are its own.
     pub(super) host: Vec<u8>,
+    /// How long the child waits for its shared lock ([`HOLD_WAIT`]).
+    pub(super) wait: std::time::Duration,
+}
+
+/// The longest a starting command waits for its worktree's hold. It is held
+/// exclusively only while nothing may start in the worktree: a quiesce
+/// guard through one merge-back commit, a removal through `git worktree
+/// remove` and the deletion of the tree, a reopen or startup cleanup. One
+/// such holder may wait 30 minutes for the worktree-admin lock and then run
+/// git commands bounded at 10 minutes each, or delete a large build folder;
+/// an hour covers it, so a wait this long means a holder that is stuck. The
+/// parent's `spawn` waits as long, since std waits for the child's exec.
+pub(super) const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The message of a child that gave up waiting for its hold.
+const HOLD_TIMEOUT: &str =
+    "timed out waiting for the worktree hold: a removal, reopen or quiesce held it exclusively";
+
+/// Take a shared `flock` on `fd`, waiting at most `bound_ms` milliseconds.
+/// `Err(errno)`: `ETIMEDOUT` at the bound, else the lock's own error.
+///
+/// Runs in the forked child, so only async-signal-safe calls: `flock` with
+/// `LOCK_NB` (a system call, as the blocking form was), `clock_gettime` and
+/// `select` with no descriptors as the pause (both on the POSIX list). No
+/// allocation, no lock.
+fn lock_shared_within(fd: libc::c_int, bound_ms: u64) -> Result<(), i32> {
+    fn now_ms() -> u64 {
+        // SAFETY: zeroed is a valid timespec; clock_gettime writes it.
+        let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-pointer; async-signal-safe.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+        (t.tv_sec as u64) * 1000 + (t.tv_nsec as u64) / 1_000_000
+    }
+    let start = now_ms();
+    let mut pause_ms: u64 = 1;
+    loop {
+        // SAFETY: flock on a descriptor the caller opened.
+        if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let errno = last_errno();
+        if errno != libc::EWOULDBLOCK && errno != libc::EINTR {
+            return Err(errno);
+        }
+        let waited = now_ms().saturating_sub(start);
+        if waited >= bound_ms {
+            return Err(libc::ETIMEDOUT);
+        }
+        let step = pause_ms.min(bound_ms - waited);
+        let mut tv = libc::timeval {
+            tv_sec: (step / 1000) as libc::time_t,
+            tv_usec: ((step % 1000) * 1000) as libc::suseconds_t,
+        };
+        // SAFETY: no descriptor sets; a pause of `tv`. An interruption only
+        // shortens it.
+        unsafe {
+            libc::select(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+        pause_ms = (pause_ms * 2).min(20);
+    }
 }
 
 /// Append `n` in decimal to `buf` at `*at`. No allocation.
@@ -120,7 +186,10 @@ fn pipe_io_error(source: io::Error) -> SandboxError {
 /// `PR_SET_PDEATHSIG`), so after the orchestrator is killed the command, and on
 /// macOS any orphan it leaves, can keep writing its worktree;
 /// `WorkspaceManager::reopen` takes the lock exclusively first and refuses
-/// while any holder lives. On Linux with namespaces the command is PID 1 of
+/// while any holder lives. The child waits at most [`Hold::wait`] for its
+/// shared lock while another process holds it exclusively, then fails the
+/// spawn with `ETIMEDOUT` and a reason saying so. On Linux with namespaces
+/// the command is PID 1 of
 /// its own PID namespace, so an orphan cannot outlive the command: the kernel
 /// kills everything left in the namespace when the command exits. The command
 /// itself still outlives a killed orchestrator there, and so do its children
@@ -171,7 +240,8 @@ pub(super) fn install(
 
     // SAFETY: the hook runs in the forked child before exec and calls only
     // setsid, write and the step (documented async-signal-safe by each
-    // backend), plus open and flock for the hold. It touches no process locks
+    // backend), plus open, flock, clock_gettime and select for the hold's
+    // bounded wait (`lock_shared_within`). It touches no process locks
     // and does not allocate.
     unsafe {
         cmd.pre_exec(move || {
@@ -190,8 +260,15 @@ pub(super) fn install(
                 if fd < 0 {
                     return Err(reporter.fail("cannot open the worktree hold file", last_errno()));
                 }
-                if libc::flock(fd, libc::LOCK_SH) != 0 {
-                    return Err(reporter.fail("cannot take the worktree hold", last_errno()));
+                let bound_ms = u64::try_from(hold.wait.as_millis()).unwrap_or(u64::MAX);
+                match lock_shared_within(fd, bound_ms) {
+                    Ok(()) => {}
+                    Err(libc::ETIMEDOUT) => {
+                        return Err(reporter.fail(HOLD_TIMEOUT, libc::ETIMEDOUT));
+                    }
+                    Err(errno) => {
+                        return Err(reporter.fail("cannot take the worktree hold", errno));
+                    }
                 }
                 // `<session id> <leader start time> <boot> <pid ns> <time ns>`:
                 // this PID is the session id after setsid; the start time and
@@ -266,6 +343,82 @@ mod tests {
         let mut cmd = Command::new("/usr/bin/true");
         let probe = install(&mut cmd, None, None).unwrap();
         assert!(cmd.status().unwrap().success());
+        assert_eq!(probe.reason(), None);
+    }
+
+    fn hold_in(dir: &std::path::Path, wait: std::time::Duration) -> Hold {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: std::path::PathBuf| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        Hold {
+            lock: c(dir.join("hold")),
+            sessions: c(dir.join("sessions")),
+            host: b"- - -".to_vec(),
+            wait,
+        }
+    }
+
+    /// Spawn on a thread, so a child that never takes its hold fails the
+    /// test instead of hanging it.
+    fn spawn_within(
+        mut cmd: Command,
+        bound: std::time::Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(cmd.spawn().and_then(|mut c| c.wait()));
+        });
+        rx.recv_timeout(bound)
+            .expect("the spawn returned within the bound")
+    }
+
+    #[test]
+    fn a_hold_held_exclusively_fails_the_spawn_at_its_bound_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = std::fs::File::create(dir.path().join("hold")).unwrap();
+        holder.lock().unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        let wait = std::time::Duration::from_millis(300);
+        let probe = install(&mut cmd, Some(hold_in(dir.path(), wait)), None).unwrap();
+        let started = std::time::Instant::now();
+        let err = spawn_within(cmd, std::time::Duration::from_secs(20)).unwrap_err();
+        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+        assert_eq!(err.raw_os_error(), Some(libc::ETIMEDOUT), "{err}");
+        assert_eq!(probe.reason().as_deref(), Some(HOLD_TIMEOUT));
+
+        // Free again: the next command takes its shared hold and runs.
+        holder.unlock().unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        let probe = install(
+            &mut cmd,
+            Some(hold_in(dir.path(), std::time::Duration::from_secs(5))),
+            None,
+        )
+        .unwrap();
+        assert!(
+            spawn_within(cmd, std::time::Duration::from_secs(20))
+                .unwrap()
+                .success()
+        );
+        assert_eq!(probe.reason(), None);
+    }
+
+    #[test]
+    fn a_shared_hold_does_not_wait_for_another_shared_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = std::fs::File::create(dir.path().join("hold")).unwrap();
+        other.lock_shared().unwrap();
+        let mut cmd = Command::new("/usr/bin/true");
+        let probe = install(
+            &mut cmd,
+            Some(hold_in(dir.path(), std::time::Duration::from_millis(300))),
+            None,
+        )
+        .unwrap();
+        assert!(
+            spawn_within(cmd, std::time::Duration::from_secs(20))
+                .unwrap()
+                .success()
+        );
         assert_eq!(probe.reason(), None);
     }
 }

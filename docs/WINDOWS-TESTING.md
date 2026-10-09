@@ -340,14 +340,44 @@ process environment.
    cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3b-runner-windows.txt"
    ```
 
-   Expected: all five pass, and none prints a "skipped" line (a skipped line means the
-   backend is not the sandbox user: send the output of `kgraf sandbox status`). When a
+   Expected: all six pass, and none prints a "skipped" line (a skipped line means the
+   backend is not the sandbox user: send the output of `kgraf sandbox status`).
+   `the_runners_lists_are_written_before_it_runs_and_read_back` prints one line,
+   `runner lists before resume: ...`. `Some(Ok(()))` means kGraf wrote the protected
+   access lists on the runner's process and main thread while it was still suspended,
+   and read them back. `Some(Err(...))` is a measurement, not only a failure: it holds the
+   step and the Win32 error of that write on this machine (the rights of the handles
+   `CreateProcessWithLogonW` returns are not documented). The command still ran, with the
+   runner protecting itself as its first step. Send the line either way. When a
    command cannot start as the sandbox user, the error names the step and, where the
    runner ended before it connected, its exit code with its meaning: `0xC0000142` (a DLL
    failed to start, most likely the window station or desktop), `0x2B470005` (the runner
    could not protect its own process, threads or token), `0x2B470002` (the runner could not
    open its pipe). A failure to put the runner in kGraf's job prints
    `IsProcessInJob(runner) = ...`. Send the full text of any such error.
+
+   **3c.** A command's standard handles, on whichever backend is active. Run it before
+   `kgraf sandbox setup` (token sandbox) and again after it (sandbox user):
+
+   ```powershell
+   cargo test -p kgraf-sandbox --test stdio_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\3c-stdio-windows.txt"
+   ```
+
+   Expected: all three pass.
+   `a_concurrent_unrelated_spawn_does_not_hold_a_sandboxed_commands_output` runs 20
+   sandboxed commands while four threads start unrelated processes that live about five
+   seconds each, and prints `20 sandboxed commands beside N unrelated spawns; slowest
+   ...`. Send that line. A failure names a command whose output pipe stayed open after it
+   ended: an unrelated process took a copy of its pipe end. `a_commands_standard_input_is_never_a_console`
+   and `an_inherited_console_as_standard_input_is_refused` check that a command never gets
+   a console as its standard input; the second briefly opens a console window of its own.
+
+   Every wait for a sandboxed command now ends. If a test or a kGraf run stops with one of
+   these errors, send its full text: `the sandboxed command (process N): did not exit
+   within ...`, `... a process it started was still running ... after its tree was
+   ended`, or `waited ... for the process spawn lock and gave up`. If a kgraf-host test
+   stops making progress, its harness prints what it waits on (lock waits and running
+   children, with their age); send that output too.
 
 4. The worker's shell tool on Windows (a plain program and a `sh -c` line run and return
    their output, the network notice comes once, an exit status comes back, a timeout and

@@ -423,13 +423,31 @@ fn still_at(_file: &File, _path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// The longest a process waits for the migration lock. The holder moves one
+/// state directory (a rename), repairs its worktrees with git commands
+/// bounded at 10 minutes each (`git worktree repair`, the attempt refs) and
+/// rewrites a few JSON files. A project has a handful of worktrees, each
+/// repaired in milliseconds; 30 minutes covers a holder whose git commands
+/// are slow, so a wait this long means a holder that is stuck.
+const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// Take the migration lock, and read whether an interrupted move left its
 /// mark. Retries while the file this call locked is not the one at the path.
 fn acquire_lock(lock_path: &Path) -> Result<(File, bool)> {
+    acquire_lock_within(lock_path, MIGRATION_LOCK_WAIT)
+}
+
+/// [`acquire_lock`], waiting at most `bound` for each take of the lock.
+fn acquire_lock_within(lock_path: &Path, bound: std::time::Duration) -> Result<(File, bool)> {
     for _ in 0..64 {
         let mut file = open_lock(lock_path)?;
-        file.lock()
-            .with_step(|| format!("cannot lock {}", lock_path.display()))?;
+        kgraf_core::waits::lock_file(
+            &file,
+            kgraf_core::waits::FileLockMode::Exclusive,
+            &format!("the migration lock {}", lock_path.display()),
+            bound,
+        )
+        .with_step(|| format!("cannot lock {}", lock_path.display()))?;
         if !still_at(&file, lock_path)? {
             continue;
         }
@@ -1114,6 +1132,28 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_migration_lock_times_out_with_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MIGRATION_LOCK);
+        let holder = File::create(&path).unwrap();
+        holder.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_path = path.clone();
+        std::thread::spawn(move || {
+            let got = acquire_lock_within(&waiter_path, std::time::Duration::from_millis(200));
+            let _ = tx.send(got.map(|_| ()).map_err(|e| format!("{e:#}")));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the wait ended")
+            .expect_err("held");
+        assert!(err.contains("the migration lock"), "{err}");
+        assert!(err.contains("gave up"), "{err}");
+        holder.unlock().unwrap();
+        acquire_lock_within(&path, std::time::Duration::from_secs(5)).expect("free");
+    }
 
     fn pairs() -> Vec<(String, String)> {
         vec![("/p/.haustoria".to_owned(), "/p/.kgraf".to_owned())]

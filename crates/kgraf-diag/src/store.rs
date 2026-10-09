@@ -125,11 +125,28 @@ fn trim_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Run `f` while holding a blocking exclusive lock on `path`'s sibling lock
-/// file, creating it if needed. `f` runs once for the whole append-and-maybe
-/// -trim operation, so no other process's append or trim can interleave with
-/// it (see the module doc).
+/// The longest a writer waits for the diagnostics lock. A holder appends one
+/// line and at most trims the capped file once (a read, a write of a smaller
+/// copy and a rename): milliseconds on a local disk. 60 s covers a slow or
+/// busy disk with a wide margin, so a wait this long means a holder that is
+/// stuck.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `f` while holding an exclusive lock on `path`'s sibling lock file,
+/// creating it if needed, waiting at most [`LOCK_WAIT`] for it. `f` runs once
+/// for the whole append-and-maybe-trim operation, so no other process's
+/// append or trim can interleave with it (see the module doc).
 fn with_locked<T>(path: &Path, f: impl FnOnce() -> Result<T, DiagError>) -> Result<T, DiagError> {
+    with_locked_within(path, LOCK_WAIT, f)
+}
+
+/// [`with_locked`] with another bound on the wait. A wait that reaches it is
+/// [`DiagError::Lock`] with a `TimedOut` source naming the lock and the wait.
+fn with_locked_within<T>(
+    path: &Path,
+    bound: std::time::Duration,
+    f: impl FnOnce() -> Result<T, DiagError>,
+) -> Result<T, DiagError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| DiagError::Open {
             path: path.to_path_buf(),
@@ -148,9 +165,18 @@ fn with_locked<T>(path: &Path, f: impl FnOnce() -> Result<T, DiagError>) -> Resu
             path: lp.clone(),
             source,
         })?;
-    lock_file.lock().map_err(|source| DiagError::Lock {
+    kgraf_core::waits::lock_file(
+        &lock_file,
+        kgraf_core::waits::FileLockMode::Exclusive,
+        &format!("the diagnostics lock {}", lp.display()),
+        bound,
+    )
+    .map_err(|e| DiagError::Lock {
         path: lp.clone(),
-        source,
+        source: match e {
+            kgraf_core::waits::LockError::Timeout(t) => io::Error::new(io::ErrorKind::TimedOut, t),
+            kgraf_core::waits::LockError::Io { source, .. } => source,
+        },
     })?;
     let _held = HeldLock::new(lock_file);
     f()
@@ -315,6 +341,36 @@ pub fn read_all(path: &Path) -> Result<Vec<Record>, DiagError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_diagnostics_lock_times_out_with_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.jsonl");
+        let holder = File::create(lock_path(&path)).unwrap();
+        holder.lock().unwrap();
+        let waiter = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = with_locked_within(&waiter, std::time::Duration::from_millis(200), || Ok(()));
+            let _ = tx.send(got);
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the wait ended")
+            .expect_err("held");
+        match err {
+            DiagError::Lock { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::TimedOut, "{source}");
+                assert!(
+                    source.to_string().contains("the diagnostics lock"),
+                    "{source}"
+                );
+            }
+            other => panic!("{other}"),
+        }
+        holder.unlock().unwrap();
+        with_locked_within(&path, std::time::Duration::from_secs(5), || Ok(())).expect("free");
+    }
     use crate::event::DiagEvent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

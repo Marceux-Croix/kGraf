@@ -151,6 +151,13 @@ pub struct SettingsStore {
 /// enough that a transient failure heals, rare enough not to log every frame.
 const SETTINGS_RETRY: Duration = Duration::from_secs(5);
 
+/// The longest a window waits for the settings lock. A holder is another
+/// window's read-modify-write of one small file: milliseconds. 5 s covers a
+/// slow disk; the wait runs on the window's own thread, so a longer one would
+/// freeze the window. A wait that reaches it fails like any write: logged,
+/// shown in the settings surface and retried after [`SETTINGS_RETRY`].
+const SETTINGS_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 /// The project list to write (1): the file's current list with only
 /// this window's own changes applied. `own_before` is this window's list at its
 /// last write, `own_now` its list now: what it added is added (at the end, in
@@ -189,8 +196,14 @@ impl SettingsStore {
     }
 
     /// The advisory lock around the read-modify-write, in a sibling file so the
-    /// settings file itself can be replaced by rename while it is held.
+    /// settings file itself can be replaced by rename while it is held, waiting
+    /// at most [`SETTINGS_LOCK_WAIT`].
     fn lock(&self) -> Result<kgraf_core::flock::HeldLock, String> {
+        self.lock_within(SETTINGS_LOCK_WAIT)
+    }
+
+    /// [`Self::lock`] with another bound on the wait.
+    fn lock_within(&self, bound: Duration) -> Result<kgraf_core::flock::HeldLock, String> {
         let mut name = self.path.as_os_str().to_owned();
         name.push(".lock");
         let lock = PathBuf::from(name);
@@ -203,8 +216,13 @@ impl SettingsStore {
             .write(true)
             .open(&lock)
             .map_err(|e| format!("{}: {e}", lock.display()))?;
-        file.lock()
-            .map_err(|e| format!("locking {}: {e}", lock.display()))?;
+        kgraf_core::waits::lock_file(
+            &file,
+            kgraf_core::waits::FileLockMode::Exclusive,
+            &format!("the settings lock {}", lock.display()),
+            bound,
+        )
+        .map_err(|e| format!("locking {}: {e}", lock.display()))?;
         Ok(kgraf_core::flock::HeldLock::new(file))
     }
 
@@ -1792,6 +1810,30 @@ mod tests {
             egui::Key::W,
             egui::Modifiers::COMMAND
         )));
+    }
+
+    /// A settings lock another window keeps is waited for only up to the
+    /// bound, then reported as a failure naming the lock.
+    #[test]
+    fn a_held_settings_lock_times_out_naming_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let store = SettingsStore::new(path.clone(), Settings::default());
+        let held = store.lock().expect("free");
+        let waiter = SettingsStore::new(path, Settings::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = waiter.lock_within(Duration::from_millis(200)).map(drop);
+            let _ = tx.send(got);
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the wait ended")
+            .expect_err("held");
+        assert!(err.contains("the settings lock"), "{err}");
+        assert!(err.contains("gave up"), "{err}");
+        drop(held);
+        drop(store.lock_within(Duration::from_secs(5)).expect("free"));
     }
 
     /// A color vision chosen in one settings write
