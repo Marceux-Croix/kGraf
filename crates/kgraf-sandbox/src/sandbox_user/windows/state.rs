@@ -98,13 +98,17 @@ impl Users {
     /// moves to this folder first loses its write grants on the folders it
     /// held. While every slot of the pool is held for another folder, it
     /// waits up to `wait`, then is refused.
+    ///
+    /// The notes beside the lease are what those grant removals left behind:
+    /// a file whose access list they could not write keeps the entry it had,
+    /// and the caller carries that to the owner with the command's output.
     pub(crate) fn lease(
         &self,
         pool: Pool,
         worker: Option<&crate::sandbox::WorkerSlot>,
         roots: &[PathBuf],
         wait: std::time::Duration,
-    ) -> Result<Arc<Lease>, SandboxError> {
+    ) -> Result<(Arc<Lease>, Vec<String>), SandboxError> {
         let slot_error = |e: super::super::slots::SlotError| error(e);
         if let Some(worker) = worker.filter(|w| w.0.pool() == pool) {
             let first = roots
@@ -117,17 +121,23 @@ impl Users {
                 }));
             }
             worker.0.note_roots(roots).map_err(slot_error)?;
-            return Ok(worker.0.clone());
+            return Ok((worker.0.clone(), Vec::new()));
         }
-        let mut revoke = |role: Role, path: &Path| -> Result<(), String> {
-            let user = self.user(role).map_err(|e| e.to_string())?;
-            crate::sandbox::revoke_sandbox_grant(path, &[user.sid.as_str()])
-                .map_err(|e| e.to_string())
+        let mut notes: Vec<String> = Vec::new();
+        let lease = {
+            let mut revoke = |role: Role, path: &Path| -> Result<(), String> {
+                let user = self.user(role).map_err(|e| e.to_string())?;
+                let left = crate::sandbox::revoke_sandbox_grant(path, &[user.sid.as_str()])
+                    .map_err(|e| e.to_string())?;
+                notes.extend(left);
+                Ok(())
+            };
+            self.leases
+                .lease_waiting(pool, roots, &mut revoke, wait)
+                .map(|(lease, _)| lease)
+                .map_err(slot_error)?
         };
-        self.leases
-            .lease_waiting(pool, roots, &mut revoke, wait)
-            .map(|(lease, _)| lease)
-            .map_err(slot_error)
+        Ok((lease, notes))
     }
 
     /// Every user, for a grant that any of them may need.

@@ -190,6 +190,22 @@ pub fn build_from_commits(
 /// needs its own performance budget, and a missing or non-git directory must
 /// raise rather than silently yielding an empty relation (fail loud).
 pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<HistoryCommit>> {
+    read_history_with(
+        std::path::Path::new("git"),
+        root,
+        max_commits,
+        kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+    )
+}
+
+/// [`read_git_history`] with the git program and the run's limits named, so a
+/// test can feed it a program that prints more than any buffer holds.
+fn read_history_with(
+    exe: &std::path::Path,
+    root: &std::path::Path,
+    max_commits: u32,
+    limits: kgraf_core::child_run::Limits,
+) -> Result<Vec<HistoryCommit>> {
     if max_commits == 0 {
         // `--max-count=0` prints nothing and succeeds: an empty relation that
         // reads as "no history" (fail loud).
@@ -212,7 +228,11 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
         })?;
     let max_count = format!("--max-count={max_commits}");
     let output = kgraf_core::host_git::command(
-        &kgraf_core::host_git::Invocation::in_dir(&pre),
+        &kgraf_core::host_git::Invocation {
+            exe,
+            cwd: None,
+            pre: &pre,
+        },
         &[
             "log",
             "-z",
@@ -226,12 +246,25 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
     .map_err(|e| GraphError::History {
         reason: format!("cannot run git: {e}"),
     })?;
-    // Bounded, the tree killed at the bound (`kgraf_core::child_run`).
-    let output = kgraf_core::child_run::run(
+    // Bounded, the tree killed at the bound (`kgraf_core::child_run`). Read
+    // as a stream, one NUL-ended token at a time: a repository's whole history
+    // runs to hundreds of megabytes, and nothing here needs it in one buffer,
+    // so no output cap applies. The first parse error stops the parsing; the
+    // rest is read and dropped (the child is still ended by the deadline).
+    let mut parser = LogParser::default();
+    let mut parse_error: Option<GraphError> = None;
+    let output = kgraf_core::child_run::run_streaming(
         output,
         "git log (co-change history)",
-        None,
-        kgraf_core::child_run::Limits::new(kgraf_core::host_git::COMMAND_TIMEOUT),
+        limits,
+        0,
+        |token| {
+            if parse_error.is_none()
+                && let Err(e) = parser.token(token)
+            {
+                parse_error = Some(e);
+            }
+        },
     )
     .map_err(|e| GraphError::History {
         reason: format!("cannot run git: {e}"),
@@ -241,27 +274,47 @@ pub fn read_git_history(root: &std::path::Path, max_commits: u32) -> Result<Vec<
             reason: format_reason(&output.stderr),
         });
     }
-    parse_git_log_z(&output.stdout)
+    if let Some(e) = parse_error {
+        return Err(e);
+    }
+    Ok(parser.finish())
 }
 
-/// Parse `git log -z --name-only --pretty=format:%x01%ct` output. A NUL ends
-/// each path (and separates commits with an empty token); a header token starts
-/// with `\x01`, holds the commit time, and is followed after a newline by that
-/// commit's first path.
+/// Parse `git log -z --name-only --pretty=format:%x01%ct` output, whole. The
+/// reader feeds [`LogParser`] token by token; this is the same parse over a
+/// buffer.
+#[cfg(test)]
 fn parse_git_log_z(stdout: &[u8]) -> Result<Vec<HistoryCommit>> {
-    let bad = |what: String| GraphError::History { reason: what };
-    let mut commits = Vec::new();
-    let mut current: Option<HistoryCommit> = None;
-    let finish = |commit: Option<HistoryCommit>, commits: &mut Vec<HistoryCommit>| {
-        if let Some(commit) = commit
+    let mut parser = LogParser::default();
+    for token in stdout.split(|b| *b == 0) {
+        parser.token(token)?;
+    }
+    Ok(parser.finish())
+}
+
+/// The parse of `git log -z --name-only --pretty=format:%x01%ct`, one token
+/// at a time. A NUL ends each path (and separates commits with an empty
+/// token); a header token starts with `\x01`, holds the commit time, and is
+/// followed after a newline by that commit's first path.
+#[derive(Default)]
+struct LogParser {
+    commits: Vec<HistoryCommit>,
+    current: Option<HistoryCommit>,
+}
+
+impl LogParser {
+    fn close_current(&mut self) {
+        if let Some(commit) = self.current.take()
             && !commit.paths.is_empty()
         {
-            commits.push(commit);
+            self.commits.push(commit);
         }
-    };
-    for token in stdout.split(|b| *b == 0) {
+    }
+
+    fn token(&mut self, token: &[u8]) -> Result<()> {
+        let bad = |what: String| GraphError::History { reason: what };
         if token.is_empty() {
-            continue;
+            return Ok(());
         }
         let text = std::str::from_utf8(token).map_err(|_| {
             bad(format!(
@@ -271,7 +324,7 @@ fn parse_git_log_z(stdout: &[u8]) -> Result<Vec<HistoryCommit>> {
         })?;
         let mut path = text;
         if let Some(header) = text.strip_prefix('\u{1}') {
-            finish(current.take(), &mut commits);
+            self.close_current();
             let (stamp, first) = match header.split_once('\n') {
                 Some((stamp, first)) => (stamp, first),
                 None => (header, ""),
@@ -280,26 +333,30 @@ fn parse_git_log_z(stdout: &[u8]) -> Result<Vec<HistoryCommit>> {
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| bad(format!("git log printed a bad commit time `{stamp}`")))?;
-            current = Some(HistoryCommit {
+            self.current = Some(HistoryCommit {
                 timestamp,
                 paths: Vec::new(),
             });
             path = first;
         }
         if path.is_empty() {
-            continue;
+            return Ok(());
         }
-        match current.as_mut() {
-            Some(commit) => commit.paths.push(path.to_owned()),
-            None => {
-                return Err(bad(format!(
-                    "git log printed the path `{path}` before any commit header"
-                )));
+        match self.current.as_mut() {
+            Some(commit) => {
+                commit.paths.push(path.to_owned());
+                Ok(())
             }
+            None => Err(bad(format!(
+                "git log printed the path `{path}` before any commit header"
+            ))),
         }
     }
-    finish(current, &mut commits);
-    Ok(commits)
+
+    fn finish(mut self) -> Vec<HistoryCommit> {
+        self.close_current();
+        self.commits
+    }
 }
 
 fn format_reason(stderr: &[u8]) -> String {
@@ -776,6 +833,77 @@ mod tests {
         assert!(matches!(orphan, GraphError::History { .. }), "{orphan:?}");
         let raw = parse_git_log_z(b"\x011\n\xff\xfe.rs\0").expect_err("non utf-8");
         assert!(matches!(raw, GraphError::History { .. }), "{raw:?}");
+    }
+
+    /// A fake `git` that prints 40,000 commits (about 3 MB of `git log -z`
+    /// output) against a run limited to 100 kB: reading as a stream holds no
+    /// whole output, so the limit that would end a buffered read does not
+    /// apply, and every commit arrives.
+    #[cfg(unix)]
+    #[test]
+    fn a_history_larger_than_the_output_cap_is_streamed_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             case \"$*\" in *version*) echo 'git version 2.43.0'; exit 0;; esac\n\
+             for a in \"$@\"; do [ \"$a\" = config ] && exit 0; done\n\
+             i=0\n\
+             while [ $i -lt 40000 ]; do\n\
+               printf '\\001%s\\nsrc/module_a/file_%s.rs\\000src/module_b/file_%s.rs\\000\\000' \"$((1700000000 + i))\" $i $i\n\
+               i=$((i + 1))\n\
+             done\n",
+        )
+        .expect("write fake git");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut limits = kgraf_core::child_run::Limits::new(std::time::Duration::from_secs(120));
+        limits.max_output = 100_000;
+        let commits =
+            read_history_with(&fake, dir.path(), 1_000_000, limits).expect("a streamed read");
+        assert_eq!(commits.len(), 40_000);
+        assert_eq!(commits[0].timestamp, 1_700_000_000);
+        assert_eq!(commits[39_999].paths[1], "src/module_b/file_39999.rs");
+        // The same output, held whole under that limit, is the named error.
+        let mut held = kgraf_core::child_run::Limits::new(std::time::Duration::from_secs(120));
+        held.max_output = 100_000;
+        let cmd = {
+            let mut c = std::process::Command::new(&fake);
+            c.arg("log");
+            c
+        };
+        let err = kgraf_core::child_run::run(cmd, "fake git log", None, held)
+            .expect_err("held whole, past the limit");
+        assert!(
+            matches!(err, kgraf_core::child_run::RunError::OutputTooLarge { .. }),
+            "{err}"
+        );
+    }
+
+    /// A parse error found mid-stream is the call's error, not a partial
+    /// relation, and the rest of the output does not turn it into success.
+    #[cfg(unix)]
+    #[test]
+    fn a_bad_record_in_a_streamed_history_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             case \"$*\" in *version*) echo 'git version 2.43.0'; exit 0;; esac\n\
+             for a in \"$@\"; do [ \"$a\" = config ] && exit 0; done\n\
+             printf '\\001notatime\\na.rs\\000\\000\\0011700000000\\nb.rs\\000'\n",
+        )
+        .expect("write fake git");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let limits = kgraf_core::child_run::Limits::new(std::time::Duration::from_secs(60));
+        let err = read_history_with(&fake, dir.path(), 10, limits).expect_err("bad time");
+        assert!(
+            matches!(&err, GraphError::History { reason } if reason.contains("notatime")),
+            "{err:?}"
+        );
     }
 
     #[test]

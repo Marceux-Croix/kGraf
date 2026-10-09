@@ -244,10 +244,13 @@ pub struct ShellTool {
     /// first result of this tool, and the description says it always.
     network_notice_said: std::sync::atomic::AtomicBool,
     /// The worker slot of this tool's folder (decision 0097), taken at its
-    /// first command and held for the tool's life. Where commands run as a
-    /// Windows sandbox user, it keeps the worker's user from going to
-    /// another folder between its commands.
-    worker_slot: std::sync::Mutex<Option<kgraf_sandbox::WorkerSlot>>,
+    /// first command and held while the tool works in that folder. Where
+    /// commands run as a Windows sandbox user, it keeps the worker's user
+    /// from going to another folder between its commands. Keyed by the
+    /// folder: a tool used for another folder lets the old slot go first,
+    /// so a tool that outlives one attempt does not keep a slot of the
+    /// pool, nor hand a command the slot of a folder it does not write.
+    worker_slot: kgraf_sandbox::WorkerSlotHolder,
 }
 
 impl ShellTool {
@@ -273,7 +276,7 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
-            worker_slot: std::sync::Mutex::new(None),
+            worker_slot: kgraf_sandbox::WorkerSlotHolder::new(),
         };
         (tool, ShellApprovalHook::new(policy))
     }
@@ -300,7 +303,7 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
-            worker_slot: std::sync::Mutex::new(None),
+            worker_slot: kgraf_sandbox::WorkerSlotHolder::new(),
         }
     }
 
@@ -318,20 +321,18 @@ impl ShellTool {
         self
     }
 
-    /// This tool's worker slot for `root`, taken at the first call and kept.
-    /// `None` where commands do not run as a Windows sandbox user. An error,
-    /// tried again at the next call, when every slot user is held by another
-    /// folder: two folders never run as one user.
+    /// This tool's worker slot for `root`, taken at the first call for that
+    /// folder and kept while the tool works there. `None` where commands do
+    /// not run as a Windows sandbox user. An error, tried again at the next
+    /// call, when every slot user is held by another folder: two folders
+    /// never run as one user.
     fn worker_slot(
         &self,
         root: &std::path::Path,
     ) -> Result<Option<kgraf_sandbox::WorkerSlot>, ToolError> {
-        let mut held = self.worker_slot.lock().unwrap_or_else(|e| e.into_inner());
-        if held.is_none() {
-            *held = kgraf_sandbox::worker_slot(root)
-                .map_err(|e| internal(format!("cannot take a sandbox worker slot: {e}")))?;
-        }
-        Ok(held.clone())
+        self.worker_slot
+            .slot_for(root)
+            .map_err(|e| internal(format!("cannot take a sandbox worker slot: {e}")))
     }
 
     /// Run every command under `SandboxPolicy::for_workspace(workspace)`, and

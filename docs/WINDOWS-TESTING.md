@@ -136,9 +136,9 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | Step | Command | What it checks |
 |---|---|---|
 | (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
-| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the DNS filter, with no tag. The output lists a received password for every one of these users. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the DNS filter line included. Every stored password logs on. |
-| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`. Any other failure stops the phase: step (e) does not run. |
+| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the three DNS filters, with no tag. The output lists a received password for every one of these users. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines included. Every stored password logs on. |
+| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. Any other failure stops the phase: step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
 
@@ -221,12 +221,18 @@ What the phase collects about the DNS filter, and what to read in the report:
 
 - The `dns:` line of selfcheck before setup (b0) and after it (d). Before: `dns: not
   confined (token sandbox; ...)`. After: `dns: confined (...)`. Any other line after setup
-  means the filter is not proved on that machine; the summary then says `DNS FAILED`.
-- The DNS filter line of status (c) and of status after removal (f): `present`, then
-  `MISSING`.
+  means the filters are not proved on that machine; the summary then says `DNS FAILED`.
+  A `dns: not proved` line names the status the probe got: a timeout, a status the check
+  does not know, or output cut off before the probe's `KGRAF-DNS-END` line. Send that
+  status back; it decides whether the next change is a longer wait or another layer.
+- The three DNS filter lines of status (c) and of status after removal (f): `present`,
+  then `MISSING`. There is one line per filter, each naming its layer (the user-mode RPC
+  layer, and the name resolution cache layer for IPv4 and for IPv6) and its own key.
 - The test binary `dns_windows`, in the baseline (each test returns at once, because no
-  sandbox user is set up) and in the re-run (e). In the re-run it checks the filter's
-  `netsh wfp show filters` entry (name, layer `FWPM_LAYER_RPC_UM`, block), and the cache
+  sandbox user is set up) and in the re-run (e). In the re-run it checks each filter's
+  `netsh wfp show filters` entry (name, layer `FWPM_LAYER_RPC_UM`,
+  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` or `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`, block),
+  and the cache
   check: after `Clear-DnsClientCache`, a lookup by the offline user fails and
   `Get-DnsClientCache` does not list its name, while the online user and the owner still
   resolve. A failure message carries the netsh entry or the lookup status.
@@ -339,8 +345,33 @@ process environment.
    decision, and which token property makes Schannel refuse a TLS credential):
 
    ```powershell
-   cargo test -p kgraf-sandbox --lib 2>&1 | Tee-Object "$r\1-sandbox-lib.txt"
+   cargo test -p kgraf-sandbox --lib -- --nocapture 2>&1 | Tee-Object "$r\1-sandbox-lib.txt"
    ```
+
+   `--nocapture` is needed for the `MEASURE` lines. Search this file for `MEASURE` and
+   send every line. Four questions ride on them, all about the access entries kGraf
+   writes on a tree it grants a sandbox user:
+
+   - `MEASURE maximum-allowed-suppresses-propagation: suppressed true|false`. kGraf
+     writes a folder's own list through a handle opened with `MAXIMUM_ALLOWED`, which
+     Microsoft documents as not propagating entries to children, and then writes each
+     existing child itself. A `false` here means Windows propagated anyway on this build,
+     so kGraf's entries reach children twice (harmless) but a hard-linked file gets the
+     entry after all (not harmless: the gap this closes).
+   - `MEASURE grant-propagation-follows-junction: target folder ... file in it ...`. A
+     `true` means Windows' own propagation enters a junction, which is what the link walk
+     in front of every write exists to stop.
+   - `MEASURE first-grant-pass: ... folders, ... files, ... children written, ... ms`. The
+     cost of kGraf's own pass. The kernel's propagation opens each child too, so the pass
+     replaces that cost rather than adding one; this line says what it is on real
+     hardware. A worktree with a built `target` folder holds far more files than this
+     test's tree, so scale the number.
+   - The tests `a_hard_linked_file_in_the_tree_never_gets_the_grant` and
+     `the_removal_takes_the_entry_off_every_existing_child` run only here. The first says
+     whether a hard-linked file keeps its own list, so a command cannot write it; the
+     second whether a removal takes kGraf's entry off every child. Send both results, and
+     any note that names a file a grant left alone: a build that writes such a file in
+     place fails with an access error.
 
 2. `sh` and `bash` through Git Bash inside the sandbox:
 
@@ -721,7 +752,7 @@ sandbox selfcheck: passed with a gap
 ```
 
 Expected after `setup` (sandbox user). The direct connection to the local origin is blocked,
-the DNS filter refuses the sandbox user's lookup, and the exit code is 0:
+the DNS filters refuse the sandbox user's lookup, and the exit code is 0:
 
 ```
 sandbox selfcheck: ok
@@ -749,13 +780,112 @@ worker slot (ten with the default four slots: `kgraf-off-`, `kgraf-on-`, `kgraf-
 `kgraf-off-` and every `kgraf-sNN-` user, and no `kgraf-oNN-` user. Send back the output of
 every command.
 
+### The closed folders: the access lists before setup, after setup and after remove
+
+The setup writes one deny entry for the sandbox group on each folder every local user may
+write: the root of each fixed drive whose file system keeps access lists, `C:\ProgramData`,
+`C:\Users\Public` and the folders directly in it, and `Temp`, `Tasks` and `tracing` under
+the Windows folder. Those entries are on the real machine, so this run has to settle what
+they change and what they leave alone.
+
+Run this **three times**: before `kgraf sandbox setup`, after it, and after
+`kgraf sandbox remove`. Save each run to its own file and send all three back.
+
+```powershell
+# Save as closed-acl.ps1 and run it as: .\closed-acl.ps1 before   (then: after, removed)
+param([Parameter(Mandatory=$true)][string]$When)
+$folders = @()
+# The root of every fixed drive that keeps access lists.
+Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
+  ForEach-Object { $folders += "$($_.DriveLetter):\" }
+$folders += $env:ProgramData
+$folders += $env:PUBLIC
+Get-ChildItem -LiteralPath $env:PUBLIC -Directory -Force |
+  ForEach-Object { $folders += $_.FullName }
+foreach ($child in 'Temp','Tasks','tracing') { $folders += (Join-Path $env:SystemRoot $child) }
+
+$out = "closed-acl-$When.txt"
+"=== $When ===" | Out-File $out
+foreach ($f in $folders) {
+  "---- $f" | Out-File $out -Append
+  if (-not (Test-Path -LiteralPath $f)) { "  (does not exist)" | Out-File $out -Append; continue }
+  # 1. Every entry, in order, as icacls writes them.
+  (icacls $f 2>&1) | Out-File $out -Append
+  # 2. Whether the list is protected, and who owns it. The protected state is
+  #    the one the setup must leave exactly as it found it.
+  try {
+    $acl = Get-Acl -LiteralPath $f -ErrorAction Stop
+    "  AreAccessRulesProtected = $($acl.AreAccessRulesProtected)" | Out-File $out -Append
+    "  Owner = $($acl.Owner)" | Out-File $out -Append
+  } catch { "  Get-Acl failed: $_" | Out-File $out -Append }
+}
+
+# 3. Did any child of ProgramData or Public gain an entry? A write that
+#    propagated would have rewritten every child's list. Counted, and the
+#    first twenty listed with their entry counts, for comparison between the
+#    three runs.
+"---- children of ProgramData and Public" | Out-File $out -Append
+foreach ($parent in $env:ProgramData, $env:PUBLIC) {
+  Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue |
+    Select-Object -First 20 | ForEach-Object {
+      try {
+        $a = Get-Acl -LiteralPath $_.FullName -ErrorAction Stop
+        "  $($_.FullName): rules=$($a.Access.Count) protected=$($a.AreAccessRulesProtected)" |
+          Out-File $out -Append
+      } catch { "  $($_.FullName): Get-Acl failed" | Out-File $out -Append }
+    }
+}
+
+# 4. May Administrators rewrite the lists of the two Windows folders that are
+#    not theirs? `Tasks` and `tracing` are the ones a setup can fail on, and
+#    WRITE_DAC (`ChangePermissions`) is the right it needs.
+"---- WRITE_DAC for Administrators" | Out-File $out -Append
+foreach ($child in 'Tasks','tracing') {
+  $f = Join-Path $env:SystemRoot $child
+  if (-not (Test-Path -LiteralPath $f)) { "  $f (does not exist)" | Out-File $out -Append; continue }
+  try {
+    $a = Get-Acl -LiteralPath $f -ErrorAction Stop
+    "  $f owner=$($a.Owner)" | Out-File $out -Append
+    $a.Access | Where-Object { $_.IdentityReference -match 'Administrators' } |
+      ForEach-Object {
+        "    $($_.IdentityReference) $($_.AccessControlType) $($_.FileSystemRights)" |
+          Out-File $out -Append
+      }
+  } catch { "  $f Get-Acl failed: $_" | Out-File $out -Append }
+}
+"wrote $out"
+```
+
+How to read the three files:
+
+- **After setup**, each folder that exists must have gained exactly one deny entry, for a
+  SID starting with `S-1-5-21-`, and it must carry no `(I)` inheritance mark. Nothing else
+  on the folder may have changed: the entry order, every other entry, the owner, and
+  `AreAccessRulesProtected` must read the same as before, folder by folder.
+- **No child of ProgramData or Public** may have changed its rule count or its protected
+  state between the runs. A change there means the write propagated, which is what the
+  `MAXIMUM_ALLOWED` handle is there to prevent.
+- **After remove**, every folder must read exactly as it did before setup, byte for byte in
+  the `icacls` output.
+- **A folder setup could not close** is named in the failure, with the principal that owns
+  it. The `WRITE_DAC for Administrators` block says whether that was to be expected:
+  Administrators need `ChangePermissions` on `Tasks` and `tracing`, and on some installs
+  they do not have it. Send that block back whether the setup succeeded or not, because it
+  settles whether those two folders can be closed on a real machine at all.
+- `kgraf sandbox status` names every folder that is closed, so its output before, after and
+  after remove is part of the same evidence.
+
 ### The DNS filter
 
-`kgraf sandbox setup` adds a Windows Filtering Platform (WFP) filter that makes the DNS
-Client service refuse name lookups from the users the firewall rules block: `kgraf-off-` and
-every slot user without the network (`kgraf-sNN-`). It never names `kgraf-on-`, a
-`kgraf-oNN-` user or the owner. No Windows run has proved it yet. These checks need an administrator PowerShell and a working
-network. Run them after `setup`:
+`kgraf sandbox setup` adds three Windows Filtering Platform (WFP) filters that are meant
+to make the DNS Client service refuse name lookups from the users the firewall rules block:
+`kgraf-off-` and every slot user without the network (`kgraf-sNN-`). They never name
+`kgraf-on-`, a `kgraf-oNN-` user or the owner. Two sit on the name resolution cache layers
+(IPv4 and IPv6), which see the local caller; the third sits on the user-mode RPC layer,
+which sees a remote caller only. No Windows run has proved any of them yet, and it is not
+known whether a block at the name resolution cache layers makes a lookup fail or only
+keeps the service from its cache: that is what this run settles. These checks need an
+administrator PowerShell and a working network. Run them after `setup`:
 
 ```powershell
 # 1. The filter, its sublayer and its provider: every item whose name starts with "kGraf sandbox".
@@ -776,21 +906,35 @@ cargo test -p kgraf-sandbox --test dns_windows -- --test-threads=1 --nocapture 2
 
 What to expect:
 
-1. `wfp-kgraf.txt` shows one filter on the layer `FWPM_LAYER_RPC_UM` with two conditions:
-   the RPC interface `45776b01-5956-4485-9f80-f428f7d60129` and the caller's token. The
-   action is block. It also shows the sublayer and the provider.
-2. The status line starts with `present  DNS filter`.
+1. `wfp-kgraf.txt` shows three filters, each with the action block. One is on the layer
+   `FWPM_LAYER_RPC_UM`, with two conditions: the RPC interface
+   `45776b01-5956-4485-9f80-f428f7d60129` and the caller's token. One is on
+   `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` and one on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`,
+   each with the single condition `FWPM_CONDITION_ALE_USER_ID`. It also shows the sublayer
+   and the provider; the sublayer's weight is 65535, so no other sublayer is decided before
+   it. Send back each entry whole: the condition the engine recorded, and
+   whether any filter carries `FWPM_FILTER_FLAG_DISABLED`, decide what the next change is.
+2. Three status lines start with `present  DNS filter on`, one per layer. A line that says
+   `WRONG` with "the Base Filtering Engine has it disabled" means the filter exists and
+   does not run.
 3. `dns-cache.txt` lists one `kgraf-probe-...` name: the one your own process looked up.
    A second name means the DNS Client service looked the sandbox user's name up: the
    filter does not work. No name at all means the cache does not keep "does not exist"
    answers on this machine, and the check proves nothing there.
 4. The three tests of `dns_windows` pass. One prints the status the offline user's
    lookups got (`offline user: DnsQuery status ..., getaddrinfo ...`). That status is how
-   the filter's refusal looks to a program; send it back. Another prints the filter's
+   the filters' refusal looks to a program; send it back. Another prints each filter's
    entry from `netsh wfp show filters` and checks its name, layer and action.
+5. **Restart the machine, then run steps 1 to 4 again, and send both sets back.** The
+   documentation contradicts itself on whether a provider that names no service has its
+   filters disabled at every start. One reboot settles which sentence is true. The case to
+   look for is a filter that carries `FWPM_FILTER_FLAG_DISABLED` after the restart, or a
+   `dns:` line that passed before it and does not pass after it. A status line that says
+   `WRONG ... disabled`, or the `dns_windows` test that fails on the disabled flag, is
+   that case.
 
 After `kgraf sandbox remove`, step 1 shows no item named `kGraf sandbox`, and the status
-line of the filter is `MISSING`.
+lines of the filters are `MISSING`.
 
 After `setup` (run it again if you removed the users), check that commands now run as
 the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must sit beside
@@ -808,7 +952,7 @@ the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must s
    network allowed): `C:\Windows\System32\curl.exe -sS -o NUL -w "%{http_code}" https://example.com`
    prints `200`. This uses Windows' own TLS (Schannel), which failed under the token sandbox.
 5. Network with the offline user (an ordinary shell command): the same `curl.exe` line
-   fails to connect. A lookup of a name must fail too (the DNS filter); the checks under
+   fails to connect. A lookup of a name must fail too (the DNS filters); the checks under
    "The DNS filter" above prove whether it left the machine.
 6. In a project's worktree, a sandboxed command can write a file inside the worktree and
    cannot write in a sibling folder, in a top-level `.git` entry, or in a hidden folder.

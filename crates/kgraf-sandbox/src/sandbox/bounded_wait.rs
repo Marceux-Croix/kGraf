@@ -16,6 +16,12 @@
 //!    outside the tree; what the command wrote is already read, so the output
 //!    is returned and the case recorded (`kgraf_core::waits::note_pipes_held`).
 //!
+//! Output is kept as a head and a tail per stream
+//! ([`kgraf_core::child_run::HeadTail::standard`]), with a marker line that
+//! names the bytes dropped from the middle, so a chatty command costs a
+//! bounded amount of memory and is not ended for it. The callers show the
+//! output; none parses it whole.
+//!
 //! The logic sits behind [`Exits`] so it is tested on every host; only the
 //! Windows backend uses it.
 
@@ -98,22 +104,32 @@ pub(crate) fn wait_exit<C: Exits>(
 }
 
 enum Event {
-    Chunk(usize, Vec<u8>),
     End(usize),
     Failed(usize, io::Error),
 }
 
-fn read_on_thread(mut pipe: Box<dyn Read + Send>, stream: usize, tx: mpsc::Sender<Event>) {
+/// What one reader has kept so far. Shared with the caller so that output
+/// already read is returned when the pipe is held open and the reader never
+/// ends. The reader keeps it, not the caller's loop: the caller is blocked
+/// in [`wait_exit`] while the command runs, and chunks queued for it would
+/// be held whole.
+type Kept = std::sync::Arc<std::sync::Mutex<kgraf_core::child_run::HeadTail>>;
+
+fn read_on_thread(
+    mut pipe: Box<dyn Read + Send>,
+    stream: usize,
+    kept: Kept,
+    tx: mpsc::Sender<Event>,
+) {
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match pipe.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Event::Chunk(stream, buf[..n].to_vec())).is_err() {
-                        return;
-                    }
-                }
+                Ok(n) => kept
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(&buf[..n]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     let _ = tx.send(Event::Failed(stream, e));
@@ -138,9 +154,14 @@ pub(crate) fn collect<C: Exits>(
 ) -> io::Result<Collected<C::Status>> {
     let (tx, rx) = mpsc::channel();
     let mut ended = [false, false];
+    let kept: [Kept; 2] = std::array::from_fn(|_| {
+        Kept::new(std::sync::Mutex::new(
+            kgraf_core::child_run::HeadTail::standard(),
+        ))
+    });
     for (i, pipe) in [stdout, stderr].into_iter().enumerate() {
         match pipe {
-            Some(pipe) => read_on_thread(pipe, i, tx.clone()),
+            Some(pipe) => read_on_thread(pipe, i, kept[i].clone(), tx.clone()),
             None => ended[i] = true,
         }
     }
@@ -157,13 +178,11 @@ pub(crate) fn collect<C: Exits>(
             ),
         ));
     }
-    let mut out = [Vec::new(), Vec::new()];
-    let grace_end = Instant::now() + bounds.drain;
+    let grace_end = kgraf_core::waits::deadline_after(bounds.drain);
     let mut pipes_held = false;
     while !(ended[0] && ended[1]) {
         let left = grace_end.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok(Event::Chunk(i, bytes)) => out[i].extend_from_slice(&bytes),
             Ok(Event::End(i)) => ended[i] = true,
             Ok(Event::Failed(i, e)) => {
                 let stream = if i == 0 { "output" } else { "error output" };
@@ -181,7 +200,14 @@ pub(crate) fn collect<C: Exits>(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    let [stdout, stderr] = out;
+    // A reader that is still running (a held pipe) pushes into an empty,
+    // zero-size keeper from here on.
+    let [stdout, stderr] = kept.map(|kept| {
+        let mut held = kept.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::replace(&mut *held, kgraf_core::child_run::HeadTail::new(0, 0))
+            .finish()
+            .0
+    });
     Ok(Collected {
         status,
         stdout,
@@ -271,6 +297,24 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_grace_too_large_to_add_to_now_does_not_panic() {
+        let mut child = Fake::new(Some(Duration::from_millis(10)));
+        let bounds = Bounds {
+            drain: Duration::MAX,
+            ..quick()
+        };
+        let got = collect(
+            &mut child,
+            Some(Box::new(io::Cursor::new(b"x".to_vec()))),
+            None,
+            "probe",
+            bounds,
+        )
+        .unwrap();
+        assert_eq!(got.stdout, b"x");
+    }
+
+    #[test]
     fn a_command_still_running_at_the_bound_is_a_named_timeout_and_its_tree_is_ended() {
         let mut child = Fake::new(None);
         let ended = child.ended.clone();
@@ -321,6 +365,42 @@ mod tests {
         assert_eq!(got.stdout, b"out");
         assert_eq!(got.stderr, b"err");
         assert!(!got.pipes_held);
+    }
+
+    /// A command that writes far more than the head and tail kept, while it
+    /// is still running: the caller gets the ends with a marker, and the
+    /// bytes between are not held anywhere.
+    #[test]
+    fn chatty_output_keeps_a_head_and_a_tail_with_a_marker() {
+        struct Endless(usize);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = buf.len().min(self.0);
+                buf[..n].fill(b'x');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        // 20 MiB, past 1 MiB of head and 8 MiB of tail.
+        let total = 20 * 1024 * 1024;
+        let mut child = Fake::new(Some(Duration::from_millis(300)));
+        let got = within(Duration::from_secs(60), move || {
+            collect(
+                &mut child,
+                Some(Box::new(Endless(total))),
+                Some(Box::new(io::Cursor::new(b"err".to_vec()))),
+                "probe",
+                quick(),
+            )
+        })
+        .unwrap();
+        assert_eq!(got.status, 7);
+        let kept = kgraf_core::child_run::KEEP_HEAD + kgraf_core::child_run::KEEP_TAIL;
+        let marker = kgraf_core::child_run::omitted_marker((total - kept) as u64);
+        assert_eq!(got.stdout.len(), kept + marker.len() + 2);
+        let text = String::from_utf8_lossy(&got.stdout);
+        assert!(text.contains(&format!("\n{marker}\n")), "no marker");
+        assert_eq!(got.stderr, b"err");
     }
 
     #[test]

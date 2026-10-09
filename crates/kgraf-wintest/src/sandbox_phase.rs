@@ -56,11 +56,14 @@ fn gate_passed(step: &StepRun) -> bool {
 /// sandbox user, proved the network, the hidden folder and the tree, and its
 /// only failed line is `dns:`. `None` for any other output.
 ///
-/// The DNS filter is the newest part of the sandbox user and the one most
-/// likely not to work on a given Windows (decision 0097). A DNS failure is
-/// reported in the summary, but the re-run (e) still runs, so one unproved
-/// filter does not throw away the evidence about Git Bash, the cargo
-/// jobserver and Schannel that the phase exists to collect.
+/// The DNS filters are the newest part of the sandbox user and the ones most
+/// likely not to work on a given Windows (decision 0097): it is not known
+/// whether a block at the name resolution cache layers makes a lookup fail at
+/// all. A DNS failure is reported in the summary, but the re-run (e) still
+/// runs, so one unproved filter does not throw away the evidence about Git
+/// Bash, the cargo jobserver and Schannel that the phase exists to collect.
+/// A `dns: not proved` line counts as a DNS failure here, like
+/// `dns: not confined`: neither is a pass.
 fn dns_only_failure(step: &StepRun) -> Option<String> {
     let lines: Vec<&str> = step.output.lines().map(str::trim_end).collect();
     let has = |want: &str| lines.contains(&want);

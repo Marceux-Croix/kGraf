@@ -165,10 +165,23 @@ fn an_offline_lookup_does_not_reach_the_dns_client_service() {
     }
     let keys = WfpKeys::derive(&owner_names());
     match wfp::existing(&keys) {
-        Ok(found) => assert!(
-            found.contains(&keys.filter),
-            "the DNS filter is missing; run `kgraf sandbox setup` again"
-        ),
+        Ok(state) => {
+            for (object, key) in keys.filters() {
+                assert!(
+                    state.present.contains(&key),
+                    "the DNS filter on {} is missing; run `kgraf sandbox setup` again",
+                    object.layer_words()
+                );
+                // Present is not effective: a filter the Base Filtering
+                // Engine has disabled is read like any other.
+                assert!(
+                    !state.disabled.contains(&key),
+                    "the DNS filter on {} carries FWPM_FILTER_FLAG_DISABLED, so it does not \
+                     run; this is the case the reboot step of the test plan looks for",
+                    object.layer_words()
+                );
+            }
+        }
         Err(why) => eprintln!("note: the WFP filters were not read: {why}"),
     }
     if !clear_cache() {
@@ -203,12 +216,24 @@ fn an_offline_lookup_does_not_reach_the_dns_client_service() {
     }
 }
 
-/// `netsh wfp show filters` lists kGraf's DNS filter on the user-mode RPC
-/// layer, by its name and key. This is the view an administrator has of the
-/// filter, independent of kGraf's own reading of it. Needs administrator
-/// rights; without them the test says so and returns.
+/// The WFP layer each filter must sit on, as `netsh wfp show filters` names
+/// it.
+fn netsh_layer_of(object: kgraf_sandbox::sandbox_user::WfpObject) -> &'static str {
+    use kgraf_sandbox::sandbox_user::WfpObject;
+    match object {
+        WfpObject::RpcFilter => "FWPM_LAYER_RPC_UM",
+        WfpObject::NameCacheFilterV4 => "FWPM_LAYER_NAME_RESOLUTION_CACHE_V4",
+        WfpObject::NameCacheFilterV6 => "FWPM_LAYER_NAME_RESOLUTION_CACHE_V6",
+        other => panic!("{other} sits on no layer"),
+    }
+}
+
+/// `netsh wfp show filters` lists each of kGraf's DNS filters, by its name,
+/// key and layer. This is the view an administrator has of the filters,
+/// independent of kGraf's own reading of them. Needs administrator rights;
+/// without them the test says so and returns.
 #[test]
-fn netsh_lists_the_dns_filter_on_the_rpc_layer() {
+fn netsh_lists_every_dns_filter_on_its_layer() {
     use kgraf_sandbox::sandbox_user::wfp::guid_text;
     if !sandbox_user_mode() {
         eprintln!("skipped: the sandbox user is not set up on this machine");
@@ -228,24 +253,32 @@ fn netsh_lists_the_dns_filter_on_the_rpc_layer() {
         );
         return;
     };
-    let key = guid_text(WfpKeys::derive(&owner_names()).filter);
     let lower = xml.to_ascii_lowercase();
-    let at = lower
-        .find(&key)
-        .unwrap_or_else(|| panic!("netsh does not list the DNS filter {key}"));
-    // The filter's own entry: from its key to the next filter's key. Its
-    // conditions are nested items, so the end of the first item is not the
-    // end of the entry.
-    let end = lower[at..]
-        .find("<filterkey>")
-        .map_or(xml.len(), |e| at + e);
-    let entry = &xml[at..end];
-    eprintln!("netsh entry of the DNS filter:\n{entry}");
-    for want in ["kGraf sandbox", "FWPM_LAYER_RPC_UM", "FWP_ACTION_BLOCK"] {
-        assert!(
-            entry.contains(want),
-            "the DNS filter's netsh entry lacks {want}:\n{entry}"
+    for (object, raw) in WfpKeys::derive(&owner_names()).filters() {
+        let key = guid_text(raw);
+        let at = lower.find(&key).unwrap_or_else(|| {
+            panic!(
+                "netsh does not list the DNS filter {key} on {}",
+                object.layer_words()
+            )
+        });
+        // The filter's own entry: from its key to the next filter's key. Its
+        // conditions are nested items, so the end of the first item is not
+        // the end of the entry.
+        let end = lower[at..]
+            .find("<filterkey>")
+            .map_or(xml.len(), |e| at + e);
+        let entry = &xml[at..end];
+        eprintln!(
+            "netsh entry of the DNS filter on {}:\n{entry}",
+            object.layer_words()
         );
+        for want in ["kGraf sandbox", netsh_layer_of(object), "FWP_ACTION_BLOCK"] {
+            assert!(
+                entry.contains(want),
+                "the DNS filter's netsh entry lacks {want}:\n{entry}"
+            );
+        }
     }
 }
 

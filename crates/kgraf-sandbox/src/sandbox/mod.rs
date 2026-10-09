@@ -105,6 +105,12 @@ pub struct SandboxPolicy {
     /// Installed dependency trees in the checkout, readable and runnable,
     /// never writable ([`Self::with_dependency_links`]).
     dependency_reads: Vec<PathBuf>,
+    /// The checkout those trees were installed in
+    /// ([`Self::with_dependency_links`]). A link inside one of the trees
+    /// leads into the rest of the checkout in a workspace monorepo
+    /// (`node_modules/@scope/pkg` is a link to `packages/pkg`), which the
+    /// Windows backend must allow where it writes the tree's access entry.
+    dependency_checkout: Option<PathBuf>,
     /// The virtual environments linked into the tree; the one owning the
     /// command's folder is activated ([`Self::with_dependency_links`]).
     virtual_envs: Vec<crate::dependencies::VirtualEnv>,
@@ -165,6 +171,68 @@ pub fn worker_slot(root: &Path) -> Result<Option<WorkerSlot>, SandboxError> {
     }
 }
 
+/// The worker slot a tool holds for the folder it works in: taken at its
+/// first command and kept while it works there.
+///
+/// Keyed by the folder, so a tool used for another folder lets its old slot
+/// go first. Without that, a tool that outlives one attempt kept the slot of
+/// the first folder it ran in for as long as it lived: that slot never went
+/// back to the pool, and every command of the tool in another folder was
+/// refused, because the slot it was handed is held for a folder that command
+/// does not write.
+#[derive(Debug, Default)]
+pub struct WorkerSlotHolder {
+    held: std::sync::Mutex<Option<(PathBuf, WorkerSlot)>>,
+}
+
+impl WorkerSlotHolder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The slot for the folder `root`: the one this holder already has for
+    /// that folder, else a new one ([`worker_slot`]). `None` where commands
+    /// do not run as a Windows sandbox user.
+    pub fn slot_for(&self, root: &Path) -> Result<Option<WorkerSlot>, SandboxError> {
+        self.slot_with(root, &worker_slot)
+    }
+
+    /// [`Self::slot_for`] with the function that takes a new slot, so the
+    /// rule above is tested on every host, where [`worker_slot`] itself has
+    /// no slot to give.
+    fn slot_with(
+        &self,
+        root: &Path,
+        take: &dyn Fn(&Path) -> Result<Option<WorkerSlot>, SandboxError>,
+    ) -> Result<Option<WorkerSlot>, SandboxError> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held
+            .as_ref()
+            .is_some_and(|(folder, _)| !same_folder(folder, root))
+        {
+            // Dropped before another is taken, so the pool never loses a
+            // slot to a folder this tool has left.
+            *held = None;
+        }
+        if held.is_none()
+            && let Some(slot) = take(root)?
+        {
+            *held = Some((root.to_path_buf(), slot));
+        }
+        Ok(held.as_ref().map(|(_, slot)| slot.clone()))
+    }
+}
+
+/// Whether two folder paths, as a tool is given them, name one folder.
+/// Windows compares paths without regard to case.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+    } else {
+        a == b
+    }
+}
+
 /// A writable git directory whose configuration files stay read-only
 /// (decision 0094). See [`SandboxPolicy::with_frozen_git_config`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +284,7 @@ impl SandboxPolicy {
             user_cargo_home: None,
             frozen_git: Vec::new(),
             dependency_reads: Vec::new(),
+            dependency_checkout: None,
             virtual_envs: Vec::new(),
             command_dir: None,
             hidden: Vec::new(),
@@ -330,6 +399,9 @@ impl SandboxPolicy {
             if !self.dependency_reads.contains(read) {
                 self.dependency_reads.push(read.clone());
             }
+        }
+        if let Some(checkout) = &links.checkout {
+            self.dependency_checkout = Some(checkout.clone());
         }
         for venv in &links.virtual_envs {
             if !self.virtual_envs.contains(venv) {
@@ -603,6 +675,13 @@ impl SandboxPolicy {
             readable,
             read_denied,
             dependency_reads,
+            // Canonical already (`link_dependency_trees` resolves it), and
+            // resolved again here, as every other policy path is.
+            dependency_checkout: self
+                .dependency_checkout
+                .as_deref()
+                .map(resolve)
+                .transpose()?,
             // Sockets may not exist yet; resolve the parent directory.
             unix_sockets: self
                 .unix_sockets
@@ -692,6 +771,10 @@ struct Resolved {
     /// folder or file in the checkout. Granted on macOS and Linux.
     #[cfg_attr(windows, allow(dead_code))]
     dependency_reads: Vec<PathBuf>,
+    /// See [`SandboxPolicy::dependency_checkout`]: canonical. Used by the
+    /// Windows backend only.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    dependency_checkout: Option<PathBuf>,
     /// See [`SandboxPolicy::hide`]: canonical, each beneath a writable root.
     hidden: Vec<Hidden>,
     /// See [`SandboxPolicy::with_worker_slot`] (Windows sandbox user).
@@ -1391,9 +1474,19 @@ pub(crate) use windows::{AttributeList, InheritWindow};
 
 /// Set the write ACL and Low label of the writable root `root` before a
 /// dependency junction is made in it (`crate::dependencies`).
+/// `dependency_trees` are the checkout's trees about to be linked into
+/// `root`: a link there that leads into one of them does not refuse the
+/// grant, so a folder whose links are already in place is still granted.
+///
+/// The notes are the files the grant left alone, each with the reason: a
+/// file with another hard link outside the tree, or one that could not be
+/// opened. A command cannot write such a file.
 #[cfg(windows)]
-pub(crate) fn prepare_windows_root(root: &Path) -> Result<(), SandboxError> {
-    windows::prepare_root(root)
+pub(crate) fn prepare_windows_root(
+    root: &Path,
+    dependency_trees: &[PathBuf],
+) -> Result<Vec<String>, SandboxError> {
+    windows::prepare_root(root, dependency_trees)
 }
 
 /// A confined command, not yet spawned. Add arguments, environment and stdio,
@@ -1680,14 +1773,18 @@ pub fn sandboxed_command(
             });
         }
         #[cfg(windows)]
-        let prepared = {
+        let (prepared, prepare_notes) = {
             if !policy.accept_partial && windows::is_partial()? {
                 return Err(SandboxError::PartialIsolation {
                     backend: windows::BACKEND_NAME,
                     gaps: windows::STRENGTH.gaps,
                 });
             }
-            windows::prepare(&resolved)?
+            let mut prepared = windows::prepare(&resolved)?;
+            // Read roots the backend could not grant: the command runs and
+            // the reason goes out with its output ([`Self::refused_reads`]).
+            let notes = std::mem::take(&mut prepared.notes);
+            (prepared, notes)
         };
         #[cfg(target_os = "macos")]
         let (mut cmd, setup) = macos::command(&resolved, program.as_ref())?;
@@ -1701,10 +1798,13 @@ pub fn sandboxed_command(
             }
             linux::command_noting(&resolved, program.as_ref())?
         };
-        // Only Linux grants (and so may refuse) ancestor reads.
+        // Only Linux grants (and so may refuse) ancestor reads; the Windows
+        // sandbox user may refuse a read root whose tree holds a link it is
+        // not granted.
         #[cfg(not(target_os = "linux"))]
-        #[cfg_attr(windows, allow(unused_mut))]
         let mut refused_reads: Vec<String> = Vec::new();
+        #[cfg(windows)]
+        refused_reads.extend(prepare_notes);
         #[cfg(unix)]
         let hold = match &policy.hold {
             Some(file) => {
@@ -1968,6 +2068,46 @@ pub fn workspace_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool whose folder changes lets its old slot go, so more folders
+    /// than there are slots can be worked in one after another. Before
+    /// this, the slot of the first folder was kept for the tool's whole
+    /// life, and every later folder was refused.
+    #[test]
+    fn a_tool_that_moves_to_another_folder_lets_its_slot_go_first() {
+        use crate::sandbox_user::slots::{Leases, Pool};
+        let dir = tempfile::tempdir().expect("tmp");
+        // One slot, and five folders in a row: the pool is only enough if
+        // each folder lets the one before it go.
+        let leases = Leases::new(dir.path().join("slots"), 1);
+        let take = |root: &Path| -> Result<Option<WorkerSlot>, SandboxError> {
+            leases
+                .lease(Pool::Offline, &[root.to_path_buf()], &mut |_, _| Ok(()))
+                .map(|(lease, _)| Some(WorkerSlot(lease)))
+                .map_err(|e| SandboxError::PlatformSetup {
+                    step: "take a worker slot",
+                    source: std::io::Error::other(e.to_string()),
+                })
+        };
+        let holder = WorkerSlotHolder::new();
+        let mut folders = Vec::new();
+        for i in 0..5 {
+            let root = dir.path().join(format!("tree-{i}"));
+            std::fs::create_dir_all(&root).expect("folder");
+            let slot = holder
+                .slot_with(&root, &take)
+                .unwrap_or_else(|e| panic!("folder {i}: {e}"))
+                .expect("a slot");
+            assert!(slot.0.is_for(&root), "the slot of another folder");
+            folders.push(root);
+        }
+        // A second command in the same folder shares the slot it holds.
+        let again = holder
+            .slot_with(&folders[4], &take)
+            .expect("the same folder")
+            .expect("a slot");
+        assert!(again.0.is_for(&folders[4]));
+    }
 
     /// The hint fires on the Schannel refusal in either spelling and on
     /// nothing else; it names the decision.

@@ -168,7 +168,8 @@ fn report_lines(backend: Backend, network: NetworkResult, dns: &DnsResult) -> Ve
 /// The DNS step under the sandbox user: the owner looks up a control name,
 /// the sandbox user looks up a probe name under `policy`, and the owner asks
 /// the DNS Client cache about both and about a third, new name. The verdict
-/// is `kgraf_sandbox::sandbox_user::dns_check::judge`.
+/// is `kgraf_sandbox::sandbox_user::dns_check::judge_settled`, which reads
+/// the cache a second time where the first reading passed.
 #[cfg(windows)]
 fn dns_check(
     proxy: &kgraf_sandbox::egress::EgressProxy,
@@ -177,7 +178,8 @@ fn dns_check(
 ) -> Result<DnsVerdict> {
     use anyhow::Context;
     use kgraf_sandbox::sandbox_user::dns_check::{
-        DnsEvidence, judge, parse_probe, probe_name, probe_script,
+        CACHE_SETTLE, DnsEvidence, PROBE_BOUND, judge_settled, parse_probe, probe_name,
+        probe_script,
     };
     use kgraf_sandbox::sandbox_user::windows::dns::query;
     use kgraf_sandbox::{Redirect, sandboxed_command};
@@ -199,23 +201,54 @@ fn dns_check(
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Redirect::Piped)
         .stderr(Redirect::Piped);
-    let out = run_command(proxy, &mut cmd)?;
+    // Bounded here, not by the generic two-hour WAIT_BOUND: a probe that
+    // hangs must not hold selfcheck for the rest of the day. A timeout, and
+    // a probe that would not start, are `dns: not proved` with the reason,
+    // never an error that throws away the lines the check already proved.
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Ok(DnsVerdict::NotProved(format!(
+                "the lookup in the sandbox would not start: {e}"
+            )));
+        }
+    };
+    let out = match child.wait_with_output_within(PROBE_BOUND) {
+        Ok(out) => out,
+        Err(e) => {
+            return Ok(DnsVerdict::NotProved(format!(
+                "the lookup in the sandbox did not finish within {} seconds: {e}",
+                PROBE_BOUND.as_secs()
+            )));
+        }
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // No result means the output carried no end marker or no status at all:
+    // the probe did not run, or its tail was cut off. Either way it is not
+    // evidence, and `judge` turns this into `dns: not proved`.
     let probe_result = parse_probe(&stdout).ok_or_else(|| {
         format!(
-            "status {:?}; {} {}",
+            "the lookup printed no whole result (no {} line, or no status): status {:?}; {} {}",
+            kgraf_sandbox::sandbox_user::dns_check::END_MARK,
             out.status.code(),
             stdout.trim(),
             String::from_utf8_lossy(&out.stderr).trim()
         )
     });
-    Ok(judge(&DnsEvidence {
-        control: control_status,
-        probe: probe_result,
-        cache_known: query(&control, true),
-        cache_fresh: query(&unseen, true),
-        cache_probe: query(&probe, true),
-    }))
+    // The cache is read after the probe's process has exited, which can be
+    // before a query that left the machine has its answer, so a passing
+    // first reading is taken again after CACHE_SETTLE.
+    Ok(judge_settled(
+        CACHE_SETTLE,
+        || DnsEvidence {
+            control: control_status,
+            probe: probe_result.clone(),
+            cache_known: query(&control, true),
+            cache_fresh: query(&unseen, true),
+            cache_probe: query(&probe, true),
+        },
+        std::thread::sleep,
+    ))
 }
 
 /// A listener for the local origin on a port the command must not reach
@@ -241,8 +274,10 @@ fn bind_origin() -> std::io::Result<std::net::TcpListener> {
     ))
 }
 
-/// Start `cmd` and wait for it. On Linux the proxy takes the listener the
-/// command opened in its namespace; elsewhere the proxy already listens.
+/// Start `cmd` and wait for it, bounded by `WAIT_BOUND`. On Linux the proxy
+/// takes the listener the command opened in its namespace; elsewhere the
+/// proxy already listens. The DNS probe does not use this: it has its own,
+/// much shorter bound ([`PROBE_BOUND`]).
 fn run_command(
     proxy: &kgraf_sandbox::egress::EgressProxy,
     cmd: &mut kgraf_sandbox::SandboxedCommand,
@@ -405,6 +440,8 @@ fn print_event(
             let what = StepId::from_key(key).map_or_else(|| key.clone(), |s| s.describe(names));
             println!("  {outcome:<12} {what}");
         }
+        // Left alone, with why: the run goes on, so this is not an error.
+        Event::Note { key, message } => println!("  kept         {key}: {message}"),
         Event::Failed { key, message } => eprintln!("  failed       {key}: {message}"),
         Event::PasswordReceived(role) => println!("  received     the {role} user's password"),
         Event::Finished => println!("The administrator step finished."),
@@ -477,7 +514,7 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
         let names = owner_names(tag)?.with_slots(MAX_SLOTS);
         let store = credentials_path(tag)?;
         let exe = launch_exe()?;
-        remove(
+        let left = remove(
             &names,
             &Launch {
                 exe: &exe,
@@ -487,6 +524,18 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
             &mut |e| print_event(&names, e),
         )?;
         println!("The Windows sandbox user, its firewall rules and its DNS filter are removed.");
+        if !left.is_empty() {
+            // The users are gone, so these entries name a SID no account
+            // has and grant nothing; they are reported so the owner can
+            // clear them where the folder stays.
+            println!(
+                "{} place(s) kept an access-list entry for a sandbox user:",
+                left.len()
+            );
+            for line in &left {
+                println!("  {line}");
+            }
+        }
         Ok(())
     }
     #[cfg(not(windows))]

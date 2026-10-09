@@ -183,6 +183,12 @@ pub struct DependencyLinks {
     /// The package stores kGraf filled for the checkout when it ran an
     /// install itself, read-only to a command ([`crate::PackageStores`]).
     pub package_stores: crate::PackageStores,
+    /// The checkout the trees were installed in, canonical; `None` before
+    /// [`link_dependency_trees`] has run. A link inside one of the trees
+    /// leads into the rest of the checkout in a workspace monorepo, which
+    /// the sandbox must allow where it writes the tree's access entry
+    /// (`SandboxPolicy::with_dependency_links`).
+    pub checkout: Option<PathBuf>,
 }
 
 /// A virtual environment linked into a tree.
@@ -412,16 +418,17 @@ pub fn find_dependency_trees(checkout: &Path) -> (Vec<DependencyTree>, Vec<Strin
 /// reached without crossing a link.
 pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
     let (trees, notes) = recent_trees(checkout);
+    let checkout_root =
+        kgraf_core::plain_path::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     let mut out = DependencyLinks {
         notes,
         package_stores: crate::PackageStores::find(checkout),
+        checkout: Some(checkout_root.clone()),
         ..DependencyLinks::default()
     };
     if cfg!(not(any(unix, windows))) {
         return out;
     }
-    let checkout_root =
-        kgraf_core::plain_path::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     // Canonical, as the command folder it is compared with.
     let tree_root =
         kgraf_core::plain_path::canonicalize(tree).unwrap_or_else(|_| tree.to_path_buf());
@@ -432,14 +439,25 @@ pub fn link_dependency_trees(tree: &Path, checkout: &Path) -> DependencyLinks {
     // The writable root's ACL is set before any junction is in it, so its
     // inheritable entries are never written while a junction is there.
     #[cfg(windows)]
-    if !trees.is_empty()
-        && let Err(e) = crate::sandbox::prepare_windows_root(&tree_root)
-    {
-        out.notes.push(format!(
-            "the installed dependencies are not linked into the tree: its access control \
-             could not be set first: {e}"
-        ));
-        return out;
+    if !trees.is_empty() {
+        match crate::sandbox::prepare_windows_root(
+            &tree_root,
+            // The trees about to be linked here: a link in the folder that
+            // leads into one of them is kGraf's own and does not refuse the
+            // grant (`sandbox::prepare_windows_root`).
+            &trees.iter().map(|t| t.source.clone()).collect::<Vec<_>>(),
+        ) {
+            // The files the grant left alone, so a later access error on one
+            // of them has its reason beside it.
+            Ok(notes) => out.notes.extend(notes),
+            Err(e) => {
+                out.notes.push(format!(
+                    "the installed dependencies are not linked into the tree: its access \
+                     control could not be set first: {e}"
+                ));
+                return out;
+            }
+        }
     }
     for found in trees {
         if let Some(why) = changed_since_search(&found) {

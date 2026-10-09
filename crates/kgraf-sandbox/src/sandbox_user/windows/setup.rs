@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::super::acl::{CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS};
 use super::super::blob::{StoredUser, decode_credentials, decode_users, encode_credentials};
 use super::super::firewall::{offline_rules, rule_users};
 use super::super::handshake::{Event, Message, Receiver, StepOutcome, new_nonce, pipe_name};
@@ -15,10 +16,11 @@ use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
     Action, CredentialCheck, Credentials, Observed, RemoveAction, StatusReport, StepId,
-    check_passwords, elevated_params, plan_remove, plan_setup, status_report,
+    check_passwords, elevated_params, failure_leaves, plan_remove, plan_setup,
+    stale_closed_entries, status_report,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
-use super::super::slots::read_table;
+use super::super::slots::roots_in_text;
 use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
 use super::super::wfp::{WfpKeys, filter_users, guid_text};
 use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure, wfp};
@@ -38,20 +40,14 @@ fn record_file_name(names: &OwnerNames) -> String {
     format!("record-{}.txt", names.group())
 }
 
-/// Where the undo record lives: under ProgramData (from the shell, not the
-/// environment), written by the elevated step. One file per owner (the group
-/// name is derived from the owner).
-pub fn record_path(names: &OwnerNames) -> Result<PathBuf, SandboxError> {
-    let mut path = secure::program_data()?;
-    RECORD_FOLDERS.iter().for_each(|p| path.push(p));
-    Ok(path.join(record_file_name(names)))
-}
-
 /// The undo record's path for the elevated step, with its folders made or
 /// checked so that no one but an administrator can change them
 /// (`secure::trusted_folder`). Every user may create a folder under
 /// ProgramData, so the step never writes through a folder it did not check.
-fn trusted_record_path(names: &OwnerNames, create: bool) -> Result<Option<PathBuf>, SandboxError> {
+fn trusted_record_path(
+    names: &OwnerNames,
+    create: bool,
+) -> Result<Option<(PathBuf, secure::TrustedFolder)>, SandboxError> {
     let base = secure::program_data()?;
     let me = accounts::current_user_sid()?;
     let dir = if create {
@@ -59,7 +55,7 @@ fn trusted_record_path(names: &OwnerNames, create: bool) -> Result<Option<PathBu
     } else {
         secure::existing_trusted_folder(&base, &RECORD_FOLDERS, &me)?
     };
-    Ok(dir.map(|d| d.join(record_file_name(names))))
+    Ok(dir.map(|d| (d.path.join(record_file_name(names)), d)))
 }
 
 /// What the machine holds for `names`. Logon rights are read only when
@@ -90,15 +86,19 @@ pub fn observe(names: &OwnerNames, with_rights: bool) -> Result<Observed, Sandbo
     if o.group.is_some() {
         o.group_sid = accounts::sid_of(&names.group())?;
     }
+    o.closable = secure::closable_folders()?;
     for folder in secure::folders_to_close()? {
         let closed = match &o.group_sid {
             None => Some(false),
-            Some(sid) => secure::is_closed(Path::new(&folder), sid).ok(),
+            Some(sid) => secure::closed_now(Path::new(&folder), sid).ok(),
         };
         o.closed.insert(folder, closed);
     }
     match wfp::existing(&WfpKeys::derive(names)) {
-        Ok(found) => o.wfp = found,
+        Ok(state) => {
+            o.wfp = state.present;
+            o.wfp_disabled = state.disabled;
+        }
         Err(why) => o.wfp_unreadable = Some(why),
     }
     Ok(o)
@@ -121,16 +121,75 @@ fn write_record(path: &Path, record: &Record) -> Result<(), SandboxError> {
 /// Deny the sandbox group the right to create entries in each folder every
 /// local user may write, and list each in the record as soon as it is done,
 /// so a run cut short can still be undone.
-fn close_folders(names: &OwnerNames, record: &mut Record, path: &Path) -> Result<(), SandboxError> {
+fn close_folders(
+    names: &OwnerNames,
+    observed: &Observed,
+    record: &mut Record,
+    path: &Path,
+) -> Result<(), SandboxError> {
     let sid = accounts::sid_of(&names.group())?
         .ok_or_else(|| setup_error("find the sandbox group", "missing"))?;
+    // Every folder is tried, and the failures are reported together: one
+    // folder an administrator may not write (`%SystemRoot%\Tasks` where
+    // Administrators hold less than full control, a drive that cannot be
+    // opened) would otherwise stop the setup at the first one, after the
+    // accounts, the rights and the rules already exist, and the owner would
+    // learn of the next one only on the next run.
+    let mut failures: Vec<String> = Vec::new();
+    // A generation an earlier setup left behind, whose group was deleted
+    // outside kGraf: its entries are taken off and its record lines dropped
+    // before this setup writes its own. Without this each setup added another
+    // ten entries and ten more lines, and `remove` refused the lot. A stale
+    // entry that cannot be taken off joins the failures above instead of
+    // stopping the step, so it can never be the one thing that keeps a setup
+    // from finishing.
+    for entry in stale_closed_entries(names, record, observed, &accounts::sid_resolves) {
+        if let UndoEntry::Closed {
+            sid: old,
+            path: folder,
+            mask,
+            flags,
+        } = &entry
+        {
+            let at = Path::new(folder);
+            if let Err(e) = secure::reopen_folder(at, old, *mask, *flags) {
+                let held_by = secure::owner_of(at);
+                failures.push(format!(
+                    "{folder}, which {held_by} owns: the deny entry of an earlier setup, for \
+                     {old}, could not be taken off: {e}"
+                ));
+                continue;
+            }
+            record.remove(&entry);
+            write_record(path, record)?;
+        }
+    }
     for folder in secure::folders_to_close()? {
-        secure::close_folder(Path::new(&folder), &sid)?;
+        let at = Path::new(&folder);
+        if let Err(e) = secure::close_folder(at, &sid) {
+            let held_by = secure::owner_of(at);
+            failures.push(format!("{folder}, which {held_by} owns: {e}"));
+            continue;
+        }
         record.add(UndoEntry::Closed {
             sid: sid.clone(),
             path: folder,
+            mask: CLOSED_FOLDER_DENY,
+            flags: CLOSED_FOLDER_FLAGS,
         });
         write_record(path, record)?;
+    }
+    if !failures.is_empty() {
+        return Err(setup_error(
+            "close the folders every local user may write",
+            format!(
+                "{} of them could not be closed to the sandbox users. Each is named with the \
+                 principal that owns it and the reason; the others were closed and are in \
+                 the undo record. {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        ));
     }
     Ok(())
 }
@@ -206,7 +265,10 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
     let fail = |key: &str, e: &dyn std::fmt::Display| (key.to_owned(), e.to_string());
     let observed = observe(names, true).map_err(|e| fail("observe", &e))?;
     let steps = plan_setup(names, &observed).map_err(|e| fail("plan", &e))?;
-    let path = trusted_record_path(names, true)
+    // `_hold` keeps the record's folder and every folder above it open
+    // until this step ends, so none of them can be renamed away between the
+    // check and the writes that follow.
+    let (path, _hold) = trusted_record_path(names, true)
         .map_err(|e| fail("record", &e))?
         .ok_or_else(|| {
             fail(
@@ -284,14 +346,24 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                     .ok_or_else(|| setup_error("plan a firewall rule", "no such rule"))
                     .and_then(|spec| firewall::put(&spec))
             }),
-            StepId::CloseFolders => close_folders(names, &mut record, &path),
+            StepId::CloseFolders => close_folders(names, &observed, &mut record, &path),
             StepId::DnsFilter => sids_of(&filter_users(names)).and_then(|sids| {
                 let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
                 wfp::put(names, &refs)
             }),
             StepId::Record => Ok(()),
         };
-        done.map_err(|e| fail(&key, &e))?;
+        done.map_err(|e| {
+            // Fail loud: name what a failure of this step leaves behind. A
+            // re-run that fails here keeps the earlier setup's credentials,
+            // so commands keep running as a sandbox user.
+            let left = failure_leaves(step.id);
+            if left.is_empty() {
+                fail(&key, &e)
+            } else {
+                fail(&key, &format!("{e}; {left}"))
+            }
+        })?;
         for entry in &step.undo {
             record.add(entry.clone());
         }
@@ -313,7 +385,8 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
     // No folder is no record: nothing to undo. A folder that exists but
     // that others could change is refused before anything is read from it
     // or written to it.
-    let Some(path) = trusted_record_path(names, false).map_err(|e| fail("record", &e))? else {
+    let Some((path, _hold)) = trusted_record_path(names, false).map_err(|e| fail("record", &e))?
+    else {
         return Ok(());
     };
     let mut record = match read_record(&path) {
@@ -322,9 +395,22 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
         Err(e) => return Err(fail("record", &e)),
     };
     let observed = observe(names, true).map_err(|e| fail("observe", &e))?;
-    let steps = plan_remove(names, &record, &observed).map_err(|e| fail("plan", &e))?;
+    let steps = plan_remove(names, &record, &observed, &accounts::sid_resolves)
+        .map_err(|e| fail("plan", &e))?;
     for step in steps {
         let key = undo_key(&step.entry);
+        // Kept: this removal may not undo the entry (the plan says why). The
+        // record keeps it, every other step still runs, and the owner is
+        // told, so one entry kGraf cannot judge never blocks a removal.
+        if step.action == RemoveAction::Kept {
+            let message = step
+                .note
+                .unwrap_or_else(|| "it is not one this removal may undo".to_owned());
+            if !send(Message::Note { key, message }) {
+                return Err(fail("pipe", &"the user's process stopped listening"));
+            }
+            continue;
+        }
         let outcome = if step.action == RemoveAction::AlreadyGone {
             StepOutcome::AlreadyGone
         } else {
@@ -341,7 +427,12 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
                 },
                 UndoEntry::Group(n) => accounts::delete_group(n).map(drop),
                 UndoEntry::User(n) => accounts::delete_user(n).map(drop),
-                UndoEntry::Closed { sid, path } => secure::reopen_folder(Path::new(path), sid),
+                UndoEntry::Closed {
+                    sid,
+                    path,
+                    mask,
+                    flags,
+                } => secure::reopen_folder(Path::new(path), sid, *mask, *flags),
                 UndoEntry::Wfp { object, key } => wfp::remove(*object, *key).map(drop),
             };
             done.map_err(|e| fail(&key, &e))?;
@@ -475,18 +566,25 @@ pub fn setup(
 
 /// `kgraf sandbox remove`: undo what the record lists, then delete the stored
 /// passwords at `store`.
+///
+/// Returns what is left behind, one line each: a folder whose entries for
+/// the sandbox users could not be removed, or a list that could not be read.
+/// The users, the firewall rules and the DNS filter are removed whatever is
+/// left, so a folder kGraf cannot reach now (an unready drive, a junction, a
+/// list this user cannot write) never keeps a machine set up for good. An
+/// entry for a deleted user's SID grants nothing to anyone.
 pub fn remove(
     names: &OwnerNames,
     launch: &Launch<'_>,
     store: &Path,
     on_event: &mut dyn FnMut(&Event),
-) -> Result<(), SandboxError> {
-    revoke_grants(store)?;
-    revoke_slot_grants(store)?;
+) -> Result<Vec<String>, SandboxError> {
+    let mut left = revoke_grants(store);
+    left.extend(revoke_slot_grants(store));
     drive(names, launch, ElevatedAction::Remove, on_event)?;
     match std::fs::remove_file(store) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(left),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(left),
         Err(e) => Err(setup_error("delete the stored passwords", e)),
     }
 }
@@ -508,9 +606,17 @@ pub fn status(names: &OwnerNames, store: &Path) -> Result<StatusReport, SandboxE
     };
     let found = count(Role::Slot).max(count(Role::OnlineSlot));
     let names = &names.clone().with_slots(u8::try_from(found).unwrap_or(0));
-    let record = record_path(names)
-        .map_err(|e| e.to_string())
-        .and_then(|p| read_record(&p));
+    // The record is read through the same folder judgment the elevated step
+    // uses, not by name: a junction in place of the record's folder would
+    // otherwise feed the owner a record of someone else's choosing, a
+    // removal that looks complete among them. A folder that does not pass
+    // is reported as a record that cannot be trusted, with the reason.
+    let record = trusted_record_path(names, false)
+        .map_err(|e| format!("the undo record's folder is not trusted: {e}"))
+        .and_then(|found| match found {
+            None => Ok(None),
+            Some((path, _hold)) => read_record(&path),
+        });
     let credentials = match std::fs::read(store) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Credentials::Missing,
         Err(e) => Credentials::Unreadable(e.to_string()),
@@ -560,50 +666,135 @@ pub fn stored_user(
         .map_err(|e| setup_error("open the stored sandbox password", e))
 }
 
+/// The SIDs of the stored sandbox users, or why they could not be read.
+/// Without them nothing can be revoked, and a removal says so instead of
+/// stopping: the users are deleted anyway, and an entry for a SID that no
+/// account has grants nothing to anyone.
+fn stored_sids(store: &Path) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(store).map_err(|e| format!("{}: {e}", store.display()))?;
+    let users = decode_users(&bytes).map_err(|e| format!("{}: {e}", store.display()))?;
+    Ok(users.into_iter().map(|(u, _)| u.sid).collect())
+}
+
 /// Remove each slot user's write grant from every folder the slot table
 /// beside `store` names ([`super::super::slots`]), then delete the table and
 /// its lock files. Runs before the users are removed. A folder that is gone
-/// is skipped. The first failure stops it and keeps the table.
-fn revoke_slot_grants(store: &Path) -> Result<(), SandboxError> {
+/// is skipped.
+///
+/// Every folder is tried, and what could not be revoked is returned for the
+/// owner to read. The table and its lock files are deleted either way: the
+/// users that follow them are deleted too, so a leftover entry names a SID
+/// no account has. Before this, the first failure (an unready drive, a
+/// junction, a folder whose list this user cannot write, one damaged line)
+/// stopped the whole removal, so the users, the firewall rules and the DNS
+/// filter stayed on the machine, on this run and on every run after it.
+fn revoke_slot_grants(store: &Path) -> Vec<String> {
+    let mut left = Vec::new();
     let dir = slots_dir(store);
-    let table = read_table(&dir).map_err(|e| setup_error("read the sandbox slot table", e))?;
-    let roots = table.all_roots();
-    if !roots.is_empty() {
-        let bytes =
-            std::fs::read(store).map_err(|e| setup_error("read the stored sandbox users", e))?;
-        let users =
-            decode_users(&bytes).map_err(|e| setup_error("read the stored sandbox users", e))?;
-        let sids: Vec<&str> = users.iter().map(|(u, _)| u.sid.as_str()).collect();
-        for path in roots {
-            crate::sandbox::revoke_sandbox_grant(&path, &sids)?;
+    let path = dir.join("table.txt");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            left.push(format!(
+                "the sandbox slot table {} could not be read ({e}), so the write grants it \
+                 lists are still in place",
+                path.display()
+            ));
+            String::new()
         }
+    };
+    let (roots, damaged) = roots_in_text(&text);
+    if !damaged.is_empty() {
+        left.push(format!(
+            "the sandbox slot table {} has {} damaged line(s) ({}), whose folders could not \
+             be read; remove any entry for a kGraf sandbox user there with `icacls`",
+            path.display(),
+            damaged.len(),
+            damaged
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
+    left.extend(revoke_each(store, roots));
     match std::fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(setup_error("delete the sandbox slot table", e)),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => left.push(format!(
+            "the sandbox slot folder {} could not be deleted: {e}",
+            dir.display()
+        )),
     }
+    left
 }
 
 /// Remove the sandbox users' entries from every folder of the owner's that
 /// the grants list beside `store` names, then delete the list. Runs before
 /// the users are removed, as the owner, who may rewrite the DACLs of the
-/// owner's own folders. The first failure stops it and keeps the list, so
-/// `remove` can run again.
-fn revoke_grants(store: &Path) -> Result<(), SandboxError> {
+/// owner's own folders. Every folder is tried; what is left is returned, as
+/// in [`revoke_slot_grants`].
+fn revoke_grants(store: &Path) -> Vec<String> {
+    let mut left = Vec::new();
     let list = grants_path(store);
     let text = match std::fs::read_to_string(&list) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(setup_error("read the sandbox grants list", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return left,
+        Err(e) => {
+            return vec![format!(
+                "the sandbox grants list {} could not be read ({e}), so the entries it lists \
+                 are still in place",
+                list.display()
+            )];
+        }
     };
-    let bytes =
-        std::fs::read(store).map_err(|e| setup_error("read the stored sandbox users", e))?;
-    let users =
-        decode_users(&bytes).map_err(|e| setup_error("read the stored sandbox users", e))?;
-    let sids: Vec<&str> = users.iter().map(|(u, _)| u.sid.as_str()).collect();
-    for path in parse_grants(&text) {
-        crate::sandbox::revoke_sandbox_grant(&path, &sids)?;
+    left.extend(revoke_each(store, parse_grants(&text)));
+    match std::fs::remove_file(&list) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => left.push(format!(
+            "the sandbox grants list {} could not be deleted: {e}",
+            list.display()
+        )),
     }
-    std::fs::remove_file(&list).map_err(|e| setup_error("delete the sandbox grants list", e))
+    left
+}
+
+/// Revoke the stored sandbox users' entries on every folder of `roots`,
+/// and describe each folder that kept them.
+///
+/// The notes the removal pass leaves on a folder (a child it could not open
+/// or write) are dropped here: the users themselves go right after this, so
+/// an entry a child kept names a user that no longer exists, which `icacls`
+/// shows as a raw SID the owner can take off. A folder that kept its entries
+/// as a whole is a leftover, and is reported.
+fn revoke_each(store: &Path, roots: Vec<PathBuf>) -> Vec<String> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let sids = match stored_sids(store) {
+        Ok(sids) => sids,
+        Err(why) => {
+            return vec![format!(
+                "the stored sandbox users could not be read ({why}), so the entries on {} \
+                 folder(s) are still in place; remove them with `icacls` if the folders stay",
+                roots.len()
+            )];
+        }
+    };
+    let sids: Vec<&str> = sids.iter().map(String::as_str).collect();
+    roots
+        .into_iter()
+        .filter_map(|path| {
+            crate::sandbox::revoke_sandbox_grant(&path, &sids)
+                .err()
+                .map(|e| {
+                    format!(
+                        "{} keeps its entries for the sandbox users: {e}",
+                        path.display()
+                    )
+                })
+        })
+        .collect()
 }

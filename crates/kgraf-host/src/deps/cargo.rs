@@ -73,7 +73,7 @@ use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Where the dependencies are declared and whose cargo settings apply.
@@ -1011,7 +1011,18 @@ struct Watch<'a> {
 /// group: cargo can start children (a credential provider named in the
 /// checkout's configuration, the `git` program), and none may outlive a
 /// timeout or a cancel.
-fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io::Result<Output> {
+fn run_bounded(cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io::Result<Output> {
+    run_bounded_capped(cmd, timeout, watch, kgraf_core::child_run::MAX_OUTPUT)
+}
+
+/// [`run_bounded`] with the most standard output it holds named, so a test
+/// can pass the cap without writing a gigabyte.
+fn run_bounded_capped(
+    mut cmd: Command,
+    timeout: Duration,
+    watch: Watch<'_>,
+    stdout_cap: usize,
+) -> std::io::Result<Output> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1037,31 +1048,61 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
         }
     };
     let stdout = child.stdout.take();
+    // Standard output is parsed whole (`cargo metadata` prints one JSON
+    // document), so it is held up to `kgraf_core::child_run::MAX_OUTPUT`, and
+    // more is an error: a head and a tail of a JSON document would parse as a
+    // different document or not at all. A read that passes the cap sets
+    // `stdout_too_large`; the wait loop below ends the group and the call
+    // fails, named.
+    let stdout_too_large = Arc::new(AtomicBool::new(false));
+    let too_large = stdout_too_large.clone();
     let out = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut p) = stdout {
-            let _ = p.read_to_end(&mut bytes);
+            let cap = stdout_cap as u64;
+            // One byte past the cap tells a full read from an overlong one.
+            let _ = (&mut p).take(cap + 1).read_to_end(&mut bytes);
+            if bytes.len() as u64 > cap {
+                too_large.store(true, Ordering::SeqCst);
+                bytes = Vec::new();
+                // Read on without holding, so the child is not blocked on a
+                // full pipe before the loop ends it.
+                let _ = std::io::copy(&mut p, &mut std::io::sink());
+            }
         }
         String::from_utf8_lossy(&bytes).into_owned()
     });
     let downloads = Arc::new(AtomicUsize::new(0));
     let stderr = child.stderr.take();
     let counted = downloads.clone();
+    // Standard error is shown, not parsed: a head and a tail with a marker
+    // (`kgraf_core::child_run::HeadTail`), so a chatty build costs bounded
+    // memory and is not ended for its size. Downloads are counted from every
+    // line, kept or not.
     let err = std::thread::spawn(move || {
-        let mut text = String::new();
+        let mut kept = kgraf_core::child_run::HeadTail::standard();
         if let Some(p) = stderr {
             let mut reader = std::io::BufReader::new(p);
             let mut line = Vec::new();
-            while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
-                let piece = String::from_utf8_lossy(&line);
-                if is_package_download(piece.trim()) {
+            // A line is read in pieces of at most `LINE_PIECE` bytes, so a
+            // line with no end costs bounded memory; only the first piece of
+            // a line is a candidate for a download report, which is short.
+            let mut at_line_start = true;
+            while (&mut reader)
+                .take(LINE_PIECE)
+                .read_until(b'\n', &mut line)
+                .unwrap_or(0)
+                > 0
+            {
+                if at_line_start && is_package_download(String::from_utf8_lossy(&line).trim()) {
                     counted.fetch_add(1, Ordering::SeqCst);
                 }
-                text.push_str(&piece);
+                at_line_start = line.last() == Some(&b'\n');
+                kept.push(&line);
                 line.clear();
             }
         }
-        text
+        String::from_utf8_lossy(&kept.finish().0).into_owned()
     });
     let deadline = Instant::now() + timeout;
     let kill = |child: &mut std::process::Child, kind, why: String| {
@@ -1104,6 +1145,9 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
                 format!("did not finish within {} s", timeout.as_secs()),
             );
         }
+        if stdout_too_large.load(Ordering::SeqCst) {
+            return kill(&mut child, std::io::ErrorKind::Other, too_large_message());
+        }
         if watch.stop.is_some_and(Stop::is_stopped) {
             return kill(
                 &mut child,
@@ -1136,7 +1180,13 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
             .is_finished()
             .then(|| reader.join().unwrap_or_default())
     };
-    match (collect(out), collect(err)) {
+    let collected = (collect(out), collect(err));
+    // A child that wrote past the cap and exited in the same instant: the
+    // output was dropped, so the call fails rather than parse nothing.
+    if stdout_too_large.load(Ordering::SeqCst) {
+        return Err(std::io::Error::other(too_large_message()));
+    }
+    match collected {
         (Some(stdout), Some(stderr)) => Ok(Output {
             ok: status.success(),
             stdout,
@@ -1147,6 +1197,17 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
              and still holds the output",
         )),
     }
+}
+
+/// The most of one standard error line read at a time.
+const LINE_PIECE: u64 = 64 * 1024;
+
+fn too_large_message() -> String {
+    format!(
+        "wrote more than {} bytes to its standard output; its process tree was killed \
+         and the output dropped",
+        kgraf_core::child_run::MAX_OUTPUT
+    )
 }
 
 #[cfg(test)]
@@ -1374,6 +1435,58 @@ mod tests {
             err
         });
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    /// Standard error far past the head and tail kept: the call succeeds
+    /// with the command's status, the start and the end of the text, and a
+    /// marker naming what was dropped. The command is not ended for chatter.
+    #[cfg(unix)]
+    #[test]
+    fn chatty_stderr_keeps_a_head_and_a_tail_with_a_marker() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(
+                "echo START >&2; head -c 12000000 /dev/zero | tr '\\0' x >&2; \
+                 echo >&2; echo END >&2; echo done",
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = run_bounded(cmd, Duration::from_secs(120), Watch::default()).expect("ran");
+        assert!(out.ok);
+        assert_eq!(out.stdout.trim(), "done");
+        assert!(out.stderr.starts_with("START\n"), "{}", &out.stderr[..20]);
+        assert!(out.stderr.ends_with("\nEND\n"));
+        assert!(
+            out.stderr
+                .contains("MiB of output omitted from the middle]"),
+            "no marker"
+        );
+        assert!(out.stderr.len() < 10 * 1024 * 1024, "{}", out.stderr.len());
+    }
+
+    /// Standard output is parsed whole, so past its cap the call fails named
+    /// and the command's tree is ended: never a cut document.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_past_the_cap_is_a_named_error_and_ends_the_command() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 3000000 /dev/zero; sleep 30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let err = run_bounded_capped(cmd, Duration::from_secs(120), Watch::default(), 100_000)
+            .err()
+            .expect("past the cap");
+        assert!(
+            err.to_string()
+                .contains("bytes to its standard output; its process tree was killed"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "waited for the sleep"
+        );
     }
 
     /// A timeout ends the command, and promptly.

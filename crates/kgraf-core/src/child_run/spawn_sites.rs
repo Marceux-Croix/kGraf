@@ -60,8 +60,8 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "kgraf-cli/src/sandbox_cmd.rs",
-        1,
-        "`SandboxedCommand::spawn` (selfcheck), which takes the lock on Windows",
+        2,
+        "`SandboxedCommand::spawn` (selfcheck, and its DNS probe), which takes the lock on Windows",
     ),
     (
         "kgraf-host/src/gates.rs",

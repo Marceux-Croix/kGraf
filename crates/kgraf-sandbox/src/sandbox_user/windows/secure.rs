@@ -9,10 +9,10 @@
 //! that is then renamed over the old one: a rename replaces a link's name,
 //! never its target, and a planted hard link is only unlinked.
 //!
-//! The deny entries are written with `SetKernelObjectSecurity` on a handle,
-//! which sets the one folder's list and propagates nothing: the entries are
-//! for that folder alone, and a call that propagates would walk a whole
-//! drive.
+//! The deny entries are written with `SetSecurityInfo` on a handle opened
+//! with `MAXIMUM_ALLOWED`, which keeps the write on the one folder: the
+//! entries are for that folder alone, and a call that propagates would walk
+//! a whole drive. [`set_folder_dacl`] quotes the pages it rests on.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Read, Write};
@@ -29,14 +29,13 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    SE_FILE_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AddAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, NO_INHERITANCE,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERITED,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    InitializeAcl, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
@@ -45,17 +44,20 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle, GetLogicalDrives,
     GetVolumeInformationW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemServices::{
-    ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS, SECURITY_DESCRIPTOR_REVISION,
+    ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS, MAXIMUM_ALLOWED,
 };
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, FOLDERID_Public, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
 };
 
-use super::super::acl::{AceView, CLOSED_FOLDER_DENY, Locations, closed_folders, distrust};
+use super::super::acl::{
+    ACE_INHERITANCE_FLAGS, AceView, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS, Locations,
+    closed_folders, distrust,
+};
 use crate::error::SandboxError;
 
 fn fail(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
@@ -123,14 +125,14 @@ pub fn program_data() -> Result<PathBuf, SandboxError> {
 
 // ---- handles that never follow a link ----------------------------------------
 
-fn open_no_follow(path: &Path, access: u32) -> io::Result<OwnedHandle> {
+fn open_no_follow_shared(path: &Path, access: u32, share: u32) -> io::Result<OwnedHandle> {
     let name = wide(path.as_os_str());
     // SAFETY: `name` is NUL-terminated; the handle, if any, is owned below.
     let h = unsafe {
         CreateFileW(
             name.as_ptr(),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share,
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -142,6 +144,35 @@ fn open_no_follow(path: &Path, access: u32) -> io::Result<OwnedHandle> {
     }
     // SAFETY: a fresh handle this code now owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+}
+
+fn open_no_follow(path: &Path, access: u32) -> io::Result<OwnedHandle> {
+    open_no_follow_shared(
+        path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+/// A handle that holds the folder `path` where it is: `FILE_SHARE_DELETE` is
+/// left out and `FILE_LIST_DIRECTORY | FILE_TRAVERSE` is asked for, which
+/// take part in sharing checks, so no other process may delete or rename the
+/// folder while the handle lives.
+///
+/// The step checks a folder and then writes through it by name, which
+/// resolves the path again; without this handle the folder could have been
+/// renamed away between the two, and the write would land in whatever took
+/// its name. The upstream Windows backend states the same rule: keep the
+/// handle through the security changes, and leave `FILE_SHARE_DELETE` out
+/// while asking for access that takes part in sharing checks.
+fn open_held(path: &Path) -> io::Result<OwnedHandle> {
+    const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+    const FILE_TRAVERSE: u32 = 0x0000_0020;
+    open_no_follow_shared(
+        path,
+        FILE_LIST_DIRECTORY | FILE_TRAVERSE | FOLDER_CHECK_ACCESS,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
 }
 
 fn attributes(h: &OwnedHandle) -> io::Result<u32> {
@@ -182,11 +213,14 @@ fn sid_text(sid: PSID) -> Result<String, SandboxError> {
     }))
 }
 
-/// The owner, the access list and its control bits of the object behind `h`.
+/// The owner and the access list of the object behind `h`.
+///
+/// The control bits are not read: the write in [`set_folder_dacl`] leaves
+/// the folder's protection exactly as Windows found it, so this code never
+/// has to carry those bits from the read to the write.
 struct Security {
     owner: PSID,
     dacl: *mut ACL,
-    control: u16,
     _sd: Local,
 }
 
@@ -214,21 +248,10 @@ fn security_of(h: &OwnedHandle, path: &Path) -> Result<Security, SandboxError> {
             source: io::Error::from_raw_os_error(code as i32),
         });
     }
-    let sd = Local(sd);
-    let mut control = 0u16;
-    let mut revision = 0u32;
-    // SAFETY: a valid descriptor.
-    if unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) } == 0 {
-        return Err(os_fail(
-            "read a security descriptor's control bits",
-            io::Error::last_os_error(),
-        ));
-    }
     Ok(Security {
         owner,
         dacl,
-        control,
-        _sd: sd,
+        _sd: Local(sd),
     })
 }
 
@@ -286,16 +309,20 @@ pub fn dacl_of(path: &Path) -> Result<Option<Vec<AceView>>, SandboxError> {
 
 // ---- the undo record's folder ------------------------------------------------
 
-/// Why the folder at `path` cannot hold the undo record, or `None` when it
-/// can. `elevated_user` is the SID the elevated step runs as.
-fn folder_distrust(path: &Path, elevated_user: &str) -> Result<Option<String>, SandboxError> {
-    let h = open_no_follow(path, READ_CONTROL | FILE_READ_ATTRIBUTES).map_err(|source| {
-        SandboxError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    let attrs = attributes(&h).map_err(|source| SandboxError::Io {
+/// The access a folder check needs: its attributes and its security.
+const FOLDER_CHECK_ACCESS: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES;
+
+/// Why the folder at `path`, which the caller holds open, cannot hold the
+/// undo record, or `None` when it can. `elevated_user` is the SID the
+/// elevated step runs as. The caller opens the folder once and keeps the
+/// handle ([`open_held`]), so the path is neither resolved twice nor open to
+/// a rename between the check and the writes.
+fn folder_distrust_of(
+    h: &OwnedHandle,
+    path: &Path,
+    elevated_user: &str,
+) -> Result<Option<String>, SandboxError> {
+    let attrs = attributes(h).map_err(|source| SandboxError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -303,10 +330,87 @@ fn folder_distrust(path: &Path, elevated_user: &str) -> Result<Option<String>, S
     if !reparse && attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Ok(Some("it is a file, not a folder".to_owned()));
     }
-    let sec = security_of(&h, path)?;
+    let sec = security_of(h, path)?;
     let owner = sid_text(sec.owner)?;
     let entries = ace_views(sec.dacl)?;
     Ok(distrust(&owner, entries.as_deref(), reparse, elevated_user))
+}
+
+/// Refuse the folder the record's own folders are made under unless its text
+/// is a plain path on a local drive ([`super::super::acl::record_base_shape`])
+/// and its volume is a fixed one that keeps access lists. The closed folders
+/// are picked by both rules already; the record's folder was not checked by
+/// either, and its access list is what keeps every other user out of it.
+fn check_record_base(base: &Path) -> Result<(), SandboxError> {
+    let text = base.to_string_lossy();
+    if let Some(why) = super::super::acl::record_base_shape(&text) {
+        return Err(fail("check the undo record's folder", why));
+    }
+    let root = format!("{}:\\", &text[..1]);
+    if !fixed_acl_volume(&root) {
+        return Err(fail(
+            "check the undo record's folder",
+            format!(
+                "{root} is not a fixed local drive whose file system keeps access lists, so the \
+                 sandbox undo record cannot be kept there"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Why the folder the record's own folders are made under cannot be trusted,
+/// or `None` when it can. `%ProgramData%` is that folder, and the rules are
+/// not [`folder_distrust_of`]'s: every local user may create a folder directly
+/// under ProgramData by default, which is the premise of the whole scheme,
+/// so the writer test would refuse every machine. What must hold is that the
+/// base is a folder, not a link, and that an administrator principal owns it,
+/// because the folders below it are made with a protected list of their own
+/// and are checked by [`folder_distrust_of`].
+fn base_distrust(
+    h: &OwnedHandle,
+    path: &Path,
+    elevated_user: &str,
+) -> Result<Option<String>, SandboxError> {
+    let attrs = attributes(h).map_err(|source| SandboxError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(Some("it is a link (junction or symbolic link)".to_owned()));
+    }
+    if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Ok(Some("it is a file, not a folder".to_owned()));
+    }
+    let sec = security_of(h, path)?;
+    let owner = sid_text(sec.owner)?;
+    Ok(
+        (!super::super::acl::is_trusted_owner(&owner, elevated_user)).then(|| {
+            format!("its owner is {owner}, not SYSTEM, Administrators or TrustedInstaller")
+        }),
+    )
+}
+
+/// The record's folder, with every folder from the base down held open for
+/// as long as this value lives ([`open_held`]), so none of them can be
+/// deleted or renamed between the check and the writes that follow.
+#[derive(Debug)]
+pub struct TrustedFolder {
+    pub path: PathBuf,
+    _held: Vec<OwnedHandle>,
+}
+
+/// Open and judge the folder the record's folders are made under.
+fn held_base(base: &Path, elevated_user: &str) -> Result<OwnedHandle, SandboxError> {
+    check_record_base(base)?;
+    let h = open_held(base).map_err(|source| SandboxError::Io {
+        path: base.to_path_buf(),
+        source,
+    })?;
+    match base_distrust(&h, base, elevated_user)? {
+        Some(why) => Err(refuse_folder(base, &why)),
+        None => Ok(h),
+    }
 }
 
 fn refuse_folder(path: &Path, why: &str) -> SandboxError {
@@ -329,7 +433,8 @@ pub fn trusted_folder(
     base: &Path,
     parts: &[&str],
     elevated_user: &str,
-) -> Result<PathBuf, SandboxError> {
+) -> Result<TrustedFolder, SandboxError> {
+    let mut held = vec![held_base(base, elevated_user)?];
     let sddl = wide(OsStr::new(super::super::acl::TRUSTED_FOLDER_SDDL));
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; the descriptor is allocated by the
@@ -369,13 +474,18 @@ pub fn trusted_folder(
                 });
             }
         }
+        let h = open_held(&path).map_err(|source| SandboxError::Io {
+            path: path.clone(),
+            source,
+        })?;
         // Also a folder made just now: its owner follows the system's
         // policy for objects administrators create.
-        if let Some(why) = folder_distrust(&path, elevated_user)? {
+        if let Some(why) = folder_distrust_of(&h, &path, elevated_user)? {
             return Err(refuse_folder(&path, &why));
         }
+        held.push(h);
     }
-    Ok(path)
+    Ok(TrustedFolder { path, _held: held })
 }
 
 /// [`trusted_folder`] without making anything: `None` when a part does not
@@ -385,20 +495,25 @@ pub fn existing_trusted_folder(
     base: &Path,
     parts: &[&str],
     elevated_user: &str,
-) -> Result<Option<PathBuf>, SandboxError> {
+) -> Result<Option<TrustedFolder>, SandboxError> {
+    let mut held = vec![held_base(base, elevated_user)?];
     let mut path = base.to_path_buf();
     for part in parts {
         path.push(part);
-        match open_no_follow(&path, FILE_READ_ATTRIBUTES) {
-            Ok(_) => {}
+        // One open, which answers whether the part exists, carries the check
+        // and then holds the folder: a second open would resolve the path
+        // again.
+        let h = match open_held(&path) {
+            Ok(h) => h,
             Err(e) if is_not_found(&e) => return Ok(None),
             Err(source) => return Err(SandboxError::Io { path, source }),
-        }
-        if let Some(why) = folder_distrust(&path, elevated_user)? {
+        };
+        if let Some(why) = folder_distrust_of(&h, &path, elevated_user)? {
             return Err(refuse_folder(&path, &why));
         }
+        held.push(h);
     }
-    Ok(Some(path))
+    Ok(Some(TrustedFolder { path, _held: held }))
 }
 
 // ---- files in a trusted folder -----------------------------------------------
@@ -518,8 +633,36 @@ pub fn read_no_follow(path: &Path) -> io::Result<Option<String>> {
 /// The machine's folders for [`closed_folders`]: fixed drives whose file
 /// system keeps access lists, ProgramData, Public and the folders directly
 /// in it, and the Windows folder.
-pub fn locations() -> Result<Locations, SandboxError> {
+/// Whether the volume whose root is `root` (`C:\`) is a fixed local drive
+/// whose file system keeps access lists. A removable, remote or non-ACL
+/// volume is skipped: a deny entry there would not last, and the undo record
+/// cannot live there, because its access list is what keeps other users out
+/// of it.
+fn fixed_acl_volume(root: &str) -> bool {
     const DRIVE_FIXED: u32 = 3;
+    let w = wide(OsStr::new(root));
+    // SAFETY: NUL-terminated root path.
+    if unsafe { GetDriveTypeW(w.as_ptr()) } != DRIVE_FIXED {
+        return false;
+    }
+    let mut flags = 0u32;
+    // SAFETY: NUL-terminated root; only the flags are requested.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            w.as_ptr(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut flags,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    ok != 0 && flags & FILE_PERSISTENT_ACLS != 0
+}
+
+pub fn locations() -> Result<Locations, SandboxError> {
     let mut loc = Locations::default();
     // SAFETY: plain call.
     let mask = unsafe { GetLogicalDrives() };
@@ -528,26 +671,7 @@ pub fn locations() -> Result<Locations, SandboxError> {
             continue;
         }
         let root = format!("{}:\\", char::from(b'A' + i));
-        let w = wide(OsStr::new(&root));
-        // SAFETY: NUL-terminated root path.
-        if unsafe { GetDriveTypeW(w.as_ptr()) } != DRIVE_FIXED {
-            continue;
-        }
-        let mut flags = 0u32;
-        // SAFETY: NUL-terminated root; only the flags are requested.
-        let ok = unsafe {
-            GetVolumeInformationW(
-                w.as_ptr(),
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut flags,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if ok != 0 && flags & FILE_PERSISTENT_ACLS != 0 {
+        if fixed_acl_volume(&root) {
             loc.fixed_drive_roots.push(PathBuf::from(root));
         }
     }
@@ -579,13 +703,41 @@ pub fn locations() -> Result<Locations, SandboxError> {
     Ok(loc)
 }
 
+/// Every folder [`closed_folders`] names on this machine, as text, whether
+/// it exists or not. Removal bounds what it may take a deny entry off by
+/// this set.
+pub fn closable_folders() -> Result<std::collections::BTreeSet<String>, SandboxError> {
+    Ok(closed_folders(&locations()?)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
 /// [`closed_folders`] of this machine that exist, as text for the record.
+///
+/// A link is not a folder here: `symlink_metadata` does not follow one,
+/// where `is_dir` did, so a junction planted at one of these names is left
+/// out instead of being carried to [`close_folder`], which would refuse it
+/// and report a failure the owner cannot act on.
 pub fn folders_to_close() -> Result<Vec<String>, SandboxError> {
     Ok(closed_folders(&locations()?)
         .into_iter()
-        .filter(|p| p.is_dir())
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
         .map(|p| p.to_string_lossy().into_owned())
         .collect())
+}
+
+/// The owner of `path` as text, or why it could not be read. For the message
+/// about a folder whose access list this step may not write: its owner is
+/// who can grant that right.
+pub fn owner_of(path: &Path) -> String {
+    let read = open_no_follow(path, READ_CONTROL)
+        .map_err(|e| e.to_string())
+        .and_then(|h| security_of(&h, path).map_err(|e| e.to_string()));
+    match read.and_then(|sec| sid_text(sec.owner).map_err(|e| e.to_string())) {
+        Ok(sid) => sid,
+        Err(why) => format!("its owner could not be read: {why}"),
+    }
 }
 
 struct Sid(Local);
@@ -600,25 +752,30 @@ fn parse_sid(text: &str) -> Result<Sid, SandboxError> {
     Ok(Sid(Local(sid)))
 }
 
-const INHERITED_ACE: u8 = 0x10;
-const INHERITANCE_BITS: u8 = 0x0F;
-
-/// Whether `acl` holds the group's own deny entry: explicit, on the folder
-/// alone, covering [`CLOSED_FOLDER_DENY`].
-fn is_closing_entry(ace: *const c_void, sid: &Sid) -> bool {
+/// Whether the entry `ace` is the deny entry described by `sid`, `mask` and
+/// `flags`: a deny entry for that SID with exactly that mask and exactly
+/// those flags.
+///
+/// The mask is matched exactly, not as a subset. A caller that takes an
+/// entry off names the mask the entry was written with, from the undo
+/// record, so a later version of kGraf that denies more rights neither
+/// leaves an older entry behind nor takes off an entry wider than the one
+/// it wrote. `flags` must carry no inheritance bit, whatever the caller
+/// says: nothing this code writes or removes may reach a child.
+fn is_closing_entry(ace: *const c_void, sid: &Sid, mask: u32, flags: u8) -> bool {
+    if flags & ACE_INHERITANCE_FLAGS != 0 {
+        return false;
+    }
     // SAFETY: every entry starts with a header.
     let header = unsafe { &*(ace as *const ACE_HEADER) };
-    if u32::from(header.AceType) != ACCESS_DENIED_ACE_TYPE
-        || header.AceFlags & (INHERITED_ACE | INHERITANCE_BITS) != 0
-    {
+    if u32::from(header.AceType) != ACCESS_DENIED_ACE_TYPE || header.AceFlags != flags {
         return false;
     }
     // SAFETY: a deny entry has the allow entry's layout.
     let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
     let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
     // SAFETY: both are valid SIDs.
-    body.Mask & CLOSED_FOLDER_DENY == CLOSED_FOLDER_DENY
-        && unsafe { EqualSid(ace_sid, sid.0.0) } != 0
+    body.Mask == mask && unsafe { EqualSid(ace_sid, sid.0.0) } != 0
 }
 
 fn entries(acl: *const ACL) -> Vec<*mut c_void> {
@@ -636,13 +793,61 @@ fn entries(acl: *const ACL) -> Vec<*mut c_void> {
         .collect()
 }
 
-fn open_folder_for_dacl(path: &Path) -> Result<OwnedHandle, SandboxError> {
-    let h = open_no_follow(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).map_err(
-        |source| SandboxError::Io {
-            path: path.to_path_buf(),
+/// A handle on the folder `path` for a read and a write of its access list.
+///
+/// The access asked for is `MAXIMUM_ALLOWED`, not `READ_CONTROL | WRITE_DAC`,
+/// because that is what keeps the write off the folder's children
+/// ([`set_folder_dacl`]). The two rights it stands in for are not asked for
+/// by name, so a folder whose list an administrator may not write (one
+/// TrustedInstaller owns, say) opens here and fails at the write with
+/// `ERROR_ACCESS_DENIED`, which [`super::setup`] reports with the folder's
+/// owner.
+/// Refuse a link in any component of `path` above the last one. The last one
+/// is judged from the handle by [`open_folder_for_dacl`], whose open does not
+/// follow it; without this, a link higher up would still be followed and the
+/// access list of its target written instead.
+///
+/// This is a check and then an open, so another process could put a link in
+/// place between the two. The atomic form opens every component with
+/// `OBJ_DONT_REPARSE` through `NtCreateFile`, which this code does not have
+/// (the upstream backend does). The components above a closed folder are a
+/// drive root, `C:\Users` and the Windows folder, which administrators alone
+/// may write.
+fn refuse_links_above(path: &Path) -> Result<(), SandboxError> {
+    for part in path.ancestors().skip(1) {
+        if part.parent().is_none() {
+            // A drive root or a prefix: there is no name here to redirect.
+            continue;
+        }
+        let h = open_no_follow(part, FILE_READ_ATTRIBUTES).map_err(|source| SandboxError::Io {
+            path: part.to_path_buf(),
             source,
-        },
-    )?;
+        })?;
+        let attrs = attributes(&h).map_err(|source| SandboxError::Io {
+            path: part.to_path_buf(),
+            source,
+        })?;
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(fail(
+                "close a folder to the sandbox users",
+                format!(
+                    "{} lies below the link {}; refusing to change the access list of whatever \
+                     that link points at",
+                    path.display(),
+                    part.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_folder_for_dacl(path: &Path) -> Result<OwnedHandle, SandboxError> {
+    refuse_links_above(path)?;
+    let h = open_no_follow(path, MAXIMUM_ALLOWED).map_err(|source| SandboxError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let attrs = attributes(&h).map_err(|source| SandboxError::Io {
         path: path.to_path_buf(),
         source,
@@ -659,38 +864,64 @@ fn open_folder_for_dacl(path: &Path) -> Result<OwnedHandle, SandboxError> {
     Ok(h)
 }
 
-/// Write `acl` as the list of the folder behind `h` alone, keeping the
-/// protected and auto-inherited bits it had (`control`).
-fn set_folder_dacl(
-    h: &OwnedHandle,
-    acl: *const ACL,
-    control: u16,
-    path: &Path,
-) -> Result<(), SandboxError> {
-    // SAFETY: zeroed is a valid value of this plain struct, initialized next.
-    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
-    let psd: PSECURITY_DESCRIPTOR = ptr::addr_of_mut!(sd).cast();
-    let bits = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED;
-    // SAFETY: `psd` points to a descriptor this frame owns; `acl` is valid
-    // for the call.
-    let ok = unsafe {
-        InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) != 0
-            && SetSecurityDescriptorDacl(psd, 1, acl, 0) != 0
-            && SetSecurityDescriptorControl(psd, bits, control & bits) != 0
-            && SetKernelObjectSecurity(h.as_raw_handle() as HANDLE, DACL_SECURITY_INFORMATION, psd)
-                != 0
+/// Write `acl` as the list of the folder behind `h`, that folder alone.
+///
+/// **Not `SetKernelObjectSecurity`.** Its page says: "This function should
+/// not be used when setting a security descriptor on file system objects.
+/// Instead, use the SetSecurityInfo or SetNamedSecurityInfo functions."
+///
+/// **How the write stays off the children.** `SetSecurityInfo` normally
+/// walks them: "If you are setting the discretionary access control list
+/// (DACL) or any elements in the system access control list (SACL) of an
+/// object, the system automatically propagates any inheritable access
+/// control entries (ACEs) to existing child objects". On a drive root that
+/// is a walk of the whole drive. The same page gives the switch, and `h` is
+/// opened with it ([`open_folder_for_dacl`]): "Warning: If the supplied
+/// handle was opened with an ACCESS_MASK value of MAXIMUM_ALLOWED, then the
+/// SetSecurityInfo function will not propagate ACEs to children." The entry
+/// this code writes is `NO_INHERITANCE` as well, so there is nothing a child
+/// could inherit from it either.
+///
+/// **How the folder keeps its protection.** Neither
+/// `PROTECTED_DACL_SECURITY_INFORMATION` ("The DACL cannot inherit access
+/// control entries (ACEs)") nor `UNPROTECTED_DACL_SECURITY_INFORMATION`
+/// ("The DACL inherits ACEs from the parent object") is passed, and those
+/// two flags are the only channel that sets the state, so ProgramData stays
+/// protected and a folder that is not protected stays open to inheritance.
+/// On a folder that is not protected the kernel also keeps the inherited
+/// entries itself, so this list does not have to carry them:
+/// `SeSetSecurityDescriptorInfoEx`, which is what the file system calls,
+/// says that with `SE_DACL_PROTECTED` absent it "constructs the output
+/// security descriptor from the inherited ACEs of the current security
+/// descriptor and noninherited ACEs of SecurityDescriptor. That is, it is
+/// impossible to change an inherited ACE by changing the ACL on an object."
+fn set_folder_dacl(h: &OwnedHandle, acl: *const ACL, path: &Path) -> Result<(), SandboxError> {
+    // SAFETY: a valid handle on a file system object and a valid list; no
+    // owner, group or SACL is written.
+    let code = unsafe {
+        SetSecurityInfo(
+            h.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl,
+            ptr::null(),
+        )
     };
-    if !ok {
+    if code != ERROR_SUCCESS {
         return Err(SandboxError::Io {
             path: path.to_path_buf(),
-            source: io::Error::last_os_error(),
+            source: io::Error::from_raw_os_error(code as i32),
         });
     }
     Ok(())
 }
 
-/// Whether the folder `path` holds the sandbox group's deny entry.
-pub fn is_closed(path: &Path, group_sid: &str) -> Result<bool, SandboxError> {
+/// Whether the folder `path` holds the deny entry `sid`, `mask` and `flags`
+/// describe. [`closed_now`] asks about the entry this version of setup
+/// writes; `remove` asks about the entry its record line names.
+pub fn is_closed(path: &Path, group_sid: &str, mask: u32, flags: u8) -> Result<bool, SandboxError> {
     let sid = parse_sid(group_sid)?;
     let h = open_no_follow(path, READ_CONTROL).map_err(|source| SandboxError::Io {
         path: path.to_path_buf(),
@@ -699,7 +930,13 @@ pub fn is_closed(path: &Path, group_sid: &str) -> Result<bool, SandboxError> {
     let sec = security_of(&h, path)?;
     Ok(entries(sec.dacl)
         .into_iter()
-        .any(|ace| is_closing_entry(ace, &sid)))
+        .any(|ace| is_closing_entry(ace, &sid, mask, flags)))
+}
+
+/// Whether the folder `path` holds the deny entry this version of setup
+/// writes, for the status report and for the setup plan.
+pub fn closed_now(path: &Path, group_sid: &str) -> Result<bool, SandboxError> {
+    is_closed(path, group_sid, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS)
 }
 
 /// Deny the sandbox group (`group_sid`) the right to create or change
@@ -710,7 +947,7 @@ pub fn close_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
     let sec = security_of(&h, path)?;
     if entries(sec.dacl)
         .into_iter()
-        .any(|ace| is_closing_entry(ace, &sid))
+        .any(|ace| is_closing_entry(ace, &sid, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS))
     {
         return Ok(());
     }
@@ -737,8 +974,8 @@ pub fn close_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
         });
     }
     let _free = Local(new_acl.cast());
-    set_folder_dacl(&h, new_acl, sec.control, path)?;
-    if !is_closed(path, group_sid)? {
+    set_folder_dacl(&h, new_acl, path)?;
+    if !closed_now(path, group_sid)? {
         return Err(fail(
             "close a folder to the sandbox users",
             format!(
@@ -752,8 +989,15 @@ pub fn close_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
 
 /// Take the sandbox group's deny entry off the folder `path` again, and
 /// nothing else: every other entry keeps its place. A folder that no longer
-/// exists is skipped.
-pub fn reopen_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
+/// exists is skipped. Read back after, as [`close_folder`] does: a write
+/// that kept the old list would otherwise leave the deny in place while
+/// `remove` deletes the only record of it.
+pub fn reopen_folder(
+    path: &Path,
+    group_sid: &str,
+    mask: u32,
+    flags: u8,
+) -> Result<(), SandboxError> {
     let sid = parse_sid(group_sid)?;
     let h = match open_folder_for_dacl(path) {
         Ok(h) => h,
@@ -765,7 +1009,7 @@ pub fn reopen_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
     let keep: Vec<*mut c_void> = all
         .iter()
         .copied()
-        .filter(|ace| !is_closing_entry(*ace, &sid))
+        .filter(|ace| !is_closing_entry(*ace, &sid, mask, flags))
         .collect();
     if keep.len() == all.len() {
         return Ok(());
@@ -786,7 +1030,17 @@ pub fn reopen_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
             return Err(os_fail("build an access list", io::Error::last_os_error()));
         }
     }
-    set_folder_dacl(&h, acl, sec.control, path)
+    set_folder_dacl(&h, acl, path)?;
+    if is_closed(path, group_sid, mask, flags)? {
+        return Err(fail(
+            "open a folder to the sandbox users again",
+            format!(
+                "the deny entry for the sandbox group is still on {} after it was taken off",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Windows only; compile-checked on the development host. Each test works in
@@ -814,6 +1068,41 @@ mod tests {
         let sec = security_of(&h, path).unwrap();
         // SAFETY: a valid list from the descriptor `sec` holds.
         unsafe { (*sec.dacl).AceCount }
+    }
+
+    /// The control bits of the folder's descriptor, so a test can show the
+    /// protected and auto-inherited state is the same after a write as it
+    /// was before. Production code never reads them.
+    fn dacl_control(path: &Path) -> u16 {
+        let h = open_no_follow(path, READ_CONTROL).unwrap();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: a handle opened with READ_CONTROL; `sd` is freed by `Local`.
+        let code = unsafe {
+            GetSecurityInfo(
+                h.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS, "read {}", path.display());
+        let sd = Local(sd);
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: a valid descriptor.
+        let ok = unsafe {
+            windows_sys::Win32::Security::GetSecurityDescriptorControl(
+                sd.0,
+                &mut control,
+                &mut revision,
+            )
+        };
+        assert_ne!(ok, 0, "read the control bits of {}", path.display());
+        control
     }
 
     #[test]
@@ -847,7 +1136,7 @@ mod tests {
     fn a_missing_folder_is_no_record_and_is_not_made() {
         let base = tempfile::tempdir().unwrap();
         let found = existing_trusted_folder(base.path(), &["kGraf", "sandbox"], &me()).unwrap();
-        assert_eq!(found, None);
+        assert!(found.is_none());
         assert!(!base.path().join("kGraf").exists());
     }
 
@@ -895,7 +1184,7 @@ mod tests {
         }
         let base = tempfile::tempdir().unwrap();
         let made = trusted_folder(base.path(), &["kGraf", "sandbox"], &me()).unwrap();
-        assert_eq!(made, base.path().join("kGraf").join("sandbox"));
+        assert_eq!(made.path, base.path().join("kGraf").join("sandbox"));
         // Again: it exists now and is checked, not made.
         trusted_folder(base.path(), &["kGraf", "sandbox"], &me()).unwrap();
     }
@@ -906,21 +1195,74 @@ mod tests {
         const GROUP: &str = "S-1-5-21-1-2-3-4";
         let dir = tempfile::tempdir().unwrap();
         let before = dacl_count(dir.path());
-        assert!(!is_closed(dir.path(), GROUP).unwrap());
+        assert!(!closed_now(dir.path(), GROUP).unwrap());
         close_folder(dir.path(), GROUP).unwrap();
         close_folder(dir.path(), GROUP).unwrap();
-        assert!(is_closed(dir.path(), GROUP).unwrap());
+        assert!(closed_now(dir.path(), GROUP).unwrap());
         assert_eq!(dacl_count(dir.path()), before + 1, "written once");
-        reopen_folder(dir.path(), GROUP).unwrap();
-        assert!(!is_closed(dir.path(), GROUP).unwrap());
+        // A record line that named a wider mask takes nothing off: the
+        // match is exact, so an entry this version did not write stays.
+        reopen_folder(dir.path(), GROUP, CLOSED_FOLDER_DENY | 0x1, 0).unwrap();
+        assert!(closed_now(dir.path(), GROUP).unwrap());
+        assert_eq!(dacl_count(dir.path()), before + 1);
+        reopen_folder(dir.path(), GROUP, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS).unwrap();
+        assert!(!closed_now(dir.path(), GROUP).unwrap());
         assert_eq!(dacl_count(dir.path()), before);
         // A folder that is gone is skipped; a link is refused.
-        reopen_folder(&dir.path().join("gone"), GROUP).unwrap();
+        reopen_folder(
+            &dir.path().join("gone"),
+            GROUP,
+            CLOSED_FOLDER_DENY,
+            CLOSED_FOLDER_FLAGS,
+        )
+        .unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let link = dir.path().join("link");
         mklink_junction(&link, elsewhere.path());
         assert!(close_folder(&link, GROUP).is_err());
-        assert!(!is_closed(elsewhere.path(), GROUP).unwrap());
+        assert!(!closed_now(elsewhere.path(), GROUP).unwrap());
+        // A link above the folder is refused too, so the list written is
+        // never that of a folder below the link's target.
+        let target = elsewhere.path().join("below");
+        std::fs::create_dir(&target).unwrap();
+        let through = link.join("below");
+        let err = close_folder(&through, GROUP).unwrap_err();
+        assert!(err.to_string().contains("link"), "{err}");
+        assert!(!closed_now(&target, GROUP).unwrap());
+    }
+
+    /// The write must leave the folder's protection as Windows had it and
+    /// must change no child. `SetSecurityInfo` on a handle opened with
+    /// `MAXIMUM_ALLOWED` propagates nothing ([`set_folder_dacl`]); a write
+    /// that propagated would rebuild each child's list.
+    #[test]
+    fn closing_a_folder_changes_no_child_and_keeps_the_protection() {
+        const GROUP: &str = "S-1-5-21-1-2-3-5";
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let grandchild = child.join("leaf");
+        std::fs::create_dir(&grandchild).unwrap();
+        // An inheritable entry on the folder about to be closed: a call that
+        // propagates would push it down and rewrite both lists.
+        let status = std::process::Command::new("icacls.exe")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-5-32-546:(OI)(CI)R"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed");
+        let control = dacl_control(dir.path());
+        let (child_before, leaf_before) = (dacl_of(&child).unwrap(), dacl_of(&grandchild).unwrap());
+        close_folder(dir.path(), GROUP).unwrap();
+        assert!(closed_now(dir.path(), GROUP).unwrap());
+        assert_eq!(dacl_control(dir.path()), control, "protection kept");
+        assert_eq!(dacl_of(&child).unwrap(), child_before, "no child touched");
+        assert_eq!(dacl_of(&grandchild).unwrap(), leaf_before);
+        assert!(!closed_now(&child, GROUP).unwrap(), "the deny stays put");
+        reopen_folder(dir.path(), GROUP, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS).unwrap();
+        assert_eq!(dacl_control(dir.path()), control, "protection still kept");
+        assert_eq!(dacl_of(&child).unwrap(), child_before);
+        assert_eq!(dacl_of(&grandchild).unwrap(), leaf_before);
     }
 
     #[test]

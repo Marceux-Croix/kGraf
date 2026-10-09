@@ -27,7 +27,7 @@ use windows_sys::Win32::Security::Authentication::Identity::{
     LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
 };
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
-use windows_sys::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
+use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID, SID_NAME_USE};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_OPTION_NON_VOLATILE,
     RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY, RegCloseKey, RegCreateKeyExW, RegDeleteValueW,
@@ -139,6 +139,49 @@ impl Drop for OwnedSid {
     fn drop(&mut self) {
         // SAFETY: frees the SID ConvertStringSidToSidW allocated.
         unsafe { LocalFree(self.0 as HLOCAL) };
+    }
+}
+
+/// Whether `sid` still names an account this machine can look up:
+/// `Some(true)` when it resolves, `Some(false)` when the system says no
+/// account has it, `None` when the lookup failed for another reason (an
+/// unreachable domain controller, say).
+///
+/// `remove` asks this of the SID in a `closed` record line whose group is
+/// not the one the current setup made. A SID whose account is gone is a
+/// sandbox group an earlier setup made and deleted, because the account
+/// database does not reuse a relative identifier; one that still resolves is
+/// some other principal, and nothing of kGraf's may be taken off its behalf.
+pub fn sid_resolves(sid: &str) -> Option<bool> {
+    let Ok(sid) = OwnedSid::parse(sid) else {
+        return Some(false);
+    };
+    let (mut name_len, mut domain_len) = (0u32, 0u32);
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: a valid SID; the sizes are asked for with no buffers, which the
+    // call answers with ERROR_INSUFFICIENT_BUFFER when the account exists and
+    // ERROR_NONE_MAPPED when it does not.
+    let ok = unsafe {
+        LookupAccountSidW(
+            ptr::null(),
+            sid.0,
+            ptr::null_mut(),
+            &mut name_len,
+            ptr::null_mut(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if ok != 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error()
+        .raw_os_error()
+        .map(|c| c as u32)
+    {
+        Some(ERROR_INSUFFICIENT_BUFFER) => Some(true),
+        Some(ERROR_NONE_MAPPED) => Some(false),
+        _ => None,
     }
 }
 
@@ -675,7 +718,20 @@ pub fn current_user_sid() -> Result<String, SandboxError> {
 /// Whether `user` can log on with `password` (an interactive logon, the kind
 /// the secondary logon service performs). The token is closed at once.
 pub fn logon_works(user: &str, password: &str) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    logon_token(user, password).map(drop)
+}
+
+/// A primary token for the sandbox user `user`, from an interactive logon
+/// with `password`. The sandbox users keep interactive logon (the other
+/// kinds are denied), which is what the secondary logon service performs
+/// for a command.
+pub fn logon_token(
+    user: &str,
+    password: &str,
+) -> Result<std::os::windows::io::OwnedHandle, String> {
+    use std::os::windows::io::FromRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{
         LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
     };
@@ -706,7 +762,6 @@ pub fn logon_works(user: &str, password: &str) -> Result<(), String> {
             None => err.to_string(),
         });
     }
-    // SAFETY: closes the token LogonUserW returned.
-    unsafe { CloseHandle(token) };
-    Ok(())
+    // SAFETY: a fresh token handle this code now owns.
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(token) })
 }

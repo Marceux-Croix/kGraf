@@ -58,12 +58,21 @@ pub struct Observed {
     /// The SID of the sandbox group, if the group exists.
     pub group_sid: Option<String>,
     /// The folders setup closes to the sandbox group
-    /// ([`super::acl::closed_folders`]), each with whether the group's deny
-    /// entry is on it; `None` when that could not be read.
+    /// ([`super::acl::closed_folders`]) that exist, each with whether the
+    /// group's deny entry is on it; `None` when that could not be read.
     pub closed: BTreeMap<String, Option<bool>>,
+    /// Every folder setup closes on this machine
+    /// ([`super::acl::closed_folders`]), whether it exists or not. Removal
+    /// takes a `closed` record line's deny entry off only on a folder in
+    /// this set, so a line whose path was edited cannot make it change the
+    /// access list of any other folder.
+    pub closable: BTreeSet<String>,
     /// The keys of kGraf's WFP objects (provider, sublayer, DNS filter) that
     /// exist.
     pub wfp: BTreeSet<u128>,
+    /// The filter keys that exist but that the Base Filtering Engine has
+    /// disabled: present, and not effective.
+    pub wfp_disabled: BTreeSet<u128>,
     /// Why the WFP objects could not be read, when they could not (reading
     /// them can need administrator rights).
     pub wfp_unreadable: Option<String>,
@@ -154,11 +163,39 @@ impl StepId {
                                      ProgramData, Public and the Windows temporary folders"
                 .into(),
             StepId::DnsFilter => format!(
-                "WFP filter: the DNS Client service refuses lookups from the offline users ({})",
-                guid_text(WfpKeys::derive(names).filter)
+                "WFP filters: the DNS Client service refuses lookups from the offline users ({})",
+                WfpKeys::derive(names)
+                    .filters()
+                    .iter()
+                    .map(|(_, k)| guid_text(*k))
+                    .collect::<Vec<String>>()
+                    .join(", ")
             ),
             StepId::Record => "undo record".into(),
         }
+    }
+}
+
+/// What a failure of `id` leaves on the machine, as a clause the setup's
+/// error carries. Empty where the failure leaves nothing that matters.
+///
+/// A first setup that fails stores no passwords, so no command runs as a
+/// sandbox user. A re-run is different: the credential store from the earlier
+/// setup stays, and the launch path does not read the WFP keys, so commands
+/// keep running as the sandbox user with whatever filter the machine has. The
+/// launch path cannot check the filters itself: reading a WFP object can need
+/// administrator rights, and a command's launch is a standard user's. So the
+/// failure says it here, where it happens.
+pub fn failure_leaves(id: StepId) -> &'static str {
+    match id {
+        StepId::DnsFilter => {
+            "the sandbox users and the stored passwords of an earlier setup stay in place, so \
+             commands still run as a sandbox user without this filter and a name lookup can \
+             leave the machine; run `kgraf sandbox status` for the DNS filter lines, \
+             `kgraf sandbox selfcheck` for the effect, and `kgraf sandbox remove` to take the \
+             users off the machine"
+        }
+        _ => "",
     }
 }
 
@@ -357,11 +394,18 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
         },
         undo: Vec::new(),
     });
-    // After the users: the filter names the blocked users' SIDs.
+    // After the users: the filters name the blocked users' SIDs.
     let keys = WfpKeys::derive(names);
     steps.push(Step {
         id: StepId::DnsFilter,
-        action: if observed.wfp.contains(&keys.filter) {
+        // Update only when every filter is already there and runs: one
+        // missing or disabled filter means the layer it covers is open, so
+        // the step is a Create.
+        action: if keys
+            .filters()
+            .iter()
+            .all(|(_, k)| observed.wfp.contains(k) && !observed.wfp_disabled.contains(k))
+        {
             Action::Update
         } else {
             Action::Create
@@ -375,17 +419,120 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
     Ok(steps)
 }
 
-/// Whether `sid` may be the sandbox group's in a `Closed` undo entry: a
-/// machine-local account SID, never a built-in group such as Users, and the
-/// group's own SID while the group exists. Removal takes only the group's
-/// own deny entry off, but this keeps an edited record from naming anyone
-/// else.
-fn is_group_sid(sid: &str, observed: &Observed) -> bool {
-    sid.starts_with("S-1-5-21-")
-        && observed
-            .group_sid
-            .as_deref()
-            .is_none_or(|g| g.eq_ignore_ascii_case(sid))
+/// Whether `sid` is an account of the same authority as the owner, with a
+/// relative identifier an account database hands out (1,000 and up).
+///
+/// A prefix of `S-1-5-21-` does not say this: every domain SID starts with
+/// it too, so `Domain Users` passed that test. The owner's own SID names the
+/// authority that also made the sandbox group, so its prefix is the bound.
+fn same_authority(sid: &str, owner_sid: &str) -> bool {
+    let Some((authority, _)) = owner_sid.rsplit_once('-') else {
+        return false;
+    };
+    sid.len() > authority.len()
+        && sid[..authority.len()].eq_ignore_ascii_case(authority)
+        && sid[authority.len()..]
+            .strip_prefix('-')
+            .and_then(|rid| rid.parse::<u32>().ok())
+            .is_some_and(|rid| rid >= 1000)
+}
+
+/// Why removal may not take the deny entry of a `closed` record line off, or
+/// `None` when it may.
+///
+/// Two bounds, because the line is read from a file and a path or a SID in
+/// it could have been edited (which needs administrator rights, so this is
+/// the last fence, not the first):
+///
+/// - the folder must be one setup closes on this machine, so an edited path
+///   cannot send the removal at another folder;
+/// - the SID must be the sandbox group's own, or an account of the owner's
+///   own authority, not the owner itself, that no longer resolves, which is
+///   a sandbox group an earlier setup made and that was deleted since. A SID
+///   that still resolves names a live principal, and kGraf never takes an
+///   entry off on its behalf.
+///
+/// `resolves` answers whether a SID still names an account: `Some(false)`
+/// for an account that is gone, `None` when it could not be read, which
+/// counts against removal.
+fn closed_entry_refusal(
+    sid: &str,
+    path: &str,
+    names: &OwnerNames,
+    observed: &Observed,
+    resolves: &dyn Fn(&str) -> Option<bool>,
+) -> Option<String> {
+    if !observed
+        .closable
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(path))
+    {
+        return Some(format!(
+            "{path} is not one of the folders setup closes on this machine"
+        ));
+    }
+    if observed
+        .group_sid
+        .as_deref()
+        .is_some_and(|g| g.eq_ignore_ascii_case(sid))
+    {
+        return None;
+    }
+    if sid.eq_ignore_ascii_case(names.owner_sid()) {
+        return Some(format!(
+            "{sid} is the owner's own account, which is never the sandbox group"
+        ));
+    }
+    if !same_authority(sid, names.owner_sid()) {
+        return Some(format!(
+            "{sid} is not an account of the same authority as the owner"
+        ));
+    }
+    match resolves(sid) {
+        Some(false) => None,
+        Some(true) => Some(format!(
+            "{sid} still names an account, so it is not a sandbox group of an earlier setup"
+        )),
+        None => Some(format!(
+            "whether {sid} still names an account could not be read"
+        )),
+    }
+}
+
+/// The `closed` entries of the record that name a group other than the one
+/// the current setup made, and that setup may undo itself: the folder is one
+/// this machine closes and the SID is of the owner's own authority.
+///
+/// Setup opens these folders again and drops the entries before it writes
+/// its own, so a generation left behind by a group that was deleted outside
+/// kGraf does not pile up. Without this, each setup added ten more entries
+/// and ten more record lines, and `remove` could never finish.
+pub fn stale_closed_entries(
+    names: &OwnerNames,
+    record: &Record,
+    observed: &Observed,
+    resolves: &dyn Fn(&str) -> Option<bool>,
+) -> Vec<UndoEntry> {
+    let Some(group) = observed.group_sid.as_deref() else {
+        return Vec::new();
+    };
+    record
+        .entries
+        .iter()
+        .filter(|e| match e {
+            UndoEntry::Closed { sid, path, .. } => {
+                // The same bounds as a removal: the folder is one this
+                // machine closes, and the SID names a group of the owner's
+                // own authority that no longer resolves. An entry for a
+                // group that still exists is another owner's, and setup
+                // leaves it where it is.
+                !sid.eq_ignore_ascii_case(group)
+                    && closed_entry_refusal(sid, path, names, observed, resolves).is_none()
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,12 +540,19 @@ pub enum RemoveAction {
     Remove,
     /// Listed but already gone: nothing to do.
     AlreadyGone,
+    /// Listed, and this removal may not undo it ([`RemoveStep::note`] says
+    /// why). The entry stays in the undo record, and the rest of the plan is
+    /// carried out: one entry kGraf cannot judge must not stop a removal
+    /// from taking the users, the group, the rights and the rules away.
+    Kept,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoveStep {
     pub entry: UndoEntry,
     pub action: RemoveAction,
+    /// Why the entry is kept, for [`RemoveAction::Kept`] alone.
+    pub note: Option<String>,
 }
 
 impl RemoveStep {
@@ -425,18 +579,21 @@ fn entry_text(e: &UndoEntry) -> String {
         UndoEntry::Rights { user, .. } => format!("logon rights of {user}"),
         UndoEntry::Hidden(n) => format!("sign-in screen entry of {n}"),
         UndoEntry::Rule(n) => format!("firewall rule {n}"),
-        UndoEntry::Closed { sid, path } => format!("the deny entry for {sid} on {path}"),
+        UndoEntry::Closed { sid, path, .. } => format!("the deny entry for {sid} on {path}"),
         UndoEntry::Wfp { object, key } => format!("{object} {}", guid_text(*key)),
     }
 }
 
 /// The removal steps for what the record lists, in an order that keeps each
-/// step possible: rules and registry values first, logon rights while the
-/// user's SID still resolves, the group, then the users.
+/// step possible: rules and registry values first, the folder deny entries
+/// and the hidden values, logon rights while the user's SID still resolves,
+/// the group, then the users, and the WFP objects last of all, each filter
+/// before the sublayer and the provider it names.
 pub fn plan_remove(
     names: &OwnerNames,
     record: &Record,
     observed: &Observed,
+    resolves: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Vec<RemoveStep>, PlanError> {
     if record.owner_sid != names.owner_sid() || record.tag.as_deref() != names.tag() {
         return Err(PlanError::RecordOwner {
@@ -446,13 +603,29 @@ pub fn plan_remove(
     }
     let rules = names.rules();
     let keys = WfpKeys::derive(names);
+    // Why each `closed` entry may not be undone, by entry. A refusal here is
+    // never a refusal of the whole plan: a deny entry whose group was deleted
+    // outside kGraf would otherwise block every removal for good, leaving the
+    // users, the group, the rights, the rules and every other deny entry in
+    // place with no way out but `icacls` by hand.
+    let kept: BTreeMap<&UndoEntry, String> = record
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            UndoEntry::Closed { sid, path, .. } => {
+                closed_entry_refusal(sid, path, names, observed, resolves).map(|why| (e, why))
+            }
+            _ => None,
+        })
+        .collect();
     for e in &record.entries {
         let ours = match e {
             UndoEntry::User(n) | UndoEntry::Hidden(n) => names.role_of(n).is_some(),
             UndoEntry::Rights { user, .. } => names.role_of(user).is_some(),
             UndoEntry::Group(n) => *n == names.group(),
             UndoEntry::Rule(n) => rules.contains(n),
-            UndoEntry::Closed { sid, .. } => is_group_sid(sid, observed),
+            // Judged above, with its own reason in the error.
+            UndoEntry::Closed { .. } => true,
             UndoEntry::Wfp { object, key } => keys.get(*object) == *key,
         };
         if !ours {
@@ -460,25 +633,30 @@ pub fn plan_remove(
         }
     }
     // A deny entry goes before the group, while its SID still names it.
+    //
+    // The WFP objects go last, after the accounts. Removal stops at the first
+    // step that fails, and a block filter that will not go is fail-safe: it
+    // blocks name lookups for users that no longer exist, which is nothing.
+    // An account that will not go is not fail-safe. A stopped Base Filtering
+    // Engine, a firewall service that is off, or a sublayer another object
+    // still names would otherwise leave the sandbox users, the group, the
+    // denied logon rights, the firewall rules and the folder deny entries on
+    // the machine. Nothing in the removal of a filter needs the users: its
+    // user condition is a security descriptor of SIDs, which deletes with or
+    // without them.
     let rank = |e: &UndoEntry| match e {
-        // The filter before the sublayer and provider it names.
-        UndoEntry::Wfp {
-            object: WfpObject::Filter,
-            ..
-        } => -3,
-        UndoEntry::Wfp {
-            object: WfpObject::Sublayer,
-            ..
-        } => -2,
-        UndoEntry::Wfp {
-            object: WfpObject::Provider,
-            ..
-        } => -1,
         UndoEntry::Rule(_) => 0,
         UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
         UndoEntry::Rights { .. } => 2,
         UndoEntry::Group(_) => 3,
         UndoEntry::User(_) => 4,
+        // Each filter before the sublayer and the provider it names: a
+        // provider or sublayer an object still names cannot be deleted.
+        UndoEntry::Wfp { object, .. } => match object {
+            WfpObject::RpcFilter | WfpObject::NameCacheFilterV4 | WfpObject::NameCacheFilterV6 => 5,
+            WfpObject::Sublayer => 6,
+            WfpObject::Provider => 7,
+        },
     };
     let mut entries = record.entries.clone();
     entries.sort_by_key(|e| rank(e));
@@ -515,13 +693,15 @@ pub fn plan_remove(
                 None => false,
             },
         };
+        let note = kept.get(&entry).cloned();
         steps.push(RemoveStep {
             entry,
-            action: if present {
-                RemoveAction::Remove
-            } else {
-                RemoveAction::AlreadyGone
+            action: match (&note, present) {
+                (Some(_), _) => RemoveAction::Kept,
+                (None, true) => RemoveAction::Remove,
+                (None, false) => RemoveAction::AlreadyGone,
             },
+            note,
         });
     }
     Ok(steps)
@@ -713,21 +893,30 @@ pub fn status_report(
             state,
         );
     }
-    let filter = WfpKeys::derive(names).filter;
-    let state = match &observed.wfp_unreadable {
-        Some(why) => ItemState::Unknown(why.clone()),
-        None if observed.wfp.contains(&filter) => ItemState::Present,
-        None => ItemState::Missing,
-    };
-    // Present is not proved: only `kgraf sandbox selfcheck` shows the effect.
-    push(
-        format!(
-            "DNS filter {} (WFP; the DNS Client service refuses the offline users; \
-             `kgraf sandbox selfcheck` proves the effect)",
-            guid_text(filter)
-        ),
-        state,
-    );
+    for (object, key) in WfpKeys::derive(names).filters() {
+        let state = match &observed.wfp_unreadable {
+            Some(why) => ItemState::Unknown(why.clone()),
+            // Present is not effective: a filter the Base Filtering Engine
+            // has disabled is listed and read like any other.
+            None if observed.wfp_disabled.contains(&key) => ItemState::Wrong(
+                "present, but the Base Filtering Engine has it disabled, so it does not run"
+                    .to_owned(),
+            ),
+            None if observed.wfp.contains(&key) => ItemState::Present,
+            None => ItemState::Missing,
+        };
+        // Present is not proved: only `kgraf sandbox selfcheck` shows the
+        // effect.
+        push(
+            format!(
+                "DNS filter on {} {} (the DNS Client service refuses the offline users; \
+                 `kgraf sandbox selfcheck` proves the effect)",
+                object.layer_words(),
+                guid_text(key)
+            ),
+            state,
+        );
+    }
     let state = match record {
         Ok(None) => ItemState::Missing,
         Ok(Some(r)) if r.owner_sid != names.owner_sid() || r.tag.as_deref() != names.tag() => {
@@ -766,6 +955,12 @@ pub fn status_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A SID lookup for a host test: no SID resolves, which is the state of
+    /// a sandbox group an earlier setup made and deleted.
+    fn all_gone(_sid: &str) -> Option<bool> {
+        Some(false)
+    }
 
     const OWNER: &str = "S-1-5-21-1-2-3-1001";
 
@@ -861,10 +1056,19 @@ mod tests {
             }
         }
         // The undo list names every user, the group, both hidden entries,
-        // both rights sets, every rule and the three WFP objects, and nothing
+        // both rights sets, every rule and every WFP object, and nothing
         // else.
         let r = record_from(&steps, &n);
-        assert_eq!(r.entries.len(), 2 + 1 + 2 + 2 + RulePurpose::ALL.len() + 3);
+        assert_eq!(
+            r.entries.len(),
+            2 + 1 + 2 + 2 + RulePurpose::ALL.len() + WfpObject::ALL.len()
+        );
+        for (object, key) in WfpKeys::derive(&n).all() {
+            assert!(
+                r.entries.contains(&UndoEntry::Wfp { object, key }),
+                "{object}"
+            );
+        }
         for user in n.users() {
             assert!(r.entries.contains(&UndoEntry::User(user.clone())));
             assert!(r.entries.contains(&UndoEntry::Hidden(user.clone())));
@@ -981,22 +1185,17 @@ mod tests {
         let n = names();
         let o = full(&n);
         let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
-        let steps = plan_remove(&n, &r, &o).unwrap();
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
         assert_eq!(steps.len(), r.entries.len());
         assert!(steps.iter().all(|s| s.action == RemoveAction::Remove));
         let rank = |e: &UndoEntry| match e {
-            UndoEntry::Wfp {
-                object: WfpObject::Filter,
-                ..
-            } => -3,
-            UndoEntry::Wfp {
-                object: WfpObject::Sublayer,
-                ..
-            } => -2,
-            UndoEntry::Wfp {
-                object: WfpObject::Provider,
-                ..
-            } => -1,
+            UndoEntry::Wfp { object, .. } => match object {
+                WfpObject::RpcFilter
+                | WfpObject::NameCacheFilterV4
+                | WfpObject::NameCacheFilterV6 => 5,
+                WfpObject::Sublayer => 6,
+                WfpObject::Provider => 7,
+            },
             UndoEntry::Rule(_) => 0,
             UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
             UndoEntry::Rights { .. } => 2,
@@ -1007,10 +1206,39 @@ mod tests {
         let mut sorted = ranks.clone();
         sorted.sort();
         assert_eq!(ranks, sorted, "rights go before users, users last");
+        // The WFP objects are last of all, so a filter that will not go
+        // cannot stop the removal of an account, and each filter goes before
+        // the sublayer and the provider it names.
+        let is_wfp = |s: &RemoveStep| matches!(s.entry, UndoEntry::Wfp { .. });
+        let first_wfp = steps.iter().position(is_wfp).expect("WFP steps");
+        assert!(
+            steps[first_wfp..].iter().all(is_wfp),
+            "an account step runs after a WFP step"
+        );
+        let object_of = |s: &RemoveStep| match s.entry {
+            UndoEntry::Wfp { object, .. } => object,
+            _ => panic!("not a WFP step"),
+        };
+        assert_eq!(object_of(&steps[steps.len() - 1]), WfpObject::Provider);
+        assert_eq!(object_of(&steps[steps.len() - 2]), WfpObject::Sublayer);
+        for object in [
+            WfpObject::RpcFilter,
+            WfpObject::NameCacheFilterV4,
+            WfpObject::NameCacheFilterV6,
+        ] {
+            let at = steps
+                .iter()
+                .position(|s| matches!(s.entry, UndoEntry::Wfp { object: o, .. } if o == object))
+                .unwrap_or_else(|| panic!("{object:?} has no step"));
+            assert!(
+                at < steps.len() - 2,
+                "{object:?} is not before the sublayer"
+            );
+        }
         // Only listed things: a record with one rule removes one rule.
         let mut one = Record::new(OWNER, None);
         one.add(UndoEntry::Rule(n.rule(RulePurpose::BlockOutbound)));
-        let steps = plan_remove(&n, &one, &o).unwrap();
+        let steps = plan_remove(&n, &one, &o, &all_gone).unwrap();
         assert_eq!(steps.len(), 1);
     }
 
@@ -1019,7 +1247,7 @@ mod tests {
         let n = names();
         let r = record_from(&plan_setup(&n, &full(&n)).unwrap(), &n);
         let empty = Observed::default();
-        let steps = plan_remove(&n, &r, &empty).unwrap();
+        let steps = plan_remove(&n, &r, &empty, &all_gone).unwrap();
         assert!(steps.iter().all(|s| s.action == RemoveAction::AlreadyGone));
     }
 
@@ -1047,18 +1275,21 @@ mod tests {
             r.add(UndoEntry::Rule(n.rule(RulePurpose::BlockOutbound)));
             r.add(foreign.clone());
             assert!(
-                matches!(plan_remove(&n, &r, &o), Err(PlanError::ForeignEntry(_))),
+                matches!(
+                    plan_remove(&n, &r, &o, &all_gone),
+                    Err(PlanError::ForeignEntry(_))
+                ),
                 "{foreign:?}"
             );
         }
         let other = Record::new("S-1-5-21-9-9-9-1001", None);
         assert!(matches!(
-            plan_remove(&n, &other, &o),
+            plan_remove(&n, &other, &o, &all_gone),
             Err(PlanError::RecordOwner { .. })
         ));
         let tagged = Record::new(OWNER, Some("wintest"));
         assert!(matches!(
-            plan_remove(&n, &tagged, &o),
+            plan_remove(&n, &tagged, &o, &all_gone),
             Err(PlanError::RecordOwner { .. })
         ));
     }
@@ -1071,7 +1302,7 @@ mod tests {
         let mut r = Record::new(OWNER, None);
         r.add(UndoEntry::User(n.user(Role::Offline)));
         assert_eq!(
-            plan_remove(&n, &r, &o),
+            plan_remove(&n, &r, &o, &all_gone),
             Err(PlanError::ForeignUser(n.user(Role::Offline)))
         );
     }
@@ -1258,7 +1489,7 @@ mod tests {
         assert!(!status_report(&n, &short, Ok(Some(&r)), &all_stored(&n)).ready);
         // Remove deletes every pool user the record lists, with names that
         // cover no slots: a removal does not know the slot count.
-        let steps = plan_remove(&names(), &r, &o).unwrap();
+        let steps = plan_remove(&names(), &r, &o, &all_gone).unwrap();
         for role in &pool {
             let user = n.user(*role);
             assert!(
@@ -1390,15 +1621,18 @@ mod tests {
         }
         assert_eq!(r.entries.len(), before, "the record does not grow");
         // A filter whose provider survived but not the filter itself is made
-        // again.
-        let mut half = full(&n);
-        half.wfp.remove(&WfpKeys::derive(&n).filter);
-        let step = plan_setup(&n, &half)
-            .unwrap()
-            .into_iter()
-            .find(|s| s.id == StepId::DnsFilter)
-            .unwrap();
-        assert_eq!(step.action, Action::Create);
+        // again. One missing filter of the three is enough: the layer it
+        // covers is open until the step runs.
+        for (_, key) in WfpKeys::derive(&n).filters() {
+            let mut half = full(&n);
+            half.wfp.remove(&key);
+            let step = plan_setup(&n, &half)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == StepId::DnsFilter)
+                .unwrap();
+            assert_eq!(step.action, Action::Create, "{}", guid_text(key));
+        }
     }
 
     #[test]
@@ -1406,7 +1640,7 @@ mod tests {
         let n = names();
         let o = full(&n);
         let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
-        let steps = plan_remove(&n, &r, &o).unwrap();
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
         let wfp: Vec<(WfpObject, RemoveAction)> = steps
             .iter()
             .filter_map(|s| match s.entry {
@@ -1414,26 +1648,46 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let mut expected: Vec<(WfpObject, RemoveAction)> = WfpObject::FILTERS
+            .into_iter()
+            .map(|o| (o, RemoveAction::Remove))
+            .collect();
+        expected.push((WfpObject::Sublayer, RemoveAction::Remove));
+        expected.push((WfpObject::Provider, RemoveAction::Remove));
+        assert_eq!(wfp, expected, "every filter before the sublayer");
+        // The WFP objects go last, after every account: a block filter that
+        // will not go must never stop the removal of a user.
+        let first_wfp = steps
+            .iter()
+            .position(|s| matches!(s.entry, UndoEntry::Wfp { .. }))
+            .expect("a WFP step");
         assert_eq!(
-            wfp,
-            vec![
-                (WfpObject::Filter, RemoveAction::Remove),
-                (WfpObject::Sublayer, RemoveAction::Remove),
-                (WfpObject::Provider, RemoveAction::Remove),
-            ]
+            first_wfp,
+            steps.len() - WfpObject::ALL.len(),
+            "the WFP steps are the last ones: {:?}",
+            steps.iter().map(RemoveStep::key).collect::<Vec<String>>()
         );
-        // They go before anything else, while the users still exist.
-        assert!(matches!(steps[0].entry, UndoEntry::Wfp { .. }));
-        let key = steps[0].key();
-        assert_eq!(
-            key,
-            format!(
+        for kind in [
+            UndoEntry::User(String::new()),
+            UndoEntry::Group(String::new()),
+            UndoEntry::Rule(String::new()),
+        ] {
+            let at = steps
+                .iter()
+                .position(|s| std::mem::discriminant(&s.entry) == std::mem::discriminant(&kind))
+                .unwrap_or_else(|| panic!("a step of {kind:?}"));
+            assert!(at < first_wfp, "{kind:?} is removed before the filters");
+        }
+        let keys: Vec<String> = steps[first_wfp..].iter().map(RemoveStep::key).collect();
+        assert!(
+            keys.contains(&format!(
                 "remove-wfp-filter:{}",
-                guid_text(WfpKeys::derive(&n).filter)
-            )
+                guid_text(WfpKeys::derive(&n).rpc_filter)
+            )),
+            "{keys:?}"
         );
         // Gone already: nothing to do.
-        let gone = plan_remove(&n, &r, &Observed::default()).unwrap();
+        let gone = plan_remove(&n, &r, &Observed::default(), &all_gone).unwrap();
         assert!(
             gone.iter()
                 .filter(|s| matches!(s.entry, UndoEntry::Wfp { .. }))
@@ -1445,7 +1699,7 @@ mod tests {
             ..Observed::default()
         };
         assert!(
-            plan_remove(&n, &r, &unknown)
+            plan_remove(&n, &r, &unknown, &all_gone)
                 .unwrap()
                 .iter()
                 .filter(|s| matches!(s.entry, UndoEntry::Wfp { .. }))
@@ -1463,55 +1717,152 @@ mod tests {
             wfp_entries(&other)[2].clone(),
             wfp_entries(&tagged)[0].clone(),
             UndoEntry::Wfp {
-                object: WfpObject::Filter,
+                object: WfpObject::RpcFilter,
                 key: WfpKeys::derive(&n).provider,
             },
             UndoEntry::Wfp {
-                object: WfpObject::Filter,
+                object: WfpObject::RpcFilter,
                 key: 0x75a89dda_95e4_40f3_adc7_7688a9c847e1,
+            },
+            // One filter's key under another filter's name is foreign too.
+            UndoEntry::Wfp {
+                object: WfpObject::NameCacheFilterV4,
+                key: WfpKeys::derive(&n).name_cache_v6,
             },
         ] {
             let mut r = Record::new(OWNER, None);
             r.add(foreign.clone());
             assert!(
-                matches!(plan_remove(&n, &r, &o), Err(PlanError::ForeignEntry(_))),
+                matches!(
+                    plan_remove(&n, &r, &o, &all_gone),
+                    Err(PlanError::ForeignEntry(_))
+                ),
                 "{foreign:?}"
             );
         }
     }
 
     #[test]
-    fn status_reports_the_dns_filter() {
+    fn status_reports_every_dns_filter() {
         let n = names();
-        let line = |o: &Observed| {
+        let lines = |o: &Observed| -> Vec<StatusLine> {
             status_report(&n, o, Ok(None), &Credentials::Missing)
                 .lines
                 .into_iter()
-                .find(|l| l.item.contains("DNS"))
-                .expect("a DNS filter line")
+                .filter(|l| l.item.contains("DNS filter"))
+                .collect()
         };
         let o = full(&n);
-        assert_eq!(line(&o).state, ItemState::Present);
-        assert!(
-            line(&o)
-                .item
-                .contains(&guid_text(WfpKeys::derive(&n).filter))
-        );
-        let mut missing = o.clone();
-        missing.wfp.clear();
-        assert_eq!(line(&missing).state, ItemState::Missing);
+        // One line per filter, each naming its layer and its own key: a
+        // single line could report present while another layer is open.
+        let got = lines(&o);
+        assert_eq!(got.len(), WfpObject::FILTERS.len(), "{got:?}");
+        for (object, key) in WfpKeys::derive(&n).filters() {
+            let line = got
+                .iter()
+                .find(|l| l.item.contains(&guid_text(key)))
+                .unwrap_or_else(|| panic!("no line for {object}: {got:?}"));
+            assert_eq!(line.state, ItemState::Present);
+            assert!(line.item.contains(object.layer_words()), "{line:?}");
+        }
+        // One missing filter is reported, and makes the setup not ready.
         let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
-        assert!(!status_report(&n, &missing, Ok(Some(&r)), &all_stored(&n)).ready);
+        for (_, key) in WfpKeys::derive(&n).filters() {
+            let mut missing = o.clone();
+            missing.wfp.remove(&key);
+            let line = lines(&missing)
+                .into_iter()
+                .find(|l| l.item.contains(&guid_text(key)))
+                .expect("a line for the missing filter");
+            assert_eq!(line.state, ItemState::Missing);
+            assert!(!status_report(&n, &missing, Ok(Some(&r)), &all_stored(&n)).ready);
+        }
         let mut unread = o.clone();
         unread.wfp.clear();
         unread.wfp_unreadable = Some("needs administrator rights".into());
-        assert!(matches!(line(&unread).state, ItemState::Unknown(_)));
+        assert!(
+            lines(&unread)
+                .iter()
+                .all(|l| matches!(l.state, ItemState::Unknown(_)))
+        );
+    }
+
+    /// A setup that fails at the DNS step must say what it leaves: the
+    /// credentials of an earlier setup stay, so commands keep running as a
+    /// sandbox user with no filter.
+    #[test]
+    fn a_failed_dns_step_says_what_it_leaves_behind() {
+        let left = failure_leaves(StepId::DnsFilter);
+        assert!(!left.is_empty());
+        for needle in [
+            "stored passwords of an earlier setup stay",
+            "a name lookup can leave the machine",
+            "kgraf sandbox status",
+            "kgraf sandbox selfcheck",
+            "kgraf sandbox remove",
+        ] {
+            assert!(left.contains(needle), "{needle:?} is missing: {left}");
+        }
+        // Every other step is covered by its own error; no clause.
+        let n = names();
+        for step in plan_setup(
+            &n,
+            &Observed {
+                firewall: firewall_ok(),
+                ..Observed::default()
+            },
+        )
+        .unwrap()
+        {
+            if step.id != StepId::DnsFilter {
+                assert_eq!(failure_leaves(step.id), "", "{:?}", step.id);
+            }
+        }
+    }
+
+    /// A filter the Base Filtering Engine has disabled exists and does not
+    /// run. Status must not call it present, and the setup must not call
+    /// itself ready or the step an Update.
+    #[test]
+    fn a_disabled_filter_is_present_but_not_effective() {
+        let n = names();
+        let o = full(&n);
+        let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
+        for (object, key) in WfpKeys::derive(&n).filters() {
+            let mut off = o.clone();
+            off.wfp_disabled.insert(key);
+            let report = status_report(&n, &off, Ok(Some(&r)), &all_stored(&n));
+            let line = report
+                .lines
+                .iter()
+                .find(|l| l.item.contains(&guid_text(key)))
+                .unwrap_or_else(|| panic!("a line for {object}"));
+            let ItemState::Wrong(why) = &line.state else {
+                panic!("{object} is disabled, not {:?}", line.state);
+            };
+            assert!(why.contains("disabled"), "{why}");
+            assert!(!report.ready, "{object} disabled is not ready");
+            // The step replaces the filters, so it is a Create, not an
+            // Update of something that already works.
+            let step = plan_setup(&n, &off)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == StepId::DnsFilter)
+                .expect("the DNS filter step");
+            assert_eq!(step.action, Action::Create, "{object}");
+        }
     }
 }
 
 #[cfg(test)]
 mod closed_folder_tests {
     use super::*;
+
+    /// A SID lookup for a host test: no SID resolves, which is the state of
+    /// a sandbox group an earlier setup made and deleted.
+    fn all_gone(_sid: &str) -> Option<bool> {
+        Some(false)
+    }
 
     const OWNER: &str = "S-1-5-21-1-2-3-1001";
     const GROUP_SID: &str = "S-1-5-21-1-2-3-1100";
@@ -1520,10 +1871,42 @@ mod closed_folder_tests {
         OwnerNames::derive(OWNER, None).unwrap()
     }
 
+    /// The folders this machine would close. Removal takes an entry off only
+    /// on one of these.
+    fn closable() -> BTreeSet<String> {
+        [
+            r"C:\",
+            r"C:\ProgramData",
+            r"C:\Users\Public",
+            r"C:\Windows\Temp",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// The plan keeps the one `closed` entry of `r` and undoes nothing of
+    /// it, with a reason. A refusal of the whole plan would be the defect a
+    /// deleted group once caused.
+    fn is_kept(
+        n: &OwnerNames,
+        r: &Record,
+        o: &Observed,
+        resolves: &dyn Fn(&str) -> Option<bool>,
+    ) -> bool {
+        let steps = plan_remove(n, r, o, resolves).expect("a plan, never a refusal");
+        steps
+            .iter()
+            .filter(|s| matches!(s.entry, UndoEntry::Closed { .. }))
+            .all(|s| s.action == RemoveAction::Kept && s.note.is_some())
+    }
+
     fn closed(sid: &str, path: &str) -> UndoEntry {
         UndoEntry::Closed {
             sid: sid.into(),
             path: path.into(),
+            mask: super::super::acl::CLOSED_FOLDER_DENY,
+            flags: super::super::acl::CLOSED_FOLDER_FLAGS,
         }
     }
 
@@ -1563,12 +1946,13 @@ mod closed_folder_tests {
         let o = Observed {
             group: Some(n.group_comment()),
             group_sid: Some(GROUP_SID.into()),
+            closable: closable(),
             ..Observed::default()
         };
         let mut r = Record::new(OWNER, None);
         r.add(UndoEntry::Group(n.group()));
         r.add(closed(GROUP_SID, r"C:\ProgramData"));
-        let steps = plan_remove(&n, &r, &o).unwrap();
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
         let order: Vec<&UndoEntry> = steps.iter().map(|s| &s.entry).collect();
         assert_eq!(
             order,
@@ -1586,25 +1970,130 @@ mod closed_folder_tests {
         let o = Observed {
             group: Some(n.group_comment()),
             group_sid: Some(GROUP_SID.into()),
+            closable: closable(),
             ..Observed::default()
         };
-        // Users, Everyone, SYSTEM, another local account.
-        for sid in ["S-1-5-32-545", "S-1-1-0", "S-1-5-18", "S-1-5-21-1-2-3-1001"] {
+        // Users, Everyone, SYSTEM, the owner's own account, and a domain
+        // group, whose SID starts with S-1-5-21- as every local one does.
+        for sid in [
+            "S-1-5-32-545",
+            "S-1-1-0",
+            "S-1-5-18",
+            "S-1-5-21-1-2-3-1001",
+            "S-1-5-21-9-9-9-513",
+            "S-1-5-21-9-9-9-1101",
+        ] {
             let mut r = Record::new(OWNER, None);
             r.add(closed(sid, r"C:\"));
-            assert!(
-                matches!(plan_remove(&n, &r, &o), Err(PlanError::ForeignEntry(_))),
-                "{sid}"
-            );
+            assert!(is_kept(&n, &r, &o, &all_gone), "{sid}");
         }
-        // With the group gone, a local SID is taken: the entry can only be
-        // the group's, whose SID no longer resolves. A built-in one is not.
-        let gone = Observed::default();
+        // With the group gone, the SID of a group an earlier setup made is
+        // taken: it is of the owner's authority and no longer resolves.
+        let gone = Observed {
+            closable: closable(),
+            ..Observed::default()
+        };
         let mut r = Record::new(OWNER, None);
         r.add(closed(GROUP_SID, r"C:\"));
-        assert!(plan_remove(&n, &r, &gone).is_ok());
-        r.add(closed("S-1-5-32-545", r"C:\"));
-        assert!(plan_remove(&n, &r, &gone).is_err());
+        assert!(plan_remove(&n, &r, &gone, &all_gone).is_ok());
+        // A SID that still resolves names a live principal: not taken, and
+        // neither is one whose lookup failed.
+        assert!(is_kept(&n, &r, &gone, &|_| Some(true)));
+        assert!(is_kept(&n, &r, &gone, &|_| None));
+    }
+
+    /// A deny entry whose group was deleted outside kGraf must never block
+    /// the whole removal: setup cleans the stale generation up, and a
+    /// removal that still meets one keeps that entry alone and undoes the
+    /// rest.
+    #[test]
+    fn a_stale_group_generation_is_cleaned_up_and_blocks_nothing() {
+        let n = names();
+        const OLD_GROUP: &str = "S-1-5-21-1-2-3-1050";
+        // The group of the first setup is gone and the second setup made a
+        // new one. Both generations are in the record.
+        let o = Observed {
+            group: Some(n.group_comment()),
+            group_sid: Some(GROUP_SID.into()),
+            closable: closable(),
+            ..Observed::default()
+        };
+        let mut r = Record::new(OWNER, None);
+        r.add(UndoEntry::Group(n.group()));
+        r.add(closed(OLD_GROUP, r"C:\ProgramData"));
+        r.add(closed(OLD_GROUP, r"C:\"));
+        r.add(closed(GROUP_SID, r"C:\ProgramData"));
+        // Setup takes the old generation off and leaves its own alone.
+        let stale = stale_closed_entries(&n, &r, &o, &all_gone);
+        assert_eq!(
+            stale,
+            vec![
+                closed(OLD_GROUP, r"C:\ProgramData"),
+                closed(OLD_GROUP, r"C:\")
+            ]
+        );
+        // A group that still exists is another owner's: left where it is.
+        assert!(stale_closed_entries(&n, &r, &o, &|_| Some(true)).is_empty());
+        // Without the group of the current setup there is nothing to compare
+        // against, so setup takes nothing off.
+        let no_group = Observed {
+            closable: closable(),
+            ..Observed::default()
+        };
+        assert!(stale_closed_entries(&n, &r, &no_group, &all_gone).is_empty());
+        // Removal undoes everything it may, and keeps what it may not: here
+        // a domain group's entry, which no removal of kGraf's may touch.
+        let mut edited = Record::new(OWNER, None);
+        edited.add(UndoEntry::Group(n.group()));
+        edited.add(closed("S-1-5-21-9-9-9-513", r"C:\ProgramData"));
+        edited.add(closed(GROUP_SID, r"C:\"));
+        let steps = plan_remove(&n, &edited, &o, &all_gone).unwrap();
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        let by = |e: &UndoEntry| {
+            steps
+                .iter()
+                .find(|s| s.entry == *e)
+                .cloned()
+                .expect("a step per entry")
+        };
+        let kept = by(&closed("S-1-5-21-9-9-9-513", r"C:\ProgramData"));
+        assert_eq!(kept.action, RemoveAction::Kept);
+        assert!(kept.note.is_some_and(|w| w.contains("S-1-5-21-9-9-9-513")));
+        assert_eq!(by(&closed(GROUP_SID, r"C:\")).action, RemoveAction::Remove);
+        assert_eq!(
+            by(&UndoEntry::Group(n.group())).action,
+            RemoveAction::Remove,
+            "the group still goes"
+        );
+    }
+
+    /// A path the record names must be one of the folders setup closes on
+    /// this machine, so an edited line cannot send the removal at the access
+    /// list of another folder.
+    #[test]
+    fn remove_refuses_a_deny_entry_on_a_folder_setup_never_closes() {
+        let n = names();
+        let o = Observed {
+            group: Some(n.group_comment()),
+            group_sid: Some(GROUP_SID.into()),
+            closable: closable(),
+            ..Observed::default()
+        };
+        for path in [
+            r"C:\Users\owner\Documents",
+            r"C:\Windows\System32",
+            r"D:\",
+            r"C:",
+            "",
+        ] {
+            let mut r = Record::new(OWNER, None);
+            r.add(closed(GROUP_SID, path));
+            assert!(is_kept(&n, &r, &o, &all_gone), "{path:?}");
+        }
+        // The same folder written in another case is the same folder.
+        let mut r = Record::new(OWNER, None);
+        r.add(closed(GROUP_SID, r"c:\programdata"));
+        assert!(plan_remove(&n, &r, &o, &all_gone).is_ok());
     }
 
     #[test]

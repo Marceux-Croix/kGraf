@@ -18,14 +18,18 @@
 //! rights kgraf-off-1a2b3c4d SeDenyNetworkLogonRight,SeDenyBatchLogonRight
 //! hidden kgraf-off-1a2b3c4d
 //! rule kgraf-sandbox-1a2b3c4d-block-outbound
-//! closed S-1-5-21-...-1003 C:\ProgramData
+//! closed S-1-5-21-...-1003 0xd0156 0x0 C:\ProgramData
 //! wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b
 //! ```
 //!
 //! A `closed` line names a folder where setup denied the sandbox group the
-//! right to create or change entries, and the group's SID, so `remove` can
-//! take exactly that entry off again even after the group is gone.
+//! right to create or change entries, the group's SID, and the entry's own
+//! access mask and flags, so `remove` can take exactly that entry off again
+//! even after the group is gone and even after a later version of kGraf
+//! writes a different mask. Removal matches the mask and the flags exactly:
+//! it never takes off an entry wider than the one it wrote.
 
+use super::acl::{ACE_INHERITANCE_FLAGS, WRITE_RIGHTS};
 use super::names::is_sid_string;
 use super::wfp::{WfpObject, guid_text, parse_guid};
 
@@ -56,10 +60,14 @@ pub enum UndoEntry {
     Hidden(String),
     Rule(String),
     /// A deny entry for the sandbox group (`sid`) on the folder `path`
-    /// alone, so no sandbox user can create or change entries there.
+    /// alone, so no sandbox user can create or change entries there, with
+    /// the entry's own access mask and flags: removal matches on those, not
+    /// on the constants of the version that runs it.
     Closed {
         sid: String,
         path: String,
+        mask: u32,
+        flags: u8,
     },
     /// A WFP provider, sublayer or filter, by its key.
     Wfp {
@@ -135,7 +143,12 @@ impl Record {
                 UndoEntry::Rights { user, rights } => format!("rights {user} {}", rights.join(",")),
                 UndoEntry::Hidden(n) => format!("hidden {n}"),
                 UndoEntry::Rule(n) => format!("rule {n}"),
-                UndoEntry::Closed { sid, path } => format!("closed {sid} {path}"),
+                UndoEntry::Closed {
+                    sid,
+                    path,
+                    mask,
+                    flags,
+                } => format!("closed {sid} {mask:#x} {flags:#x} {path}"),
                 UndoEntry::Wfp { object, key } => format!("{} {}", object.key(), guid_text(*key)),
             };
             out.push_str(&line);
@@ -175,13 +188,32 @@ impl Record {
                 "hidden" => entries.push(UndoEntry::Hidden(one_word(rest)?)),
                 "rule" => entries.push(UndoEntry::Rule(one_word(rest)?)),
                 "closed" => {
-                    let (sid, path) = rest.split_once(' ').ok_or_else(bad)?;
-                    if !is_sid_string(sid) || path.trim().is_empty() {
+                    let (sid, rest) = rest.split_once(' ').ok_or_else(bad)?;
+                    let (mask, rest) = rest.split_once(' ').ok_or_else(bad)?;
+                    let (flags, path) = rest.split_once(' ').ok_or_else(bad)?;
+                    let hex = |s: &str| u32::from_str_radix(s.strip_prefix("0x")?, 16).ok();
+                    let (Some(mask), Some(flags)) = (hex(mask), hex(flags)) else {
+                        return Err(bad());
+                    };
+                    let flags = u8::try_from(flags).map_err(|_| bad())?;
+                    // The mask must be write rights alone and not empty, and
+                    // the flags must carry no inheritance: removal takes the
+                    // entry the line describes off a folder, so a line that
+                    // described a read deny or an inherited entry would make
+                    // removal change more than setup wrote.
+                    if !is_sid_string(sid)
+                        || path.trim().is_empty()
+                        || mask == 0
+                        || mask & !WRITE_RIGHTS != 0
+                        || flags & ACE_INHERITANCE_FLAGS != 0
+                    {
                         return Err(bad());
                     }
                     entries.push(UndoEntry::Closed {
                         sid: sid.to_owned(),
                         path: path.to_owned(),
+                        mask,
+                        flags,
                     });
                 }
                 "rights" => {
@@ -232,6 +264,8 @@ mod tests {
         r.add(UndoEntry::Closed {
             sid: "S-1-5-21-1-2-3-1003".into(),
             path: r"C:\Users\Public\Public Documents".into(),
+            mask: super::super::acl::CLOSED_FOLDER_DENY,
+            flags: super::super::acl::CLOSED_FOLDER_FLAGS,
         });
         for object in WfpObject::ALL {
             r.add(UndoEntry::Wfp {
@@ -287,6 +321,39 @@ mod tests {
         assert_eq!(r.entries.len(), before - 1);
     }
 
+    /// A `closed` line carries the mask and the flags of the entry setup
+    /// wrote, not the constants of the version that reads it. A version that
+    /// denies more rights later must neither orphan an entry an earlier one
+    /// wrote nor take off a wider entry while deleting its line.
+    #[test]
+    fn a_closed_line_carries_the_entrys_own_mask_and_flags() {
+        let line = |mask: u32| {
+            let mut r = Record::new("S-1-5-21-1-2-3-1001", None);
+            r.add(UndoEntry::Closed {
+                sid: "S-1-5-21-1-2-3-1003".into(),
+                path: r"C:\ProgramData".into(),
+                mask,
+                flags: 0,
+            });
+            let text = r.to_text();
+            assert_eq!(Record::parse(&text).unwrap(), r, "{text}");
+            text.lines()
+                .find(|l| l.starts_with("closed "))
+                .unwrap()
+                .to_owned()
+        };
+        // Today's mask, and a narrower one an earlier version could have
+        // written: each comes back as it went in.
+        assert_eq!(
+            line(super::super::acl::CLOSED_FOLDER_DENY),
+            r"closed S-1-5-21-1-2-3-1003 0xd0156 0x0 C:\ProgramData"
+        );
+        assert_eq!(
+            line(0x0000_0116),
+            r"closed S-1-5-21-1-2-3-1003 0x116 0x0 C:\ProgramData"
+        );
+    }
+
     #[test]
     fn damaged_records_are_refused() {
         assert_eq!(Record::parse(""), Err(RecordError::Header));
@@ -303,8 +370,17 @@ mod tests {
             "rule",
             "user ",
             "closed S-1-5-21-1-2-3-1003",
-            "closed not-a-sid C:\\ProgramData",
-            "closed S-1-5-21-1-2-3-1003  ",
+            "closed S-1-5-21-1-2-3-1003 C:\\ProgramData",
+            "closed not-a-sid 0xd0156 0x0 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0xd0156 0x0  ",
+            // Not a hexadecimal mask, an empty mask, a read right in the
+            // mask, and an inherited or inheritable entry.
+            "closed S-1-5-21-1-2-3-1003 d0116 0x0 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0x0 0x0 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0xd01a9 0x0 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0xd0156 0x10 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0xd0156 0x3 C:\\ProgramData",
+            "closed S-1-5-21-1-2-3-1003 0xd0156 0x100 C:\\ProgramData",
             "wfp-filter not-a-guid",
             "wfp-filter 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b extra",
             "wfp-callout 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b",

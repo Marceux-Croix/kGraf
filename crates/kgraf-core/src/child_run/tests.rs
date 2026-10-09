@@ -313,3 +313,151 @@ fn output_gives_the_child_no_input() {
         "{out:?}"
     );
 }
+
+/// A tree whose kill fails `fail_first` times, then works; the child "exits"
+/// (the waiter's event) once a kill has worked, if `exits`.
+struct ScriptedTree {
+    fail_first: usize,
+    always_fail: bool,
+    kills: std::sync::atomic::AtomicUsize,
+    exited: Option<mpsc::Sender<Event>>,
+}
+
+impl Kill for ScriptedTree {
+    fn kill(&self) -> std::io::Result<()> {
+        let n = self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.always_fail || n < self.fail_first {
+            return Err(std::io::Error::other("access denied"));
+        }
+        if let Some(tx) = &self.exited {
+            let _ = tx.send(Event::Exited(Ok(exit_status_zero())));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn exit_status_zero() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
+}
+
+#[cfg(windows)]
+fn exit_status_zero() -> ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
+}
+
+fn quick_limits() -> Limits {
+    let mut limits = Limits::new(Duration::from_secs(1));
+    limits.kill_bound = Duration::from_millis(600);
+    limits
+}
+
+#[test]
+fn a_kill_that_fails_is_sent_again_and_a_later_one_that_works_ends_the_wait() {
+    let (tx, rx) = mpsc::channel();
+    let tree = ScriptedTree {
+        fail_first: 2,
+        always_fail: false,
+        kills: Default::default(),
+        exited: Some(tx),
+    };
+    let err = kill_after_timeout(&tree, &rx, "probe", quick_limits());
+    assert!(matches!(err, RunError::TimedOut { .. }), "{err}");
+    assert_eq!(tree.kills.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn a_kill_that_never_works_is_the_kill_error_after_the_bound() {
+    let (_tx, rx) = mpsc::channel();
+    let tree = ScriptedTree {
+        fail_first: 0,
+        always_fail: true,
+        kills: Default::default(),
+        exited: None,
+    };
+    let started = Instant::now();
+    let err = kill_after_timeout(&tree, &rx, "probe", quick_limits());
+    assert!(matches!(err, RunError::Kill { .. }), "{err}");
+    assert!(started.elapsed() >= Duration::from_millis(600));
+    assert!(tree.kills.load(std::sync::atomic::Ordering::SeqCst) > 2);
+}
+
+#[test]
+fn a_tree_that_does_not_end_is_killed_again_during_the_bound_then_stuck() {
+    let (_tx, rx) = mpsc::channel();
+    let tree = ScriptedTree {
+        fail_first: 0,
+        always_fail: false,
+        kills: Default::default(),
+        exited: None,
+    };
+    let err = kill_after_timeout(&tree, &rx, "probe", quick_limits());
+    assert!(matches!(err, RunError::Stuck { .. }), "{err}");
+    assert!(tree.kills.load(std::sync::atomic::Ordering::SeqCst) > 2);
+}
+
+/// The waiter holds no handle that keeps the job open: when `run` lets the
+/// tree go, the job closes and the child ends. Compile-checked only on the
+/// development host; it runs on Windows.
+#[cfg(windows)]
+#[test]
+fn dropping_the_tree_ends_a_child_the_waiter_still_waits_for() {
+    let mut cmd = sh("ping -n 60 127.0.0.1 >nul");
+    let unadopted = tree::Tree::prepare(&mut cmd).expect("job");
+    let mut child = cmd.spawn().expect("spawn");
+    let tree = unadopted.adopt(&mut child).expect("adopt");
+    let waiter = tree.waiter();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(waiter.wait_and_end(child, KILL_BOUND).map(|s| s.success()));
+    });
+    drop(tree);
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("the child ended once the last real handle to the job closed")
+        .expect("status");
+}
+
+/// A child that writes more than the cap is ended and the error says the
+/// output was cut; the runner does not hold it all.
+#[cfg(unix)]
+#[test]
+fn output_past_the_cap_ends_the_child_and_says_so() {
+    let mut limits = Limits::new(Duration::from_secs(30));
+    limits.max_output = 10_000;
+    let started = Instant::now();
+    let err = bounded(Duration::from_secs(60), move || {
+        run(
+            sh("head -c 5000000 /dev/zero; sleep 30"),
+            "probe",
+            None,
+            limits,
+        )
+    })
+    .expect_err("past the cap");
+    match err {
+        RunError::OutputTooLarge { stream, cap, .. } => {
+            assert_eq!(stream, "standard output");
+            assert_eq!(cap, 10_000);
+        }
+        other => panic!("{other}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "waited for the sleep"
+    );
+}
+
+/// Output at the cap is kept whole.
+#[cfg(unix)]
+#[test]
+fn output_at_the_cap_is_returned_whole() {
+    let mut limits = Limits::new(Duration::from_secs(30));
+    limits.max_output = 10_000;
+    let got = bounded(Duration::from_secs(60), move || {
+        run(sh("head -c 10000 /dev/zero"), "probe", None, limits)
+    })
+    .expect("ran");
+    assert_eq!(got.stdout.len(), 10_000);
+}

@@ -1,32 +1,53 @@
-//! The DNS filter of the sandbox user setup (decision 0097): one Windows
-//! Filtering Platform (WFP) filter that makes the DNS Client service refuse
+//! The DNS filter of the sandbox user setup (decision 0097): the Windows
+//! Filtering Platform (WFP) filters that make the DNS Client service refuse
 //! name lookups from the users whose network is blocked.
 //!
 //! A name lookup does not leave the calling process as a packet. The process
 //! asks the DNS Client service (Dnscache) over local RPC, and the service
 //! sends the query as NETWORK SERVICE. The firewall rules match the calling
-//! user's SID, so they never see that query. The filter here sits on the
-//! user-mode RPC layer (`FWPM_LAYER_RPC_UM`) instead: it blocks a call to
-//! the DNS Client's RPC interface when the caller's token is one of the
-//! blocked users. The direct path, a query the process sends itself, is
-//! already blocked by the firewall rules.
+//! user's SID, so they never see that query. The filters here sit on the
+//! layers that do see the caller:
+//!
+//! * **The name resolution cache layers**
+//!   (`FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` and `..._V6`), one filter each,
+//!   with the condition `FWPM_CONDITION_ALE_USER_ID`, "the identification of
+//!   the local user". This is the only layer pair at which WFP is handed the
+//!   local caller of a name lookup, so it is the only one that can reach a
+//!   lookup the DNS Client service serves over local RPC.
+//! * **The user-mode RPC layer** (`FWPM_LAYER_RPC_UM`), with the RPC
+//!   interface and `FWPM_CONDITION_REMOTE_USER_TOKEN`. That layer is reached
+//!   only for a remote DCE/RPC caller, never for a local ALPC call, so it
+//!   cannot cover the local path; it is kept for a caller that reaches the
+//!   interface over a network transport.
 //!
 //! ```text
 //!   offline or slot user process          Dnscache (NETWORK SERVICE)
-//!     getaddrinfo / DnsQuery --RPC------> [RPC_UM filter: interface and
-//!                                          caller token match -> block]
+//!     getaddrinfo / DnsQuery --ALPC-----> [NAME_RESOLUTION_CACHE_V4/V6
+//!                                          filters: ALE_USER_ID matches
+//!                                          a blocked user -> block]
 //!     direct UDP 53 -------X firewall rule (scoped to the user's SID)
+//!   a remote DCE/RPC caller ----------->  [RPC_UM filter: interface and
+//!                                          remote token match -> block]
 //! ```
+//!
+//! **Not known without a Windows run.** Whether a block at the name
+//! resolution cache layers makes the lookup fail, or only keeps the service
+//! from using and filling its cache while the query still leaves the machine.
+//! Microsoft documents the layer in one sentence, "This filtering layer
+//! allows for querying the names recently resolved by the system", and says
+//! nothing about the effect of a block there. `kgraf sandbox selfcheck` is
+//! the only proof: it judges the filters by their effect, never by their
+//! presence.
 //!
 //! Everything here is platform-neutral: the keys, the names, the matching
 //! security descriptor and the interface identifier are tested on every
 //! host. The WFP calls are in `windows::wfp`.
 //!
-//! **Keys.** WFP names its objects by GUID. The provider, sublayer and filter
-//! keys are derived from the owner's SID and the tag, as the user names are,
-//! so two owners on one machine, or a tagged test setup and a real one, never
-//! share an object, and `kgraf sandbox remove` deletes exactly the keys its
-//! record lists and no other.
+//! **Keys.** WFP names its objects by GUID. The provider, sublayer and the
+//! three filter keys are each derived from the owner's SID and the tag, as
+//! the user names are, so two owners on one machine, or a tagged test setup
+//! and a real one, never share an object, and `kgraf sandbox remove` deletes
+//! exactly the keys its record lists and no other.
 
 use std::fmt;
 
@@ -47,32 +68,76 @@ pub const DNS_RESOLVER_INTERFACE: u128 = 0x45776b01_5956_4485_9f80_f428f7d60129;
 /// A token that the descriptor grants this right matches the condition.
 pub const MATCH_FILTER_ACCESS: u32 = 0x0000_0001;
 
-/// The sublayer's weight, the middle of the range, as codex uses.
-pub const SUBLAYER_WEIGHT: u16 = 0x8000;
+/// The sublayer's weight: the maximum, so nothing is decided before kGraf's
+/// block.
+///
+/// Microsoft's "Filter Arbitration" page: "Network traffic traverses
+/// sub-layers from the highest priority to the lowest priority", a permit
+/// whose action right is cleared is a "hard permit" that "can be blocked at
+/// another sub-layer only by a callout Veto", and "In order to silently
+/// override 'Hard Permit' filters a firewall has to add its filters within a
+/// higher priority sub-layer". `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` on the
+/// block therefore stops only a *lower*-weight sublayer from permitting over
+/// it; a third-party sublayer of higher weight with a hard permit is decided
+/// first. The reuse source (openai/codex `windows-sandbox-rs`) uses 0x8000,
+/// the middle of the range, and gives no reason; mid-range leaves half the
+/// range above kGraf.
+///
+/// The maximum is right here because this sublayer holds block filters only.
+/// A sublayer that can never permit cannot take traffic away from another
+/// provider by being decided first: a block it does not match leaves the
+/// action as it was, and a block it does match is what kGraf is for.
+pub const SUBLAYER_WEIGHT: u16 = u16::MAX;
 
-/// One of the three WFP objects the setup makes.
+/// One of the WFP objects the setup makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WfpObject {
-    /// kGraf's provider: the filter and the sublayer name it as theirs.
+    /// kGraf's provider: the filters and the sublayer name it as theirs.
     Provider,
-    /// kGraf's sublayer, which holds the filter.
+    /// kGraf's sublayer, which holds the filters.
     Sublayer,
-    /// The filter that blocks the DNS Client interface for blocked users.
-    Filter,
+    /// The filter on the user-mode RPC layer, for a remote caller of the DNS
+    /// Client interface. It cannot see a local lookup (see the module
+    /// header).
+    RpcFilter,
+    /// The filter on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4`, which does see
+    /// the local caller.
+    NameCacheFilterV4,
+    /// The same on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`.
+    NameCacheFilterV6,
 }
 
 impl WfpObject {
     /// In the order they must be added. Removal runs in the reverse order:
     /// a provider or sublayer that an object still names cannot be deleted.
-    pub const ALL: [WfpObject; 3] = [WfpObject::Provider, WfpObject::Sublayer, WfpObject::Filter];
+    pub const ALL: [WfpObject; 5] = [
+        WfpObject::Provider,
+        WfpObject::Sublayer,
+        WfpObject::RpcFilter,
+        WfpObject::NameCacheFilterV4,
+        WfpObject::NameCacheFilterV6,
+    ];
+
+    /// Just the filters, in the order they are added.
+    pub const FILTERS: [WfpObject; 3] = [
+        WfpObject::RpcFilter,
+        WfpObject::NameCacheFilterV4,
+        WfpObject::NameCacheFilterV6,
+    ];
 
     /// The word in the undo record: `wfp-provider`, `wfp-sublayer`,
-    /// `wfp-filter`.
+    /// `wfp-filter`, `wfp-filter-name-cache-v4`, `wfp-filter-name-cache-v6`.
+    ///
+    /// The RPC filter keeps the plain `wfp-filter` word it had when it was
+    /// the only filter, so a record an earlier setup wrote still parses and
+    /// `kgraf sandbox remove` can still undo it.
     pub fn key(self) -> &'static str {
         match self {
             WfpObject::Provider => "wfp-provider",
             WfpObject::Sublayer => "wfp-sublayer",
-            WfpObject::Filter => "wfp-filter",
+            WfpObject::RpcFilter => "wfp-filter",
+            WfpObject::NameCacheFilterV4 => "wfp-filter-name-cache-v4",
+            WfpObject::NameCacheFilterV6 => "wfp-filter-name-cache-v6",
         }
     }
 
@@ -80,12 +145,30 @@ impl WfpObject {
         WfpObject::ALL.into_iter().find(|o| o.key() == s)
     }
 
+    /// Whether the object is a filter, not the provider or the sublayer.
+    pub fn is_filter(self) -> bool {
+        WfpObject::FILTERS.contains(&self)
+    }
+
+    /// The layer a filter sits on, in words. Empty for the provider and the
+    /// sublayer, which sit on no layer.
+    pub fn layer_words(self) -> &'static str {
+        match self {
+            WfpObject::Provider | WfpObject::Sublayer => "",
+            WfpObject::RpcFilter => "the user-mode RPC layer",
+            WfpObject::NameCacheFilterV4 => "the name resolution cache layer, IPv4",
+            WfpObject::NameCacheFilterV6 => "the name resolution cache layer, IPv6",
+        }
+    }
+
     /// What the object is, in words.
     pub fn noun(self) -> &'static str {
         match self {
             WfpObject::Provider => "WFP provider",
             WfpObject::Sublayer => "WFP sublayer",
-            WfpObject::Filter => "WFP filter",
+            WfpObject::RpcFilter => "WFP filter (user-mode RPC layer)",
+            WfpObject::NameCacheFilterV4 => "WFP filter (name resolution cache, IPv4)",
+            WfpObject::NameCacheFilterV6 => "WFP filter (name resolution cache, IPv6)",
         }
     }
 }
@@ -101,19 +184,23 @@ impl fmt::Display for WfpObject {
 pub struct WfpKeys {
     pub provider: u128,
     pub sublayer: u128,
-    pub filter: u128,
+    pub rpc_filter: u128,
+    pub name_cache_v4: u128,
+    pub name_cache_v6: u128,
 }
 
 impl WfpKeys {
     /// The keys for `names`. They depend on the owner's SID and the tag only,
     /// not on the slot count, so a setup with more slots refreshes the same
-    /// filter.
+    /// filters.
     pub fn derive(names: &OwnerNames) -> Self {
         let key = |o: WfpObject| derive_key(names.owner_sid(), names.tag(), o);
         Self {
             provider: key(WfpObject::Provider),
             sublayer: key(WfpObject::Sublayer),
-            filter: key(WfpObject::Filter),
+            rpc_filter: key(WfpObject::RpcFilter),
+            name_cache_v4: key(WfpObject::NameCacheFilterV4),
+            name_cache_v6: key(WfpObject::NameCacheFilterV6),
         }
     }
 
@@ -121,14 +208,43 @@ impl WfpKeys {
         match object {
             WfpObject::Provider => self.provider,
             WfpObject::Sublayer => self.sublayer,
-            WfpObject::Filter => self.filter,
+            WfpObject::RpcFilter => self.rpc_filter,
+            WfpObject::NameCacheFilterV4 => self.name_cache_v4,
+            WfpObject::NameCacheFilterV6 => self.name_cache_v6,
         }
     }
 
     /// Each object with its key, in the order they must be added.
-    pub fn all(&self) -> [(WfpObject, u128); 3] {
+    pub fn all(&self) -> [(WfpObject, u128); 5] {
         WfpObject::ALL.map(|o| (o, self.get(o)))
     }
+
+    /// Each filter with its key, in the order they are added.
+    pub fn filters(&self) -> [(WfpObject, u128); 3] {
+        WfpObject::FILTERS.map(|o| (o, self.get(o)))
+    }
+}
+
+/// `FWPM_FILTER_FLAG_DISABLED`: the Base Filtering Engine has the filter, but
+/// does not run it. A filter whose provider names no service gets this flag
+/// when the engine cannot decide that the provider's service is running, and
+/// Microsoft's own pages do not agree on whether that happens at every start,
+/// which is the reason to read the flag instead of trusting either sentence.
+pub const FILTER_DISABLED: u32 = 0x0000_0020;
+
+/// Whether `flags`, an `FWPM_FILTER0::flags`, says the filter does not run.
+pub fn filter_is_disabled(flags: u32) -> bool {
+    flags & FILTER_DISABLED != 0
+}
+
+/// What a read of one owner's WFP objects found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WfpState {
+    /// The keys that exist.
+    pub present: std::collections::BTreeSet<u128>,
+    /// The filter keys that exist and carry [`FILTER_DISABLED`]. Always a
+    /// subset of `present`: present is not effective.
+    pub disabled: std::collections::BTreeSet<u128>,
 }
 
 /// A stable GUID for one object of one owner: 128 bits of FNV-1a over the
@@ -208,12 +324,17 @@ pub fn filter_users(names: &OwnerNames) -> Vec<String> {
     names.blocked_users()
 }
 
-/// The security descriptor, in SDDL, that the filter's caller-token condition
-/// (`FWPM_CONDITION_REMOTE_USER_TOKEN`) checks: one allow entry for
-/// [`MATCH_FILTER_ACCESS`] (`CC` in SDDL) per user whose lookups must be
-/// refused. A token that holds none of these SIDs is granted nothing, so the
-/// filter does not match it: the owner and the online users resolve names as
-/// before.
+/// The security descriptor, in SDDL, that the filters' user conditions check:
+/// one allow entry for [`MATCH_FILTER_ACCESS`] (`CC` in SDDL) per user whose
+/// lookups must be refused. A token that holds none of these SIDs is granted
+/// nothing, so the filter does not match it: the owner and the online users
+/// resolve names as before.
+///
+/// One descriptor serves every filter. `FWPM_CONDITION_ALE_USER_ID` (the name
+/// resolution cache layers) and `FWPM_CONDITION_REMOTE_USER_TOKEN` (the
+/// user-mode RPC layer) both take `FWP_SECURITY_DESCRIPTOR_TYPE`, so the same
+/// bytes match the local caller on one layer and the remote caller on the
+/// other.
 ///
 /// One entry per user SID, never the sandbox group's SID: the group also
 /// holds the online users, which need lookups for dependency installs.
@@ -239,8 +360,16 @@ pub fn display_name(names: &OwnerNames, object: WfpObject) -> String {
     match object {
         WfpObject::Provider => format!("kGraf sandbox ({})", names.group()),
         WfpObject::Sublayer => format!("kGraf sandbox filters ({})", names.group()),
-        WfpObject::Filter => format!(
-            "kGraf sandbox: no DNS lookups for offline users ({})",
+        WfpObject::RpcFilter => format!(
+            "kGraf sandbox: no DNS lookups for offline users, remote RPC ({})",
+            names.group()
+        ),
+        WfpObject::NameCacheFilterV4 => format!(
+            "kGraf sandbox: no DNS lookups for offline users, IPv4 ({})",
+            names.group()
+        ),
+        WfpObject::NameCacheFilterV6 => format!(
+            "kGraf sandbox: no DNS lookups for offline users, IPv6 ({})",
             names.group()
         ),
     }
@@ -250,13 +379,22 @@ pub fn display_name(names: &OwnerNames, object: WfpObject) -> String {
 pub fn description(object: WfpObject) -> &'static str {
     match object {
         WfpObject::Provider => {
-            "Made by kgraf sandbox setup; kgraf sandbox remove deletes it. Owns the filter \
-             that keeps kGraf's offline sandbox users from name lookups."
+            "Made by kgraf sandbox setup; kgraf sandbox remove deletes it. Owns the filters \
+             that keep kGraf's offline sandbox users from name lookups."
         }
         WfpObject::Sublayer => "Holds kGraf's sandbox filters.",
-        WfpObject::Filter => {
+        WfpObject::RpcFilter => {
             "Blocks calls to the DNS Client service's RPC interface from kGraf's offline \
-             and worker slot sandbox users, so their name lookups cannot leave the machine."
+             and worker slot sandbox users. This layer sees a remote caller only, so the \
+             name resolution cache filters cover a lookup on this machine."
+        }
+        WfpObject::NameCacheFilterV4 => {
+            "Blocks IPv4 name resolution for kGraf's offline and worker slot sandbox users, \
+             so their name lookups cannot leave the machine."
+        }
+        WfpObject::NameCacheFilterV6 => {
+            "Blocks IPv6 name resolution for kGraf's offline and worker slot sandbox users, \
+             so their name lookups cannot leave the machine."
         }
     }
 }
@@ -312,7 +450,12 @@ mod tests {
         assert_eq!(k, WfpKeys::derive(&n));
         assert_eq!(k, WfpKeys::derive(&n.clone().with_slots(9)));
         let all: std::collections::BTreeSet<u128> = k.all().iter().map(|(_, v)| *v).collect();
-        assert_eq!(all.len(), 3, "three distinct keys");
+        assert_eq!(all.len(), 5, "five distinct keys");
+        // Every filter has its own key, so one layer's filter can be read,
+        // replaced or removed without touching another's.
+        assert_eq!(k.filters().len(), 3);
+        assert!(k.filters().iter().all(|(o, _)| o.is_filter()));
+        assert!(!WfpObject::Provider.is_filter() && !WfpObject::Sublayer.is_filter());
         let other = WfpKeys::derive(&OwnerNames::derive("S-1-5-21-1-2-3-1002", None).unwrap());
         let tagged = WfpKeys::derive(&OwnerNames::derive(OWNER, Some("wintest")).unwrap());
         for (o, v) in k.all() {
@@ -322,6 +465,40 @@ mod tests {
             assert_eq!(&text[14..15], "8", "version 8: {text}");
             assert!(matches!(&text[19..20], "8" | "9" | "a" | "b"), "{text}");
         }
+    }
+
+    /// A filter the Base Filtering Engine has disabled is read like any
+    /// other, so the flag is the only witness.
+    /// Nothing is decided before a block-only sublayer: clearing the action
+    /// right stops a lower-weight sublayer from permitting over the block,
+    /// but a higher-weight sublayer with a hard permit is decided first.
+    #[test]
+    fn the_sublayer_weight_leaves_nothing_above_it() {
+        // Not the reuse source's mid-range 0x8000, which leaves half the
+        // range above kGraf.
+        assert_eq!(SUBLAYER_WEIGHT, u16::MAX);
+        assert_ne!(SUBLAYER_WEIGHT, 0x8000);
+    }
+
+    #[test]
+    fn the_disabled_flag_is_read_from_the_filter_flags() {
+        assert_eq!(FILTER_DISABLED, 0x20, "FWPM_FILTER_FLAG_DISABLED");
+        assert!(filter_is_disabled(FILTER_DISABLED));
+        // Persistent (0x01) and clear action right (0x08), the flags the
+        // setup sets, with and without the disabled bit.
+        assert!(!filter_is_disabled(0x01 | 0x08));
+        assert!(filter_is_disabled(0x01 | 0x08 | FILTER_DISABLED));
+        assert!(!filter_is_disabled(0));
+        // A disabled key is always a present key too.
+        let n = OwnerNames::derive(OWNER, None).unwrap();
+        let k = WfpKeys::derive(&n);
+        let state = WfpState {
+            present: k.all().iter().map(|(_, v)| *v).collect(),
+            disabled: [k.name_cache_v4].into_iter().collect(),
+        };
+        assert!(state.disabled.is_subset(&state.present));
+        assert_eq!(WfpState::default(), WfpState::default());
+        assert!(WfpState::default().present.is_empty());
     }
 
     #[test]
@@ -351,6 +528,21 @@ mod tests {
             assert_eq!(WfpObject::from_key(o.key()), Some(o));
         }
         assert_eq!(WfpObject::from_key("wfp"), None);
+        // The RPC filter keeps the word it had when it was the only filter,
+        // so a record an earlier setup wrote still parses.
+        assert_eq!(
+            WfpObject::from_key("wfp-filter"),
+            Some(WfpObject::RpcFilter)
+        );
+        let words: std::collections::BTreeSet<&str> =
+            WfpObject::ALL.iter().map(|o| o.key()).collect();
+        assert_eq!(words.len(), WfpObject::ALL.len(), "distinct record words");
+        // Each filter's display name says which layer it sits on, so an
+        // administrator reading `netsh wfp show filters` can tell them apart.
+        let v4 = display_name(&n, WfpObject::NameCacheFilterV4);
+        let v6 = display_name(&n, WfpObject::NameCacheFilterV6);
+        assert_ne!(v4, v6);
+        assert_ne!(v4, display_name(&n, WfpObject::RpcFilter));
     }
 
     /// The DNS filter names exactly the users the firewall rules block: the

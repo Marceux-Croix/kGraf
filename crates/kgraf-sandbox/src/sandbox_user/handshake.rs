@@ -75,10 +75,28 @@ impl fmt::Display for StepOutcome {
 
 #[derive(Debug)]
 pub enum Message {
-    Hello { nonce: String },
-    Step { key: String, outcome: StepOutcome },
-    Fail { key: String, message: String },
-    Password { role: Role, password: Password },
+    Hello {
+        nonce: String,
+    },
+    Step {
+        key: String,
+        outcome: StepOutcome,
+    },
+    /// Something the step left alone, with why. Unlike [`Message::Fail`] the
+    /// run goes on: a removal that cannot undo one entry still undoes the
+    /// rest, and the entry stays in the undo record.
+    Note {
+        key: String,
+        message: String,
+    },
+    Fail {
+        key: String,
+        message: String,
+    },
+    Password {
+        role: Role,
+        password: Password,
+    },
     End,
 }
 
@@ -138,6 +156,7 @@ impl Message {
         Zeroizing::new(match self {
             Message::Hello { nonce } => format!("{PIPE_PROTOCOL} {PIPE_VERSION} {nonce}\n"),
             Message::Step { key, outcome } => format!("step {key} {outcome}\n"),
+            Message::Note { key, message } => format!("note {key} {}\n", one_line(message)),
             Message::Fail { key, message } => format!("fail {key} {}\n", one_line(message)),
             Message::Password { role, password } => {
                 return password_line(*role, password);
@@ -177,6 +196,10 @@ impl Message {
             ("step", Some(key), Some(word)) if key_ok(key) => Ok(Message::Step {
                 key: key.to_owned(),
                 outcome: StepOutcome::from_word(word).ok_or(HandshakeError::Malformed)?,
+            }),
+            ("note", Some(key), message) if key_ok(key) => Ok(Message::Note {
+                key: key.to_owned(),
+                message: message.unwrap_or_default().to_owned(),
             }),
             ("fail", Some(key), message) if key_ok(key) => Ok(Message::Fail {
                 key: key.to_owned(),
@@ -322,8 +345,19 @@ enum ReceiverState {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Started,
-    Step { key: String, outcome: StepOutcome },
-    Failed { key: String, message: String },
+    Step {
+        key: String,
+        outcome: StepOutcome,
+    },
+    /// Left alone, with why; the run goes on.
+    Note {
+        key: String,
+        message: String,
+    },
+    Failed {
+        key: String,
+        message: String,
+    },
     PasswordReceived(Role),
     Finished,
 }
@@ -346,6 +380,7 @@ impl Receiver {
                 Ok(Event::Started)
             }
             (S::Steps, Message::Step { key, outcome }) => Ok(Event::Step { key, outcome }),
+            (S::Steps, Message::Note { key, message }) => Ok(Event::Note { key, message }),
             (S::Steps | S::Passwords, Message::Fail { key, message }) => {
                 self.state = S::Failed;
                 Ok(Event::Failed { key, message })

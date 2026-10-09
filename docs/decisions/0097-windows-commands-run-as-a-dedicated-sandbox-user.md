@@ -485,6 +485,128 @@ Not yet confirmed on Windows:
 - the `netsh wfp show filters` text of the filter (name, layer, action), which a Windows
   test checks.
 
+**Amendment (2026-10-08): the DNS filter is at the name resolution cache layers, not only
+at the RPC layer.** A confinement review of the filter above found that the `RPC_UM` filter
+can never see a local name lookup, so the setup reported success, `netsh wfp show filters`
+listed the filter, `kgraf sandbox status` said present, the Windows test passed, and the
+lookup still left the machine. None of the code below has run on Windows either.
+
+Evidence for the finding. `FWPM_LAYER_RPC_UM` is classified in user mode by the RPC
+runtime and is reached only for a DCE/RPC call with a remote caller, never for a local
+ALPC call. The DNS Client service serves its interface on `ncalrpc` only, which is LRPC
+over ALPC, so a lookup on this machine is never classified at that layer. Microsoft's own
+`netsh rpc` field name for the condition is `remote_user_token`, "Token for remote user
+authentication", and the condition identifier table gives
+`FWPM_CONDITION_REMOTE_USER_TOKEN` as "The identification of the remote user".
+
+Choices made here:
+
+- (k) **Two more filters, at `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` and
+  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`**, each a block with the single condition
+  `FWPM_CONDITION_ALE_USER_ID`. Microsoft's "Filtering conditions available at each
+  filtering layer" (Fwpmu.h, ms.date 05/02/2024) lists `FWPM_CONDITION_ALE_USER_ID` at
+  both of those layers for "Windows 7 and later", and "Filtering condition identifiers"
+  gives it as "The identification of the local user. Data type:
+  FWP_SECURITY_DESCRIPTOR_TYPE". That is the same data type as the RPC layer's condition,
+  so the existing user match descriptor is reused unchanged, with the same one allow entry
+  for `FWP_ACTRL_MATCH_FILTER` per blocked user. This is the only layer pair at which WFP
+  is handed the local caller of a name lookup.
+- (l) **The `RPC_UM` filter stays**, for a caller that reaches the interface over a
+  network transport. Its code comment and its description say that it cannot cover the
+  local path.
+- (m) **Five objects, five keys.** The key set grows from three to five: provider,
+  sublayer, and one filter per layer. Each key is still derived from the installing user's
+  SID and the tag, removal is still by those keys only, a key that is not this user's
+  derived key is still refused, and it is still one transaction. The RPC filter keeps the
+  undo record word `wfp-filter` it had when it was the only filter, so a record an earlier
+  setup wrote still parses; the new ones are `wfp-filter-name-cache-v4` and
+  `wfp-filter-name-cache-v6`. `kgraf sandbox status` prints one line per filter, each
+  naming its layer and its own key, because a single line could say present while another
+  layer was open.
+
+**Not known, and a Windows run is the only way to settle it.** Whether a block at the
+name resolution cache layers makes the lookup fail, or only keeps the DNS Client service
+from reading and filling its cache while the query still leaves the machine. Microsoft
+documents the layer in one sentence, "This filtering layer allows for querying the names
+recently resolved by the system", and says nothing about the effect of a block there. The
+gap therefore stays in the Windows sandbox user backend's gaps text, and
+`kgraf sandbox selfcheck` stays the only proof: it judges the filters by their effect,
+never by their presence.
+
+**Amendment (2026-10-08): the DNS probe must prove a local failure.** The same review
+found that `dns: confined` could be printed with no probe evidence. A line equal to
+`KGRAF-DNS-CODE=` with nothing after it set the "a status was printed" flag by its prefix
+alone and left the status unset; the old polarity, "anything that is not a server answer is
+a local failure", then read that as confinement, and `sandbox selfcheck: ok` followed. The
+output really can be cut there: after a normal exit the readers get only a short grace and
+a truncated tail is returned as if it were whole.
+
+Changed here:
+
+- (n) **Three-way classification.** The probe's status is sorted three ways: a DNS
+  server's answer is a leak, a named local refusal is the confined side
+  (`ERROR_ACCESS_DENIED`, `E_ACCESSDENIED`, `RPC_S_SERVER_UNAVAILABLE`,
+  `EPT_S_NOT_REGISTERED`, `DNS_ERROR_NO_DNS_SERVERS`, `WSAEACCES`), and anything else is
+  `dns: not proved` with the status named. There is no "not a server answer, so a local
+  failure" case.
+- (o) **A timeout is not proof.** `ERROR_TIMEOUT` and `WSAETIMEDOUT` are `not proved`
+  with the reason named: the probe uses `-QuickTimeout`, so a query that left the machine
+  and got no answer in time also fails inside the process.
+- (p) **An end marker.** The probe prints `KGRAF-DNS-END` last, on both the `try` and the
+  `catch` path. Output without it is refused, so a cut-off tail is reported instead of
+  read as a pass. Output that carries the end but neither a status nor a named error is
+  refused too: a missing witness must never read as a pass.
+- (q) **The cache is read twice where the first reading passed.** The first reading is
+  taken as soon as the probe's process has exited, which can be before a query that left
+  the machine has its answer. A second reading five seconds later decides. A leak or a
+  `not proved` is decided at once: a second reading cannot turn either into a pass.
+- (r) **A disabled filter is present and not effective.** The read returns each filter's
+  flags, not only its key. `kgraf sandbox status` reports a filter that carries
+  `FWPM_FILTER_FLAG_DISABLED` as WRONG, not present, so the setup is not ready; the setup
+  step is a Create, not an Update of something that works; and the Windows test fails on
+  the flag. The documentation does not agree with itself on whether a provider that names
+  no service has its filters disabled at every start, which is the reason to read the flag
+  rather than trust either sentence. The Windows test plan now has a reboot step, so one
+  run settles it.
+- (s) **The WFP objects are removed last, after the accounts.** Removal stops at the first
+  step that fails. A block filter that will not go is fail-safe: it blocks name lookups for
+  users that no longer exist. An account that will not go is not. With the filters first, a
+  stopped Base Filtering Engine, a firewall service that is off, or a sublayer another
+  object still names left the sandbox users, the group, the denied logon rights, the
+  firewall rules and the folder deny entries on the machine. Nothing in the removal of a
+  filter needs the users: its user condition is a security descriptor of SIDs, which
+  deletes with or without them. The record still lists any key that did not go, so a second
+  `kgraf sandbox remove` retries it.
+- (t) **The probe has its own bound.** `kgraf sandbox selfcheck` waits at most 120 seconds
+  for the lookup in the sandbox, not the two hours a sandboxed command gets when it names
+  no bound of its own. The bound is set by the probe's longest legitimate holder, Windows
+  PowerShell 5.1's own start-up on a cold machine; the lookup itself is bounded by
+  `-QuickTimeout`. A probe that reaches the bound, or that will not start, is
+  `dns: not proved` with the reason, never an error that throws away the lines the check
+  has already proved.
+- (u) **The sublayer weight is the maximum**, not the reuse source's mid-range 0x8000, and
+  the wording of (f) above is corrected: clearing the action right stops a *lower*-weight
+  sublayer from permitting over the block, not every sublayer. Microsoft's "Filter
+  Arbitration" page: traffic traverses sublayers from the highest priority to the lowest, a
+  permit whose action right is cleared is a hard permit that only a callout veto can block,
+  and "In order to silently override 'Hard Permit' filters a firewall has to add its
+  filters within a higher priority sub-layer". At 0x8000 a third-party sublayer of higher
+  weight with a hard permit was decided first. The maximum is right here because this
+  sublayer holds block filters only: a sublayer that can never permit cannot take traffic
+  away from another provider by being decided first. Setup now deletes and adds the
+  sublayer as well, inside the same transaction and after the filters that name it, so a
+  machine set up by an earlier version picks up the weight.
+- (v) **A failed DNS step says what it leaves.** A first setup that fails stores no
+  passwords, so no command runs as a sandbox user. A re-run is different: the credential
+  store of the earlier setup stays, and `state.rs load()` does not look at the WFP keys, so
+  commands keep running as the sandbox user with whatever filter the machine has. A command's
+  launch cannot check the filters itself, because reading a WFP object can need
+  administrator rights and a launch is a standard user's. The failing setup therefore names
+  it, in the error of the step: the users and the stored passwords of the earlier setup stay
+  in place, a name lookup can leave the machine, and `kgraf sandbox status`,
+  `kgraf sandbox selfcheck` and `kgraf sandbox remove` are the commands to run. The backend's
+  gaps text carries the same sentence for the case where nobody reads the error.
+
 **Amendment (2026-10-08): bounded waits, pipe ends inheritable for one call, no console
 input, the runner protected before it runs.** The Windows self-test hung in the
 kgraf-host tests. A fix outside the backend bounded every child wait and lock
@@ -701,3 +823,494 @@ Choices made with this amendment:
 - (s) The runner's list check fails on any entry type it does not read, unknown types
   included, not only the other allow types: the lists kGraf writes hold plain allow
   entries only.
+
+**Amendment (2026-10-08): the link check in front of every inheritable access
+entry.** The guard that refuses to write an access entry on a tree while a link
+below it leads out of that tree stays, because whether Windows carries an
+inheritable entry through a junction is still unmeasured
+(`measure_whether_propagation_follows_a_junction`). It refused three legitimate
+cases for good, and three more writes went around it. None of this has run on
+Windows yet.
+
+- **A link into a folder the same grant admits is allowed.** The check now takes a
+  set of allowed targets: the folders the same call admits the same user to (the
+  writable roots and the read roots), and, for a grant on one of the checkout's own
+  dependency trees, the checkout that tree belongs to. This closes three refusals: a
+  worktree that comes back on another slot user, where kGraf's own dependency
+  junctions are already in place; a read grant on the checkout's tree in an npm,
+  yarn or pnpm workspace, where `node_modules/@scope/pkg` is a junction to a package
+  of the checkout; and the first grant for the online slot user on such a worktree
+  (item (h) above). The refusal message no longer says "remove the link": kGraf makes
+  its own links again. A link anywhere else is still refused and nothing is written.
+  The policy carries the checkout the trees came from
+  (`DependencyLinks::checkout`), so no name such as `node_modules` is hard-coded.
+- **Why those targets carry no new reach, and what is still unknown.** The argument
+  for an in-tree link is that the propagation reaches only what the grant covers
+  anyway; it holds for a folder the same call grants the same user. Two things are
+  still wider than the grant where propagation does follow a junction: a write grant
+  on a worktree whose dependency link leads to the checkout's tree would carry write
+  onto a folder the user is granted to read, and an entry carried onto a folder
+  admits the user to what that folder holds now. The checkout root is therefore
+  never in the set for a write grant: a command may write in its own worktree and
+  could plant a junction to the checkout root there. A grant on a dependency tree is
+  read and run only, and no command can write inside the checkout's trees, so no
+  command can plant a link there.
+- **The tree is walked again after the write.** A command of another sandbox user
+  that may write in the same folder can plant a junction between the walk and the
+  write (`mklink /J` needs no privilege), and Windows writes the tree in one call of
+  its own, so the window cannot be closed here. A link the second walk finds now
+  fails loud, naming the folder and saying the entry may already have been carried
+  onto the link's target.
+- **The deny entries and the Low label go through the same check.** The deny of a
+  top-level `.git`, the deny on a hidden folder and the Low label are inheritable
+  writes as well and were not checked at all. The Low label is now written only
+  while it is absent, as the grants are: before, every command rewrote it, which
+  walked the whole tree's labels each time and could not be guarded at that cost.
+- **A folder the walk cannot read is named**, not reported as a failure of the root.
+- **The walk is bounded**: 2,000,000 entries and 60 seconds, each a refusal with its
+  own message. A link whose target is an unreachable network or removable path holds
+  `canonicalize` until the operating system gives up; the bound is checked per entry,
+  so the walk stops at the next entry after such a call returns.
+- **A read root the walk refuses is not granted, and the command says so**
+  (`SandboxedCommand::refused_reads`), instead of failing. The walk also runs on the
+  toolchain read roots and the `PATH` folders inside the owner's profile, so a
+  toolchain linked into the rustup home (`rustup toolchain link`) or a link in a
+  cargo registry crate, both the owner's own, would otherwise stop every command on
+  that machine. Nothing is written either way.
+
+**Not closed, and in the backend's gaps text.**
+
+- **Hard links are invisible to the check.** `is_symlink` is true only for a reparse
+  point with the name-surrogate bit, and a file's other hard links share one security
+  descriptor, so an inheritable entry written on a tree reaches every name of a
+  hard-linked file in it, wherever that name is. pnpm and uv hard-link into a shared
+  store. No check was added: it needs the link count of every file, one open each,
+  which on a worktree with a built `target` folder costs more than the whole grant,
+  and in a pnpm or uv tree nearly every file has more than one link, so a refusal
+  would refuse every command of a legitimate project. The reach is a read or write
+  entry for the sandbox user on store files the user is usually granted to read
+  anyway; a write entry on the store is the case to watch.
+- **A tree the walk cannot finish is refused**, so the first grant on a tree larger
+  than the bound fails rather than running unchecked.
+- **A grant removal is not checked.** Writing a folder's list again to remove a
+  user's entries propagates the folder's remaining inheritable entries to what is
+  below it, so where Windows follows a junction a removal reaches the junction's
+  target as a grant would. Its callers, the slot table and `kgraf sandbox remove`,
+  know the folder and nothing else, so no set of allowed targets can be built there,
+  and an empty set would refuse every removal on a worktree that holds kGraf's own
+  dependency links. A refused removal would leave one user's write grant on a folder
+  another user now works in, which is worse than the propagation the check guards
+  against, so the removal stays unchecked and the gap is recorded.
+- Whether propagation follows a junction at all is still unmeasured, and every
+  allowance above rests on that question.
+
+Choices made with this amendment:
+
+- (q) For a write grant the allowed set is the exact dependency trees, not the
+  checkout root: a command that may write its own worktree could plant a junction to
+  the checkout root there, and the checkout is the owner's repository.
+- (r) A refused read root becomes a note rather than failing the command, which
+  follows the Linux backend's ancestor reads. A refused write grant still fails.
+- (s) The walk's bounds (2,000,000 entries, 60 seconds) end in a refusal, because
+  there is no safe "allow" for a tree that could not be checked.
+
+---
+
+## Amendment (2026-10-08): the access-list lock, owners of files in a granted tree, and a removal that finishes
+
+The defects below are fixed and compile-checked for Windows; none has run on Windows.
+
+- **One lock around every access-list read-modify-write.** Every grant, deny and
+  revoke read a folder's list, merged its entries into what it read, and wrote the
+  result back, with no lock, and a tree walk sat inside that window. Four slot users
+  granted on one toolchain folder at the same time each wrote a list holding its own
+  entry alone, so the last writer took the other three grants away: random
+  access-denied failures on the first parallel commands. A grant that held a list read
+  before a revoke wrote the revoked entries back, and nothing would ever remove them,
+  because the table no longer names that folder for that user. `slots::lock_acls` is
+  one exclusive lock file in the slot folder, bounded (`ACL_LOCK_WAIT`, ten minutes,
+  set by the longest legitimate holder: one list write on a large build tree), and
+  reentrant within a thread, because a revoke inside a lease writes lists. Lock order:
+  the access-list lock, then the table lock, never the other way round. The link walk
+  stays outside the lock and the list is read again under it, immediately before the
+  write.
+- **An owner of a file in a granted tree.** A standard user owns every file it
+  creates, and an owner may read and rewrite the access list of what it owns whatever
+  that list says. A slot user that moved to another folder still owned the files it
+  created in the old one, so from its new folder it could rewrite their lists and
+  write and delete them, although the revoke took its entries away. A write grant on a
+  worktree now carries an inheritable OWNER RIGHTS entry of READ_CONTROL alone, and
+  kGraf's own user is named with READ_CONTROL and WRITE_DAC, the two rights that entry
+  would otherwise take from kGraf, which owns the tree. Nothing gains a right it did
+  not have. The alternative, resetting the owner of every object on each revoke, was
+  rejected: an owner is not inherited, so it would mean a walk of the whole tree,
+  object by object, on the slot-move path. The token sandbox keeps the entries it had:
+  every command there runs as kGraf's own user.
+- **A root recorded before it was judged wedged its slot.** The lease recorded every
+  root in the table before anything judged it, so a root that then failed (a junction,
+  a volume without access lists, a folder whose list this user cannot write) stayed
+  there, and the revoke of that path, which can never succeed, aborted every later
+  lease of that slot. The sandbox-user path now judges every root before it takes a
+  slot, and a lease whose candidate cannot lose its old grants lets that candidate go,
+  with its table entry as it was, and tries the next; the failure is returned only
+  when no candidate works. A candidate is still taken only when every one of its
+  revokes succeeded.
+- **`kgraf sandbox remove` finishes.** It stopped at the first failed revoke, keeping
+  the table and the list, so an unready drive, a junction, a folder whose list this
+  user cannot write or one damaged table line left the users, the firewall rules and
+  the DNS filter on the machine for good. Every folder is now tried, what kept its
+  entries is reported line by line, and the users are deleted whatever is left: an
+  entry for a deleted user's SID grants nothing to anyone. A damaged table is read as
+  far as it goes.
+- **A worker slot follows its tool's folder.** The shell tool kept the slot of the
+  first folder it ran in until the tool was dropped. Where its environment outlives
+  one attempt (a route's environment), that slot never went back to the pool, and a
+  command in another folder was handed a slot held for a folder it does not write. The
+  held slot is keyed by the folder now, and a tool used for another folder drops the
+  old slot first.
+- **The table is written durably.** The temporary file is flushed with `sync_all`
+  before the rename (a table of zero length reads as a setup that holds no folder, so
+  the grants it listed would never be revoked), the rename is tried a few times, and
+  the error of a table that cannot be read names the two commands that recover it.
+- **Smaller ones.** A folder whose path the table cannot give back unchanged, or whose
+  name holds a line break, is refused instead of written in another spelling that no
+  revoke would find. A lock file whose folder went away is opened again, with the
+  folder made again between tries. The refusal when every slot is held names the folder
+  each slot was last taken for.
+
+Two items are left as they are:
+
+- A worker with no wait can still be refused while its own slot is being released, in
+  the window between a lease's last handle dropping and its lock file closing. The fix
+  is one retry of the candidate loop inside the lease.
+- Two processes can each hold a slot of the same folder, which uses the pool up
+  faster, and two users then write one folder. Sharing a slot between processes needs
+  a shared lock mode and a count of holders in the lock file.
+
+---
+
+## Amendment (2026-10-08): where the access-list lock is held, and a slot whose revokes fail
+
+Two of the fixes above meet in `Leases::lease`. One holds the slot table's lock and the
+in-process lock only to choose a slot, bind it and write the table, and runs the revokes
+with no lock held, because a revoke rewrites the access lists of a whole tree and costs
+seconds to minutes. The other wraps the revoke loop in the access-list lock and lets a
+candidate whose revoke fails keep what it held, so the next candidate can be tried. The
+merged function keeps both, as follows.
+
+- The lease takes the access-list lock at no point. Each write of a list takes it for
+  itself, a revoke included (`revoke_sandbox_grant`), so every read-modify-write of a
+  list is covered, and a tree walk still runs outside the lock. One take around the
+  whole revoke loop would hold a lock bounded at ten minutes for minutes of tree
+  writing, so a slow revoke of one folder would block every other folder's lease; and
+  it would protect nothing more, because the hazard is one list, read and written by
+  two writers.
+- The lock order stands: the access-list lock, then the table lock, never the other way
+  round. `lease` holds neither across a revoke and never holds both: it releases the
+  table lock before the revokes run, and the lock a revoke takes is released before the
+  table lock is taken again to drop the revoked folders.
+- One candidate is tried per pass. The slot is chosen, bound and the table written under
+  the table lock, with the folders the slot is losing listed ahead of the new ones; both
+  locks go; the revokes run. A revoke that fails ends the pass: the slot's lock file is
+  released, its table entry is put back as it was, in the place it had in the order, and
+  the next candidate is tried. The first failure is returned only when no candidate
+  works.
+- The folders a slot is losing stay listed until their revokes are done, so a holder
+  killed between the write and the revokes leaves them to the next holder of that
+  folder. A folder already revoked when a later one fails stays listed as well, which
+  costs one revoke that finds nothing, rather than leaving a grant no revoke would find.
+- `apply_inheritable` reads the list under the access-list lock and writes it there, so
+  no caller hands it a list read earlier. The link walk before the write and the walk
+  after it stay outside the lock, because each reads a whole tree while the lock's bound
+  is set by one list write.
+- The test `a_lease_holds_the_access_list_lock_while_it_revokes` asserted the structure
+  that went. It is replaced by
+  `each_revoke_of_a_lease_holds_the_access_list_lock_and_the_lease_holds_it_at_no_point`,
+  which pins what survives: the lock is free to another holder while a revoke runs, the
+  revoke's own write of a list is covered by it, and it is reentrant within a thread.
+
+---
+
+## Amendment (2026-10-08): the undo record's folder and the deny entries
+
+The changes below harden the folder the undo record lives in and the deny entries on the
+closed folders. Each bullet is one behavior change. None of it has run on Windows.
+
+- **The deny entries are written with `SetSecurityInfo`, on a handle opened with
+  `MAXIMUM_ALLOWED`.** They were written with `SetKernelObjectSecurity`, which Microsoft
+  documents must not be used on a file system object: "This function should not be used
+  when setting a security descriptor on file system objects. Instead, use the
+  SetSecurityInfo or SetNamedSecurityInfo functions." The reason the call was picked is
+  real, because `SetSecurityInfo` normally walks the children, which on a drive root is a
+  walk of the whole drive, but the documented switch for that is the handle's access mask:
+  "If the supplied handle was opened with an ACCESS_MASK value of MAXIMUM_ALLOWED, then
+  the SetSecurityInfo function will not propagate ACEs to children." The old code also
+  built its own descriptor and copied the folder's `SE_DACL_PROTECTED` and
+  `SE_DACL_AUTO_INHERITED` bits into it, and relied on an undocumented path honoring
+  them; had Windows dropped the protected bit, `C:\ProgramData` would have become open to
+  inheritance from `C:\`, and the drive root's inheritable `Authenticated Users` entry
+  would have reached ProgramData and everything below it at the next write on `C:\`. The
+  write now passes `DACL_SECURITY_INFORMATION` alone, with neither
+  `PROTECTED_DACL_SECURITY_INFORMATION` nor `UNPROTECTED_DACL_SECURITY_INFORMATION`, so
+  the folder keeps the protection Windows had on it, and the hand-built descriptor is
+  gone.
+- **Taking a deny entry off is read back, as writing one was.** `close_folder` read
+  the folder's list again and refused when the entry it had just written was absent, while
+  `reopen_folder` returned on a bare success from the write, and `remove` then deleted the
+  record line. A write that silently kept the old list would have left the deny on the
+  folder with nothing left to say so. `reopen_folder` now reads the list again and fails
+  while the entry is still there, so the record line stays and `remove` can run again.
+- **The record folder's check opens each part once.** `existing_trusted_folder`
+  opened a part to find out whether it exists and then dropped the handle, and the check
+  that followed opened it again, so the path was resolved twice. The check now runs on the
+  handle the first open returned.
+- **A link above a folder being closed is refused.** The no-follow open covers the
+  last component alone, so a link in a component above it was followed and the access list
+  of its target would have been written. The write path now checks every component above
+  the folder and refuses a link there, the way the record folder's check walks part by
+  part. The check and the open are two steps, so this is not atomic; the atomic form needs
+  an `NtCreateFile` open with `OBJ_DONT_REPARSE`, which this code does not have, and the
+  components above a closed folder are writable by administrators alone.
+- **The undo record's folder is checked for its volume and its shape.** The closed
+  folders are picked only from fixed local drives whose file system keeps access lists, and
+  the record's folder was checked by neither rule, although its access list is the whole
+  reason it is trusted. The elevated step now refuses a record folder whose drive is
+  removable, remote or without persistent access lists, and one whose text is not a plain
+  path on a local drive: a component carrying a colon names an alternate data stream, and a
+  relative component could leave the drive.
+- **A `closed` record line carries the entry's own mask and flags, and removal
+  matches them exactly.** The line named the folder and the group's SID alone, and removal
+  looked for an entry whose mask covered today's `CLOSED_FOLDER_DENY`, a subset test. A
+  later version that denied more rights would then have orphaned every entry an earlier
+  version wrote, while deleting its record line, and a version that denied fewer would have
+  taken off a wider entry than it wrote. The line is now
+  `closed <sid> <mask> <flags> <path>`, removal matches the mask and the flags exactly, and
+  a line whose mask carries a right outside the write rights, or whose flags carry any
+  inheritance bit, is refused when the record is read.
+- **A `closed` record line's folder and SID are both bounded.** The path went
+  straight from the record to the call that rewrites a folder's access list, and the SID
+  test accepted any SID starting with `S-1-5-21-` once the group was gone, which every
+  domain SID does too, so `Domain Users` passed. Writing the record needs administrator
+  rights, so this was the last fence and not the first, but an edited line could have made
+  `remove` strip an explicit deny entry for another principal from another folder. Removal
+  now takes an entry off only on a folder `closed_folders` names on this machine, and only
+  when the SID is the sandbox group's own, or an account of the user's own authority, not
+  the user itself, that no longer resolves, which is the shape of a sandbox group an
+  earlier setup made and deleted. A SID that still resolves, or one whose lookup failed, is
+  refused.
+- **A deny entry kGraf cannot judge no longer blocks every removal, and a stale
+  generation is cleaned up.** `remove` refused the whole plan on the first `closed` record
+  line whose SID was not the current group's, and built no step at all: not the users, the
+  group, the logon rights, the firewall rules, the WFP filter, nor twenty deny entries. The
+  record reaches that state without anyone editing it. A group deleted outside kGraf (a
+  cleanup script, a removal cut short, an image rebuild) leaves ten lines whose SID no
+  longer resolves, and no relative identifier is reused, so the next setup makes a group
+  with a new SID and adds ten more lines. From then on every `remove` refused everything,
+  and the user's only way out was `icacls` by hand. Two changes: setup takes the entries
+  of a group of the user's own authority that no longer resolves off the folders and drops
+  their lines before it writes its own, so a generation does not pile up; and a `closed`
+  entry this removal may not undo is now one kept step with its reason, sent to the user's
+  terminal, while every other step runs and the entry stays in the record. The setup pipe
+  carries a new non-fatal `note` message for that reason.
+- **Every folder is tried, and the failures are reported together.** The step stopped
+  at the first folder it could not close, and the setup failed there, after the accounts,
+  the logon rights and the firewall rules already existed. One machine can hold several
+  such folders at once (`Tasks` or `tracing` under the Windows folder where Administrators
+  hold less than full control, a drive reported fixed that cannot be opened), so the user
+  learned of the next one only on the next run. Each folder is now tried, the others are
+  closed and recorded, and the failure names every folder with the principal that owns it
+  and the reason, so one run tells the user everything to fix. A junction planted at one
+  of these names is also no longer listed as a folder to close: the existence test does not
+  follow a link any more.
+- **The record's folders are held open from the check to the last write, and the
+  folder they are made under is judged.** The check dropped its handle and every write
+  after it resolved the path by name, with `FILE_SHARE_DELETE` granted, which lets another
+  process delete or rename a folder while it is open. The elevated step now keeps a handle
+  on `%ProgramData%` and on each folder below it until the step ends, opened without
+  `FILE_SHARE_DELETE` and with `FILE_LIST_DIRECTORY | FILE_TRAVERSE`, which take part in
+  sharing checks, so none of them can be renamed away between the check and the writes.
+  The base is judged as well, by its own rules: it must be a folder, not a link, and an
+  administrator principal must own it. The writer test is deliberately not applied to the
+  base, because every local user may create a folder directly under ProgramData by default,
+  which is the premise of the whole scheme; what carries the safety is the folder below it,
+  which is made with a protected list of its own, owner Administrators, and is checked by
+  that test. Handle-relative opens for the record file itself were weighed and not taken:
+  they need the `NtCreateFile` path this code does not have, and the file is written to a
+  new name and renamed over the old one inside a folder no other principal may write.
+- **`kgraf sandbox status` reads the record through the checked folder.** It built the
+  path by name and read whatever was there, so a junction in place of the record's folder
+  could feed the user a record of someone else's choosing, including one that makes a
+  removal look complete. Status now uses the same folder judgment the elevated step uses,
+  and reports a folder that does not pass as a record that cannot be trusted, with the
+  reason. Status still needs no administrator rights: the folder grants Users read.
+- **The sandbox-user path verifies effective write, and refuses a writable root that
+  setup closed.** It wrote the grants and stopped there, while the token backend checks
+  effective write with `AccessCheck` after every grant. A grant that reads back proves only
+  that the allow entry is present, and a deny entry is evaluated first, so a writable root
+  equal to ProgramData, Public, a child of Public, a drive root or one of the three Windows
+  folders passed the read-back and then failed every write at runtime with no message
+  naming the cause. Two changes: such a root is refused before any grant, with an error
+  naming the folder and the deny; and after every grant and deny of the command is written,
+  the sandbox user's own write access on each root is checked with `AccessCheck` under a
+  token from its own logon. The existing probe could not serve, because it builds a
+  restricted token from the user's own, in which a deny entry for the sandbox group is not
+  evaluated at all; the cost is one more logon per command, beside the one the runner
+  already performs.
+
+---
+
+**Amendment (2026-10-08): kGraf propagates its own access entries, and a hard link
+never carries one out of a tree.** This closes the hard-link gap the amendment
+above recorded as open ("Hard links are invisible to the check"). The sentence in that
+amendment that says "No check was added" no longer holds; the earlier text stays as it
+was written, and this amendment is the correction. None of it has run on Windows.
+
+- **The kernel's propagation is suppressed, and kGraf writes each existing child
+  itself.** Writing a folder's access list makes Windows walk the tree and write every
+  object already below it, with rules kGraf cannot steer: it may enter a junction, and
+  it writes the one security descriptor a hard-linked file shares with every other name
+  of that file, which can lie outside the tree (decision 0083). kGraf now writes the
+  folder's own list through a handle opened with `MAXIMUM_ALLOWED`, which Microsoft's
+  `SetSecurityInfo` page documents as not propagating entries to children ("If the
+  supplied handle was opened with an ACCESS_MASK value of MAXIMUM_ALLOWED, then the
+  SetSecurityInfo function will not propagate ACEs to children"; upstream openai/codex
+  `windows-sandbox-rs` opens its handles the same way), with
+  `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_FLAG_OPEN_REPARSE_POINT` and neither
+  protection flag, so the object keeps the inheritance protection Windows set. kGraf
+  then walks the tree once: one open per child, which reports the reparse state and
+  `nNumberOfLinks` in the same call, then the write through that same handle. The
+  kernel's own propagation opens each child too, so this replaces a cost instead of
+  adding one; a `MEASURE` line in the self-test reports the wall time of a first grant
+  on a tree of 100 folders and 2,000 files, and the Windows testing guide says what
+  to read from it.
+- **What holds the tree boundary.** A reparse point is not entered and not written, and
+  it is judged against the allowed-target set by the same walk as before. A file with
+  more than one hard link is never written: it keeps the list it has, which is the right
+  outcome for a dependency store file, because the command needs to read it and the read
+  grant on the store is what makes the dependency usable. Each such file is recorded and
+  named in a note that goes out with the command's output. **A command therefore cannot
+  write a hard-linked file in its own tree**: a package manager that writes such a file
+  in place fails with an access error, while replacing it works, because the new file is
+  a new object that inherits the folder's entry.
+- **The entry a child gets is a plain explicit entry, not the inherited copy Windows
+  would derive**. Reproducing the derivation (`INHERITED_ACE`, `INHERIT_ONLY_ACE`,
+  `NO_PROPAGATE_INHERIT_ACE`, the container and object mapping, the canonical entry
+  order) cannot be judged correct without a Windows machine, and a child that ends
+  narrower than Windows would have made it is a failed build. A child therefore gets the
+  tree mask: a folder with the same inheritable flags the root carries, so everything
+  made in it later still gets its entry from Windows, and a file the effective entry.
+  The entry grants nothing beyond the tree, because the whole tree is granted to that
+  user already, and the two rules above are what keep it inside the tree. Two
+  consequences: `icacls` shows these entries as explicit on every file and folder, not
+  as inherited copies, so the output differs from the restricted-token backend's; and a
+  later write of the folder's list does not remove them, so a removal takes them off
+  itself.
+- **The grant pass does not enter what kGraf denies.** The top-level `.git` and the
+  policy's hidden folders are skipped and not entered, so no generous entry lands where
+  a deny must hold. The deny entries are written after the grants, and
+  `SetEntriesInAclW` keeps a deny entry before an allow one, so a deny wins on a child
+  that holds both. A deny or the Low label, which are inheritable writes as well, go
+  through the same pass and hold nothing back from it.
+- **A child that cannot be opened, written or listed is recorded, and the pass goes
+  on.** Microsoft's same page states that "if share access to the children of the object
+  is not available, this function will not propagate unprotected ACEs to the children",
+  so Windows skips such a child as well; failing here would refuse a grant that worked
+  before. The note names the first few with their reasons and counts the rest.
+- **The link walk in front of every write stays, as the second line of defense.** With
+  the propagation suppressed, a junction out of the tree is no longer reached by the
+  write at all. The walk holds where the suppression does not: it rests on one
+  documented sentence that no Windows run has measured. A `MEASURE` line now reports
+  whether the suppression worked, beside the older one that reports whether Windows'
+  own propagation follows a junction.
+- Tests: the per-child decision and the walk are pure functions over data and run on
+  every host (a hard-linked file, a folder whatever its link count, a junction, a denied
+  folder and a file inside it, a child that cannot be opened, a root that cannot be
+  listed). The Windows calls have tests that compile only here: a hard-linked file that
+  keeps the owner's store file's list while a plain file beside it gets the entry, the
+  denied `.git`, and the two `MEASURE` lines.
+
+**Amendment (2026-10-08): a grant removal propagates nothing and still refuses
+nothing.** This closes the removal gap the amendment above recorded as open ("A grant
+removal is not checked"). The sentence there that says "the removal stays unchecked and the gap is recorded" no longer
+holds; the earlier text stays as it was written, and this amendment is the correction.
+It has not run on Windows.
+
+- **The exposure.** Writing a folder's list again to take a user's entries off made
+  Windows propagate the folder's remaining inheritable entries to everything below it,
+  so a removal carried the same risk as a grant: an entry through a junction, or onto
+  the one descriptor a hard-linked file shares with a name outside the tree. The
+  amendment above declined to guard it, because its callers (the slot table and
+  `kgraf sandbox remove`) know only the folder, so they can build no set of allowed
+  link targets, and refusing a removal is worse than the exposure: it would leave one
+  user's write grant on a folder another user now works in.
+- **The fix needs no guard and no refusal.** The folder's own list is written with the
+  propagation suppressed, as a grant is now, and the entries are taken off each child
+  by the same pass the grant uses. The pass only ever takes access away, so nothing of
+  kGraf's can land outside the tree, whatever the tree holds: it enters no reparse
+  point, writes no hard-linked file, and records each child it skipped or could not
+  write. A removal is therefore never refused, and no link walk runs in front of it.
+- **The pass has to run now.** A child carries kGraf's entry as an explicit entry of
+  its own, not as an inherited copy, so rewriting the folder's list no longer takes it
+  off by itself. A Windows test checks exactly that: it grants a tree, reads the entry
+  back on a child, removes the grant and checks that no entry is left on the folder, the
+  subfolder or the file.
+- **What a removal leaves, and it is in the backend's gaps text.** A hard-linked file is
+  skipped, as during a grant. After the grant pass of this version such a file never
+  holds an entry of kGraf's, so there is nothing to take off; a tree granted by an
+  earlier kGraf, whose kernel propagation did reach it, can still hold one, and it is
+  taken off with `icacls` on the file itself. A child that cannot be opened keeps its
+  entry too, and is named in the note.
+- **The note has an output path.** A slot lease that moves a slot to a new folder
+  returns what its removals left, and the command that took the slot carries it with its
+  output. `kgraf sandbox remove` drops the note, because the users themselves go right
+  after it, so an entry a file kept names a user that no longer exists.
+
+---
+
+## Amendment (2026-10-09): one entry set at the root and on every existing child
+
+Two of the fixes above meet on the tree grant. One gave a write grant an inheritable
+`OWNER RIGHTS: READ_CONTROL` entry, with kGraf's own user named for the two rights that
+entry would otherwise take from it, so a sandbox user that owns a file it created cannot
+rewrite that file's access list after a revoke took its entries away. The other stops
+relying on the kernel's propagation: the root's list is written through a handle opened
+with `MAXIMUM_ALLOWED`, which propagates nothing to the children that already exist, and
+kGraf walks the tree itself so that no entry reaches a reparse point's target or a file
+that has a hard link outside the tree.
+
+Written separately, the second undoes the first for every file that already exists: the
+root would carry the owner-rights restriction while the files in the worktree kept the
+sandbox user as their owner, with an owner's implicit right to rewrite their own lists.
+The resolution:
+
+- The entry set is derived once, in `acl::tree_grant`, and used in both places. The
+  per-child set is `acl::child_grant` of that same list: every entry that applies below
+  the root is written on the child with its own trustee, effective on a file, effective
+  and inheritable on a folder. An entry that applies to the root alone is not a child's.
+  So the owner-rights restriction and kGraf's compensating entry reach a file that
+  existed before the grant.
+- The two rules that hold the tree boundary are unchanged and are what keeps those
+  entries inside it: a reparse point is neither entered nor written, and a file with more
+  than one hard link is never written and is recorded.
+- Proved on any host, over the pure per-child functions, by
+  `a_file_that_existed_before_the_grant_carries_the_owner_rights_restriction`: a
+  pre-existing file is a child the pass writes; its set names the sandbox user with the
+  tree mask, `OWNER RIGHTS` with `READ_CONTROL` alone and kGraf with
+  `READ_CONTROL | WRITE_DAC`; nothing on a file is inheritable; a folder of the tree
+  carries the same three trustees, effective and inherited; and a hard-linked file and a
+  link are skipped, so neither entry is ever written on them. With the per-child set
+  reduced to the sandbox user's entry alone, the test fails on the owner-rights entry.
+- The two denies and the Low label go through the same pass. Each writes one entry for
+  one trustee, so there is nothing to derive for them; what they needed was the pass
+  itself, which they now have, because each was an inheritable write whose propagation is
+  suppressed as the grant's is.
+- The access-list lock is held for each list written: the root's own read-modify-write,
+  and each child's inside the pass (`write_child_entries`). It is not held across the
+  pass or across a walk, which would hold a lock bounded at ten minutes for as long as a
+  walk of a large tree takes; the hazard it exists for is one list, read and written by
+  two writers, and the lock is reentrant within a thread, so a nested take costs a
+  counter.
+- One sentence of the backend's gaps text no longer held and was rewritten: a link into a
+  folder the same grant admits no longer carries a write entry onto that folder, because
+  the pass does not enter a reparse point and the kernel propagates nothing. What the
+  command reaches through such a link is what the grant on that folder gives it.

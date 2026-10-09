@@ -201,8 +201,12 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
            with STATUS_DLL_INIT_FAILED (0xC0000142), because their runtime opens its own \
            signal pipe for write with an ACL that names only the user, Administrators and \
            SYSTEM, and a write-restricted token passes a write only where a restricting \
-           SID is granted; the gitlink deny, the Low label on the writable roots, and \
-           cross-sandbox write denial are unverified on Windows",
+           SID is granted; a file in a writable root that has another hard link keeps the \
+           access list and the integrity label it has, because every hard link of a file \
+           shares one security descriptor, so a command cannot write such a file in its \
+           own tree and a build that writes one in place fails with an access error; the \
+           gitlink deny, the Low label on the writable roots, and cross-sandbox write \
+           denial are unverified on Windows",
 };
 
 /// The backend name once `kgraf sandbox setup` has run: commands run as a
@@ -239,10 +243,19 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            own profile, which keeps files from one command to the next; registry keys and \
            named objects every user may write are not closed; DNS lookups go through the \
            system's DNS client service, which the firewall rules do not scope to the \
-           sandbox user: `kgraf sandbox setup` adds a WFP filter meant to refuse that \
+           sandbox user: `kgraf sandbox setup` adds WFP filters meant to refuse that \
            service to the slot users without the network, but no Windows run has proved \
-           it, so until `kgraf sandbox selfcheck` prints `dns: confined` on this machine \
-           a name lookup can leave the machine; traffic Windows sends on the user's behalf \
+           them, so until `kgraf sandbox selfcheck` prints `dns: confined` on this machine \
+           a name lookup can leave the machine; it is also not known whether a block at \
+           the name resolution cache layers makes a lookup fail or only keeps the service \
+           from its cache while the query still leaves the machine, because Microsoft \
+           documents no effect for a block there; a command's launch does not check that \
+           the filters are still on the machine, because reading a Windows Filtering \
+           Platform object can need administrator rights and a launch is a standard user's, \
+           so a setup whose DNS step failed after an earlier setup had stored the passwords \
+           runs commands as the sandbox user with no filter until `kgraf sandbox status` or \
+           `kgraf sandbox selfcheck` is run (the failing setup says so in its error); \
+           traffic Windows sends on the user's behalf \
            is not proved blocked: a UNC path (\\\\host\\share) makes the kernel's SMB \
            client connect, the WebClient service carries WebDAV, and ICMP \
            (ping) is sent by the system's own network stack, none of which runs as the \
@@ -255,7 +268,29 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            reads them back, but a program of the same sandbox user can still open the runner \
            in the moment between its creation and that write, open a thread the runner starts \
            before it protects itself, or open the whole runner where that write fails; \
-           unix-domain sockets are confined only by their own ACLs; write confinement, the \
+           unix-domain sockets are confined only by their own ACLs; a file in a tree \
+           kGraf grants that has another hard link keeps the access list it has, because \
+           every hard link of a file shares one security descriptor and writing it would \
+           change the file under its other name as well: pnpm and uv hard-link package \
+           files from a shared store, so a command cannot write such a file in its own \
+           tree and a build that writes one in place fails with an access error, while \
+           replacing it works; every file and folder that exists when a grant is written \
+           carries the entry as an explicit entry of its own, not as the inherited copy \
+           Windows would derive, and that entry is the whole tree mask, which the owner \
+           chose over a failed run (`icacls` output therefore differs from the token \
+           backend's); a file kGraf cannot open or write keeps its old list, as Windows' \
+           own propagation also skips a child whose share access is not available, and \
+           the command reports each one; a tree granted by an earlier kGraf can hold an \
+           entry on a hard-linked file that a removal does not take off, because a \
+           removal skips such a file as a grant does; the link check allows a link that \
+           leads into a folder the same grant admits the same user to, so a worktree \
+           whose dependency link leads to the checkout's installed tree is granted \
+           rather than refused: no entry of kGraf's is written through that link, \
+           because the pass neither enters a reparse point nor writes one, so what the \
+           command reaches there is what the grant on that folder gives it, which for a \
+           read root is read; a tree the link check cannot finish \
+           (more than 2,000,000 entries, or 60 seconds) refuses the grant, so a command \
+           on a tree that large does not run; write confinement, the \
            gitlink deny and the network block are unverified on Windows",
 };
 
@@ -275,12 +310,20 @@ mod user_gaps_tests {
             "registry keys",
             "DNS",
             "`dns: confined`",
+            "name resolution cache layers",
+            "does not check that the filters are still on the machine",
             "UNC path",
             "WebDAV",
             "ICMP",
             "proxy's secret",
             "runner holds the owner's logon SID",
             "where that write fails",
+            "another hard link keeps the access list",
+            "explicit entry of its own",
+            "cannot open or write keeps its old list",
+            "an earlier kGraf",
+            "the link check allows a link",
+            "cannot finish",
             "unverified on Windows",
         ] {
             assert!(gaps.contains(needle), "{needle:?} is missing: {gaps}");
@@ -378,36 +421,225 @@ fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
         })
 }
 
+/// Whether the resolved link target `target` lies inside the tree `root` or
+/// inside one of `allowed`, the folders the same grant admits the same user
+/// to ([`allowed_link_targets`]).
+///
+/// Paths compare by whole components, case-sensitively: every path given
+/// here comes from `canonicalize`, which returns each name as the file
+/// system holds it, so two spellings of one path do not reach this. A path
+/// that still differs in case counts as outside, which refuses the grant
+/// instead of writing it.
+pub(super) fn link_target_is_inside(
+    target: &std::path::Path,
+    root: &std::path::Path,
+    allowed: &[std::path::PathBuf],
+) -> bool {
+    std::iter::once(root)
+        .chain(allowed.iter().map(std::path::PathBuf::as_path))
+        .any(|inside| target.starts_with(inside))
+}
+
+/// The folders a link beneath `grant_on` may lead into without refusing the
+/// grant: every folder this same call admits the same user to (`granted`:
+/// the writable roots and the read roots), and, for a grant on one of the
+/// checkout's own dependency trees (`dependency_trees`), the whole
+/// `checkout` that tree belongs to.
+///
+/// **Why these carry no new reach.** The argument for a link that stays
+/// inside the tree is that the propagation would reach only what the grant
+/// covers anyway. It holds for `granted` as well: the same user is admitted
+/// to those folders in this same call, so an entry carried onto one of them
+/// reaches nothing the user could not already reach. `checkout` is narrower
+/// than it looks: a grant on a dependency tree is read and run only, and the
+/// links inside such a tree are the package manager's own
+/// (`node_modules/@scope/pkg` is a junction to a workspace package of the
+/// project, outside `node_modules` but inside the checkout). No command can
+/// write inside the checkout's dependency trees, so no command can plant a
+/// link there.
+///
+/// The read roots must be in the set, not only the dependency trees: kGraf
+/// makes the Gradle wrapper's distribution reachable with a junction inside
+/// the command's own tmp folder, which is in a writable root, that leads to
+/// the owner's Gradle home or the project's store (`crate::gradle_wrapper`),
+/// and both are read roots of the same policy.
+///
+/// **Still unknown, and why the guard stays.** Whether Windows carries an
+/// inheritable entry through a junction at all is not documented, and no
+/// Windows run has measured it (`measure_whether_propagation_follows_a_junction`).
+/// Where it does, two things are wider than the grant the caller asked for:
+/// a write grant on a worktree whose dependency link leads to the checkout's
+/// tree would carry **write** onto a folder the user is granted to **read**,
+/// and a grant carried onto a folder admits the user to what that folder
+/// holds now, not only to what it held when the policy named it. The
+/// checkout root is therefore never in the set for a write grant: a command
+/// may write in its own worktree and could plant a junction to the checkout
+/// root there, and the checkout is the owner's repository.
+pub(super) fn allowed_link_targets(
+    grant_on: &std::path::Path,
+    granted: &[std::path::PathBuf],
+    dependency_trees: &[std::path::PathBuf],
+    checkout: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut allowed: Vec<std::path::PathBuf> = granted.to_vec();
+    if let Some(checkout) = checkout
+        && dependency_trees.iter().any(|t| grant_on.starts_with(t))
+        && !allowed.iter().any(|a| a == checkout)
+    {
+        allowed.push(checkout.to_path_buf());
+    }
+    allowed
+}
+
 /// The first link beneath `root` (a junction or symbolic link on Windows,
-/// where std's `is_symlink` is true for both) whose target lies outside
-/// `root` or cannot be resolved, with that target; `None` when there is
-/// none. Links are never entered.
+/// where std's `is_symlink` is true for both) whose target lies neither
+/// inside `root` nor inside `allowed` ([`allowed_link_targets`]), or cannot
+/// be resolved, with that target; `None` when there is none. Links are never
+/// entered.
 ///
 /// Writing an inheritable entry on a folder makes Windows write it on every
 /// object that already exists below, and whether that walk enters a junction
-/// is not documented. An earlier command could have planted one pointing at
-/// the owner's files, so the first grant for a SID on a tree is refused while
-/// such a link exists. A link whose target stays inside `root` is allowed:
-/// the walk would reach only what the grant covers anyway (pnpm lays out
-/// `node_modules` with such junctions). Bounded by the tree's size; it runs
-/// only when the entry is absent, and that write walks the same tree.
+/// is not documented. kGraf suppresses that propagation and writes each
+/// existing child itself, entering no link ([`child_action`]), so the walk is
+/// now the second line of defense and not the first: it holds where the
+/// suppression does not, which rests on one documented sentence that no
+/// Windows run has measured yet (`imp::open_for_security`). An earlier
+/// command could have planted a junction pointing at the owner's files, so a
+/// grant for a SID on a tree is refused while such a link exists. A link that leads inside the tree, or into one of the
+/// folders the same grant admits the same user to, is allowed: the
+/// propagation would reach only what the user may reach anyway (pnpm lays
+/// out `node_modules` with in-tree junctions, and kGraf links the checkout's
+/// installed dependencies into a worktree). The walk runs only when the
+/// entry is absent, and the write that follows it walks the same tree.
+/// Bounded in entries and in time ([`WalkLimits`]); a walk that reaches
+/// either bound refuses the grant, as a link out of the tree does.
 ///
 /// A command that runs at the same time could plant a link between this walk
 /// and the write; the first grant for a SID on a folder happens before any
 /// command of that SID runs there, which leaves only commands of another
-/// sandbox user in the same folder.
+/// sandbox user in the same folder. The caller walks the tree again after
+/// the write for that reason (`apply_inheritable`).
+///
+/// **A hard link is invisible here, and is handled in the pass instead.**
+/// `is_symlink` is true only for a reparse point with the name-surrogate
+/// bit, so this walk cannot see a hard link. A refusal would be the wrong
+/// answer anyway: in a pnpm or uv tree nearly every file has more than one
+/// link, so it would refuse every command of a legitimate project. The
+/// propagation pass reads the link count in the open it makes for each child
+/// and writes no file that has more than one
+/// ([`ChildAction::SkipHardLink`]), which keeps an entry inside the tree
+/// without refusing anything.
 pub(super) fn first_outside_link(
     root: &std::path::Path,
-) -> std::io::Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>> {
-    let real_root = kgraf_core::plain_path::canonicalize(root)?;
+    allowed: &[std::path::PathBuf],
+) -> Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>, WalkStop> {
+    walk_for_outside_link(root, allowed, &WalkLimits::DEFAULT)
+}
+
+/// How far one link walk goes before it gives up ([`first_outside_link`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WalkLimits {
+    /// Directory entries looked at.
+    pub entries: usize,
+    /// Wall-clock time the whole walk may take.
+    pub bound: std::time::Duration,
+}
+
+impl WalkLimits {
+    /// A worktree with a built `target` folder holds hundreds of thousands
+    /// of files and the walk must still finish there, so the entry count is
+    /// high: only a tree far larger than any project reaches it. The time
+    /// bound is what stops the walk a link to an unreachable network or
+    /// removable path would otherwise hold: `canonicalize` on such a link
+    /// waits for the operating system's own timeout, which can be tens of
+    /// seconds each. Both end in a refusal, never in a grant: a tree that
+    /// cannot be checked is not written.
+    pub const DEFAULT: Self = Self {
+        entries: 2_000_000,
+        bound: std::time::Duration::from_secs(60),
+    };
+}
+
+/// Why a link walk could not finish. Each case names the path or the limit
+/// it stopped at, so one unreadable folder deep in a tree is not reported as
+/// a failure of the root.
+#[derive(Debug)]
+pub(super) enum WalkStop {
+    /// A folder or an entry in it could not be read.
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    /// The entry bound was reached.
+    TooLarge { entries: usize },
+    /// The time bound was reached.
+    TimedOut {
+        elapsed: std::time::Duration,
+        bound: std::time::Duration,
+    },
+}
+
+impl std::fmt::Display for WalkStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(f, "{} could not be read: {source}", path.display())
+            }
+            Self::TooLarge { entries } => write!(
+                f,
+                "the tree holds more than {entries} entries, the most one link check looks at"
+            ),
+            Self::TimedOut { elapsed, bound } => write!(
+                f,
+                "the link check ran for {} s, past its bound of {} s; a link to an unreachable \
+                 network or removable path can hold it that long",
+                elapsed.as_secs(),
+                bound.as_secs()
+            ),
+        }
+    }
+}
+
+/// [`first_outside_link`] with the limits given, so the limits are tested
+/// without a tree of millions of files.
+pub(super) fn walk_for_outside_link(
+    root: &std::path::Path,
+    allowed: &[std::path::PathBuf],
+    limits: &WalkLimits,
+) -> Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>, WalkStop> {
+    fn read_error(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> WalkStop + '_ {
+        move |source| WalkStop::Read {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+    let real_root = kgraf_core::plain_path::canonicalize(root).map_err(read_error(root))?;
+    let started = std::time::Instant::now();
+    let mut seen = 0usize;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
+        for entry in std::fs::read_dir(&dir).map_err(read_error(&dir))? {
+            seen += 1;
+            if seen > limits.entries {
+                return Err(WalkStop::TooLarge {
+                    entries: limits.entries,
+                });
+            }
+            // Checked per entry: the time a single `canonicalize` of a link
+            // to an unreachable path takes cannot be cut short from here, so
+            // the walk stops at the next entry after it returns.
+            let elapsed = started.elapsed();
+            if elapsed > limits.bound {
+                return Err(WalkStop::TimedOut {
+                    elapsed,
+                    bound: limits.bound,
+                });
+            }
+            let entry = entry.map_err(read_error(&dir))?;
+            let kind = entry.file_type().map_err(read_error(&entry.path()))?;
             if kind.is_symlink() {
                 match kgraf_core::plain_path::canonicalize(entry.path()) {
-                    Ok(target) if target.starts_with(&real_root) => {}
+                    Ok(target) if link_target_is_inside(&target, &real_root, allowed) => {}
                     Ok(target) => return Ok(Some((entry.path(), Some(target)))),
                     Err(_) => return Ok(Some((entry.path(), None))),
                 }
@@ -419,7 +651,9 @@ pub(super) fn first_outside_link(
     Ok(None)
 }
 
-/// The refusal [`first_outside_link`] leads to.
+/// The refusal [`first_outside_link`] leads to. It never asks for the link
+/// to be removed: the links kGraf makes in a worktree are kGraf's own, and
+/// it would make them again.
 pub(super) fn outside_link_refusal(
     root: &std::path::Path,
     link: &std::path::Path,
@@ -430,18 +664,784 @@ pub(super) fn outside_link_refusal(
         |t| t.display().to_string(),
     );
     format!(
-        "{} holds the link {} to {target}, outside it. Writing the sandbox user's entry on \
-         {} could carry it through the link onto {target}, so nothing was written. Remove \
-         the link, then run the command again.",
+        "{} holds the link {} to {target}, which this command is not granted. Writing the \
+         sandbox user's entry on {} could carry it through the link onto {target}, so nothing \
+         was written. The dependency trees kGraf links into a tree are granted, and a link \
+         inside the tree is allowed, so this link leads somewhere else: it has to lead inside \
+         the tree, or into a folder the command is granted, before a command can run here.",
         root.display(),
         link.display(),
         root.display()
     )
 }
 
+/// The note a command carries for a read root the link walk refused. The
+/// root is not granted, so the command can run: a read it is not admitted
+/// to takes nothing away from the sandbox, and a failure instead would stop
+/// every command on a machine whose toolchain holds a link of the owner's
+/// own (`rustup toolchain link`, a link in a cargo registry crate). The
+/// note goes out with the command's output
+/// (`super::SandboxedCommand::refused_reads`).
+pub(super) fn refused_read_note(dir: &std::path::Path, why: &str) -> String {
+    format!(
+        "the sandboxed command is not granted {}, so a read there fails: {why}",
+        dir.display()
+    )
+}
+
+/// How a guarded write of an inheritable entry failed
+/// ([`guarded_inheritable_write`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GuardedWrite<E> {
+    /// The walk refused the tree before the write: nothing was written.
+    Refused(String),
+    /// The write itself failed.
+    Write(E),
+    /// The entry was written, and the walk then found a link the walk
+    /// before the write did not: the entry may already have been carried
+    /// onto that link's target.
+    PlantedAfterWrite(String),
+}
+
+/// Write an inheritable entry on a tree, with the link walk before and
+/// after the write: `walk` reports why the tree must not be written
+/// ([`first_outside_link`]), `write` writes the entry on the folder and then
+/// on each existing child itself ([`child_action`]).
+///
+/// Why the walk runs twice. kGraf writes the tree's entries in one pass of
+/// its own, and a command of another sandbox user that may write in the same
+/// folder can plant a junction between the walk and that pass (`mklink /J`
+/// needs no privilege). The window cannot be closed from here, so it is
+/// reported instead of passing unseen: a link the second walk finds means the
+/// pass may already have reached the link's target. The caller then fails
+/// loud, with the path.
+///
+/// The sequencing is here, not in the backend, so it is tested on any host.
+pub(super) fn guarded_inheritable_write<T, E>(
+    walk: impl Fn() -> Option<String>,
+    write: impl FnOnce() -> Result<T, E>,
+) -> Result<T, GuardedWrite<E>> {
+    if let Some(why) = walk() {
+        return Err(GuardedWrite::Refused(why));
+    }
+    let out = write().map_err(GuardedWrite::Write)?;
+    match walk() {
+        None => Ok(out),
+        Some(why) => Err(GuardedWrite::PlantedAfterWrite(why)),
+    }
+}
+
+/// What kGraf's own propagation pass does with one existing child of a tree
+/// whose access list it just wrote.
+///
+/// Windows propagates an inheritable entry to every existing child by
+/// itself, and it walks the tree for that with rules kGraf cannot steer: a
+/// junction may be entered, and a hard link carries the entry onto a file
+/// that is also named outside the tree, because every hard link of a file
+/// shares one security descriptor. kGraf therefore suppresses that
+/// propagation (`imp::open_for_security`) and makes the pass itself, one
+/// child at a time, so the two rules below hold.
+///
+/// **The tree boundary is what this pass protects.** A reparse point is not
+/// entered and not written, and a file with more than one hard link is never
+/// written. Those two rules, and nothing else here, keep an entry inside the
+/// tree it was asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ChildAction {
+    /// A folder: write the entry on it, with the same inheritable flags the
+    /// root carries, so everything made in it later gets it from Windows,
+    /// and enter it.
+    WriteFolder,
+    /// A file: write the effective entry on it. A file inherits nothing
+    /// further, so the entry carries no inheritance flags.
+    WriteFile,
+    /// A reparse point (a junction or a symbolic link; both carry the
+    /// name-surrogate bit): never entered, never written. The walk in front
+    /// of the write already refused a link that leads out of the tree
+    /// ([`first_outside_link`]), and the walk behind it reports one planted
+    /// meanwhile, so the pass itself only has to leave it alone. A link that
+    /// leads inside the tree needs nothing: the pass reaches its target by
+    /// the target's own name.
+    SkipLink,
+    /// A file with more than one hard link: never written, and recorded.
+    ///
+    /// A file's security descriptor belongs to the file, not to the
+    /// directory entry, so every hard link of it shares one descriptor.
+    /// pnpm and uv hard-link package files from a shared store into a
+    /// project, so writing such a file's descriptor would write the owner's
+    /// store file as well, wherever it is (decision 0083). The file keeps the
+    /// list it has, which is the right outcome for a store file: the command
+    /// needs to read it, and the read grant on the store is what makes the
+    /// dependency usable.
+    ///
+    /// **A command therefore cannot write a hard-linked file in its own
+    /// tree.** A package manager that writes such a file in place, instead of
+    /// replacing it, fails with an access error; replacing it works, because
+    /// the new file is a new object and inherits the folder's entry. The
+    /// same holds for a hard link made after the first grant: it carries the
+    /// file's own descriptor, not the folder's inheritance.
+    SkipHardLink,
+    /// A folder kGraf denies this user (the top-level `.git`, a hidden
+    /// folder): not written and not entered, so a generous entry never lands
+    /// where a deny is meant to hold.
+    SkipDenied,
+}
+
+/// What kGraf's propagation pass does with one existing child
+/// ([`ChildAction`]). `links` is `nNumberOfLinks` of the child, read in the
+/// same open as `is_reparse` and `is_dir`, so no second open is needed.
+///
+/// The order of the rules is the order of the risks: what kGraf denies, then
+/// a link, then a hard-linked file, and only then a write. `denied` holds
+/// whole folders, so a path inside one is skipped as well, which matters
+/// where the caller named a folder it had already entered.
+pub(super) fn child_action(
+    path: &std::path::Path,
+    is_reparse: bool,
+    is_dir: bool,
+    links: u32,
+    denied: &[std::path::PathBuf],
+) -> ChildAction {
+    if denied.iter().any(|d| path.starts_with(d)) {
+        return ChildAction::SkipDenied;
+    }
+    if is_reparse {
+        return ChildAction::SkipLink;
+    }
+    if is_dir {
+        // NTFS keeps no hard link to a folder, so the link count of a folder
+        // is not checked: a folder is entered and written.
+        return ChildAction::WriteFolder;
+    }
+    if links > 1 {
+        return ChildAction::SkipHardLink;
+    }
+    ChildAction::WriteFile
+}
+
+/// What one propagation pass wrote and what it left alone
+/// ([`child_action`]). The counts and the paths go into the note the command
+/// carries, so a child that did not get the entry is never silent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Skipped {
+    /// Children whose list was written.
+    pub written: usize,
+    /// Reparse points, not entered and not written.
+    pub links: usize,
+    /// Folders kGraf denies, not entered and not written.
+    pub denied: usize,
+    /// How many files with more than one hard link were not written
+    /// ([`ChildAction::SkipHardLink`]), and the first [`NOTE_PATHS`] of
+    /// them. Only the first few are kept: a pnpm or uv tree can hold a
+    /// hundred thousand of them, and a list of every path would cost more
+    /// memory than the pass itself.
+    pub hard_links: usize,
+    pub first_hard_links: Vec<std::path::PathBuf>,
+    /// Children kGraf could not open, read or write, with the reason. The
+    /// pass goes on, as Windows' own propagation does: Microsoft's
+    /// `SetSecurityInfo` page states that "if share access to the children
+    /// of the object is not available, this function will not propagate
+    /// unprotected ACEs to the children", so a file another program holds
+    /// open without sharing is skipped by Windows too, and failing here
+    /// would refuse a grant that used to work.
+    pub blocked: usize,
+    /// The first [`NOTE_PATHS`] of them, with the reason.
+    pub first_blocked: Vec<(std::path::PathBuf, String)>,
+}
+
+/// How many paths one note lists before it only counts them, so a tree with
+/// thousands of hard links does not fill a command's output.
+const NOTE_PATHS: usize = 5;
+
+impl Skipped {
+    /// Record a file that was not written because it has another hard link.
+    fn hard_link(&mut self, path: std::path::PathBuf) {
+        self.hard_links += 1;
+        if self.first_hard_links.len() < NOTE_PATHS {
+            self.first_hard_links.push(path);
+        }
+    }
+
+    /// Record a child that could not be opened, written or listed.
+    fn blocked(&mut self, path: std::path::PathBuf, why: String) {
+        self.blocked += 1;
+        if self.first_blocked.len() < NOTE_PATHS {
+            self.first_blocked.push((path, why));
+        }
+    }
+
+    /// The note a command carries for the children this pass left alone, or
+    /// `None` when it left none. `what` names the write (for example "the
+    /// write grant"), and `root` the tree.
+    pub(super) fn note(&self, root: &std::path::Path, what: &str) -> Option<String> {
+        if self.hard_links == 0 && self.blocked == 0 {
+            return None;
+        }
+        let mut note = format!("{what} on {} reached {} ", root.display(), self.written);
+        note.push_str("of its files and folders; these keep the access list they had");
+        if self.hard_links > 0 {
+            note.push_str(&format!(
+                ", {} because another hard link of the same file lies outside this tree and \
+                 would be changed with it ({})",
+                self.hard_links,
+                names(&self.first_hard_links, self.hard_links)
+            ));
+        }
+        if self.blocked > 0 {
+            note.push_str(&format!(
+                ", {} because they could not be opened or written ({})",
+                self.blocked,
+                reasons(&self.first_blocked, self.blocked)
+            ));
+        }
+        note.push_str(
+            ". A command cannot write them, and a build that writes one in place \
+                       fails with an access error.",
+        );
+        Some(note)
+    }
+}
+
+/// What the one open per child reports to kGraf's propagation pass
+/// ([`propagation_plan`]).
+pub(super) struct ChildFacts<H> {
+    /// A junction or a symbolic link: both carry the name-surrogate bit.
+    pub is_reparse: bool,
+    /// A folder.
+    pub is_dir: bool,
+    /// `nNumberOfLinks`: how many names this file has on its volume.
+    pub links: u32,
+    /// What the write goes through, so the child is opened once.
+    pub handle: H,
+}
+
+/// kGraf's propagation pass over the existing children of `root`, with the
+/// three operations it needs injected, so the walk itself is tested on any
+/// host ([`imp::propagate`] is the Windows adapter).
+///
+/// `list` names the children of one folder. `probe` makes the one open per
+/// child and reports [`ChildFacts`] from it: the reparse state, the kind,
+/// the hard-link count and the handle to write through. `write` writes the
+/// entry through that handle.
+///
+/// The rules the walk holds, and the reason each is here:
+/// - a reparse point is never entered and never written, so nothing of ours
+///   reaches what it points at;
+/// - a folder kGraf denies is never entered and never written, so a
+///   generous entry never lands where a deny must hold;
+/// - a file with more than one hard link is never written, so nothing of
+///   ours reaches the file under a name outside the tree;
+/// - a child that cannot be opened, written or listed is recorded and the
+///   walk goes on, as Windows' own propagation does
+///   ([`Skipped::blocked`]).
+///
+/// Only a failure to list `root` itself is an error: the folder's own list
+/// is written by then, so the pass must reach what it can.
+pub(super) fn propagation_plan<H>(
+    root: &std::path::Path,
+    denied: &[std::path::PathBuf],
+    list: &mut dyn FnMut(&std::path::Path) -> Result<Vec<std::path::PathBuf>, String>,
+    probe: &mut dyn FnMut(&std::path::Path) -> Result<ChildFacts<H>, String>,
+    write: &mut dyn FnMut(&H, &std::path::Path, bool) -> Result<(), String>,
+) -> Result<Skipped, String> {
+    let mut skipped = Skipped::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let children = match list(&dir) {
+            Ok(children) => children,
+            Err(why) if dir == root => return Err(why),
+            Err(why) => {
+                skipped.blocked(dir, why);
+                continue;
+            }
+        };
+        for path in children {
+            let facts = match probe(&path) {
+                Ok(facts) => facts,
+                Err(why) => {
+                    skipped.blocked(path, why);
+                    continue;
+                }
+            };
+            match child_action(&path, facts.is_reparse, facts.is_dir, facts.links, denied) {
+                ChildAction::WriteFolder => {
+                    if let Err(why) = write(&facts.handle, &path, true) {
+                        skipped.blocked(path.clone(), why);
+                    } else {
+                        skipped.written += 1;
+                    }
+                    // Entered even when its own write failed: a child of it
+                    // may still take the entry.
+                    pending.push(path);
+                }
+                ChildAction::WriteFile => {
+                    if let Err(why) = write(&facts.handle, &path, false) {
+                        skipped.blocked(path, why);
+                    } else {
+                        skipped.written += 1;
+                    }
+                }
+                ChildAction::SkipLink => skipped.links += 1,
+                ChildAction::SkipDenied => skipped.denied += 1,
+                ChildAction::SkipHardLink => skipped.hard_link(path),
+            }
+        }
+    }
+    Ok(skipped)
+}
+
+/// The paths kept, with a count of the rest (`total` is how many there
+/// were).
+fn names(paths: &[std::path::PathBuf], total: usize) -> String {
+    let shown: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let mut out = shown.join(", ");
+    if total > paths.len() {
+        out.push_str(&format!(" and {} more", total - paths.len()));
+    }
+    out
+}
+
+/// The paths kept with their reasons, with a count of the rest.
+fn reasons(paths: &[(std::path::PathBuf, String)], total: usize) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .map(|(p, why)| format!("{}: {why}", p.display()))
+        .collect();
+    let mut out = shown.join("; ");
+    if total > paths.len() {
+        out.push_str(&format!("; and {} more", total - paths.len()));
+    }
+    out
+}
+
+/// The per-child decision of the propagation pass, and the note it leaves.
+/// These run on every host: the decision is data, not a Windows call.
+#[cfg(test)]
+mod child_action_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{ChildAction, ChildFacts, Skipped, child_action};
+
+    #[test]
+    fn a_file_with_one_link_is_written_and_a_folder_carries_the_inheritance() {
+        assert_eq!(
+            child_action(Path::new("t/a.rs"), false, false, 1, &[]),
+            ChildAction::WriteFile
+        );
+        assert_eq!(
+            child_action(Path::new("t/src"), false, true, 1, &[]),
+            ChildAction::WriteFolder
+        );
+    }
+
+    /// A file that existed before the grant carries the whole entry set the
+    /// root carries, the `OWNER RIGHTS` restriction and kGraf's compensating
+    /// entry included, and neither of those reaches a hard-linked file or
+    /// anything through a link.
+    ///
+    /// Why this test exists. The owner-rights restriction keeps a sandbox
+    /// user that owns a file it created from rewriting that file's own list
+    /// after a revoke took its entries away. It used to reach the files that
+    /// already existed through the kernel's propagation of the root's
+    /// inheritable entries; that propagation is suppressed now
+    /// ([`imp::open_for_security`]), so the set must be written per child, by
+    /// the pass, or the restriction would hold only for files created after
+    /// the grant.
+    #[test]
+    fn a_file_that_existed_before_the_grant_carries_the_owner_rights_restriction() {
+        use crate::sandbox_user::acl::{
+            READ_CONTROL_RIGHT, Scope, WRITE_DAC_RIGHT, Who, child_grant, tree_grant,
+        };
+        const ROOT_MASK: u32 = 0x0012_01bf;
+        const TREE_MASK: u32 = ROOT_MASK | 0x0001_0000;
+        let aces = tree_grant(ROOT_MASK, TREE_MASK);
+
+        // A file that was in the worktree before the grant is a child the
+        // pass writes.
+        let old = Path::new("t/src/main.rs");
+        assert_eq!(
+            child_action(old, false, false, 1, &[]),
+            ChildAction::WriteFile
+        );
+        let on_file = child_grant(&aces, false);
+        let mask_of = |who: Who| -> Vec<u32> {
+            on_file
+                .iter()
+                .filter(|a| a.who == who)
+                .map(|a| a.mask)
+                .collect()
+        };
+        assert_eq!(mask_of(Who::SandboxUser), vec![TREE_MASK], "the user");
+        assert_eq!(
+            mask_of(Who::OwnerRights),
+            vec![READ_CONTROL_RIGHT],
+            "an owner of this file may read its list and change nothing"
+        );
+        assert_eq!(
+            mask_of(Who::Owner),
+            vec![READ_CONTROL_RIGHT | WRITE_DAC_RIGHT],
+            "kGraf keeps the two rights the entry above would take from it"
+        );
+        // Nothing on a file is inheritable: a file has nothing below it.
+        assert!(on_file.iter().all(|a| a.scope == Scope::Folder));
+
+        // A folder that existed before the grant carries the same three
+        // trustees, effective on it and inherited by what is made in it.
+        let on_dir = child_grant(&aces, true);
+        for who in [Who::SandboxUser, Who::OwnerRights, Who::Owner] {
+            assert!(
+                on_dir
+                    .iter()
+                    .any(|a| a.who == who && a.scope == Scope::HereAndBelow),
+                "{who:?} is missing on a folder of the tree"
+            );
+        }
+        assert_eq!(on_dir.len(), on_file.len(), "the same trustees either way");
+
+        // The root keeps its own set, which is where these came from: one
+        // derivation, used at the root and per child.
+        assert_eq!(aces.len(), 6);
+
+        // And neither entry is ever written on a hard-linked file or
+        // through a link: the pass does not write those children at all.
+        assert_eq!(
+            child_action(
+                Path::new("t/node_modules/.pnpm/x/index.js"),
+                false,
+                false,
+                2,
+                &[]
+            ),
+            ChildAction::SkipHardLink
+        );
+        assert_eq!(
+            child_action(Path::new("t/link"), true, true, 1, &[]),
+            ChildAction::SkipLink
+        );
+        assert_eq!(
+            child_action(Path::new("t/link.txt"), true, false, 1, &[]),
+            ChildAction::SkipLink
+        );
+    }
+
+    /// The gap this pass closes: a file with a second hard link shares one
+    /// security descriptor with it, so its list is never written. pnpm and
+    /// uv hard-link package files from a shared store into a project.
+    #[test]
+    fn a_hard_linked_file_is_never_written() {
+        assert_eq!(
+            child_action(
+                Path::new("t/node_modules/.pnpm/x/index.js"),
+                false,
+                false,
+                2,
+                &[]
+            ),
+            ChildAction::SkipHardLink
+        );
+        assert_eq!(
+            child_action(Path::new("t/big.bin"), false, false, 9, &[]),
+            ChildAction::SkipHardLink
+        );
+    }
+
+    /// A folder's link count is not a hard link: NTFS keeps none to a
+    /// folder, and a folder must be written and entered.
+    #[test]
+    fn a_folder_is_written_whatever_its_link_count_says() {
+        assert_eq!(
+            child_action(Path::new("t/src"), false, true, 3, &[]),
+            ChildAction::WriteFolder
+        );
+    }
+
+    /// A junction or symbolic link is left alone, whatever it points at:
+    /// the walk in front of the write judges the target, the pass does not
+    /// enter it, so no entry of ours can reach what it points at.
+    #[test]
+    fn a_link_is_left_alone_and_a_denied_folder_is_skipped_first() {
+        assert_eq!(
+            child_action(Path::new("t/node_modules"), true, true, 1, &[]),
+            ChildAction::SkipLink
+        );
+        assert_eq!(
+            child_action(Path::new("t/out"), true, true, 1, &[]),
+            ChildAction::SkipLink
+        );
+        let denied = vec![PathBuf::from("t/.git"), PathBuf::from("t/secrets")];
+        // A denied folder, a file inside it, and a link inside it: none is
+        // written, so a generous entry never lands where a deny must hold.
+        assert_eq!(
+            child_action(Path::new("t/.git"), false, true, 1, &denied),
+            ChildAction::SkipDenied
+        );
+        assert_eq!(
+            child_action(Path::new("t/.git/config"), false, false, 1, &denied),
+            ChildAction::SkipDenied
+        );
+        assert_eq!(
+            child_action(Path::new("t/secrets/k"), true, true, 1, &denied),
+            ChildAction::SkipDenied
+        );
+        // A name that only starts with the same letters is not denied.
+        assert_eq!(
+            child_action(Path::new("t/.gitignore"), false, false, 1, &denied),
+            ChildAction::WriteFile
+        );
+    }
+
+    /// One tree, described as the pass would see it: `(path, reparse, dir,
+    /// links)`. The listing and the probe come from this, so the walk is
+    /// tested without a file system.
+    const TREE: &[(&str, bool, bool, u32)] = &[
+        ("t/src", false, true, 1),
+        ("t/src/main.rs", false, false, 1),
+        ("t/src/store.js", false, false, 3),
+        ("t/.git", false, true, 1),
+        ("t/.git/config", false, false, 1),
+        ("t/jn", true, true, 1),
+        ("t/jn/outside.txt", false, false, 1),
+        ("t/README.md", false, false, 1),
+    ];
+
+    /// `list`, `probe` and `write` over [`TREE`], and what `write` reached.
+    fn walk(denied: &[PathBuf]) -> (Skipped, Vec<String>) {
+        let mut written: Vec<String> = Vec::new();
+        let skipped = {
+            let mut list = |dir: &Path| -> Result<Vec<PathBuf>, String> {
+                Ok(TREE
+                    .iter()
+                    .map(|(p, ..)| PathBuf::from(p))
+                    .filter(|p| p.parent() == Some(dir))
+                    .collect())
+            };
+            let mut probe = |path: &Path| -> Result<ChildFacts<()>, String> {
+                TREE.iter()
+                    .find(|(p, ..)| Path::new(p) == path)
+                    .map(|&(_, is_reparse, is_dir, links)| ChildFacts {
+                        is_reparse,
+                        is_dir,
+                        links,
+                        handle: (),
+                    })
+                    .ok_or_else(|| "no such child".to_owned())
+            };
+            let mut write = |_: &(), path: &Path, _: bool| -> Result<(), String> {
+                written.push(path.display().to_string());
+                Ok(())
+            };
+            super::propagation_plan(Path::new("t"), denied, &mut list, &mut probe, &mut write)
+                .expect("the root is listed")
+        };
+        written.sort();
+        (skipped, written)
+    }
+
+    /// Gap 1 of the review, and the rule that holds the tree boundary: the
+    /// pass writes every plain child, enters no link, and writes no file
+    /// that has a second hard link.
+    #[test]
+    fn the_pass_enters_no_link_and_writes_no_hard_linked_file() {
+        let (skipped, written) = walk(&[]);
+        assert_eq!(
+            written,
+            vec![
+                "t/.git",
+                "t/.git/config",
+                "t/README.md",
+                "t/src",
+                "t/src/main.rs",
+            ]
+        );
+        assert_eq!(
+            (skipped.hard_links, skipped.first_hard_links.as_slice()),
+            (1, [PathBuf::from("t/src/store.js")].as_slice())
+        );
+        assert_eq!((skipped.links, skipped.denied, skipped.written), (1, 0, 5));
+        // Nothing below the junction was reached, by any name.
+        assert!(
+            !written.iter().any(|p| p.contains("outside")),
+            "{written:?}"
+        );
+    }
+
+    /// A grant holds back what kGraf denies; a removal passes an empty set,
+    /// so it reaches every child and can take an entry off inside `.git`
+    /// as well. That difference is gap 2 of the review.
+    #[test]
+    fn a_denied_folder_is_not_entered_and_a_removal_enters_everything() {
+        let (skipped, written) = walk(&[PathBuf::from("t/.git")]);
+        assert_eq!(written, vec!["t/README.md", "t/src", "t/src/main.rs"]);
+        assert_eq!(skipped.denied, 1, "the denied folder was counted once");
+        assert!(!written.iter().any(|p| p.contains(".git")), "{written:?}");
+        // The removal pass names nothing as denied.
+        let (_, all) = walk(&[]);
+        assert!(all.contains(&"t/.git/config".to_owned()), "{all:?}");
+    }
+
+    /// A child the pass cannot open, or a folder it cannot list, is
+    /// recorded and the walk goes on. Windows' own propagation skips such a
+    /// child as well, so failing here would refuse a grant that worked.
+    #[test]
+    fn a_child_that_cannot_be_opened_is_recorded_and_the_walk_goes_on() {
+        let mut list = |dir: &Path| -> Result<Vec<PathBuf>, String> {
+            match dir.file_name().and_then(|n| n.to_str()) {
+                Some("t") => Ok(vec![
+                    PathBuf::from("t/locked.db"),
+                    PathBuf::from("t/closed"),
+                    PathBuf::from("t/ok.rs"),
+                ]),
+                Some("closed") => Err("access is denied".to_owned()),
+                _ => Ok(Vec::new()),
+            }
+        };
+        let facts = |is_dir: bool| ChildFacts {
+            is_reparse: false,
+            is_dir,
+            links: 1,
+            handle: (),
+        };
+        let mut probe = |path: &Path| -> Result<ChildFacts<()>, String> {
+            match path.file_name().and_then(|n| n.to_str()) {
+                Some("locked.db") => Err("sharing violation".to_owned()),
+                Some("closed") => Ok(facts(true)),
+                _ => Ok(facts(false)),
+            }
+        };
+        let mut written: Vec<String> = Vec::new();
+        let mut write = |_: &(), path: &Path, _: bool| -> Result<(), String> {
+            written.push(path.display().to_string());
+            Ok(())
+        };
+        let skipped =
+            super::propagation_plan(Path::new("t"), &[], &mut list, &mut probe, &mut write)
+                .expect("the root is listed");
+        written.sort();
+        assert_eq!(written, vec!["t/closed", "t/ok.rs"]);
+        assert_eq!(skipped.blocked, 2);
+        assert_eq!(
+            skipped.first_blocked,
+            vec![
+                (PathBuf::from("t/locked.db"), "sharing violation".to_owned()),
+                (PathBuf::from("t/closed"), "access is denied".to_owned()),
+            ]
+        );
+    }
+
+    /// A root that cannot be listed is the one failure of the pass: the
+    /// folder's own list is written by then, so the caller must hear it.
+    #[test]
+    fn a_root_that_cannot_be_listed_is_an_error() {
+        let mut list = |_: &Path| -> Result<Vec<PathBuf>, String> { Err("gone".to_owned()) };
+        let mut probe = |_: &Path| -> Result<ChildFacts<()>, String> { unreachable!() };
+        let mut write = |_: &(), _: &Path, _: bool| -> Result<(), String> { unreachable!() };
+        assert_eq!(
+            super::propagation_plan(Path::new("t"), &[], &mut list, &mut probe, &mut write,),
+            Err("gone".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_note_names_the_hard_links_and_counts_the_rest() {
+        let mut skipped = Skipped {
+            written: 12,
+            links: 2,
+            denied: 1,
+            ..Skipped::default()
+        };
+        assert_eq!(skipped.note(Path::new("t"), "the write grant"), None);
+        for i in 0..7 {
+            skipped.hard_link(PathBuf::from(format!("t/f{i}.js")));
+        }
+        skipped.blocked(PathBuf::from("t/locked.db"), "sharing violation".to_owned());
+        let note = skipped
+            .note(Path::new("t"), "the write grant")
+            .expect("a note");
+        assert!(note.contains("the write grant on t reached 12"), "{note}");
+        assert!(note.contains("t/f0.js"), "{note}");
+        assert!(note.contains("and 2 more"), "{note}");
+        assert!(!note.contains("t/f6.js"), "{note}");
+        assert!(note.contains("t/locked.db: sharing violation"), "{note}");
+        assert!(note.contains("fails with an access error"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod guarded_write_tests {
+    use std::cell::Cell;
+
+    use super::{GuardedWrite, guarded_inheritable_write};
+
+    #[test]
+    fn a_refused_tree_is_never_written() {
+        let writes = Cell::new(0);
+        let out = guarded_inheritable_write::<(), &str>(
+            || Some("a link leads out".to_owned()),
+            || {
+                writes.set(writes.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            out,
+            Err(GuardedWrite::Refused("a link leads out".to_owned()))
+        );
+        assert_eq!(writes.get(), 0, "the entry must not be written");
+    }
+
+    #[test]
+    fn a_clean_tree_is_written_once_and_walked_twice() {
+        let walks = Cell::new(0);
+        let writes = Cell::new(0);
+        let out = guarded_inheritable_write::<(), &str>(
+            || {
+                walks.set(walks.get() + 1);
+                None
+            },
+            || {
+                writes.set(writes.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Ok(()));
+        assert_eq!((walks.get(), writes.get()), (2, 1));
+    }
+
+    /// A link planted between the walk and the write is reported, not
+    /// passed over: the entry is already written then.
+    #[test]
+    fn a_link_planted_after_the_walk_is_reported() {
+        let walks = Cell::new(0);
+        let out = guarded_inheritable_write::<(), &str>(
+            || {
+                walks.set(walks.get() + 1);
+                (walks.get() > 1).then(|| "a junction appeared".to_owned())
+            },
+            || Ok(()),
+        );
+        assert_eq!(
+            out,
+            Err(GuardedWrite::PlantedAfterWrite(
+                "a junction appeared".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_failed_write_keeps_its_own_error() {
+        let out = guarded_inheritable_write(|| None, || Err::<(), _>("SetSecurityInfo failed"));
+        assert_eq!(out, Err(GuardedWrite::Write("SetSecurityInfo failed")));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod outside_link_tests {
-    use super::first_outside_link;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        WalkLimits, WalkStop, allowed_link_targets, first_outside_link, outside_link_refusal,
+        walk_for_outside_link,
+    };
 
     #[test]
     fn a_link_out_of_the_tree_is_found_and_one_inside_is_not() {
@@ -452,11 +1452,11 @@ mod outside_link_tests {
         std::fs::write(deep.join("f.txt"), "x").unwrap();
         // Inside: allowed, and not entered.
         std::os::unix::fs::symlink(root.path().join("a"), deep.join("up")).unwrap();
-        assert_eq!(first_outside_link(root.path()).unwrap(), None);
+        assert_eq!(first_outside_link(root.path(), &[]).unwrap(), None);
         // Outside, two levels down.
         let link = deep.join("out");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-        let (found, target) = first_outside_link(root.path()).unwrap().unwrap();
+        let (found, target) = first_outside_link(root.path(), &[]).unwrap().unwrap();
         assert_eq!(found, link);
         assert_eq!(
             target.unwrap(),
@@ -467,9 +1467,149 @@ mod outside_link_tests {
         let dangling = root.path().join("dangling");
         std::os::unix::fs::symlink(outside.path().join("gone"), &dangling).unwrap();
         assert_eq!(
-            first_outside_link(root.path()).unwrap(),
+            first_outside_link(root.path(), &[]).unwrap(),
             Some((dangling, None))
         );
+    }
+
+    /// A worktree holding the dependency link kGraf made into the checkout:
+    /// refused while the checkout's tree is not in the allowed set, allowed
+    /// once it is. This is the grant a worktree gets when it comes back on
+    /// another slot user, where the link is already there.
+    #[test]
+    fn the_dependency_link_kgraf_made_is_allowed_only_as_a_granted_target() {
+        let tree = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let installed = checkout.path().join("node_modules");
+        std::fs::create_dir_all(installed.join("pkg")).unwrap();
+        let link = tree.path().join("node_modules");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        let found = first_outside_link(tree.path(), &[]).unwrap();
+        assert_eq!(found.as_ref().map(|(l, _)| l.clone()), Some(link));
+        let granted = vec![kgraf_core::plain_path::canonicalize(&installed).unwrap()];
+        assert_eq!(first_outside_link(tree.path(), &granted).unwrap(), None);
+    }
+
+    /// A workspace monorepo: `node_modules/@scope/pkg` is a link to a
+    /// package of the checkout, outside `node_modules`. A read grant on the
+    /// checkout's own tree allows it, because the whole checkout is in the
+    /// set for that grant.
+    #[test]
+    fn a_workspace_link_inside_the_checkouts_own_tree_is_allowed() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checkout_root = kgraf_core::plain_path::canonicalize(checkout.path()).unwrap();
+        let installed = checkout_root.join("node_modules");
+        std::fs::create_dir_all(installed.join("@scope")).unwrap();
+        std::fs::create_dir_all(checkout_root.join("packages").join("pkg")).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("..").join("..").join("packages").join("pkg"),
+            installed.join("@scope").join("pkg"),
+        )
+        .unwrap();
+        // Without the checkout in the set the walk refuses the grant.
+        assert!(first_outside_link(&installed, &[]).unwrap().is_some());
+        let trees = vec![installed.clone()];
+        let allowed =
+            allowed_link_targets(&installed, &trees, &trees, Some(checkout_root.as_path()));
+        assert_eq!(first_outside_link(&installed, &allowed).unwrap(), None);
+    }
+
+    /// The checkout is in the set only for a grant on one of its own
+    /// dependency trees, never for a grant on a worktree: a command may
+    /// write in its worktree and could plant a link to the checkout root.
+    #[test]
+    fn the_checkout_is_allowed_only_for_a_grant_on_its_own_dependency_tree() {
+        let tree = PathBuf::from("/w/tree");
+        let checkout = PathBuf::from("/c");
+        let trees = vec![checkout.join("node_modules")];
+        let granted = vec![tree.clone(), trees[0].clone()];
+        let for_tree = allowed_link_targets(&tree, &granted, &trees, Some(&checkout));
+        assert!(!for_tree.contains(&checkout), "{for_tree:?}");
+        assert!(for_tree.contains(&trees[0]), "{for_tree:?}");
+        let for_installed = allowed_link_targets(&trees[0], &granted, &trees, Some(&checkout));
+        assert!(for_installed.contains(&checkout), "{for_installed:?}");
+        let deeper = trees[0].join("pkg");
+        let for_deeper = allowed_link_targets(&deeper, &granted, &trees, Some(&checkout));
+        assert!(for_deeper.contains(&checkout), "{for_deeper:?}");
+    }
+
+    /// A folder that cannot be read fails the walk by name, not as a
+    /// failure of the root: one unreadable subfolder was reported as the
+    /// root before, which named nothing the owner could act on.
+    #[test]
+    fn an_unreadable_folder_is_named_not_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let closed = root.path().join("a").join("closed");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stop = first_outside_link(root.path(), &[]).unwrap_err();
+        // Restored before any assertion, so a failure still cleans up.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match &stop {
+            WalkStop::Read { path, .. } => assert_eq!(path, &closed),
+            other => panic!("{other:?}"),
+        }
+        let text = stop.to_string();
+        assert!(text.contains("closed"), "{text}");
+    }
+
+    /// The walk has an entry bound and a time bound, and reaching either
+    /// refuses the grant instead of running on. Without a bound a link to
+    /// an unreachable network path holds the walk until the operating
+    /// system gives up.
+    #[test]
+    fn the_walk_stops_at_its_entry_bound_and_at_its_time_bound() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..4 {
+            std::fs::write(root.path().join(format!("f{n}")), "x").unwrap();
+        }
+        let tight = WalkLimits {
+            entries: 2,
+            bound: std::time::Duration::from_secs(60),
+        };
+        let stop = walk_for_outside_link(root.path(), &[], &tight).unwrap_err();
+        match &stop {
+            WalkStop::TooLarge { entries } => assert_eq!(*entries, 2),
+            other => panic!("{other:?}"),
+        }
+        assert!(stop.to_string().contains("more than 2 entries"), "{stop}");
+        let no_time = WalkLimits {
+            entries: usize::MAX,
+            bound: std::time::Duration::ZERO,
+        };
+        let stop = walk_for_outside_link(root.path(), &[], &no_time).unwrap_err();
+        assert!(matches!(stop, WalkStop::TimedOut { .. }), "{stop:?}");
+        assert!(stop.to_string().contains("past its bound"), "{stop}");
+        // The default limits pass the same tree.
+        assert_eq!(first_outside_link(root.path(), &[]).unwrap(), None);
+    }
+
+    /// A read root the walk refuses is reported as not granted, with the
+    /// reason and the folder: the command runs, so a link of the owner's own
+    /// in the toolchain does not stop every command.
+    #[test]
+    fn a_refused_read_root_is_a_note_that_names_the_folder_and_the_reason() {
+        let note = super::refused_read_note(
+            Path::new("/u/.rustup/toolchains"),
+            "it holds the link x to y, which this command is not granted",
+        );
+        assert!(note.contains("/u/.rustup/toolchains"), "{note}");
+        assert!(note.contains("is not granted"), "{note}");
+        assert!(note.contains("a read there fails"), "{note}");
+    }
+
+    /// The refusal never tells the owner to remove a link kGraf itself made.
+    #[test]
+    fn the_refusal_does_not_ask_for_the_link_to_be_removed() {
+        let text = outside_link_refusal(
+            Path::new("/w/tree"),
+            Path::new("/w/tree/node_modules"),
+            Some(Path::new("/c/node_modules")),
+        );
+        assert!(!text.to_lowercase().contains("remove the link"), "{text}");
+        assert!(text.contains("/c/node_modules"), "{text}");
     }
 }
 
@@ -753,8 +1893,8 @@ mod imp {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-        GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SE_WINDOW_OBJECT, SetEntriesInAclW,
-        SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        GetNamedSecurityInfoW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_WINDOW_OBJECT,
+        SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AccessCheck, AddMandatoryAce,
@@ -771,10 +1911,12 @@ mod imp {
         TokenGroups, TokenImpersonation, TokenIntegrityLevel, TokenUser, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_DELETE_CHILD,
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, GetFileInformationByHandle,
         GetFileType, GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
         PIPE_ACCESS_OUTBOUND, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
@@ -802,8 +1944,8 @@ mod imp {
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS,
-        JOB_OBJECT_UILIMIT_ALL, SE_GROUP_INTEGRITY, SE_GROUP_LOGON_ID,
-        SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+        JOB_OBJECT_UILIMIT_ALL, MAXIMUM_ALLOWED, SE_GROUP_INTEGRITY, SE_GROUP_LOGON_ID,
+        SYSTEM_MANDATORY_LABEL_ACE_TYPE, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
     };
     use windows_sys::Win32::System::Threading::{
         CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
@@ -821,10 +1963,13 @@ mod imp {
     };
     use crate::error::SandboxError;
     use crate::sandbox_user::PROXY_PORTS;
+    use crate::sandbox_user::acl;
+    use crate::sandbox_user::acl::{Locations, closed_folder_of};
     use crate::sandbox_user::runner::Request;
-    use crate::sandbox_user::slots::{COMMAND_WAIT, Lease, Pool};
-    use crate::sandbox_user::windows::launch;
+    use crate::sandbox_user::slots::{AclLock, COMMAND_WAIT, Lease, Pool};
+    use crate::sandbox_user::store::{credentials_path, slots_dir};
     use crate::sandbox_user::windows::state::{self, LoadedUser, Users};
+    use crate::sandbox_user::windows::{accounts, launch, secure};
     use std::sync::Arc;
     // Shared with the command policy's check of a `cmd /c` or PowerShell
     // script, so it is built on every platform.
@@ -924,6 +2069,24 @@ mod imp {
         }
     }
 
+    /// kGraf's own user, read once: the owner of the worktrees whose access
+    /// lists it writes. Named in a tree grant, because the `OWNER RIGHTS`
+    /// entry there replaces the implicit right of an owner to rewrite a list
+    /// ([`acl::tree_grant`]).
+    fn owner_sid() -> Result<&'static Sid, SandboxError> {
+        static SID: std::sync::OnceLock<Result<Sid, String>> = std::sync::OnceLock::new();
+        SID.get_or_init(|| {
+            crate::sandbox_user::windows::accounts::current_user_sid()
+                .and_then(|text| Sid::from_string(&text))
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|why| SandboxError::PlatformSetup {
+            step: "read this process's own user SID",
+            source: io::Error::other(why.clone()),
+        })
+    }
+
     fn trustee(sid: &Sid) -> TRUSTEE_W {
         TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
@@ -963,6 +2126,41 @@ mod imp {
         | WRITE_DAC
         | WRITE_OWNER;
 
+    /// The folder the access-list lock file lives in: this owner's slot
+    /// folder, derived from the tag and the configuration folder rather than
+    /// from the stored passwords, so it is the same file before and after
+    /// `kgraf sandbox setup` has run, and the same for the token sandbox,
+    /// whose grants are written on the same folders.
+    fn acl_lock_dir() -> Result<&'static Path, SandboxError> {
+        static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let tag = std::env::var(state::TAG_ENV).ok().filter(|t| !t.is_empty());
+            credentials_path(tag.as_deref()).as_deref().map(slots_dir)
+        })
+        .as_deref()
+        .ok_or_else(|| SandboxError::PlatformSetup {
+            step: "find the folder of the sandbox access-list lock",
+            source: io::Error::other(
+                "no kGraf configuration folder was found, so the lock that keeps two \
+                 processes from writing one folder's access list at the same time has \
+                 nowhere to live",
+            ),
+        })
+    }
+
+    /// Hold the one lock around a read-modify-write of an access list
+    /// ([`crate::sandbox_user::slots::lock_acls`]): read the list, merge the
+    /// entries, write it back. Every function below that writes a list takes
+    /// it, and re-reads the list under it, so no writer merges its entries
+    /// into a list another writer has since replaced.
+    fn lock_acls() -> Result<AclLock, SandboxError> {
+        let dir = acl_lock_dir()?;
+        crate::sandbox_user::slots::lock_acls(dir).map_err(|e| SandboxError::PlatformSetup {
+            step: "take the sandbox access-list lock",
+            source: io::Error::other(e.to_string()),
+        })
+    }
+
     /// A file object's DACL and the descriptor that owns it.
     struct Dacl {
         acl: *mut ACL,
@@ -984,6 +2182,37 @@ mod imp {
                 ptr::null_mut(),
                 &mut acl,
                 ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(acl_error(path, code));
+        }
+        Ok(Dacl {
+            acl,
+            _sd: Local(sd),
+        })
+    }
+
+    /// A file object's mandatory label (its system list, read with
+    /// `LABEL_SECURITY_INFORMATION`, which needs only `READ_CONTROL`, unlike
+    /// the audit entries of the same list). The struct is [`Dacl`]: a label
+    /// list holds entries of the same shape.
+    fn read_label(path: &Path) -> Result<Dacl, SandboxError> {
+        let name = wide(path.as_os_str());
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated; outputs are written on success and
+        // the descriptor is freed by `Local`.
+        let code = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut acl,
                 &mut sd,
             )
         };
@@ -1029,10 +2258,142 @@ mod imp {
         })
     }
 
-    /// Merge `entries` into the DACL of `path` and write it back. Writing a
-    /// directory's DACL propagates inheritable ACEs to every existing child,
-    /// so callers skip this when the ACEs are already present.
-    fn apply(path: &Path, dacl: &Dacl, entries: &[EXPLICIT_ACCESS_W]) -> Result<(), SandboxError> {
+    /// A handle on `path` through which [`SetSecurityInfo`] writes the
+    /// object's own list and propagates nothing to what already exists below
+    /// it.
+    ///
+    /// Microsoft's `SetSecurityInfo` page states the rule this rests on:
+    /// "If the supplied handle was opened with an ACCESS_MASK value of
+    /// MAXIMUM_ALLOWED, then the SetSecurityInfo function will not propagate
+    /// ACEs to children." (Windows API, aclapi.h, SetSecurityInfo, Warning;
+    /// read 2026-10-08). Upstream openai/codex
+    /// `codex-rs/windows-sandbox-rs` opens its handles the same way for the
+    /// same reason. kGraf then walks the tree itself
+    /// ([`propagate`]), because the kernel's own walk follows what it finds:
+    /// a junction it may enter, and a hard link whose file is also named
+    /// outside the tree (decision 0083).
+    ///
+    /// `FILE_FLAG_BACKUP_SEMANTICS` is what opens a folder at all, and
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` opens the name itself, so a junction
+    /// is never followed. Neither protection flag
+    /// (`PROTECTED_DACL_SECURITY_INFORMATION`,
+    /// `UNPROTECTED_DACL_SECURITY_INFORMATION`) is passed to the write, so
+    /// the object keeps the inheritance protection Windows set on it.
+    ///
+    /// The share mode lets other programs keep the file open while kGraf
+    /// writes its list; a file another program opened without sharing
+    /// cannot be opened here, which [`propagate`] records.
+    fn open_for_security(path: &Path) -> Result<OwnedHandle, SandboxError> {
+        let name = wide(path.as_os_str());
+        // SAFETY: `name` is NUL-terminated; the call returns a handle or an
+        // invalid-handle value, which `owned` turns into this crate's error.
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                MAXIMUM_ALLOWED,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            // SAFETY: plain call, made right after the failing one.
+            let code = unsafe { GetLastError() };
+            return Err(acl_error(path, code));
+        }
+        // SAFETY: a valid handle this process now owns alone.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+    }
+
+    /// `dwFileAttributes` and `nNumberOfLinks` of whatever `handle` reached,
+    /// in one call on the open [`propagate`] already makes. The kernel's own
+    /// propagation opens each child too, so the pass replaces that cost
+    /// instead of adding one.
+    fn handle_info(handle: &OwnedHandle, path: &Path) -> Result<(u32, u32), SandboxError> {
+        // SAFETY: a zeroed POD struct the call fills.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid handle and a buffer of the right size.
+        if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
+            return Err(SandboxError::Io {
+                path: path.to_path_buf(),
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok((info.dwFileAttributes, info.nNumberOfLinks))
+    }
+
+    /// The DACL of whatever `handle` reached. The handle was opened without
+    /// following a reparse point, so this is the list of the name itself.
+    fn read_dacl_handle(handle: &OwnedHandle, path: &Path) -> Result<Dacl, SandboxError> {
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: a valid handle; outputs are written on success and the
+        // descriptor is freed by `Local`.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut acl,
+                ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(acl_error(path, code));
+        }
+        Ok(Dacl {
+            acl,
+            _sd: Local(sd),
+        })
+    }
+
+    /// The mandatory label of whatever `handle` reached ([`read_label`] by
+    /// handle).
+    fn read_label_handle(handle: &OwnedHandle, path: &Path) -> Result<Dacl, SandboxError> {
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: a valid handle; outputs are written on success and the
+        // descriptor is freed by `Local`.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut acl,
+                &mut sd,
+            )
+        };
+        if code != ERROR_SUCCESS {
+            return Err(acl_error(path, code));
+        }
+        Ok(Dacl {
+            acl,
+            _sd: Local(sd),
+        })
+    }
+
+    /// Merge `entries` into `dacl` and write the result as the list of
+    /// whatever `handle` reached, with no propagation to existing children
+    /// ([`open_for_security`]).
+    ///
+    /// `dacl` must have been read under the access-list lock ([`lock_acls`]),
+    /// which every caller holds: the merge keeps whatever the list held when
+    /// it was read, so a list read before another writer's write would put
+    /// that writer's entries back as they were.
+    fn apply_handle(
+        handle: &OwnedHandle,
+        path: &Path,
+        dacl: &Dacl,
+        entries: &[EXPLICIT_ACCESS_W],
+    ) -> Result<(), SandboxError> {
         let mut new_acl: *mut ACL = ptr::null_mut();
         // SAFETY: `entries` is a valid slice; the old ACL is valid or null;
         // the new ACL is LocalAlloc'd and freed by `Local`.
@@ -1048,11 +2409,10 @@ mod imp {
             return Err(acl_error(path, code));
         }
         let _guard = Local(new_acl.cast());
-        let name = wide(path.as_os_str());
-        // SAFETY: `name` is NUL-terminated; `new_acl` is a valid ACL.
+        // SAFETY: a valid handle and a valid ACL.
         let code = unsafe {
-            SetNamedSecurityInfoW(
-                name.as_ptr(),
+            SetSecurityInfo(
+                handle.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
@@ -1067,60 +2427,424 @@ mod imp {
         Ok(())
     }
 
-    /// Refuse to write an inheritable entry on the tree `root` while a link
-    /// beneath it leads outside it ([`super::first_outside_link`]): the write
+    /// Merge `entries` into the DACL of `path` and write it back, without
+    /// propagating to what already exists below it
+    /// ([`open_for_security`]). A caller whose entries are inheritable
+    /// propagates them itself ([`apply_inheritable`]); callers skip this
+    /// altogether when the entries are already present.
+    fn apply(path: &Path, dacl: &Dacl, entries: &[EXPLICIT_ACCESS_W]) -> Result<(), SandboxError> {
+        let handle = open_for_security(path)?;
+        apply_handle(&handle, path, dacl, entries)
+    }
+
+    /// What one existing child of a tree gets: a folder the same
+    /// inheritable pair the root carries, a file the effective entry.
+    const CHILD_INHERIT: u32 = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+
+    /// Write one entry on an existing child of a tree kGraf just granted or
+    /// denied: `mask` with `mode` ([`GRANT_ACCESS`], [`DENY_ACCESS`]) for
+    /// `sid`, inheritable on a folder so that everything made in it later
+    /// gets it from Windows, effective only on a file.
+    ///
+    /// **This entry is explicit, not an inherited copy.** Windows would mark
+    /// a propagated entry `INHERITED_ACE` and derive its mask and flags from
+    /// the parent's entry; kGraf writes one plain entry instead, which is at
+    /// least as wide as anything that derivation gives. That is the owner's
+    /// choice (2026-10-08): excessive permission inside the tree over a
+    /// failed run. It grants nothing beyond the tree, because the whole tree
+    /// is granted to this user already, and the two rules that hold the tree
+    /// boundary are elsewhere ([`super::child_action`]): a reparse point is
+    /// not entered and not written, and a file with more than one hard link
+    /// is never written.
+    ///
+    /// Two consequences to know. `icacls` shows these entries as explicit on
+    /// every folder and file of the tree, not as inherited copies, so its
+    /// output differs from the restricted-token backend's. And a later write
+    /// of the parent's list does not remove them, so the removal pass takes
+    /// them off itself ([`revoke`]).
+    ///
+    /// Already-present entries are not written again, so a second pass over
+    /// the same tree costs one list read per child.
+    fn write_child_entry(
+        handle: &OwnedHandle,
+        path: &Path,
+        is_dir: bool,
+        sid: &Sid,
+        mask: u32,
+        mode: i32,
+        ace_type: u32,
+    ) -> Result<(), SandboxError> {
+        let flags = if is_dir {
+            CHILD_INHERIT
+        } else {
+            NO_INHERITANCE
+        };
+        write_child_entries(
+            handle,
+            path,
+            &[explicit(sid, mask, mode, flags)],
+            &|d: &Dacl| has_ace(d, ace_type, sid, mask, flags),
+        )
+    }
+
+    /// Write `entries` on an existing child of a tree, as
+    /// [`write_child_entry`] writes one: nothing is written while `done`
+    /// reports the list already holds them.
+    ///
+    /// A grant writes several entries on one child, not one: the set is the
+    /// one the root carries, mapped onto this child
+    /// ([`acl::child_grant`]), so the `OWNER RIGHTS` restriction and kGraf's
+    /// compensating entry reach a file that existed before the grant. The
+    /// kernel used to carry them there and no longer does
+    /// ([`open_for_security`]).
+    ///
+    /// The access-list lock is held for this one read-modify-write, as it is
+    /// for every other ([`lock_acls`]), and not across the pass: a pass over
+    /// a large tree lasts as long as the walk, and the hazard the lock exists
+    /// for is one list, read and written by two writers. Taking it again
+    /// inside a pass that already holds it costs a counter, because it is
+    /// reentrant within a thread.
+    fn write_child_entries(
+        handle: &OwnedHandle,
+        path: &Path,
+        entries: &[EXPLICIT_ACCESS_W],
+        done: &dyn Fn(&Dacl) -> bool,
+    ) -> Result<(), SandboxError> {
+        let _acl = lock_acls()?;
+        let dacl = read_dacl_handle(handle, path)?;
+        if done(&dacl) {
+            return Ok(());
+        }
+        apply_handle(handle, path, &dacl, entries)
+    }
+
+    /// kGraf's own propagation pass over the existing children of `root`:
+    /// one open per child, the decision of [`super::child_action`] on what
+    /// that open reports, and `write` on the children it may write.
+    /// `denied` names folders no entry of this pass may land in (the
+    /// top-level `.git`, the policy's hidden folders), which are not entered
+    /// either.
+    ///
+    /// The pass is made instead of the kernel's, which is suppressed
+    /// ([`open_for_security`]), because the kernel follows what it finds:
+    /// it may enter a junction, and it writes the one security descriptor a
+    /// hard-linked file shares with every other name of it, which can lie
+    /// outside the tree (decision 0083).
+    ///
+    /// A child it cannot open or write is recorded and the pass goes on, as
+    /// Windows' own propagation does with a child whose share access is not
+    /// available (`super::Skipped::blocked`); the note reaches the command's
+    /// output, so a file that keeps its old list is never silent. A folder
+    /// that cannot be listed is recorded the same way and not entered.
+    ///
+    /// No time or entry bound: the walk in front of the write is bounded and
+    /// refuses a tree larger than that bound, and this pass must finish once
+    /// the folder's own list is written. It enters no reparse point, so no
+    /// unreachable network path can hold it.
+    /// Take every entry for `sids` off an existing child of a tree whose
+    /// grant is being removed ([`revoke`]). A removal only narrows access,
+    /// so it needs no entry of its own and cannot carry anything out of the
+    /// tree.
+    ///
+    /// A child that names none of the SIDs is not written at all: a removal
+    /// walks the whole tree, and a worktree with a built `target` folder
+    /// holds hundreds of thousands of files whose lists have nothing to do
+    /// with this user.
+    fn remove_child_entries(
+        handle: &OwnedHandle,
+        path: &Path,
+        sids: &[Sid],
+    ) -> Result<(), SandboxError> {
+        let dacl = read_dacl_handle(handle, path)?;
+        if !sids.iter().any(|sid| names_sid(&dacl, sid)) {
+            return Ok(());
+        }
+        let entries: Vec<EXPLICIT_ACCESS_W> = sids
+            .iter()
+            .map(|sid| explicit(sid, 0, REVOKE_ACCESS, NO_INHERITANCE))
+            .collect();
+        apply_handle(handle, path, &dacl, &entries)
+    }
+
+    /// Whether any entry of `dacl` that kGraf itself wrote names `sid`. An
+    /// inherited entry is not counted: it belongs to a folder above and a
+    /// removal on this object could not take it off anyway.
+    fn names_sid(dacl: &Dacl, sid: &Sid) -> bool {
+        if dacl.acl.is_null() {
+            return false;
+        }
+        const INHERITED_ACE: u32 = 0x10;
+        // SAFETY: `acl` points into the descriptor `dacl` owns.
+        let count = unsafe { (*dacl.acl).AceCount };
+        (0..u32::from(count)).any(|i| {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `i` is below the entry count of a valid list.
+            if unsafe { GetAce(dacl.acl, i, &mut ace) } == 0 {
+                return false;
+            }
+            // SAFETY: every entry starts with an ACE_HEADER.
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if u32::from(header.AceFlags) & INHERITED_ACE != 0 {
+                return false;
+            }
+            // SAFETY: allow and deny entries share this layout, and a file
+            // list holds no other kind.
+            let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+            let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
+            // SAFETY: both are valid SIDs.
+            unsafe { EqualSid(ace_sid, sid.as_psid()) != 0 }
+        })
+    }
+
+    /// The walk itself is [`super::propagation_plan`], which runs on any
+    /// host; this adds the three Windows operations: list a folder, open one
+    /// child and read its attributes and link count in that same open, and
+    /// write the entry through that handle.
+    fn propagate(
+        root: &Path,
+        denied: &[PathBuf],
+        write: &dyn Fn(&OwnedHandle, &Path, bool) -> Result<(), SandboxError>,
+    ) -> Result<super::Skipped, SandboxError> {
+        let mut list = |dir: &Path| -> Result<Vec<PathBuf>, String> {
+            let mut children = Vec::new();
+            for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+                children.push(entry.map_err(|e| e.to_string())?.path());
+            }
+            Ok(children)
+        };
+        let mut probe = |path: &Path| -> Result<super::ChildFacts<OwnedHandle>, String> {
+            let handle = open_for_security(path).map_err(|e| e.to_string())?;
+            let (attributes, links) = handle_info(&handle, path).map_err(|e| e.to_string())?;
+            Ok(super::ChildFacts {
+                is_reparse: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                links,
+                handle,
+            })
+        };
+        let mut write_one = |handle: &OwnedHandle, path: &Path, is_dir: bool| {
+            write(handle, path, is_dir).map_err(|e| e.to_string())
+        };
+        super::propagation_plan(root, denied, &mut list, &mut probe, &mut write_one).map_err(
+            |why| SandboxError::PlatformSetup {
+                step: "write the sandbox user's entry on what a granted tree already holds",
+                source: io::Error::other(format!("{} could not be listed: {why}", root.display())),
+            },
+        )
+    }
+
+    /// Why an inheritable entry must not be written on the tree `root`, or
+    /// `None` when it may be: the walk found a link that leads neither
+    /// inside `root` nor into one of `allowed`
+    /// ([`super::first_outside_link`]), or it could not finish. The write
     /// propagates to what already exists below, and could follow the link.
-    fn refuse_outside_links(root: &Path) -> Result<(), SandboxError> {
-        match super::first_outside_link(root) {
-            Ok(None) => Ok(()),
-            Ok(Some((link, target))) => Err(SandboxError::PlatformSetup {
-                step: "check a tree for links before granting on it",
-                source: io::Error::other(super::outside_link_refusal(
-                    root,
-                    &link,
-                    target.as_deref(),
-                )),
-            }),
-            Err(source) => Err(SandboxError::Io {
-                path: root.to_path_buf(),
-                source,
-            }),
+    fn link_walk_refusal(root: &Path, allowed: &[PathBuf]) -> Option<String> {
+        match super::first_outside_link(root, allowed) {
+            Ok(None) => None,
+            Ok(Some((link, target))) => {
+                Some(super::outside_link_refusal(root, &link, target.as_deref()))
+            }
+            Err(e) => Some(format!(
+                "{} could not be checked for links that lead out of it ({e}), so the sandbox \
+                 user's entry was not written on it",
+                root.display()
+            )),
         }
     }
 
-    /// Admit `sid` to write beneath `root`. The owner of an object may always
-    /// rewrite its DACL, so this needs no administrator rights for a
-    /// user-owned worktree. Verified by reading the DACL back (fail loud).
-    /// The first grant for `sid` is refused while a link in the tree leads
-    /// outside it ([`refuse_outside_links`]).
-    fn grant_writable_root(root: &Path, sid: &Sid) -> Result<(), SandboxError> {
-        let present = |d: &Dacl| {
-            has_ace(d, ACCESS_ALLOWED_ACE_TYPE, sid, ROOT_MASK, NO_INHERITANCE)
-                && has_ace(d, ACCESS_ALLOWED_ACE_TYPE, sid, TREE_MASK, TREE_INHERIT)
-        };
-        let dacl = read_dacl(root)?;
-        if present(&dacl) {
-            return Ok(());
+    /// Merge `entries`, which are inheritable, into the access list of the
+    /// tree `dir`, then write the same access on each existing child
+    /// ([`propagate`]), with the link walk before and after
+    /// ([`super::guarded_inheritable_write`]). Every inheritable write on a
+    /// folder goes through this: it reaches everything already below, and a
+    /// command that may write in the folder can plant a junction between the
+    /// walk and the pass.
+    ///
+    /// The folder's own entries stay inheritable, so Windows gives every
+    /// child made later the right entry by itself; only the children that
+    /// exist now are written here, and `write_child` writes the same entries
+    /// on each ([`write_child_entries`]).
+    ///
+    /// The folder's own list is read here, under the access-list lock
+    /// ([`lock_acls`]), and not by the caller: a list read before another
+    /// process wrote its own entries would carry them away again on the write
+    /// back. `done` reports a list that already holds the entries, which
+    /// another process may have written while this one walked; the pass still
+    /// runs, because a child can lack what the folder has.
+    ///
+    /// The lock is held for the folder's own read-modify-write and for each
+    /// child's, never across the whole pass or across a walk: a pass over a
+    /// large tree takes as long as the walk does, and the hazard the lock
+    /// exists for is one list, read and written by two writers.
+    fn apply_inheritable(
+        dir: &Path,
+        entries: &[EXPLICIT_ACCESS_W],
+        done: &dyn Fn(&Dacl) -> bool,
+        allowed: &[PathBuf],
+        denied: &[PathBuf],
+        write_child: &dyn Fn(&OwnedHandle, &Path, bool) -> Result<(), SandboxError>,
+    ) -> Result<super::Skipped, super::GuardedWrite<SandboxError>> {
+        super::guarded_inheritable_write(
+            || link_walk_refusal(dir, allowed),
+            || {
+                {
+                    let _acl = lock_acls()?;
+                    let dacl = read_dacl(dir)?;
+                    if !done(&dacl) {
+                        apply(dir, &dacl, entries)?;
+                    }
+                }
+                propagate(dir, denied, write_child)
+            },
+        )
+    }
+
+    /// The error a guarded inheritable write failed with.
+    fn planted_or_refused(dir: &Path, e: super::GuardedWrite<SandboxError>) -> SandboxError {
+        match e {
+            super::GuardedWrite::Refused(why) => SandboxError::PlatformSetup {
+                step: "check a tree for links before granting on it",
+                source: io::Error::other(why),
+            },
+            super::GuardedWrite::Write(e) => e,
+            super::GuardedWrite::PlantedAfterWrite(why) => SandboxError::PlatformSetup {
+                step: "check a tree for links after granting on it",
+                source: io::Error::other(format!(
+                    "the entry was written on {} and the link below it was found only \
+                     afterwards, so the entry may already have been carried onto the link's \
+                     target: {why}",
+                    dir.display()
+                )),
+            },
         }
-        refuse_outside_links(root)?;
-        apply(
+    }
+
+    /// Admit `sid` to write beneath `root`. The owner of an object may
+    /// rewrite its DACL, so this needs no administrator rights for a
+    /// user-owned worktree; with `confine_owners` that right comes from
+    /// kGraf's own entry in the list instead, which the same write puts
+    /// there. Verified by reading the DACL back (fail loud).
+    /// The first grant for `sid` is refused while a link in the tree leads
+    /// neither inside it nor into one of `allowed`
+    /// ([`apply_inheritable`], [`super::allowed_link_targets`]). `denied`
+    /// names the folders this grant must not reach (the top-level `.git`,
+    /// the policy's hidden folders): the pass over the existing children does
+    /// not enter them, so the deny entries written on them afterwards hold.
+    ///
+    /// The access-list lock is held from the read to the write
+    /// ([`apply_inheritable`], [`lock_acls`]), so two processes that grant
+    /// two users on one folder each keep the other's entry. The link walk
+    /// runs before the lock, because it reads the whole tree, and the list is
+    /// read again under the lock, immediately before the write.
+    /// With `confine_owners`, the grant also carries the two owner entries
+    /// of [`acl::tree_grant`], which keep a sandbox user that owns the files
+    /// it created from giving itself rights a revoke took away. Only the
+    /// sandbox-user backend passes it: under the token sandbox every command
+    /// runs as kGraf's own user, so ownership of a file in the tree gives no
+    /// other principal anything.
+    ///
+    /// **One entry set, at the root and on every existing child.** The set is
+    /// derived once here from [`acl::tree_grant`], and the pass writes the
+    /// same set, mapped onto one child by [`acl::child_grant`], on each child
+    /// it may write. The kernel's own propagation, which used to carry the
+    /// root's inheritable entries to the children that already existed, is
+    /// suppressed ([`open_for_security`]), so a set written at the root alone
+    /// would leave every file already in the worktree without the
+    /// `OWNER RIGHTS` restriction and without kGraf's compensating entry:
+    /// the sandbox user owns the files it creates, and an owner may rewrite
+    /// the list of what it owns whatever that list says.
+    fn grant_writable_root(
+        root: &Path,
+        sid: &Sid,
+        allowed: &[PathBuf],
+        denied: &[PathBuf],
+        confine_owners: bool,
+    ) -> Result<super::Skipped, SandboxError> {
+        let aces = if confine_owners {
+            acl::tree_grant(ROOT_MASK, TREE_MASK)
+        } else {
+            vec![
+                acl::TreeAce {
+                    who: acl::Who::SandboxUser,
+                    mask: ROOT_MASK,
+                    scope: acl::Scope::Folder,
+                },
+                acl::TreeAce {
+                    who: acl::Who::SandboxUser,
+                    mask: TREE_MASK,
+                    scope: acl::Scope::Below,
+                },
+            ]
+        };
+        // The trustees a tree grant can name, owned here, so every entry
+        // built below may point at one of them for as long as it lives.
+        let owner_rights = Sid::from_string(acl::OWNER_RIGHTS_SID)?;
+        let me = if aces.iter().any(|a| a.who == acl::Who::Owner) {
+            Some(owner_sid()?)
+        } else {
+            None
+        };
+        let sid_of = |who: acl::Who| -> &Sid {
+            match who {
+                acl::Who::SandboxUser => sid,
+                acl::Who::OwnerRights => &owner_rights,
+                // Present whenever an entry names it, by the line above.
+                acl::Who::Owner => me.expect("kGraf's own SID"),
+            }
+        };
+        let flags = |scope: acl::Scope| match scope {
+            acl::Scope::Folder => NO_INHERITANCE,
+            acl::Scope::Below => TREE_INHERIT,
+            acl::Scope::HereAndBelow => CHILD_INHERIT,
+        };
+        let entries_of = |aces: &[acl::TreeAce]| -> Vec<EXPLICIT_ACCESS_W> {
+            aces.iter()
+                .map(|ace| explicit(sid_of(ace.who), ace.mask, GRANT_ACCESS, flags(ace.scope)))
+                .collect()
+        };
+        let holds = |d: &Dacl, aces: &[acl::TreeAce]| {
+            aces.iter().all(|ace| {
+                has_ace(
+                    d,
+                    ACCESS_ALLOWED_ACE_TYPE,
+                    sid_of(ace.who),
+                    ace.mask,
+                    flags(ace.scope),
+                )
+            })
+        };
+        let present = |d: &Dacl| holds(d, &aces);
+        if present(&read_dacl(root)?) {
+            return Ok(super::Skipped::default());
+        }
+        let entries = entries_of(&aces);
+        // The walk, then the root's list read and written under the
+        // access-list lock, then the pass over the children, each child's
+        // list read and written under that lock too, then the walk again.
+        let skipped = apply_inheritable(
             root,
-            &dacl,
-            &[
-                explicit(sid, ROOT_MASK, GRANT_ACCESS, NO_INHERITANCE),
-                explicit(sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT),
-            ],
-        )?;
+            &entries,
+            &present,
+            allowed,
+            denied,
+            &|handle, path, is_dir| {
+                let child = acl::child_grant(&aces, is_dir);
+                write_child_entries(handle, path, &entries_of(&child), &|d: &Dacl| {
+                    holds(d, &child)
+                })
+            },
+        )
+        .map_err(|e| planted_or_refused(root, e))?;
         if !present(&read_dacl(root)?) {
             return Err(SandboxError::PlatformSetup {
                 step: "verify writable-root ACEs",
                 source: io::Error::other(format!(
-                    "the allow ACEs for {} are missing after SetNamedSecurityInfoW",
+                    "the allow ACEs for {} are missing after SetSecurityInfo",
                     root.display()
                 )),
             });
         }
-        Ok(())
+        Ok(skipped)
     }
 
     // ---- ACLs for the sandbox user (decision 0097) ---------------------------
@@ -1132,29 +2856,88 @@ mod imp {
     /// whose restricting SIDs are consulted for writes only.
     const DENY_ALL_MASK: u32 = READ_MASK | DENY_WRITE_MASK;
 
+    /// What one read grant did.
+    enum ReadGrant {
+        /// The entry was written now, with what the pass over the folder's
+        /// existing children left alone.
+        Written(super::Skipped),
+        /// The entry was already there.
+        Present,
+        /// The link walk refused the folder, and why: nothing was written.
+        Refused(String),
+    }
+
     /// Admit `sid` to read and run `path` and, for a folder, everything
     /// below it. Written only while absent, as [`grant_writable_root`] is.
-    /// True when it was written now. A reparse point is refused first, so
-    /// the entry never lands on a link's target (decision 0083).
-    fn grant_read(path: &Path, sid: &Sid) -> Result<bool, SandboxError> {
+    /// A reparse point is refused first, so the entry never lands on a
+    /// link's target (decision 0083). For a folder, a link beneath it that
+    /// leads neither inside it nor into one of `allowed` refuses the folder
+    /// ([`apply_inheritable`]).
+    ///
+    /// A refusal is `Refused`, not an error: a read root that is not granted
+    /// takes nothing away from the sandbox, and the caller reports it with
+    /// the command's output. The owner's toolchain reads are the case that
+    /// matters: a toolchain linked into the rustup home
+    /// (`rustup toolchain link`) or a link in a cargo registry crate is the
+    /// owner's own, and failing the command would stop every command on the
+    /// machine. An entry that was written and may have been carried through
+    /// a link planted during the write stays an error.
+    fn grant_read(path: &Path, sid: &Sid, allowed: &[PathBuf]) -> Result<ReadGrant, SandboxError> {
         refuse_reparse(path)?;
         let flags = if path.is_dir() {
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
         } else {
             NO_INHERITANCE
         };
-        let dacl = read_dacl(path)?;
-        if has_ace(&dacl, ACCESS_ALLOWED_ACE_TYPE, sid, READ_MASK, flags) {
-            return Ok(false);
+        let present = |d: &Dacl| has_ace(d, ACCESS_ALLOWED_ACE_TYPE, sid, READ_MASK, flags);
+        if present(&read_dacl(path)?) {
+            return Ok(ReadGrant::Present);
         }
+        let entries = [explicit(sid, READ_MASK, GRANT_ACCESS, flags)];
+        let mut skipped = super::Skipped::default();
         if path.is_dir() {
-            refuse_outside_links(path)?;
+            // As in `grant_writable_root`: the walk runs outside the
+            // access-list lock, each list is read and written under it.
+            // Without the lock, four slot users granted on one toolchain
+            // folder at the same time would each write a list holding its own
+            // entry alone, and the last writer would take the other three
+            // grants away.
+            //
+            // Nothing is denied inside a read root: the folders kGraf denies
+            // the sandbox user lie inside its writable roots.
+            match apply_inheritable(
+                path,
+                &entries,
+                &present,
+                allowed,
+                &[],
+                &|handle, child, is_dir| {
+                    write_child_entry(
+                        handle,
+                        child,
+                        is_dir,
+                        sid,
+                        READ_MASK,
+                        GRANT_ACCESS,
+                        ACCESS_ALLOWED_ACE_TYPE,
+                    )
+                },
+            ) {
+                Ok(pass) => skipped = pass,
+                Err(super::GuardedWrite::Refused(why)) => return Ok(ReadGrant::Refused(why)),
+                Err(e) => return Err(planted_or_refused(path, e)),
+            }
+        } else {
+            // A file's entry is not inheritable, so nothing propagates and
+            // no tree is walked. The lock is the same one all the same: two
+            // processes can read and write one file's list at once.
+            let _acl = lock_acls()?;
+            let dacl = read_dacl(path)?;
+            if present(&dacl) {
+                return Ok(ReadGrant::Present);
+            }
+            apply(path, &dacl, &entries)?;
         }
-        apply(
-            path,
-            &dacl,
-            &[explicit(sid, READ_MASK, GRANT_ACCESS, flags)],
-        )?;
         if !has_ace(
             &read_dacl(path)?,
             ACCESS_ALLOWED_ACE_TYPE,
@@ -1165,12 +2948,12 @@ mod imp {
             return Err(SandboxError::PlatformSetup {
                 step: "verify a read grant for the sandbox user",
                 source: io::Error::other(format!(
-                    "the read entry for {} is missing after SetNamedSecurityInfoW",
+                    "the read entry for {} is missing after SetSecurityInfo",
                     path.display()
                 )),
             });
         }
-        Ok(true)
+        Ok(ReadGrant::Written(skipped))
     }
 
     /// A grant on a tree that holds a junction to a folder outside it.
@@ -1223,13 +3006,17 @@ mod imp {
             std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
             std::fs::create_dir_all(root.path().join("deep")).unwrap();
             junction(&root.path().join("deep").join("jn"), outside.path());
-            let err = grant_writable_root(root.path(), &sid).unwrap_err();
-            assert!(err.to_string().contains("outside it"), "{err}");
+            let err = grant_writable_root(root.path(), &sid, &[], &[], false).unwrap_err();
+            assert!(err.to_string().contains("is not granted"), "{err}");
             assert!(!mentions(root.path(), &sid), "nothing written on the root");
             assert!(!mentions(outside.path(), &sid));
             assert!(!mentions(&outside.path().join("owner.txt"), &sid));
-            let err = grant_read(root.path(), &sid).unwrap_err();
-            assert!(err.to_string().contains("outside it"), "{err}");
+            // A read root is refused with its reason, not as an error: it is
+            // not granted, and the command says so.
+            match grant_read(root.path(), &sid, &[]).unwrap() {
+                ReadGrant::Refused(why) => assert!(why.contains("is not granted"), "{why}"),
+                _ => panic!("the read grant was not refused"),
+            }
             assert!(!mentions(outside.path(), &sid));
         }
 
@@ -1239,60 +3026,463 @@ mod imp {
             let root = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(root.path().join("store")).unwrap();
             junction(&root.path().join("jn"), &root.path().join("store"));
-            grant_writable_root(root.path(), &sid).unwrap();
+            grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
             assert!(mentions(root.path(), &sid));
+        }
+
+        /// Every other inheritable write on a tree is guarded as a grant is:
+        /// a deny entry and the Low label carried through a junction would
+        /// write the owner's own files outside the tree.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_deny_and_the_low_label_on_a_tree_with_a_junction_out_of_it_are_refused() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
+            junction(&root.path().join("jn"), outside.path());
+            for err in [
+                deny_writes(root.path(), &sid, &[]).unwrap_err(),
+                deny_all(root.path(), &sid, &[]).unwrap_err(),
+                label_root_low(root.path(), &[]).unwrap_err(),
+            ] {
+                assert!(err.to_string().contains("is not granted"), "{err}");
+            }
+            assert!(!mentions(outside.path(), &sid));
+        }
+
+        /// The Low label is written only while it is absent, so a command
+        /// does not rewrite the whole tree's labels, and the walk that
+        /// guards the write runs only then.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn the_low_label_is_written_once_and_then_only_read() {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            label_root_low(root.path(), &[]).unwrap();
+            junction(&root.path().join("jn"), outside.path());
+            // Present now, so no write and no walk: the junction does not
+            // refuse it.
+            label_root_low(root.path(), &[]).unwrap();
+        }
+
+        /// A junction to a folder the same grant admits the same user to
+        /// (a dependency tree kGraf linked into the worktree) does not stop
+        /// the grant, so a worktree that comes back on another slot user
+        /// still runs.
+        #[test]
+        fn a_junction_to_an_allowed_target_does_not_stop_the_grant() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let checkout = tempfile::tempdir().unwrap();
+            let installed = checkout.path().join("node_modules");
+            std::fs::create_dir_all(&installed).unwrap();
+            junction(&root.path().join("node_modules"), &installed);
+            let allowed = vec![kgraf_core::plain_path::canonicalize(&installed).unwrap()];
+            grant_writable_root(root.path(), &sid, &allowed, &[], false).unwrap();
+            assert!(mentions(root.path(), &sid));
+        }
+
+        /// Every entry of `path`'s list that names `sid`, in list order, as
+        /// `(ace_type, inheritance flags)`.
+        fn entries_for(path: &Path, sid: &Sid) -> Vec<(u32, u32)> {
+            let dacl = read_dacl(path).unwrap();
+            if dacl.acl.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: a valid list `dacl` owns.
+            let count = unsafe { (*dacl.acl).AceCount };
+            (0..u32::from(count))
+                .filter_map(|i| {
+                    let mut ace: *mut c_void = ptr::null_mut();
+                    // SAFETY: `i` is below the entry count.
+                    if unsafe { GetAce(dacl.acl, i, &mut ace) } == 0 {
+                        return None;
+                    }
+                    // SAFETY: every entry starts with an ACE_HEADER.
+                    let header = unsafe { &*(ace as *const ACE_HEADER) };
+                    // SAFETY: allow and deny entries share this layout.
+                    let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+                    let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
+                    // SAFETY: both are valid SIDs.
+                    if unsafe { EqualSid(ace_sid, sid.as_psid()) } == 0 {
+                        return None;
+                    }
+                    Some((u32::from(header.AceType), u32::from(header.AceFlags)))
+                })
+                .collect()
+        }
+
+        /// The grant pass writes a plain allow entry on every existing
+        /// child, so a deny written afterwards on a hidden folder has to
+        /// stand before it in the child's list, or the allow would win.
+        /// `SetEntriesInAclW` is what keeps that order.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_deny_on_a_child_stands_before_the_grant_pass_entry() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let hidden = root.path().join("secrets");
+            std::fs::create_dir_all(&hidden).unwrap();
+            let inside = hidden.join("key.txt");
+            std::fs::write(&inside, "x").unwrap();
+            // The grant reaches the hidden folder only when it is not named
+            // as denied, which is the case `prepare` avoids; this test takes
+            // that case on purpose, so the order is checked where both
+            // entries meet.
+            grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            assert_eq!(entries_for(&inside, &sid).len(), 1, "the grant entry");
+            deny_all(&hidden, &sid, &[]).unwrap();
+            let entries = entries_for(&inside, &sid);
+            let deny = entries
+                .iter()
+                .position(|(kind, _)| *kind == ACCESS_DENIED_ACE_TYPE)
+                .expect("a deny entry");
+            let allow = entries
+                .iter()
+                .position(|(kind, _)| *kind == ACCESS_ALLOWED_ACE_TYPE)
+                .expect("an allow entry");
+            assert!(deny < allow, "the deny must come first: {entries:?}");
+        }
+
+        /// The gap this pass closes: a file in the tree with a second hard
+        /// link outside it shares one security descriptor with that name, so
+        /// its list is never written. pnpm and uv hard-link package files
+        /// from a shared store into a project.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_hard_linked_file_in_the_tree_never_gets_the_grant() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let stored = store.path().join("pkg.js");
+            std::fs::write(&stored, "x").unwrap();
+            let linked = root.path().join("node_modules_pkg.js");
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            let plain = root.path().join("src").join("main.rs");
+            std::fs::write(&plain, "fn main() {}").unwrap();
+            std::fs::hard_link(&stored, &linked).unwrap();
+            let skipped = grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            // The store file keeps its own list, under both of its names.
+            assert!(
+                !mentions(&stored, &sid),
+                "the owner's store file was written"
+            );
+            assert!(!mentions(&linked, &sid));
+            // A file with one link, and every folder, got the entry.
+            assert!(mentions(&plain, &sid));
+            assert!(mentions(&root.path().join("src"), &sid));
+            assert_eq!(skipped.hard_links, 1);
+            assert_eq!(skipped.first_hard_links, vec![linked]);
+            let note = skipped
+                .note(root.path(), "the write grant")
+                .expect("a note names the file");
+            assert!(note.contains("another hard link"), "{note}");
+        }
+
+        /// A child carries kGraf's entry as an explicit entry of its own, so
+        /// rewriting the folder's list does not take it off: the removal pass
+        /// has to, and this is what gap 2 of the review asked for.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn the_removal_takes_the_entry_off_every_existing_child() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            let child = root.path().join("src").join("main.rs");
+            std::fs::write(&child, "fn main() {}").unwrap();
+            grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            assert!(mentions(&child, &sid));
+            revoke(root.path(), &[SID]).unwrap();
+            assert!(!mentions(root.path(), &sid), "the folder keeps an entry");
+            assert!(!mentions(&root.path().join("src"), &sid));
+            assert!(!mentions(&child, &sid), "a child keeps an entry");
+        }
+
+        /// A removal propagates nothing of its own and refuses nothing: a
+        /// junction planted after the grant is not entered, and its target
+        /// keeps its list. This is the exposure of gap 2.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn the_removal_reaches_neither_a_junction_target_nor_a_hard_linked_file() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
+            let store = tempfile::tempdir().unwrap();
+            let stored = store.path().join("pkg.js");
+            std::fs::write(&stored, "x").unwrap();
+            std::fs::hard_link(&stored, root.path().join("pkg.js")).unwrap();
+            grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            junction(&root.path().join("jn"), outside.path());
+            // Not refused, whatever the tree holds now.
+            revoke(root.path(), &[SID]).unwrap();
+            assert!(!mentions(outside.path(), &sid));
+            assert!(!mentions(&outside.path().join("owner.txt"), &sid));
+            // The store file was never written, by the grant or the removal.
+            assert!(!mentions(&stored, &sid));
+        }
+
+        /// The grant pass does not enter what kGraf denies, so no entry of
+        /// it stands where the deny must hold.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn the_grant_pass_does_not_enter_a_denied_folder() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let gitdir = root.path().join(".git");
+            std::fs::create_dir_all(&gitdir).unwrap();
+            let config = gitdir.join("config");
+            std::fs::write(&config, "[core]").unwrap();
+            let plain = root.path().join("README.md");
+            std::fs::write(&plain, "x").unwrap();
+            let skipped =
+                grant_writable_root(root.path(), &sid, &[], std::slice::from_ref(&gitdir), false)
+                    .unwrap();
+            assert_eq!(skipped.denied, 1);
+            assert!(!mentions(&gitdir, &sid));
+            assert!(!mentions(&config, &sid));
+            assert!(mentions(&plain, &sid));
+        }
+
+        /// What the pass costs: the wall time of a first grant on a tree of
+        /// the size named here. The kernel's own propagation opens each child
+        /// too, so this replaces a cost rather than adding one, but only a
+        /// Windows run says by how much. Search the output for `MEASURE`.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn measure_the_cost_of_a_first_grant_on_a_tree() {
+            const FOLDERS: usize = 100;
+            const FILES_PER_FOLDER: usize = 20;
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            for d in 0..FOLDERS {
+                let dir = root.path().join(format!("d{d}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in 0..FILES_PER_FOLDER {
+                    std::fs::write(dir.join(format!("f{f}.rs")), "x").unwrap();
+                }
+            }
+            let started = std::time::Instant::now();
+            let skipped = grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            let elapsed = started.elapsed();
+            println!(
+                "MEASURE first-grant-pass: {} folders, {} files, {} children written, {} ms",
+                FOLDERS,
+                FOLDERS * FILES_PER_FOLDER,
+                skipped.written,
+                elapsed.as_millis()
+            );
         }
 
         /// What the guard above prevents, measured: whether writing an
         /// inheritable entry on a folder carries it through a junction onto
         /// the junction's target. The guard holds either way; this line tells
         /// the run's reader which. Search the output for `MEASURE`.
+        /// Two measurements in one run, both of claims kGraf now rests on.
+        ///
+        /// First, whether the handle opened with `MAXIMUM_ALLOWED` really
+        /// suppresses the propagation: a child that exists gets no entry
+        /// from that write, only from kGraf's own pass. The line prints
+        /// `suppressed` as false where Windows propagated anyway.
+        ///
+        /// Second, the old question, with the write Windows propagates
+        /// (`SetNamedSecurityInfoW` by path): whether that propagation
+        /// follows a junction onto its target. Every allowance of the link
+        /// walk rests on the answer.
         #[test]
         fn measure_whether_propagation_follows_a_junction() {
+            use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+
             let sid = Sid::from_string(SID).unwrap();
+            // The suppressed write: one folder, one file in it, no pass.
+            let quiet = tempfile::tempdir().unwrap();
+            let child = quiet.path().join("child.txt");
+            std::fs::write(&child, "x").unwrap();
+            let dacl = read_dacl(quiet.path()).unwrap();
+            apply(
+                quiet.path(),
+                &dacl,
+                &[explicit(&sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT)],
+            )
+            .unwrap();
+            println!(
+                "MEASURE maximum-allowed-suppresses-propagation: suppressed {}",
+                !mentions(&child, &sid)
+            );
+
+            // The propagating write, by path, as Windows makes it.
             let root = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             std::fs::write(outside.path().join("owner.txt"), "x").unwrap();
             junction(&root.path().join("jn"), outside.path());
             let dacl = read_dacl(root.path()).unwrap();
-            apply(
-                root.path(),
-                &dacl,
-                &[explicit(&sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT)],
-            )
-            .unwrap();
+            let entries = [explicit(&sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT)];
+            let mut new_acl: *mut ACL = ptr::null_mut();
+            // SAFETY: a valid entry slice and a valid old list; the new list
+            // is LocalAlloc'd and freed by `Local`.
+            let code = unsafe {
+                SetEntriesInAclW(
+                    entries.len() as u32,
+                    entries.as_ptr(),
+                    dacl.acl,
+                    &mut new_acl,
+                )
+            };
+            assert_eq!(code, ERROR_SUCCESS, "SetEntriesInAclW");
+            let _guard = Local(new_acl.cast());
+            let name = wide(root.path().as_os_str());
+            // SAFETY: `name` is NUL-terminated and `new_acl` is a valid list.
+            let code = unsafe {
+                SetNamedSecurityInfoW(
+                    name.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    new_acl,
+                    ptr::null(),
+                )
+            };
+            assert_eq!(code, ERROR_SUCCESS, "SetNamedSecurityInfoW");
             println!(
                 "MEASURE grant-propagation-follows-junction: target folder {}, file in it {}",
                 mentions(outside.path(), &sid),
                 mentions(&outside.path().join("owner.txt"), &sid)
             );
         }
+
+        /// A tree grant for a sandbox user also limits what an owner of an
+        /// object in the tree may do, and keeps kGraf able to write the list
+        /// again. Without this, a slot user whose entries a revoke took away
+        /// still owned the files it created there and could give itself its
+        /// rights back from its next folder.
+        #[test]
+        fn a_tree_grant_limits_an_owner_and_keeps_kgraf_able_to_write_the_list() {
+            let sid = Sid::from_string(SID).unwrap();
+            let owner_rights = Sid::from_string(acl::OWNER_RIGHTS_SID).unwrap();
+            let me = owner_sid().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            grant_writable_root(root.path(), &sid, &[], &[], true).unwrap();
+            // The entry an owner is limited to: reading the list, on the
+            // folder and on everything below it.
+            let dacl = read_dacl(root.path()).unwrap();
+            for flags in [NO_INHERITANCE, TREE_INHERIT] {
+                assert!(
+                    has_ace(
+                        &dacl,
+                        ACCESS_ALLOWED_ACE_TYPE,
+                        &owner_rights,
+                        acl::READ_CONTROL_RIGHT,
+                        flags
+                    ),
+                    "the owner-rights entry is missing with flags {flags:#x}"
+                );
+                // kGraf keeps, by name, the two rights ownership gave it.
+                assert!(
+                    has_ace(
+                        &dacl,
+                        ACCESS_ALLOWED_ACE_TYPE,
+                        me,
+                        acl::READ_CONTROL_RIGHT | acl::WRITE_DAC_RIGHT,
+                        flags
+                    ),
+                    "kGraf's own entry is missing with flags {flags:#x}"
+                );
+            }
+            // Idempotent: a second grant finds every entry and writes
+            // nothing, so it never rewrites a large tree twice.
+            grant_writable_root(root.path(), &sid, &[], &[], true).unwrap();
+            // Not locked out: kGraf can still write the list of the tree it
+            // owns, which is what its own entry above is for. A file created
+            // after the grant inherits the same entries.
+            let file = root.path().join("new.txt");
+            std::fs::write(&file, "x").unwrap();
+            let dacl = read_dacl(&file).unwrap();
+            println!(
+                "MEASURE owner-rights-inherited-by-a-new-file: {}",
+                mentions(&file, &owner_rights)
+            );
+            apply(&file, &dacl, &[]).expect("kGraf can write a child's list");
+            let dacl = read_dacl(root.path()).unwrap();
+            apply(root.path(), &dacl, &[]).expect("kGraf can write the tree's list");
+        }
     }
 
     /// Deny `sid` every read and write beneath the hidden folder `dir`. A
     /// writable root beneath it keeps its own explicit grant, which precedes
     /// the inherited deny.
-    fn deny_all(dir: &Path, sid: &Sid) -> Result<(), SandboxError> {
+    fn deny_all(
+        dir: &Path,
+        sid: &Sid,
+        allowed: &[PathBuf],
+    ) -> Result<super::Skipped, SandboxError> {
         refuse_reparse(dir)?;
-        let flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-        let dacl = read_dacl(dir)?;
-        if has_ace(&dacl, ACCESS_DENIED_ACE_TYPE, sid, DENY_ALL_MASK, flags) {
-            return Ok(());
+        let flags = CHILD_INHERIT;
+        let present = |d: &Dacl| has_ace(d, ACCESS_DENIED_ACE_TYPE, sid, DENY_ALL_MASK, flags);
+        if present(&read_dacl(dir)?) {
+            return Ok(super::Skipped::default());
         }
-        apply(
+        // The access-list lock is taken inside, around the folder's own
+        // read-modify-write and around each child's, with the walks outside
+        // it. Nothing is denied to the pass itself: a deny is what this write
+        // carries, so it must reach every child of the hidden folder.
+        apply_inheritable(
             dir,
-            &dacl,
             &[explicit(sid, DENY_ALL_MASK, DENY_ACCESS, flags)],
+            &present,
+            allowed,
+            &[],
+            &|handle, child, is_dir| {
+                write_child_entry(
+                    handle,
+                    child,
+                    is_dir,
+                    sid,
+                    DENY_ALL_MASK,
+                    DENY_ACCESS,
+                    ACCESS_DENIED_ACE_TYPE,
+                )
+            },
         )
+        .map_err(|e| planted_or_refused(dir, e))
     }
 
     /// Remove every explicit entry for the SIDs `sids` from `path`
-    /// (`kgraf sandbox remove`). A path that no longer exists is skipped; a
-    /// reparse point is refused, never followed (decision 0083).
-    pub(crate) fn revoke(path: &Path, sids: &[&str]) -> Result<(), SandboxError> {
+    /// (`kgraf sandbox remove`, and a slot that moves to another folder). A
+    /// path that no longer exists is skipped; a reparse point is refused,
+    /// never followed (decision 0083).
+    ///
+    /// **A removal propagates nothing and refuses nothing.** Writing a
+    /// folder's list again used to carry the folder's remaining inheritable
+    /// entries onto everything below it, which is the same exposure a grant
+    /// has: the kernel's walk may enter a junction, and it writes the one
+    /// descriptor a hard-linked file shares with every other name of it.
+    /// The folder's own list is now written with that propagation suppressed
+    /// ([`open_for_security`]) and the entries are taken off each child by
+    /// the same pass the grant uses ([`propagate`]), which enters no reparse
+    /// point and writes no hard-linked file.
+    ///
+    /// No link walk guards it, and none is needed: the pass only ever takes
+    /// access away, so nothing of ours can land outside the tree. A removal
+    /// must also never be refused, because a refusal would leave one user's
+    /// write grant on a folder another user now works in. Its callers (the
+    /// slot table and `kgraf sandbox remove`) know only the folder, so they
+    /// could not build a set of allowed link targets anyway.
+    ///
+    /// The pass has to run: a child carries kGraf's entry as an explicit
+    /// entry of its own ([`write_child_entry`]), not as an inherited copy
+    /// that would disappear when the folder's list is rewritten.
+    ///
+    /// **What a removal leaves.** A hard-linked file is skipped, as it is
+    /// during a grant, and recorded. After the grant pass of this version
+    /// such a file never holds an entry of ours; a tree granted by an older
+    /// kGraf, whose kernel propagation reached it, can still hold one, and
+    /// the owner takes it off with `icacls` on the file itself.
+    pub(crate) fn revoke(path: &Path, sids: &[&str]) -> Result<Vec<String>, SandboxError> {
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) => {
                 return Err(SandboxError::Io {
                     path: path.to_path_buf(),
@@ -1309,8 +3499,27 @@ mod imp {
             .iter()
             .map(|sid| explicit(sid, 0, REVOKE_ACCESS, NO_INHERITANCE))
             .collect();
+        // Under the access-list lock, as every other write of a list is: a
+        // grant that read this list before the revoke would otherwise write
+        // the revoked entries back, and nothing would ever remove them,
+        // because the slot table no longer names this folder for that user.
+        let _acl = lock_acls()?;
         let dacl = read_dacl(path)?;
-        apply(path, &dacl, &entries)
+        apply(path, &dacl, &entries)?;
+        if !path.is_dir() {
+            return Ok(Vec::new());
+        }
+        let skipped = propagate(path, &[], &|handle, child, _| {
+            remove_child_entries(handle, child, &sids)
+        })?;
+        // A removal is never refused, so what it left is reported instead:
+        // the caller that has an output path carries the note to the owner
+        // (a slot that moves to another folder reports it with the command
+        // that took the slot).
+        Ok(skipped
+            .note(path, "the removal of the sandbox user's access")
+            .into_iter()
+            .collect())
     }
 
     /// The folders the sandbox user reads beyond its writable roots: the
@@ -1370,22 +3579,59 @@ mod imp {
     }
 
     /// Deny writes to `path` for `sid` (the top-level `.git` entry). Deny ACEs
-    /// are ordered before allows by `SetEntriesInAclW`.
-    fn deny_writes(path: &Path, sid: &Sid) -> Result<(), SandboxError> {
+    /// are ordered before allows by `SetEntriesInAclW`. A deny entry on a
+    /// folder is inheritable, so it goes through the link walk as a grant
+    /// does ([`apply_inheritable`]): a deny carried through a junction would
+    /// write the owner's own files outside the tree (decision 0083).
+    fn deny_writes(
+        path: &Path,
+        sid: &Sid,
+        allowed: &[PathBuf],
+    ) -> Result<super::Skipped, SandboxError> {
         let flags = if path.is_dir() {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            CHILD_INHERIT
         } else {
             NO_INHERITANCE
         };
-        let dacl = read_dacl(path)?;
-        if has_ace(&dacl, ACCESS_DENIED_ACE_TYPE, sid, DENY_WRITE_MASK, flags) {
-            return Ok(());
+        let present = |d: &Dacl| has_ace(d, ACCESS_DENIED_ACE_TYPE, sid, DENY_WRITE_MASK, flags);
+        if present(&read_dacl(path)?) {
+            return Ok(super::Skipped::default());
         }
-        apply(
-            path,
-            &dacl,
-            &[explicit(sid, DENY_WRITE_MASK, DENY_ACCESS, flags)],
-        )
+        let entries = [explicit(sid, DENY_WRITE_MASK, DENY_ACCESS, flags)];
+        if path.is_dir() {
+            // As in `deny_all`: the deny must reach every child of the
+            // folder, so nothing is held back from the pass, and the
+            // access-list lock is taken inside, once per list written.
+            apply_inheritable(
+                path,
+                &entries,
+                &present,
+                allowed,
+                &[],
+                &|handle, child, is_dir| {
+                    write_child_entry(
+                        handle,
+                        child,
+                        is_dir,
+                        sid,
+                        DENY_WRITE_MASK,
+                        DENY_ACCESS,
+                        ACCESS_DENIED_ACE_TYPE,
+                    )
+                },
+            )
+            .map_err(|e| planted_or_refused(path, e))
+        } else {
+            // A file's entry is not inheritable, so no tree is walked, and
+            // the lock is taken here, around this one list.
+            let _acl = lock_acls()?;
+            let dacl = read_dacl(path)?;
+            if present(&dacl) {
+                return Ok(super::Skipped::default());
+            }
+            apply(path, &dacl, &entries)?;
+            Ok(super::Skipped::default())
+        }
     }
 
     /// `\\?\C:\x` -> `C:\x`, through the one rule in
@@ -1476,8 +3722,62 @@ mod imp {
     /// Label `root` with a Low mandatory label (`no-write-up`, inherited), so a
     /// Low-integrity sandbox can write there while still being unable to write
     /// up to Medium objects elsewhere.
-    fn label_root_low(root: &Path) -> Result<(), SandboxError> {
+    ///
+    /// The label is inheritable, so Windows writes it on everything already
+    /// below the root, and it is written only while it is absent, as the
+    /// grants are: it then goes through the link walk
+    /// ([`apply_inheritable`]) and costs one read of the root's label on
+    /// every later command instead of a write of the whole tree. A label
+    /// carried through a junction would mark the owner's own folder Low,
+    /// which every Low process could then write.
+    fn label_root_low(root: &Path, allowed: &[PathBuf]) -> Result<super::Skipped, SandboxError> {
         let low = low_sid()?;
+        if has_ace(
+            &read_label(root)?,
+            SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+            &low,
+            SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+            CHILD_INHERIT,
+        ) {
+            return Ok(super::Skipped::default());
+        }
+        let inheritable = low_label_acl(&low, CHILD_INHERIT)?;
+        let effective = low_label_acl(&low, NO_INHERITANCE)?;
+        let write = || -> Result<super::Skipped, SandboxError> {
+            let handle = open_for_security(root)?;
+            write_label(&handle, root, &inheritable)?;
+            // The label reaches every child, the folders kGraf denies the
+            // sandbox user included: a Low label is not an access grant, and
+            // the deny entry on such a folder is what holds there.
+            propagate(root, &[], &|handle, path, is_dir| {
+                let (acl, flags) = if is_dir {
+                    (&inheritable, CHILD_INHERIT)
+                } else {
+                    (&effective, NO_INHERITANCE)
+                };
+                if has_ace(
+                    &read_label_handle(handle, path)?,
+                    SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+                    &low,
+                    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+                    flags,
+                ) {
+                    return Ok(());
+                }
+                write_label(handle, path, acl)
+            })
+        };
+        super::guarded_inheritable_write(|| link_walk_refusal(root, allowed), write)
+            .map_err(|e| planted_or_refused(root, e))
+    }
+
+    /// An access list holding one Low mandatory-label entry (`no-write-up`)
+    /// with the inheritance flags `inherit`. The inheritance rules are the
+    /// same for a label as for an access entry (Windows API, ACE Inheritance
+    /// Rules: "These inheritance rules work the same for both DACLs and
+    /// system access control lists"; read 2026-10-08), so a folder gets the
+    /// inheritable form and a file the effective one.
+    fn low_label_acl(low: &Sid, inherit: u32) -> Result<Vec<u32>, SandboxError> {
         // ACL buffer: header + one mandatory-label ACE + the label SID.
         let mut acl = vec![0u32; 64];
         let bytes = std::mem::size_of_val(acl.as_slice()) as u32;
@@ -1490,7 +3790,7 @@ mod imp {
             AddMandatoryAce(
                 acl.as_mut_ptr().cast(),
                 ACL_REVISION,
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                inherit,
                 SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
                 low.as_psid(),
             )
@@ -1498,11 +3798,16 @@ mod imp {
         if ok == 0 {
             return Err(last_error("AddMandatoryAce"));
         }
-        let name = wide(root.as_os_str());
-        // SAFETY: `name` is NUL-terminated; the SACL is a valid ACL.
+        Ok(acl)
+    }
+
+    /// Write `acl` as the mandatory label of whatever `handle` reached, with
+    /// no propagation to existing children ([`open_for_security`]).
+    fn write_label(handle: &OwnedHandle, path: &Path, acl: &[u32]) -> Result<(), SandboxError> {
+        // SAFETY: a valid handle and a valid label ACL.
         let code = unsafe {
-            SetNamedSecurityInfoW(
-                name.as_ptr(),
+            SetSecurityInfo(
+                handle.as_raw_handle(),
                 SE_FILE_OBJECT,
                 LABEL_SECURITY_INFORMATION,
                 ptr::null_mut(),
@@ -1512,7 +3817,7 @@ mod imp {
             )
         };
         if code != ERROR_SUCCESS {
-            return Err(acl_error(root, code));
+            return Err(acl_error(path, code));
         }
         Ok(())
     }
@@ -1523,6 +3828,14 @@ mod imp {
     #[derive(Debug)]
     pub(in crate::sandbox) struct Prepared {
         caps: Vec<Sid>,
+        /// What the owner must know about this command's confinement, shown
+        /// with its output
+        /// ([`super::super::SandboxedCommand::refused_reads`]): a read root
+        /// that is not granted, with the reason; the children a grant, a deny
+        /// or the Low label could not write ([`super::Skipped::note`]); and
+        /// what a slot moving to this folder left behind on the folders it
+        /// held.
+        pub(in crate::sandbox) notes: Vec<String>,
         /// Identifies the workspace, so its private desktop is reused.
         desktop_key: String,
         /// When set, the command starts as this sandbox user through the
@@ -1591,13 +3904,31 @@ mod imp {
             .iter()
             .map(|root| Sid::from_string(&capability_sid_string(&root.to_string_lossy())))
             .collect::<Result<Vec<_>, _>>()?;
+        // A link beneath one writable root that leads into another is
+        // allowed: this token is granted write on both. Reads are not
+        // confined on this backend, so there is no read root to add
+        // ([`super::allowed_link_targets`]).
+        let granted = roots.clone();
+        // The folders the grant pass must not enter: the top-level `.git` of
+        // each writable root and the policy's hidden folders. Their deny
+        // entries are written after the grants, and a plain allow entry on a
+        // child of theirs would stand beside a deny the same pass writes.
+        let denied: Vec<PathBuf> = roots
+            .iter()
+            .map(|root| root.join(".git"))
+            .chain(policy.hidden.iter().map(|h| strip_verbatim(&h.dir)))
+            .collect();
+        let mut notes: Vec<String> = Vec::new();
         for (root, sid) in roots.iter().zip(&caps) {
             // Order matters: refuse a junction and a non-ACL volume before any
             // security call, so neither is followed or silently ineffective.
             refuse_reparse(root)?;
             require_acl_volume(root)?;
-            grant_writable_root(root, sid)?;
-            label_root_low(root)?;
+            notes.extend(
+                grant_writable_root(root, sid, &granted, &denied, false)?
+                    .note(root, "the write grant"),
+            );
+            notes.extend(label_root_low(root, &granted)?.note(root, "the Low integrity label"));
             verify_effective_write(root, sid)?;
         }
         // Deny writes to a real (non-reparse) `.git` under a writable root. A
@@ -1622,7 +3953,8 @@ mod imp {
             }
             refuse_reparse(&gitlink)?;
             for sid in &caps {
-                deny_writes(&gitlink, sid)?;
+                notes
+                    .extend(deny_writes(&gitlink, sid, &granted)?.note(&gitlink, "the write deny"));
             }
         }
         // A hidden folder (`SandboxPolicy::hide`): a deny ACE for the
@@ -1633,7 +3965,7 @@ mod imp {
         for (dir, sids) in super::hidden_denials(&policy.hidden, &roots, &caps, strip_verbatim) {
             refuse_reparse(&dir)?;
             for sid in sids {
-                deny_writes(&dir, sid)?;
+                notes.extend(deny_writes(&dir, sid, &granted)?.note(&dir, "the write deny"));
             }
         }
         // The first writable root (the worktree root under the standard policy)
@@ -1644,6 +3976,7 @@ mod imp {
             .unwrap_or_default();
         Ok(Prepared {
             caps,
+            notes,
             desktop_key,
             user: None,
         })
@@ -1687,15 +4020,70 @@ mod imp {
         // time; when every slot is held by another folder, it is refused.
         // The slot is recorded with every root before any grant is written,
         // so the grants are revoked when the slot moves to another folder.
-        let slot = users.lease(pool, policy.worker_slot.as_ref(), &roots, COMMAND_WAIT)?;
-        let user = users.user(slot.role())?;
-        let sid = Sid::from_string(&user.sid)?;
+        //
+        // Every root is judged before the lease, not inside the grant loop
+        // below, for that reason: a root the lease recorded but that no grant
+        // can be written on is a root no revoke can clear either, and it
+        // would make every later folder that reached this slot fail. The
+        // judgment needs no user, so it costs nothing to do first, the
+        // closed-folder refusal included.
+        //
+        // The folders setup closed to the sandbox group. Read here, not once
+        // per process: the drive set can change, and the cost (one registry
+        // read per known folder and one listing of Public) is nothing beside
+        // the command that follows.
+        let closed = secure::locations()?;
         for root in &roots {
             // As in `prepare`: refuse a junction and a non-ACL volume before
             // any security call.
             refuse_reparse(root)?;
             require_acl_volume(root)?;
-            grant_writable_root(root, &sid)?;
+            refuse_closed_root(root, &closed)?;
+        }
+        // The lease may move a slot to this folder, which removes the slot
+        // user's access from the folders it held; what that removal left
+        // comes back as a note and goes out with this command's output.
+        let (slot, mut notes) =
+            users.lease(pool, policy.worker_slot.as_ref(), &roots, COMMAND_WAIT)?;
+        let user = users.user(slot.role())?;
+        let sid = Sid::from_string(&user.sid)?;
+        let profile = std::env::var_os("USERPROFILE")
+            .filter(|p| !p.is_empty())
+            .and_then(|p| kgraf_core::plain_path::canonicalize(PathBuf::from(p)).ok());
+        let (reads, env) = user_reads(policy, profile.as_deref());
+        // Every folder this call admits this user to. A link that leads into
+        // one of them does not refuse the grant: the user reaches it anyway
+        // ([`super::allowed_link_targets`]). The dependency trees kGraf links
+        // into a worktree are among the read roots, so a worktree that comes
+        // back on another slot user is granted with its links in place.
+        let granted: Vec<PathBuf> = roots.iter().chain(reads.iter()).cloned().collect();
+        let dependency_trees: Vec<PathBuf> = policy
+            .dependency_reads
+            .iter()
+            .map(|t| strip_verbatim(t))
+            .collect();
+        let checkout = policy
+            .dependency_checkout
+            .as_deref()
+            .map(strip_verbatim)
+            .filter(|_| !dependency_trees.is_empty());
+        let allowed_for = |path: &Path| {
+            super::allowed_link_targets(path, &granted, &dependency_trees, checkout.as_deref())
+        };
+        // The folders the grant pass must not enter, so no plain allow entry
+        // of it lands where a deny is meant to hold. The denies themselves
+        // are written below, and `SetEntriesInAclW` keeps a deny entry
+        // before an allow one, so a deny wins on a child that holds both.
+        let denied: Vec<PathBuf> = roots
+            .iter()
+            .map(|root| root.join(".git"))
+            .chain(policy.hidden.iter().map(|h| strip_verbatim(&h.dir)))
+            .collect();
+        for root in &roots {
+            notes.extend(
+                grant_writable_root(root, &sid, &allowed_for(root), &denied, true)?
+                    .note(root, "the write grant"),
+            );
         }
         for root in &roots {
             let gitlink = root.join(".git");
@@ -1710,35 +4098,61 @@ mod imp {
                 }
             }
             refuse_reparse(&gitlink)?;
-            deny_writes(&gitlink, &sid)?;
+            notes.extend(
+                deny_writes(&gitlink, &sid, &allowed_for(&gitlink))?
+                    .note(&gitlink, "the write deny"),
+            );
         }
         // A hidden folder always lies beneath a writable root (the policy
         // checks it), so the sandbox user is denied there.
         for hidden in &policy.hidden {
-            deny_all(&strip_verbatim(&hidden.dir), &sid)?;
+            let dir = strip_verbatim(&hidden.dir);
+            notes.extend(deny_all(&dir, &sid, &allowed_for(&dir))?.note(&dir, "the deny"));
         }
-        let profile = std::env::var_os("USERPROFILE")
-            .filter(|p| !p.is_empty())
-            .and_then(|p| kgraf_core::plain_path::canonicalize(PathBuf::from(p)).ok());
-        let (reads, env) = user_reads(policy, profile.as_deref());
+        // Every write grant and every deny entry of this command is written
+        // by now, so this reads the state the command will meet. A grant that
+        // reads back is not proof: a deny entry is evaluated before any
+        // grant. The read grants that follow add no entry on a writable root.
+        for root in &roots {
+            verify_effective_write_as_user(root, user)?;
+        }
         for dir in &reads {
             // A read root inside a writable root is already granted there.
             if roots.iter().any(|r| dir.starts_with(r)) {
                 continue;
             }
-            if grant_read(dir, &sid)? {
-                users.record_grant(dir)?;
+            match grant_read(dir, &sid, &allowed_for(dir))? {
+                ReadGrant::Written(skipped) => {
+                    notes.extend(skipped.note(dir, "the read grant"));
+                    users.record_grant(dir)?;
+                }
+                ReadGrant::Present => {}
+                // Not granted, so the command cannot read it; it runs and
+                // the reason goes out with its output
+                // (`SandboxedCommand::refused_reads`).
+                ReadGrant::Refused(why) => notes.push(super::refused_read_note(dir, &why)),
             }
         }
         // The runner must be readable and runnable by every sandbox user,
-        // wherever kGraf is installed.
+        // wherever kGraf is installed. It is a file, so its entry is not
+        // inheritable and no tree is walked for it.
         for u in users.all() {
-            if grant_read(&users.runner, &Sid::from_string(&u.sid)?)? {
-                users.record_grant(&users.runner)?;
+            match grant_read(&users.runner, &Sid::from_string(&u.sid)?, &[])? {
+                ReadGrant::Written(_) => users.record_grant(&users.runner)?,
+                ReadGrant::Present => {}
+                // A file is never walked, so this cannot be reached; the
+                // runner must be readable, so it fails loud.
+                ReadGrant::Refused(why) => {
+                    return Err(SandboxError::PlatformSetup {
+                        step: "grant the runner to the sandbox users",
+                        source: io::Error::other(why),
+                    });
+                }
             }
         }
         Ok(Prepared {
             caps: Vec::new(),
+            notes,
             desktop_key: String::new(),
             user: Some(SandboxUser {
                 user,
@@ -1758,7 +4172,11 @@ mod imp {
             return Ok(None);
         };
         let root = strip_verbatim(&super::super::resolve(root)?);
-        let slot = users.lease(
+        // A note of what a removal left is dropped here: this call only
+        // takes the slot for a worker, with no output path of its own, and
+        // the first command in the folder reports the same files
+        // (`prepare_for_user`).
+        let (slot, _notes) = users.lease(
             Pool::Offline,
             None,
             std::slice::from_ref(&root),
@@ -1778,8 +4196,25 @@ mod imp {
     /// afterwards never sees that propagation. Unverified on Windows: whether
     /// the propagation would follow a junction at all; the Low label is
     /// written again on each command (see `gaps`).
-    pub(in crate::sandbox) fn prepare_root(root: &Path) -> Result<(), SandboxError> {
+    ///
+    /// `dependency_trees` are the checkout's trees the caller is about to
+    /// link into `root`. A link in the root that leads into one of them does
+    /// not refuse the grant: a tree that is linked here is granted to the
+    /// same user, so the propagation would reach nothing new, and the links
+    /// are kGraf's own, so refusing them would refuse the folder for good
+    /// (the advice "remove the link" is wrong: kGraf makes it again). The
+    /// checkout root itself is not in the set: a command may write in this
+    /// folder and could plant a junction to the checkout root here.
+    pub(in crate::sandbox) fn prepare_root(
+        root: &Path,
+        dependency_trees: &[PathBuf],
+    ) -> Result<Vec<String>, SandboxError> {
         let root = strip_verbatim(root);
+        let allowed: Vec<PathBuf> = dependency_trees.iter().map(|t| strip_verbatim(t)).collect();
+        // The grant pass leaves the root's own `.git` alone, as `prepare`
+        // does: the deny on it is written when the first command runs here,
+        // and a plain allow entry below it would stand beside that deny.
+        let denied = vec![root.join(".git")];
         if let Some(users) = state::users()? {
             // This runs before kGraf makes a dependency junction in the root.
             // Only the user of the root's own slot gets the grant: the
@@ -1790,22 +4225,99 @@ mod imp {
             // while it is present.)
             refuse_reparse(&root)?;
             require_acl_volume(&root)?;
-            let slot = users.lease(
+            let (slot, mut notes) = users.lease(
                 Pool::Offline,
                 None,
                 std::slice::from_ref(&root),
                 COMMAND_WAIT,
             )?;
             let user = users.user(slot.role())?;
-            grant_writable_root(&root, &Sid::from_string(&user.sid)?)?;
-            return Ok(());
+            notes.extend(
+                grant_writable_root(
+                    &root,
+                    &Sid::from_string(&user.sid)?,
+                    &allowed,
+                    &denied,
+                    true,
+                )?
+                .note(&root, "the write grant"),
+            );
+            return Ok(notes);
         }
         let sid = Sid::from_string(&capability_sid_string(&root.to_string_lossy()))?;
         refuse_reparse(&root)?;
         require_acl_volume(&root)?;
-        grant_writable_root(&root, &sid)?;
-        label_root_low(&root)?;
-        verify_effective_write(&root, &sid)
+        let mut notes: Vec<String> = Vec::new();
+        notes.extend(
+            grant_writable_root(&root, &sid, &allowed, &denied, false)?
+                .note(&root, "the write grant"),
+        );
+        notes.extend(label_root_low(&root, &allowed)?.note(&root, "the Low integrity label"));
+        verify_effective_write(&root, &sid)?;
+        Ok(notes)
+    }
+
+    /// Refuse a writable root that setup closed to the sandbox group.
+    ///
+    /// A deny entry is evaluated before any grant, so a root equal to one of
+    /// those folders takes the grant, reads it back as present, and then
+    /// fails every write at runtime with nothing naming the cause.
+    fn refuse_closed_root(root: &Path, closed: &Locations) -> Result<(), SandboxError> {
+        match closed_folder_of(root, closed) {
+            None => Ok(()),
+            Some(folder) => Err(SandboxError::PlatformSetup {
+                step: "check a writable root against the folders closed to the sandbox users",
+                source: io::Error::other(format!(
+                    "{} is {}, where `kgraf sandbox setup` denies the sandbox users the right                      to create or change entries, and a deny is evaluated before any grant, so                      no write there could succeed. Give the command a folder of its own.",
+                    root.display(),
+                    folder.display()
+                )),
+            }),
+        }
+    }
+
+    /// Confirm the sandbox user is really granted write on `root`, under its
+    /// own token, after every grant and deny of this command is written.
+    ///
+    /// [`verify_effective_write`] does not serve here: it builds a
+    /// restricted token from this process's own, which carries the owner's
+    /// identity, and a deny entry for the sandbox group would not be
+    /// evaluated in it at all. This logs the sandbox user on instead, which
+    /// is one more logon per command beside the one the runner already does.
+    fn verify_effective_write_as_user(root: &Path, user: &LoadedUser) -> Result<(), SandboxError> {
+        let token = accounts::logon_token(&user.name, user.password.expose()).map_err(|why| {
+            SandboxError::PlatformSetup {
+                step: "log the sandbox user on to check its write access",
+                source: io::Error::other(why),
+            }
+        })?;
+        let mut imp: HANDLE = ptr::null_mut();
+        // SAFETY: `token` is a valid primary token; output written on success.
+        let ok = unsafe {
+            DuplicateTokenEx(
+                token.as_raw_handle(),
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut imp,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("DuplicateTokenEx(AccessCheck, sandbox user)"));
+        }
+        let imp = owned(imp, "DuplicateTokenEx")?;
+        if !effective_write_granted(root, &imp)? {
+            return Err(SandboxError::PlatformSetup {
+                step: "verify effective write access as the sandbox user",
+                source: io::Error::other(format!(
+                    "the sandbox user {} is not granted write on {}, although its allow entry                      is present: a deny entry on that folder outranks it",
+                    user.name,
+                    root.display()
+                )),
+            });
+        }
+        Ok(())
     }
 
     fn verify_effective_write(root: &Path, cap: &Sid) -> Result<(), SandboxError> {
@@ -2514,7 +5026,14 @@ mod imp {
     struct Stream {
         child: Option<OwnedHandle>,
         parent: Option<OwnedHandle>,
+        /// The relay thread of an inherited console stream, if any: its
+        /// channel closes when the thread ends (see [`RelayDone`]).
+        relay: Option<RelayDone>,
     }
+
+    /// Closed (disconnected) when a console relay thread has copied the last
+    /// byte and ended.
+    type RelayDone = std::sync::mpsc::Receiver<()>;
 
     /// A copy of `h` this process owns, not inheritable (see [`stream`]).
     fn duplicate(h: HANDLE, step: &'static str) -> Result<OwnedHandle, SandboxError> {
@@ -2586,6 +5105,7 @@ mod imp {
                 Ok(Stream {
                     child: Some(owned(h, "open NUL")?),
                     parent: None,
+                    relay: None,
                 })
             }
             Redirect::Piped => {
@@ -2594,6 +5114,7 @@ mod imp {
                 Ok(Stream {
                     child: Some(child),
                     parent: Some(parent),
+                    relay: None,
                 })
             }
             Redirect::Inherit => {
@@ -2605,6 +5126,7 @@ mod imp {
                     return Ok(Stream {
                         child: None,
                         parent: None,
+                        relay: None,
                     });
                 }
                 if which == STD_INPUT_HANDLE && is_console_or_device(h) {
@@ -2616,6 +5138,7 @@ mod imp {
                 Ok(Stream {
                     child: Some(duplicate(h, "DuplicateHandle(std handle)")?),
                     parent: None,
+                    relay: None,
                 })
             }
         }
@@ -2916,6 +5439,9 @@ mod imp {
         process: OwnedHandle,
         pid: u32,
         job: OwnedHandle,
+        /// The console relay threads of the command's inherited standard
+        /// streams, waited for (bounded) when the child is dropped.
+        relays: Vec<RelayDone>,
         /// See [`Self::runner_lists_before_resume`].
         runner_protection: Option<Result<(), String>>,
         /// Keeps the (shared, per-workspace) desktop alive while the child
@@ -2978,7 +5504,7 @@ mod imp {
             &mut self,
             bound: std::time::Duration,
         ) -> io::Result<Option<ExitStatus>> {
-            let deadline = std::time::Instant::now() + bound;
+            let deadline = kgraf_core::waits::deadline_after(bound);
             loop {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 // Below INFINITE (u32::MAX ms), which would never return; a
@@ -3046,17 +5572,7 @@ mod imp {
         /// reader that waits for the end of a pipe starts its wait after
         /// this, not after the terminate call.
         pub fn kill_tree_and_wait(&mut self, bound: std::time::Duration) -> io::Result<bool> {
-            self.kill()?;
-            let deadline = std::time::Instant::now() + bound;
-            loop {
-                if self.active_processes()? == 0 {
-                    return Ok(true);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Ok(false);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            kgraf_core::child_run::end_job(self, bound)
         }
 
         /// How many processes the job still holds.
@@ -3116,6 +5632,42 @@ mod imp {
                 stdout: got.stdout,
                 stderr: got.stderr,
             })
+        }
+    }
+
+    impl kgraf_core::child_run::Job for SandboxedChild {
+        fn terminate(&mut self) -> io::Result<()> {
+            self.kill()
+        }
+        fn active(&self) -> io::Result<u32> {
+            self.active_processes()
+        }
+    }
+
+    /// Closing the job handle only starts the kill: the processes end a
+    /// moment later. The command's slot (and desktop) are released after
+    /// this body, as the fields drop, so the processes are ended first, at
+    /// most [`kgraf_core::child_run::KILL_BOUND`] (the longest a killed
+    /// process has to end). Otherwise the next command could take the same
+    /// sandbox user while a process of the old command still holds files in
+    /// the folder. An error or a process that outlives the bound cannot be
+    /// handled here; the slot is released all the same, and the job handle's
+    /// close still ends what is left.
+    impl Drop for SandboxedChild {
+        fn drop(&mut self) {
+            let _ = self.kill_tree_and_wait(kgraf_core::child_run::KILL_BOUND);
+            // The relay threads of inherited console streams end when the
+            // tree's last copy of their pipe closes, which the wait above
+            // has seen. Waiting for them keeps the last bytes from being cut
+            // when this process exits next. The bound is the drain grace
+            // (microseconds when the pipe is closed; the bytes are already
+            // in it): a pipe a process outside the tree holds open ends the
+            // wait, not the thread. No lock is held here.
+            let end = kgraf_core::waits::deadline_after(kgraf_core::child_run::DRAIN_GRACE);
+            for done in self.relays.drain(..) {
+                let left = end.saturating_duration_since(std::time::Instant::now());
+                let _ = done.recv_timeout(left);
+            }
         }
     }
 
@@ -3365,6 +5917,7 @@ mod imp {
             process,
             pid: pi.dwProcessId,
             job,
+            relays: Vec::new(),
             runner_protection: None,
             _desktop: Some(DesktopGuard(desktop)),
             _slot: None,
@@ -3431,7 +5984,12 @@ mod imp {
         let read = owned(read, "CreatePipe(console relay) read")?;
         let write = owned(write, "CreatePipe(console relay) write")?;
         let mut from = std::fs::File::from(read);
+        // The sender is never used: dropping it, when the thread ends, is the
+        // signal. `SandboxedChild` waits for it (bounded) when it is dropped,
+        // so the last bytes are copied before the caller goes on or exits.
+        let (ended, done) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _ended = ended;
             // Ends when the command's last copy of the writing end closes.
             let _ = if which == STD_ERROR_HANDLE {
                 io::copy(&mut from, &mut io::stderr())
@@ -3442,6 +6000,7 @@ mod imp {
         Ok(Stream {
             child: Some(write),
             parent: None,
+            relay: Some(done),
         })
     }
 
@@ -3501,6 +6060,7 @@ mod imp {
             process: started.runner,
             pid: started.command_pid,
             job,
+            relays: [stdout.relay, stderr.relay].into_iter().flatten().collect(),
             runner_protection: Some(started.protected_before_resume),
             _desktop: None,
             _slot: Some(user.slot.clone()),

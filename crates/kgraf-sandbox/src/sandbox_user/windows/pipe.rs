@@ -16,8 +16,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_PIPE_CONNECTED, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_OBJECT_0,
+    ERROR_PIPE_CONNECTED, GENERIC_WRITE, GetLastError, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -26,6 +26,7 @@ use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
 };
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -197,12 +198,16 @@ pub(super) fn wait_for_client(
 ) -> Result<(), SandboxError> {
     let mut intruders: Vec<u32> = Vec::new();
     loop {
-        let raw = server.as_raw_handle() as usize;
+        // The connect thread owns its own copy of the handle, so it never
+        // blocks on a handle the caller has closed (and the number reused).
+        let for_connect = server
+            .try_clone()
+            .map_err(|source| SandboxError::PlatformSetup { step, source })?;
         let (connected_tx, connected_rx) = mpsc::channel::<Result<(), u32>>();
         std::thread::spawn(move || {
-            // SAFETY: a blocking connect on the server handle, which outlives
-            // this thread's use of it (the caller waits for the result).
-            let ok = unsafe { ConnectNamedPipe(raw as HANDLE, ptr::null_mut()) };
+            // SAFETY: a blocking connect on this thread's own copy of the
+            // server handle, which lives until the thread ends.
+            let ok = unsafe { ConnectNamedPipe(for_connect.as_raw_handle(), ptr::null_mut()) };
             // SAFETY: reads the thread's last error.
             let err = unsafe { GetLastError() };
             let _ = connected_tx.send(if ok != 0 || err == ERROR_PIPE_CONNECTED {
@@ -217,8 +222,7 @@ pub(super) fn wait_for_client(
                 Ok(Err(code)) => return Err(win32(step, code)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                        // Unblock the connect thread as the early-end arm does.
-                        let _ = connect_client(name);
+                        end_connect(server, name, &connected_rx);
                         let mut text = "it did not connect in time".to_owned();
                         if !intruders.is_empty() {
                             text.push_str(&intruder_note(&intruders));
@@ -230,9 +234,9 @@ pub(super) fn wait_for_client(
                     }
                     // SAFETY: a zero-timeout check of the child's handle.
                     if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
-                        // Unblock the connect thread by connecting to our own
-                        // pipe, then report the child's early end.
-                        let _ = connect_client(name);
+                        // Unblock the connect thread, then report the child's
+                        // early end.
+                        end_connect(server, name, &connected_rx);
                         return Err(SandboxError::PlatformSetup {
                             step,
                             source: std::io::Error::other(early_end_message(
@@ -272,6 +276,27 @@ pub(super) fn wait_for_client(
             return Err(last_error(step));
         }
     }
+}
+
+/// How long [`end_connect`] waits for the connect thread to finish.
+/// Longest legitimate holder: the thread, once the connect is answered or
+/// cancelled, only sends one message: milliseconds. 2 s covers a loaded
+/// machine.
+const END_CONNECT_WAIT: Duration = Duration::from_secs(2);
+
+/// Make the connect thread blocked in `ConnectNamedPipe` on `server` return,
+/// and wait for it. First by connecting to our own pipe, which the thread
+/// takes as the connection. If that connect fails (the pipe cannot be
+/// opened), the pending connect is cancelled instead; a failed connect that
+/// was ignored left the thread blocked for good.
+fn end_connect(server: &OwnedHandle, name: &str, done: &mpsc::Receiver<Result<(), u32>>) -> bool {
+    let _self_connection = connect_client(name);
+    if _self_connection.is_err() {
+        // SAFETY: cancels the pending connect on a valid handle, from any
+        // thread; a null overlapped cancels every request on the handle.
+        unsafe { CancelIoEx(server.as_raw_handle(), ptr::null()) };
+    }
+    done.recv_timeout(END_CONNECT_WAIT).is_ok()
 }
 
 fn connect_client(name: &str) -> Result<File, SandboxError> {
@@ -328,5 +353,36 @@ impl Client {
                 step: "write to the setup pipe",
                 source,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connect thread blocked on a pipe whose own-connection attempt fails
+    /// (the name given to `end_connect` is not the pipe's) is still ended,
+    /// by cancelling the pending connect. Compile-checked on the development
+    /// host; it runs on Windows.
+    #[test]
+    fn a_connect_that_cannot_be_unblocked_by_connecting_is_cancelled() {
+        let name = format!(r"\\.\pipe\kgraf-pipe-test-cancel-{}", std::process::id());
+        let sid = super::super::accounts::current_user_sid().expect("own SID");
+        let server = create(&name, &sid).expect("pipe");
+        let copy = server.handle.try_clone().expect("copy");
+        let (tx, rx) = mpsc::channel::<Result<(), u32>>();
+        std::thread::spawn(move || {
+            // SAFETY: a blocking connect on this thread's own copy.
+            let ok = unsafe { ConnectNamedPipe(copy.as_raw_handle(), ptr::null_mut()) };
+            // SAFETY: reads the thread's last error.
+            let err = unsafe { GetLastError() };
+            let _ = tx.send(if ok != 0 { Ok(()) } else { Err(err) });
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let no_such = r"\\.\pipe\kgraf-pipe-test-no-such-pipe";
+        assert!(
+            end_connect(&server.handle, no_such, &rx),
+            "the connect thread was left blocked"
+        );
     }
 }

@@ -1046,6 +1046,7 @@ mod tests {
             }),
             frozen_git: vec![],
             dependency_reads: vec![],
+            dependency_checkout: None,
             hidden: vec![],
             toolchain: super::super::ToolchainReads::default(),
             worker_slot: None,

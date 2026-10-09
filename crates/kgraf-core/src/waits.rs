@@ -96,6 +96,17 @@ pub fn lock_file(
     }
 }
 
+/// The instant `after` from now. A duration too large to add (a caller's
+/// "no limit" such as `Duration::MAX`) gives a day from now: far past any
+/// wait kGraf makes, and an instant that exists on every platform. A plain
+/// `Instant::now() + after` panics on overflow.
+pub fn deadline_after(after: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(after)
+        .or_else(|| now.checked_add(Duration::from_secs(86_400)))
+        .unwrap_or(now)
+}
+
 /// What a recorded entry is.
 #[derive(Debug, Clone)]
 enum InFlight {
@@ -245,6 +256,14 @@ mod tests {
             Duration::from_secs(5),
         )
         .expect("free");
+    }
+
+    #[test]
+    fn a_deadline_for_a_huge_duration_does_not_panic() {
+        let now = Instant::now();
+        assert!(deadline_after(Duration::MAX) > now + Duration::from_secs(3600));
+        let near = deadline_after(Duration::from_secs(5));
+        assert!(near > now + Duration::from_secs(4) && near < now + Duration::from_secs(6));
     }
 
     #[test]

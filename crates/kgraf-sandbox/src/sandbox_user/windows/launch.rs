@@ -676,7 +676,7 @@ pub(crate) fn start(
     }
     drop(thread);
 
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let deadline = kgraf_core::waits::deadline_after(HANDSHAKE_TIMEOUT);
     pipe::wait_for_client(
         &server,
         &args.pipe,

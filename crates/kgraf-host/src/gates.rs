@@ -678,6 +678,19 @@ pub(crate) fn run_confined_on(
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    // Windows: the command's leader has exited, but a process it started may
+    // still write to the log, and dropping the child (which closes the job)
+    // comes after this function reads it. End the tree first, so the log is
+    // read whole and removed with nothing writing to it. Unix ends the group
+    // above.
+    #[cfg(windows)]
+    let mut text = read_after_tree_ended(
+        &mut GateTree(&mut child),
+        command,
+        kgraf_core::child_run::KILL_BOUND,
+        || read_log(&log, cap),
+    )?;
+    #[cfg(not(windows))]
     let mut text = read_log(&log, cap);
     let _ = std::fs::remove_file(&log);
     // Said on every outcome, a pass included: a pass with the network open
@@ -784,6 +797,19 @@ fn stop_tree(
     }
 }
 
+/// End `tree`, waiting at most `bound` ([`stop_tree`]), and only then run
+/// `read`, which reads what the tree wrote.
+#[cfg(any(windows, test))]
+fn read_after_tree_ended<R>(
+    tree: &mut impl Tree,
+    command: &str,
+    bound: Duration,
+    read: impl FnOnce() -> R,
+) -> std::result::Result<R, String> {
+    stop_tree(tree, command, bound)?;
+    Ok(read())
+}
+
 /// The line a check that ran with the network open ends with.
 fn open_network_note(notice: &str) -> String {
     format!("\n[sandbox] {notice}")
@@ -872,13 +898,15 @@ impl GateRunner for CommandGateRunner {
 
 #[cfg(test)]
 mod stop_tree_tests {
-    use super::{Tree, stop_tree};
+    use super::{Tree, read_after_tree_ended, stop_tree};
     use std::time::{Duration, Instant};
 
     struct Fake {
         kill: Option<std::io::ErrorKind>,
         ends_after: Option<Duration>,
         killed_at: Option<Instant>,
+        /// Set when `tree_ended` first reports the end.
+        ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Tree for Fake {
@@ -891,10 +919,14 @@ mod stop_tree_tests {
         }
 
         fn tree_ended(&mut self) -> std::io::Result<bool> {
-            Ok(match (self.ends_after, self.killed_at) {
+            let ended = match (self.ends_after, self.killed_at) {
                 (Some(after), Some(at)) => at.elapsed() >= after,
                 _ => false,
-            })
+            };
+            if ended {
+                self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(ended)
         }
     }
 
@@ -903,6 +935,7 @@ mod stop_tree_tests {
             kill,
             ends_after,
             killed_at: None,
+            ended: Default::default(),
         }
     }
 
@@ -939,6 +972,31 @@ mod stop_tree_tests {
         );
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(5));
+    }
+
+    /// The log is read only once the tree has ended: a process the command
+    /// left behind could still be writing to it before.
+    #[test]
+    fn the_log_is_read_after_the_tree_has_ended() {
+        let mut tree = fake(None, Some(Duration::from_millis(50)));
+        let ended = tree.ended.clone();
+        let seen_ended =
+            read_after_tree_ended(&mut tree, "cargo test", Duration::from_secs(10), || {
+                ended.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        assert_eq!(seen_ended, Ok(true), "read while the tree still ran");
+    }
+
+    #[test]
+    fn a_tree_that_does_not_end_is_not_read() {
+        let mut tree = fake(None, None);
+        let mut read = false;
+        let got =
+            read_after_tree_ended(&mut tree, "cargo test", Duration::from_millis(100), || {
+                read = true;
+            });
+        assert!(got.is_err());
+        assert!(!read, "read a log a process may still write");
     }
 
     #[test]

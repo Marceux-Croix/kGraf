@@ -7032,23 +7032,52 @@ fn a_host_builds_each_run_with_the_worktree_policy_in_force() {
     );
 }
 
-/// The two tests that use the catalog's `systemone` endpoint port, one
-/// listening on it and one needing it closed, run one at a time.
-static SYSTEMONE_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A port on loopback that refuses a connection and that no test of this
+/// binary can take, for a readiness dial that must fail.
+///
+/// A port the operating system hands out (bind port 0) is the wrong choice
+/// here, even when a connect to it fails first: the port is only observed
+/// free, and the operating system may hand that very port to another test of
+/// this binary a moment later, whose listener then answers the dial. A
+/// readiness test failed that way, and sampling more ports narrows the
+/// window without closing it.
+///
+/// These ports are outside what any test of this binary can be given. The
+/// operating system never assigns a port below 1024 to a bind of port 0:
+/// the ephemeral range is 49152 to 65535 on macOS and starts at 32768 on
+/// Linux by default. No test here binds a fixed port in the low range
+/// either. So the listener that answered the dial cannot appear on one of
+/// these.
+///
+/// Privilege is a second barrier on some systems and is not relied on: a
+/// bind below 1024 is refused for this user on macOS 27, Linux lets
+/// `net.ipv4.ip_unprivileged_port_start` move the boundary down, and
+/// Windows has no privileged range at all. Each candidate is therefore
+/// still dialed first, because a machine may run a service of its own
+/// there, and the caller keeps its own check for the same reason.
+///
+/// `None` when every candidate answered, which fails nothing: the caller
+/// skips.
+fn closed_loopback_port(samples: usize) -> Option<u16> {
+    // Ports IANA keeps unassigned or for protocols a developer machine does
+    // not run: 1 is reserved, 4 and 6 are unassigned.
+    const CANDIDATES: [u16; 4] = [1, 4, 6, 1023];
+    CANDIDATES
+        .iter()
+        .take(samples)
+        .copied()
+        .find(|port| std::net::TcpStream::connect(("127.0.0.1", *port)).is_err())
+}
 
 /// A local route whose server is not running fails the build at its start,
 /// naming the route and its endpoint, before a branch or a worktree exists.
 #[test]
 fn a_build_with_an_unreachable_local_route_fails_at_start() {
-    let _port = SYSTEMONE_PORT.lock().unwrap_or_else(|p| p.into_inner());
-    // The catalog's `systemone` endpoint is `localhost:8000`. Asserted only
-    // when nothing listens there; a port in use says nothing about the check.
-    let free = std::net::TcpListener::bind("127.0.0.1:8000").is_ok()
-        && std::net::TcpStream::connect("127.0.0.1:8000").is_err();
-    if !free {
-        eprintln!("skipped: something listens on 127.0.0.1:8000");
+    let Some(port) = closed_loopback_port(4) else {
+        eprintln!("skipped: every candidate loopback port answered");
         return;
-    }
+    };
+    let endpoint = format!("http://127.0.0.1:{port}");
     let (_dir, mut config) = project();
     // The generative route is in-process: whether a server listens at the
     // catalog's Ollama address on this machine must not decide the result.
@@ -7057,15 +7086,27 @@ fn a_build_with_an_unreachable_local_route_fails_at_start() {
     let host = Host::open(config)
         .expect("open")
         .with_route_provider("mine", Arc::new(ShellCaller))
-        .expect("route");
+        .expect("route")
+        // The readiness dial goes to a port no test here can bind, not to
+        // the catalog's `localhost:8000`, which any program on this machine
+        // may listen on. The catalog's port made this test fail where it
+        // meant to skip, and a port the operating system hands out can be
+        // handed to another test of this binary in the same moment.
+        .with_local_endpoint("systemone", &endpoint)
+        .expect("endpoint");
     let startup = host.startup(&mut |_| {}).expect("startup");
-    let err = host
-        .build_base(&startup, RunId::new("unreach"), &mut |_| {})
-        .err()
-        .expect("an unreachable local route fails the build");
+    let Err(err) = host.build_base(&startup, RunId::new("unreach"), &mut |_| {}) else {
+        // Nothing listened a moment ago. Something took the port between
+        // that sample and this dial, which says nothing about the check.
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            eprintln!("skipped: something began to listen on 127.0.0.1:{port}");
+            return;
+        }
+        panic!("an unreachable local route fails the build");
+    };
     let text = err.to_string();
     assert!(
-        text.contains("route `systemone` is unreachable at http://localhost:8000"),
+        text.contains(&format!("route `systemone` is unreachable at {endpoint}")),
         "{text}"
     );
     assert!(
@@ -7089,11 +7130,16 @@ fn a_runs_model_routes_are_built_and_their_tools_join_every_environment() {
         .expect("route");
     host.check_ready(&host.route_set())
         .expect("a local typed-decision route needs no key");
-    // A build dials every local route's endpoint first (`check_reachable`).
-    // Something must accept at the catalog's `localhost:8000`: this listener,
-    // or, when the port is taken, whatever already listens there.
-    let _port = SYSTEMONE_PORT.lock().unwrap_or_else(|p| p.into_inner());
-    let _listener = std::net::TcpListener::bind("127.0.0.1:8000");
+    // A build dials every local route's endpoint first (`check_reachable`),
+    // so something must accept there. This listener does, on a port of this
+    // test's own: the catalog's `localhost:8000` is a port any program on
+    // this machine may hold, and two tests that shared it had to run one at
+    // a time.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let host = host
+        .with_local_endpoint("systemone", &format!("http://127.0.0.1:{port}"))
+        .expect("endpoint");
     let startup = host.startup(&mut |_| {}).expect("startup");
     let base = host
         .build_base(&startup, RunId::new("mk"), &mut |_| {})

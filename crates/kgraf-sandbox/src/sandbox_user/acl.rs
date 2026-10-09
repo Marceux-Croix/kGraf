@@ -108,6 +108,173 @@ pub fn distrust(
 pub const TRUSTED_FOLDER_SDDL: &str =
     "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
+// ---- the write grant on a tree ----------------------------------------------
+
+/// `READ_CONTROL`: read an object's access list.
+pub const READ_CONTROL_RIGHT: u32 = 0x0002_0000;
+/// `WRITE_DAC`: rewrite an object's access list.
+pub const WRITE_DAC_RIGHT: u32 = 0x0004_0000;
+
+/// Where an entry of a tree grant applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The object the entry is written on, and nothing below it. The root of
+    /// the grant, or one file of the tree.
+    Folder,
+    /// Everything below that object, by inheritance, and not the object
+    /// itself. Anything created there later gets it too.
+    Below,
+    /// The object the entry is written on and everything below it. What one
+    /// existing folder of the tree carries ([`child_grant`]): the entry is
+    /// effective on that folder and is inherited by what is made in it.
+    HereAndBelow,
+}
+
+/// Who an entry of a tree grant is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    /// The sandbox user the grant is written for.
+    SandboxUser,
+    /// `OWNER RIGHTS` ([`OWNER_RIGHTS_SID`]): whoever owns the object the
+    /// entry is on, which for a file a sandbox user created is that user.
+    OwnerRights,
+    /// kGraf's own user, which owns the tree.
+    Owner,
+}
+
+/// One entry of a write grant on a tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeAce {
+    pub who: Who,
+    pub mask: u32,
+    pub scope: Scope,
+}
+
+/// The entries a write grant on a worktree writes: `folder_mask` for the
+/// sandbox user on the folder, `below_mask` for it on everything below, and
+/// the two entries that keep the owner of a file in the tree from giving
+/// itself more than the list allows.
+///
+/// **Why the owner entries.** A standard user owns every file it creates,
+/// and an owner may read and rewrite the access list of what it owns
+/// whatever that list says. A slot user that moved to another folder would
+/// therefore still own the files it created in the old one, could rewrite
+/// their lists from its new folder, and could write and delete them again,
+/// although a revoke took its entries away. That breaks the rule that a
+/// user never keeps write access to a folder another user may now work in.
+/// An `OWNER RIGHTS` entry replaces an owner's implicit rights with exactly
+/// what that entry allows, which here is reading the list.
+///
+/// The same entry takes kGraf's own implicit right to rewrite a list, since
+/// kGraf owns the tree, and kGraf must still write these lists. So kGraf's
+/// user gets those two rights by name, on the folder and below it, and
+/// nothing else: it keeps exactly what ownership gave it, and no principal
+/// gains a right it did not have.
+///
+/// The alternative, resetting the owner of every object on each revoke, was
+/// rejected: an owner is not inherited, so it would mean a walk of the whole
+/// tree, object by object, on the slot-move path, where a build folder holds
+/// tens of thousands of files.
+pub fn tree_grant(folder_mask: u32, below_mask: u32) -> Vec<TreeAce> {
+    let owner_mask = READ_CONTROL_RIGHT | WRITE_DAC_RIGHT;
+    vec![
+        TreeAce {
+            who: Who::SandboxUser,
+            mask: folder_mask,
+            scope: Scope::Folder,
+        },
+        TreeAce {
+            who: Who::SandboxUser,
+            mask: below_mask,
+            scope: Scope::Below,
+        },
+        TreeAce {
+            who: Who::OwnerRights,
+            mask: READ_CONTROL_RIGHT,
+            scope: Scope::Folder,
+        },
+        TreeAce {
+            who: Who::OwnerRights,
+            mask: READ_CONTROL_RIGHT,
+            scope: Scope::Below,
+        },
+        TreeAce {
+            who: Who::Owner,
+            mask: owner_mask,
+            scope: Scope::Folder,
+        },
+        TreeAce {
+            who: Who::Owner,
+            mask: owner_mask,
+            scope: Scope::Below,
+        },
+    ]
+}
+
+/// Why the folder `base` cannot hold the undo record, judged from its text
+/// alone, or `None` when the text is sound.
+///
+/// The record's folders are made under this one, so its shape is part of what
+/// keeps the record where only administrators may write it. The known-folder
+/// call gives `C:\ProgramData`; a name with a colon in it names an alternate
+/// data stream, not a folder, and a relative part could leave the drive.
+pub fn record_base_shape(base: &str) -> Option<String> {
+    let bytes = base.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || (bytes[2] != b'\\' && bytes[2] != b'/')
+    {
+        return Some(format!("{base} is not a path on a local drive"));
+    }
+    for part in base[3..].split(['\\', '/']).filter(|p| !p.is_empty()) {
+        if part.contains(':') {
+            return Some(format!(
+                "{base} names an alternate data stream in {part}, not a folder"
+            ));
+        }
+        if part == "." || part == ".." {
+            return Some(format!("{base} holds the relative part {part}"));
+        }
+    }
+    Some(base)
+        .filter(|b| b.contains("\\\\") || b.contains("//"))
+        .map(|b| format!("{b} holds an empty part"))
+}
+
+/// The entries of a tree grant ([`tree_grant`]) as they are written on one
+/// existing child of the tree, a folder where `is_dir`, else a file.
+///
+/// **Why this exists.** Windows propagates an inheritable entry to the
+/// children that already exist by itself, but it walks the tree with rules
+/// the sandbox cannot steer: it may enter a junction, and it writes the one
+/// security descriptor that every hard link of a file shares, which can lie
+/// outside the tree. That propagation is therefore suppressed and the pass is
+/// made here, child by child. The entries below are derived from the same
+/// list the root carries, so what the root restricts the child restricts:
+/// without that, the `OWNER RIGHTS` entry and kGraf's compensating entry
+/// would reach only the files created after the grant, and every file already
+/// in the tree would keep the sandbox user as its owner, with an owner's
+/// implicit right to rewrite its own list.
+///
+/// Each entry that applies below the root is written on the child, with its
+/// own trustee: effective on a file, effective and inheritable on a folder,
+/// so what is made in that folder later still gets it from Windows. An entry
+/// that applies to the root alone is not a child's.
+pub fn child_grant(aces: &[TreeAce], is_dir: bool) -> Vec<TreeAce> {
+    aces.iter()
+        .filter(|ace| ace.scope == Scope::Below)
+        .map(|ace| TreeAce {
+            scope: if is_dir {
+                Scope::HereAndBelow
+            } else {
+                Scope::Folder
+            },
+            ..*ace
+        })
+        .collect()
+}
+
 // ---- folders closed to the sandbox users ------------------------------------
 
 /// What a deny entry on a closed folder takes from the sandbox group, on that
@@ -123,6 +290,17 @@ pub const CLOSED_FOLDER_DENY: u32 = 0x0000_0002
     | 0x0001_0000
     | 0x0004_0000
     | 0x0008_0000;
+
+/// The flags of a deny entry that setup writes: none, so the entry is on the
+/// folder alone ([`CLOSED_FOLDER_DENY`] and `NO_INHERITANCE`).
+pub const CLOSED_FOLDER_FLAGS: u8 = 0;
+
+/// The entry flags that make an access entry inherited (`INHERITED_ACE`,
+/// `0x10`) or inheritable (`OBJECT_INHERIT_ACE`, `CONTAINER_INHERIT_ACE`,
+/// `NO_PROPAGATE_INHERIT_ACE`, `INHERIT_ONLY_ACE`, the low four bits). An
+/// entry setup writes or takes off again has none of them: nothing it does
+/// may reach a child.
+pub const ACE_INHERITANCE_FLAGS: u8 = 0x1F;
 
 /// What the machine offers for [`closed_folders`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -297,6 +475,19 @@ pub fn check_self_acl(acl: &[u8], forbidden: u32) -> Result<(), SelfAclProblem> 
     Ok(())
 }
 
+/// The folder of [`closed_folders`] that `root` is, or `None` when `root` is
+/// none of them.
+///
+/// A writable root that is one of these can never be written by a sandbox
+/// user: a deny entry is evaluated before any grant, so the grant reads back
+/// as present and every write still fails, with nothing naming the cause.
+/// Compared without case, as Windows compares a path.
+pub fn closed_folder_of(root: &Path, loc: &Locations) -> Option<PathBuf> {
+    closed_folders(loc)
+        .into_iter()
+        .find(|p| p.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +588,103 @@ mod tests {
                 }
                 other => panic!("unexpected principal {other}"),
             }
+        }
+    }
+
+    /// The entries of a tree grant: an owner of a file in the tree may read
+    /// its access list and change nothing, so a sandbox user that owns the
+    /// files it created cannot give itself rights a revoke took away, and
+    /// kGraf keeps by name what ownership gave it.
+    #[test]
+    fn a_tree_grant_leaves_an_owner_no_right_to_change_the_list() {
+        const FOLDER: u32 = 0x0012_01bf;
+        const BELOW: u32 = FOLDER | 0x0001_0000;
+        let aces = tree_grant(FOLDER, BELOW);
+        let of =
+            |who: Who| -> Vec<TreeAce> { aces.iter().copied().filter(|a| a.who == who).collect() };
+        // Every entry covers the folder and everything below it, so a file
+        // created later carries it too.
+        for who in [Who::SandboxUser, Who::OwnerRights, Who::Owner] {
+            let mine = of(who);
+            assert_eq!(mine.len(), 2, "{who:?}");
+            assert_eq!(mine[0].scope, Scope::Folder);
+            assert_eq!(mine[1].scope, Scope::Below);
+        }
+        // The sandbox user's own masks are untouched.
+        assert_eq!(of(Who::SandboxUser)[0].mask, FOLDER);
+        assert_eq!(of(Who::SandboxUser)[1].mask, BELOW);
+        // An owner may read the list and change nothing.
+        for ace in of(Who::OwnerRights) {
+            assert_eq!(ace.mask, READ_CONTROL_RIGHT);
+            assert_eq!(ace.mask & WRITE_RIGHTS, 0, "an owner may change it");
+        }
+        assert_eq!(OWNER_RIGHTS_SID, "S-1-3-4");
+        // kGraf keeps, by name, the two rights ownership gave it, and no
+        // more: without them the entry above would lock it out of the lists
+        // it must write.
+        for ace in of(Who::Owner) {
+            assert_eq!(ace.mask, READ_CONTROL_RIGHT | WRITE_DAC_RIGHT);
+            assert_eq!(ace.mask & WRITE_RIGHTS, WRITE_DAC_RIGHT);
+        }
+        assert_eq!(aces.len(), 6);
+    }
+
+    /// A writable root that is one of the closed folders must be named, so
+    /// the backend refuses it instead of granting write that the deny entry
+    /// outranks.
+    #[test]
+    fn a_writable_root_that_is_a_closed_folder_is_named() {
+        let loc = Locations {
+            fixed_drive_roots: vec![PathBuf::from(r"C:\")],
+            program_data: Some(PathBuf::from(r"C:\ProgramData")),
+            public: Some(PathBuf::from(r"C:\Users\Public")),
+            public_children: vec![PathBuf::from(r"C:\Users\Public").join("Documents")],
+            windows: Some(PathBuf::from(r"C:\Windows")),
+        };
+        // Built with `join`, so the test reads the same separator on every
+        // host, as the folder list does.
+        let closed = [
+            PathBuf::from(r"C:\"),
+            PathBuf::from(r"C:\ProgramData"),
+            PathBuf::from(r"c:\programdata"),
+            PathBuf::from(r"C:\Users\Public"),
+            PathBuf::from(r"C:\Users\Public").join("Documents"),
+            PathBuf::from(r"C:\Windows").join("Temp"),
+        ];
+        for closed in closed {
+            assert!(
+                closed_folder_of(&closed, &loc).is_some(),
+                "{}",
+                closed.display()
+            );
+        }
+        for open in [
+            PathBuf::from(r"C:\ProgramData").join("kGraf"),
+            PathBuf::from(r"C:\Users").join("someone"),
+            PathBuf::from(r"D:\"),
+            PathBuf::from(r"C:\Windows"),
+        ] {
+            assert_eq!(closed_folder_of(&open, &loc), None, "{}", open.display());
+        }
+    }
+
+    #[test]
+    fn the_record_folders_base_must_be_a_plain_local_path() {
+        assert_eq!(record_base_shape(r"C:\ProgramData"), None);
+        assert_eq!(record_base_shape(r"D:\"), None);
+        assert_eq!(record_base_shape(r"C:/ProgramData"), None);
+        for bad in [
+            r"\\server\share",
+            r"ProgramData",
+            r"C:ProgramData",
+            r"C:\ProgramData:stream",
+            r"C:\ProgramData\..\Users",
+            r"C:\ProgramData\.",
+            r"C:\\ProgramData",
+            "",
+            "C:",
+        ] {
+            assert!(record_base_shape(bad).is_some(), "{bad:?} must be refused");
         }
     }
 
