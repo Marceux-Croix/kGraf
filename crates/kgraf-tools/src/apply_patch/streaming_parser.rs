@@ -4,7 +4,11 @@
 // `crate::apply_patch::parser` (this crate's module tree); the `environment_id`
 // preamble is still parsed (so a patch carrying it is not rejected) but its
 // accessor was dropped along with `ApplyPatchArgs::environment_id`, which
-// kGraf's apply-patch tool never reads. Test coverage trimmed to the cases
+// kGraf's apply-patch tool never reads. A line that is not a hunk header gets an
+// error naming its real fault: a blank line, or an Add File line without its
+// `+`, where upstream called every such line "not a valid hunk header" (models
+// read that as a header problem and resent the same blank line or bare
+// content). Test coverage trimmed to the cases
 // exercising behavior this crate keeps (no per-character streaming API is
 // exposed here, but the parser's internal state machine is still exactly
 // upstream's, so the streaming tests double as parser tests).
@@ -28,6 +32,39 @@ use Hunk::*;
 use ParseError::*;
 
 const ENVIRONMENT_ID_MARKER: &str = "*** Environment ID:";
+
+const VALID_HUNK_HEADERS: &str = "Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'";
+
+/// Why `trimmed` cannot stand where a hunk header is expected (outside any
+/// file section, or after a Delete File header).
+fn not_a_header(trimmed: &str) -> String {
+    if trimmed.is_empty() {
+        format!(
+            "the line is blank where a hunk header was expected; remove it. {VALID_HUNK_HEADERS}"
+        )
+    } else {
+        format!("'{trimmed}' is not a valid hunk header. {VALID_HUNK_HEADERS}")
+    }
+}
+
+/// Why `trimmed` cannot stand in an Add File section: every line of the new
+/// file starts with `+`, so a blank line or bare content is the usual fault,
+/// not a malformed header.
+fn not_an_added_line(trimmed: &str) -> String {
+    if trimmed.is_empty() {
+        format!(
+            "the line is blank. In an Add File section every line of the new file starts with \
+             '+', so a blank line of the file is written as a line holding only '+'. A line that \
+             starts a new section must be a hunk header. {VALID_HUNK_HEADERS}"
+        )
+    } else {
+        format!(
+            "'{trimmed}' does not start with '+'. In an Add File section every line of the new \
+             file starts with '+' (a blank line of the file is a line holding only '+'). A line \
+             that starts a new section must be a hunk header. {VALID_HUNK_HEADERS}"
+        )
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StreamingPatchParser {
@@ -196,9 +233,7 @@ impl StreamingPatchParser {
                     return Ok(());
                 }
                 Err(InvalidHunkError {
-                    message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
-                    ),
+                    message: not_a_header(trimmed),
                     line_number: self.line_number,
                 })
             }
@@ -214,9 +249,7 @@ impl StreamingPatchParser {
                     return Ok(());
                 }
                 Err(InvalidHunkError {
-                    message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
-                    ),
+                    message: not_an_added_line(trimmed),
                     line_number: self.line_number,
                 })
             }
@@ -225,9 +258,7 @@ impl StreamingPatchParser {
                     return Ok(());
                 }
                 Err(InvalidHunkError {
-                    message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
-                    ),
+                    message: not_a_header(trimmed),
                     line_number: self.line_number,
                 })
             }
@@ -497,5 +528,79 @@ mod tests {
                 line_number: 2,
             })
         );
+    }
+
+    /// A blank line in an Add File section is named as blank, with the way to
+    /// write one, not called an invalid hunk header.
+    #[test]
+    fn a_blank_line_in_an_add_file_is_named_with_how_to_write_one() {
+        let mut parser = StreamingPatchParser::default();
+        let err = parser
+            .push_delta("*** Begin Patch\n*** Add File: a.rs\n+fn a() {}\n\n+fn b() {}\n")
+            .expect_err("a blank line is refused");
+        let InvalidHunkError {
+            message,
+            line_number,
+        } = err
+        else {
+            panic!("{err:?}")
+        };
+        assert_eq!(line_number, 4);
+        assert!(message.starts_with("the line is blank."), "{message}");
+        assert!(message.contains("a line holding only '+'"), "{message}");
+        assert!(!message.contains("is not a valid hunk header"), "{message}");
+
+        // The same blank line written as `+` is accepted as an empty line.
+        let mut parser = StreamingPatchParser::default();
+        let hunks = parser
+            .push_delta(
+                "*** Begin Patch\n*** Add File: a.rs\n+fn a() {}\n+\n+fn b() {}\n*** End Patch\n",
+            )
+            .expect("a `+` line");
+        assert_eq!(
+            hunks,
+            vec![AddFile {
+                path: PathBuf::from("a.rs"),
+                contents: "fn a() {}\n\nfn b() {}\n".to_owned(),
+            }]
+        );
+    }
+
+    /// Bare content in an Add File section is named as missing its `+`.
+    #[test]
+    fn a_bare_line_in_an_add_file_is_named_as_missing_its_plus() {
+        let mut parser = StreamingPatchParser::default();
+        let err = parser
+            .push_delta("*** Begin Patch\n*** Add File: Cargo.toml\n[package]\n")
+            .expect_err("bare content is refused");
+        let InvalidHunkError { message, .. } = err else {
+            panic!("{err:?}")
+        };
+        assert!(
+            message.starts_with("'[package]' does not start with '+'."),
+            "{message}"
+        );
+        assert!(message.contains("Valid hunk headers"), "{message}");
+    }
+
+    /// A blank line where a hunk header is expected says so.
+    #[test]
+    fn a_blank_line_where_a_header_is_expected_is_named_as_blank() {
+        for patch in [
+            "*** Begin Patch\n\n*** Add File: a.rs\n",
+            "*** Begin Patch\n*** Delete File: a.rs\n\n",
+        ] {
+            let mut parser = StreamingPatchParser::default();
+            let err = parser
+                .push_delta(patch)
+                .expect_err("a blank line is refused");
+            let InvalidHunkError { message, .. } = err else {
+                panic!("{err:?}")
+            };
+            assert!(
+                message.starts_with("the line is blank where a hunk header was expected"),
+                "{patch:?}: {message}"
+            );
+        }
     }
 }

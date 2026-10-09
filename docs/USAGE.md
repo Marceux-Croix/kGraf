@@ -2234,6 +2234,12 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   budget says so, a runtime failure gives its reason, and each lists the calls a policy refused
   that no later call got past (the rule or policy and its text). The contract record keeps it
   as `last_stop` (0018).
+- A worker the stall check or its step budget ended, after it changed files, still has its tree
+  verified as it stands, the same way a finished attempt's is. A pass accepts the work, and the
+  run prints a notice that the worker was stopped before it finished. A failed check, a check
+  that checks nothing (`true` with no gate command), or a verifier that cannot run fails the
+  attempt as the stop alone did. The verifier's refusal then goes to the retry in place of the
+  stop note (0009).
 - A permission event never says `granted` for a call that a later rule refused. A mode's grant
   is recorded when the approval chain lets the call run; when a deny rule (or another hook)
   refuses the call after the mode allowed it, the trace has one `grant_refused` event naming

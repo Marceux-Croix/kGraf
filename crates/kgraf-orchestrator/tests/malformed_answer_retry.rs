@@ -117,3 +117,120 @@ async fn a_re_grounding_malformed_every_time_holds_after_the_bound_and_says_so()
     // The failed verdict names the last call, so its answer can be found.
     assert!(record.groundings[0].call.is_some());
 }
+
+/// The server's answer to a retried orchestrator call is kept in the run's
+/// trace, tied to the failed call's ledger id. The row settles unreconciled
+/// with no error text, so without the record nothing in the run's files says
+/// why (a worker transcript had the same gap). `status` and
+/// `server_parse` are fields, so a reader never has to read the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_call_after_a_server_error_leaves_its_status_in_the_trace() {
+    for (status, body) in [
+        (
+            500,
+            "XML syntax error on line 21: illegal character code U+0008",
+        ),
+        (200, "error parsing tool call: unexpected EOF"),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let plan = plan_json(&[
+            c("a", "make a", "src/a.rs", &[]),
+            c("b", "make b", "src/b.rs", &["a"]),
+        ]);
+        let reply = format!("SERVER_PARSE_ERROR:{status}:{body}");
+        // A server error is asked again unchanged, so only the first ask fails.
+        let failed_once = std::sync::atomic::AtomicBool::new(false);
+        let p = Parts::open(
+            dir.path(),
+            move |_| plan.clone(),
+            move |prompt| {
+                if prompt.contains("Next step `b`")
+                    && !failed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    reply.clone()
+                } else {
+                    SERVES.into()
+                }
+            },
+            Duration::from_millis(5),
+        );
+        let report = run(&p).await;
+        assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+
+        let failed: Vec<String> = p
+            .ledger
+            .calls()
+            .expect("rows")
+            .into_iter()
+            .filter(|r| {
+                r.trace.kind.as_deref() == Some("reground")
+                    && r.settlement == kgraf_provider::Settlement::Unreconciled
+            })
+            .map(|r| r.id.to_string())
+            .collect();
+        assert_eq!(failed.len(), 1, "one failed call: {failed:?}");
+
+        let events = kgraf_orchestrator::TraceLog::open(&dir.path().join("runs/r1/trace.jsonl"))
+            .await
+            .expect("trace")
+            .load()
+            .await
+            .expect("load");
+        let kept: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                kgraf_orchestrator::TraceEvent::CallRetried {
+                    call,
+                    agent,
+                    what,
+                    status,
+                    server_parse,
+                    error,
+                    ..
+                } => Some((call, agent, what, *status, *server_parse, error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{events:?}");
+        let (call, agent, what, got_status, server_parse, error) = kept[0];
+        assert_eq!(call, &failed[0], "tied to the failed call's id");
+        assert_eq!(agent, "orchestrator:r1");
+        assert_eq!(what, "reground");
+        assert_eq!(got_status, Some(status));
+        assert!(server_parse);
+        assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        assert!(error.contains(body), "{error}");
+    }
+}
+
+/// A refused answer that quotes "HTTP 500" is the model's text, not a server
+/// fault: no status, no parse flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_refused_answer_is_not_recorded_as_a_server_fault() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        "{\"serves\":true,\"reason\":\"the log said HTTP 500 and then",
+        true,
+    );
+    let report = run(&p).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let events = kgraf_orchestrator::TraceLog::open(&dir.path().join("runs/r1/trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load");
+    let kept: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            kgraf_orchestrator::TraceEvent::CallRetried {
+                status,
+                server_parse,
+                ..
+            } => Some((*status, *server_parse)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kept, vec![(None, false)], "{events:?}");
+}

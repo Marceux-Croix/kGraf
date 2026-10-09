@@ -605,6 +605,10 @@ impl SliceSource for GraphSlices {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tree = self.live_tree();
         let mut rendering = SliceRendering::default();
+        // One record of the lines shown across the brief's slices: two
+        // symbols of one file would otherwise each bring the whole file, and
+        // the repeats are pinned in the worker's context for its whole run.
+        let mut shown = kgraf_graph::slice::ShownRanges::default();
         for node in nodes {
             let fail = |error: &kgraf_graph::GraphError| SliceError {
                 node: node.to_string(),
@@ -625,7 +629,7 @@ impl SliceSource for GraphSlices {
             match kgraf_graph::slice::slice_for_node_in(&store, &record, self.budget_tokens, tree) {
                 Ok(slice) => rendering.slices.push(RenderedSlice {
                     node: node.clone(),
-                    text: slice_text(&record.path, slice.render()),
+                    text: slice_text(&record.path, slice.render_after(&mut shown)),
                 }),
                 // The database failing is the graph failing, not this node.
                 Err(error @ kgraf_graph::GraphError::Sqlite(_)) => return Err(fail(&error)),
@@ -982,6 +986,105 @@ mod tests {
         assert!(
             !slices[1].text.contains("<slice_data"),
             "code is not quoted"
+        );
+    }
+
+    /// One module of three classes and its test file of three test classes,
+    /// each test calling its class: the shape of a contract that names every
+    /// class and every test class as a slice.
+    fn module_and_tests() -> (tempfile::TempDir, kgraf_graph::GraphStore) {
+        let dir = tempfile::tempdir().expect("dir");
+        let write = |rel: &str, text: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, text).expect("write");
+        };
+        let class = |name: &str| {
+            format!(
+                "class {name}:\n    \"\"\"The {name} specification.\"\"\"\n\n    def __init__(self):\n        raise NotImplementedError(\"{name}\")\n"
+            )
+        };
+        let test = |name: &str| {
+            format!(
+                "class {name}Test(unittest.TestCase):\n    def test_{name}_made(self):\n        x = {name}()\n        self.assertIsNotNone(x)\n"
+            )
+        };
+        let names = ["Stack", "Queue", "Ring"];
+        write(
+            "shapes/containers.py",
+            &format!(
+                "\"\"\"Three stubs.\"\"\"\n\n\n{}",
+                names.map(class).join("\n\n")
+            ),
+        );
+        write(
+            "tests/test_containers.py",
+            &format!(
+                "import unittest\n\nfrom shapes.containers import Stack, Queue, Ring\n\n\n{}",
+                names.map(test).join("\n\n")
+            ),
+        );
+        let store = kgraf_graph::GraphStore::open_in_memory(dir.path()).expect("graph");
+        kgraf_graph::Indexer::new(&store).index().expect("index");
+        (dir, store)
+    }
+
+    /// Six slices of one module and its test file show each source line once.
+    /// Each slice's enclosing element is its whole file, which holds the
+    /// requested class and its siblings; rendered one by one, the brief held
+    /// both files once per slice, three to six times over, and that repeat was
+    /// pinned in the worker's context (a worker refused before its first round
+    /// because the pinned context reached its stop point). Every code line is
+    /// now in the brief once, and the brief is about the size of the two files.
+    #[test]
+    fn the_slices_of_one_brief_show_each_source_line_once() {
+        let (dir, store) = module_and_tests();
+        let nodes: Vec<NodeId> = [
+            "Stack",
+            "Queue",
+            "Ring",
+            "StackTest",
+            "QueueTest",
+            "RingTest",
+        ]
+        .into_iter()
+        .map(|n| node_named(&store, n))
+        .collect();
+        let rendering = GraphSlices::new(store, 2_000)
+            .render(&nodes)
+            .expect("render");
+        assert_eq!(rendering.slices.len(), 6);
+        let brief: String = rendering.slices.iter().map(|s| s.text.as_str()).collect();
+        let module = std::fs::read_to_string(dir.path().join("shapes/containers.py")).expect("r");
+        let tests =
+            std::fs::read_to_string(dir.path().join("tests/test_containers.py")).expect("r");
+        for line in module.lines().chain(tests.lines()) {
+            let line = line.trim();
+            // Lines that repeat within the sources themselves are not counted.
+            if line.is_empty() || module.matches(line).count() + tests.matches(line).count() > 1 {
+                continue;
+            }
+            assert_eq!(
+                brief.matches(line).count(),
+                1,
+                "`{line}` is shown {} times:\n{brief}",
+                brief.matches(line).count()
+            );
+        }
+        // The code the brief carries, without blank lines and the `//` lines
+        // that name each member or a range shown above, is no more than the
+        // two files' code.
+        let code_bytes = |text: &str| -> usize {
+            text.lines()
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
+                .map(|l| l.len() + 1)
+                .sum()
+        };
+        let source = code_bytes(&module) + code_bytes(&tests);
+        let code = code_bytes(&brief);
+        assert!(
+            code <= source,
+            "the brief carries {code} bytes of code for {source} bytes of source:\n{brief}"
         );
     }
 

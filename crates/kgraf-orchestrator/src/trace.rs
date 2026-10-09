@@ -463,6 +463,30 @@ pub enum TraceEvent {
         to: String,
         reason: String,
     },
+    /// An orchestrator call that failed and was asked again
+    /// (`ModelCaller::ask_json`): the failed call's id and what the provider
+    /// said. The call's ledger row settles unreconciled with no error text,
+    /// so this record is the only evidence of why. A reader tells a local
+    /// server's fault (`status` 5xx, or `server_parse` with status 200) from
+    /// a call dropped mid-flight by these fields, never by reading `error`.
+    CallRetried {
+        at_ms: i64,
+        /// The ledger id of the call that failed.
+        call: String,
+        /// The ledger agent that made it.
+        agent: String,
+        /// The call kind.
+        what: String,
+        /// The HTTP status of a provider answer; absent for a failure that
+        /// was not one (an answer that did not parse as the JSON asked for).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// The server could not parse the model's own output.
+        #[serde(default)]
+        server_parse: bool,
+        /// The failure, bounded to 2 KiB.
+        error: String,
+    },
 }
 
 /// Persist-scrub every string value of a [`TraceEvent`] (decision 0071), including the ones nested
@@ -585,6 +609,23 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             ask,
             of,
             reason: s(reason),
+        },
+        TraceEvent::CallRetried {
+            at_ms,
+            call,
+            agent,
+            what,
+            status,
+            server_parse,
+            error,
+        } => TraceEvent::CallRetried {
+            at_ms,
+            call,
+            agent,
+            what,
+            status,
+            server_parse,
+            error: s(error),
         },
         TraceEvent::InterfacesRefused {
             at_ms,

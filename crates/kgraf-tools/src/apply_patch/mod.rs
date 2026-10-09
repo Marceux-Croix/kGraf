@@ -1154,6 +1154,28 @@ mod tests {
         assert!(matches!(err, ToolError::Access { .. }));
     }
 
+    /// A blank line inside an Add File reaches the model named as blank, with
+    /// how to write one, through the tool's own refusal (a Delete File and an
+    /// Add File of one path, a blank line before the end line).
+    #[test]
+    fn a_blank_add_file_line_is_refused_naming_the_blank_line() {
+        let input = json!({"patch": "*** Begin Patch\n*** Delete File: src/lib.rs\n*** Add File: \
+                                     src/lib.rs\n+pub fn a() {}\n\n*** End Patch\n"});
+        let err = ApplyPatchTool.access(&input).expect_err("must refuse");
+        let ToolError::InvalidInput { reason, .. } = &err else {
+            panic!("{err:?}")
+        };
+        assert!(
+            reason.contains("invalid hunk at line 5, the line is blank."),
+            "{reason}"
+        );
+        assert!(reason.contains("a line holding only '+'"), "{reason}");
+        assert!(
+            !reason.contains("'' is not a valid hunk header"),
+            "{reason}"
+        );
+    }
+
     /// `x/..` normalizes to the empty path, i.e. the
     /// workspace root itself. `apply_patch` edits files, not "the workspace".
     #[test]

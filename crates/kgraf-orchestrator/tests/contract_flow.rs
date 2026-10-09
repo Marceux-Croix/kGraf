@@ -1727,8 +1727,9 @@ async fn a_resume_with_another_check_setting_is_refused_naming_both() {
 /// An interface naming a contract the plan lacks is refused back to the
 /// planner on the interface call's own budget, with the reason and the
 /// previous answer; the contracts are never asked for again. When the
-/// planner keeps answering it, the run is not refused: the edge the interface
-/// declared (`cons <- prod`) is recorded as unchecked and counted as not run.
+/// planner answers it again, refused for the same reason, no third ask is
+/// spent and the run is not refused: the edge the interface declared
+/// (`cons <- prod`) is recorded as unchecked and counted as not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interface_naming_a_contract_the_plan_lacks_is_asked_again_then_counted() {
     let dir = tempfile::tempdir().expect("dir");
@@ -1751,7 +1752,7 @@ async fn an_interface_naming_a_contract_the_plan_lacks_is_asked_again_then_count
         .expect("the run goes on");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     let prompts = rig.parts.planner.prompts();
-    assert_eq!(prompts.len(), 4, "one contracts ask, three interface asks");
+    assert_eq!(prompts.len(), 3, "one contracts ask, two interface asks");
     for reask in &prompts[2..] {
         assert!(
             reask.contains("<previous_answer>")
@@ -5081,4 +5082,112 @@ async fn an_ask_that_fails_is_counted_and_not_asked_again() {
         (1, 1, 1),
         "{report:?}"
     );
+}
+
+/// Plan and interface asks of the Terminal-Bench `pypi-server` run of two
+/// shell scripts: answers in `tb-pypi-script-*.txt`. The programs in the
+/// recorded commands are `python3`, `bash` and `sh`, which the host has.
+fn script_planner(
+    interface_answers: Vec<String>,
+    asks: Arc<std::sync::atomic::AtomicUsize>,
+) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    move |prompt: &str| {
+        if !prompt.contains("Write one interface contract per producer") {
+            // The run's workers had `apply_patch` and `shell`; this rig
+            // offers no tool route, and a named tool nobody offers is refused.
+            return recorded("tb-pypi-script-contracts.txt")
+                .replace("\"tools\": [\"apply_patch\", \"shell\"]", "\"tools\": []")
+                .replace("\"tools\": [\"apply_patch\"]", "\"tools\": []");
+        }
+        let n = asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        interface_answers[n.min(interface_answers.len() - 1)].clone()
+    }
+}
+
+/// The recorded answers, in the order the planner gave them. The three are
+/// refused for three different reasons (no content for a consumer script; a
+/// compile command that builds no test file; no content again, under other
+/// ids), so no ask is withheld: each carries a reason the planner had not
+/// been told for that interface. The first re-ask tells the planner what to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recorded_script_answers_spend_three_asks_for_three_different_reasons() {
+    let dir = tempfile::tempdir().expect("dir");
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answers = ["ask1", "ask2", "ask3"]
+        .iter()
+        .map(|n| recorded(&format!("tb-pypi-script-{n}.txt")))
+        .collect();
+    let rig = Rig::with_planner(
+        dir.path(),
+        script_planner(answers, asks.clone()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        asks.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "{report:?}"
+    );
+    assert_eq!(report.contracts.interface_asks, 3, "{report:?}");
+    let reask = &prompts[2];
+    for told in [
+        "the repository has no file at that path",
+        "give the file's content, as an object",
+        "or name a file that exists in the repository",
+    ] {
+        assert!(reask.contains(told), "{told}: {reask}");
+    }
+}
+
+/// The planner answers the same refusal with the same answer. The recorded
+/// first answer, given again, is refused for the reasons it was refused for:
+/// the second ask is the last. Before this, a third ask was spent (recorded
+/// asks of this size ran 86 to 102 s each on the local model).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_refused_again_for_the_same_reason_is_not_asked_a_third_time() {
+    let dir = tempfile::tempdir().expect("dir");
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rig = Rig::with_planner(
+        dir.path(),
+        script_planner(vec![recorded("tb-pypi-script-ask1.txt")], asks.clone()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(
+        asks.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "{report:?}"
+    );
+    assert_eq!(report.contracts.interface_asks, 2, "{report:?}");
+    assert!(
+        report.notices.iter().any(|n| n
+            .contains("was refused again for the same reason as its previous answer")
+            && n.contains("gives no content")),
+        "{:?}",
+        report.notices
+    );
+    // The edges stay unchecked, with the repeated reason: counted, not hidden.
+    let unchecked: Vec<String> = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert!(!unchecked.is_empty(), "{report:?}");
+    assert!(
+        unchecked.iter().all(|r| r.contains(
+            "behavior check not run: the planner repeated an answer refused for the same reason"
+        )),
+        "{unchecked:?}"
+    );
+    // No call is added elsewhere: the contracts ask and two interface asks.
+    assert_eq!(rig.parts.planner.prompts().len(), 3);
 }

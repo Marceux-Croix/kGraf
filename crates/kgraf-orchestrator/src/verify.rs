@@ -136,6 +136,27 @@ pub fn status_of(result: &WorkerResult) -> AttemptStatus {
     }
 }
 
+/// Whether a worker that ended without finishing left a tree the verifier
+/// should still judge: it was stopped by the stall check or ran out of rounds,
+/// and it changed files.
+///
+/// A worker's claim of completion is not progress, and neither is its lack of
+/// one: the verifier's verdict on the tree is. A worker can deliver a tree that
+/// passes, then fumble a cosmetic edit until the stall check ends it; without
+/// this, that tree was discarded unseen. Both endings stop at a round
+/// boundary (the stall check refuses the whole round before any call runs; the
+/// budget ends between rounds or refuses the final round's calls), so the
+/// tree is final. `Failed` is left out: it can end inside a round whose calls
+/// ran only in part, and it is mostly a provider or environment fault whose
+/// retry is already handled apart. `HandedBack` continues in a fresh worker,
+/// and `Cancelled` was asked for. A tree with no change has nothing to judge.
+pub fn verifies_unfinished(result: &WorkerResult) -> bool {
+    matches!(
+        result.outcome,
+        WorkerOutcome::Stalled { .. } | WorkerOutcome::BudgetExhausted
+    ) && !result.changed_paths.is_empty()
+}
+
 /// One attempt at a contract.
 #[derive(Clone, Debug)]
 pub struct Attempt {
@@ -217,6 +238,37 @@ mod tests {
             status_of(&result(WorkerOutcome::Failed { error: "x".into() }, 1, 1)),
             AttemptStatus::Error
         );
+    }
+
+    #[test]
+    fn only_a_stalled_or_spent_worker_that_changed_files_is_verified_unfinished() {
+        let stalled = || WorkerOutcome::Stalled {
+            call_digest: "d".into(),
+            repeats: 3,
+            call: String::new(),
+        };
+        let changed = |outcome| WorkerResult {
+            changed_paths: vec![PathBuf::from("src/lib.rs")],
+            ..result(outcome, 5, 5)
+        };
+        assert!(verifies_unfinished(&changed(stalled())));
+        assert!(verifies_unfinished(&changed(
+            WorkerOutcome::BudgetExhausted
+        )));
+        // Nothing changed: nothing to judge.
+        assert!(!verifies_unfinished(&result(stalled(), 5, 5)));
+        assert!(!verifies_unfinished(&result(
+            WorkerOutcome::BudgetExhausted,
+            5,
+            5
+        )));
+        // A failure can end inside a round; a cancel was asked for.
+        assert!(!verifies_unfinished(&changed(WorkerOutcome::Failed {
+            error: "x".into()
+        })));
+        assert!(!verifies_unfinished(&changed(WorkerOutcome::Cancelled)));
+        // Completed goes to the verifier by its own path.
+        assert!(!verifies_unfinished(&changed(WorkerOutcome::Completed)));
     }
 
     #[test]

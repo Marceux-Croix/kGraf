@@ -720,6 +720,78 @@ impl<T> LedgerAck<T> {
     pub fn wait(self) -> Result<T, LedgerError> {
         futures_executor::block_on(self)
     }
+
+    /// Give up on the outcome and return the value if the write succeeded
+    /// before this point. Closing the reply first makes the split exact: a
+    /// reply sent before the close is read here, and a send after it fails,
+    /// so the writer sees that nobody took the value (`run_writer`).
+    fn abandon(self) -> Option<T> {
+        match self.state {
+            AckState::Ready(result) => result.and_then(Result::ok),
+            AckState::Waiting { mut rx, map } => {
+                rx.close();
+                match rx.try_recv() {
+                    Ok(Some(Ok(done))) => map(done).ok(),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// The future [`Ledger::begin_traced_async`] returns: the `begin` is already
+/// submitted, and the token is made when its id is known.
+///
+/// Dropped before that (its caller was cancelled: a stopped worker, a steer,
+/// a time limit), it settles the row unreconciled, as a dropped
+/// [`CallToken`] does, so a reserved call never stays in flight for good. The
+/// guard has two halves, and together they leave no gap: a row whose id
+/// already reached this side is settled here; a row whose reply had not yet
+/// been sent when this side closed it is settled by the writer, whose send
+/// then fails.
+struct PendingBegin<'a> {
+    ledger: &'a Ledger,
+    adapter: &'static str,
+    /// `None` once the token has been handed out.
+    ack: Option<LedgerAck<CallId>>,
+}
+
+impl<'a> std::future::Future for PendingBegin<'a> {
+    type Output = Result<CallToken<'a>, LedgerError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Some(ack) = self.ack.as_mut() else {
+            return std::task::Poll::Ready(Err(LedgerError::Internal(
+                "a begin future was polled after it completed",
+            )));
+        };
+        let std::task::Poll::Ready(result) = std::pin::Pin::new(ack).poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        self.ack = None;
+        std::task::Poll::Ready(result.map(|id| self.ledger.token(id, self.adapter)))
+    }
+}
+
+impl Drop for PendingBegin<'_> {
+    fn drop(&mut self) {
+        let Some(ack) = self.ack.take() else {
+            return;
+        };
+        if let Some(id) = ack.abandon() {
+            // Detached, like `CallToken::drop`: `drop` cannot fail and must not
+            // block on an fsync.
+            self.ledger.submit_detached(Op::Settle {
+                id,
+                settlement: Settlement::Unreconciled,
+                usage: None,
+                request_id: None,
+            });
+        }
+    }
 }
 
 // Never pinned structurally: `poll` only moves the result out of its `Option`
@@ -1165,6 +1237,9 @@ pub(crate) struct WriterFaults {
 /// tip inside the writer, so the writer here is novel; its oneshot
 /// acknowledgement is `futures-channel` (MIT OR Apache-2.0).
 pub struct Ledger {
+    /// Failures of calls their callers asked again; memory only, outside the
+    /// chain. See [`crate::call_errors`].
+    call_errors: crate::call_errors::CallErrorLog,
     /// Test-only: the write connection, which tests tamper through to play an
     /// attacker. Outside tests only the writer thread (and, in memory,
     /// [`Reads::Shared`]) holds it.
@@ -1199,6 +1274,18 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Keep the failure of a call its caller is about to ask again. The row
+    /// itself cannot carry it (see [`crate::call_errors`]).
+    pub fn note_call_error(&self, entry: crate::call_errors::CallError) {
+        self.call_errors.push(entry);
+    }
+
+    /// Take the kept failures of the agents whose id starts with
+    /// `agent_prefix`.
+    pub fn take_call_errors(&self, agent_prefix: &str) -> crate::call_errors::Drained {
+        self.call_errors.drain(agent_prefix)
+    }
+
     /// Open a ledger on disk.
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         Self::open_on_disk(path, Duration::ZERO, WriterConfig::default())
@@ -1361,6 +1448,7 @@ impl Ledger {
         };
 
         Ok(Self {
+            call_errors: Default::default(),
             #[cfg(test)]
             conn,
             submitter: Mutex::new(Submitter { tx, next_ticket: 1 }),
@@ -1590,10 +1678,10 @@ impl Ledger {
         task_id: &str,
         trace: CallTrace,
     ) -> impl std::future::Future<Output = Result<CallToken<'_>, LedgerError>> + Send + '_ {
-        let ack = self.begin_ack(adapter, protocol, model, agent_id, task_id, trace);
-        async move {
-            let id = ack.await?;
-            Ok(self.token(id, adapter))
+        PendingBegin {
+            ledger: self,
+            adapter,
+            ack: Some(self.begin_ack(adapter, protocol, model, agent_id, task_id, trace)),
         }
     }
 
@@ -2368,12 +2456,38 @@ fn run_writer(
             guarded_batch(&conn, &tip, anchor.as_deref(), &ops, &mut hook)
         };
         progress.batches.fetch_add(1, Ordering::SeqCst);
-        progress.advance(last_ticket);
+        // A `begin` whose caller is gone (its future was dropped while this
+        // batch committed: a cancel, a stopped worker, a time limit) minted a
+        // row no token will ever settle. It is settled here, unreconciled, as
+        // a dropped token settles its own (`CallToken::drop`), so no reserved
+        // call stays in flight for good. This is the writer's half of
+        // `PendingBegin`'s guard: a reply sent before the caller closed it is
+        // settled on the caller's side instead.
+        let mut orphaned = Vec::new();
         for (request, result) in batch.into_iter().zip(results) {
-            if let Some(reply) = request.reply {
-                let _ = reply.send(result);
+            if let Some(reply) = request.reply
+                && let Err(Ok(Done::Call(id))) = reply.send(result)
+                && matches!(request.op, Op::Begin { .. })
+            {
+                orphaned.push(Op::Settle {
+                    id,
+                    settlement: Settlement::Unreconciled,
+                    usage: None,
+                    request_id: None,
+                });
             }
         }
+        if !orphaned.is_empty() {
+            let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let ops: Vec<&Op> = orphaned.iter().collect();
+            // A settle that fails leaves the row in flight, which
+            // `unreconciled` reports, as for a dropped token's settle.
+            let _ = guarded_batch(&conn, &tip, anchor.as_deref(), &ops, &mut |_| {});
+            progress.batches.fetch_add(1, Ordering::SeqCst);
+        }
+        // After the replies and any orphan settle: a read whose barrier covers
+        // this batch then also sees those settles.
+        progress.advance(last_ticket);
     }
 }
 
@@ -4001,6 +4115,91 @@ mod tests {
         let record = ledger.call(&id).expect("read").expect("present");
         assert_eq!(record.settlement, Settlement::Unreconciled);
         assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+    }
+
+    /// The raw `settlement` column of a row: `CallRecord` reads `in_flight`
+    /// as unreconciled, so it cannot tell the two apart.
+    fn raw_settlement(ledger: &Ledger, id: &CallId) -> String {
+        ledger.read_barrier();
+        let conn = ledger.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT settlement FROM calls WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .expect("row")
+    }
+
+    /// The only row of a ledger.
+    fn only_call(ledger: &Ledger) -> CallId {
+        let calls = ledger.calls().expect("calls");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        calls[0].id.clone()
+    }
+
+    /// A caller cancelled while its `begin` is waiting on the ledger (a
+    /// worker stopped, a steer, a time limit) drops the begin future after the
+    /// row was submitted and before any token exists to settle it. The row
+    /// must still settle, as unreconciled, never stay in flight for good.
+    ///
+    /// Here the caller is gone before the writer replies: the writer is held
+    /// off (its connection locked) until the future is dropped, so its reply
+    /// finds the receiver closed and the writer settles the row.
+    #[test]
+    fn a_begin_dropped_before_the_writer_replies_is_settled_by_the_writer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Ledger::open(&dir.path().join("l.sqlite")).expect("open");
+        {
+            let _writer_held = ledger.conn.lock().expect("lock");
+            drop(ledger.begin_async("test", Protocol::Inclusive, "m", "a", "t"));
+        }
+        let id = only_call(&ledger);
+        assert_eq!(raw_settlement(&ledger, &id), "unreconciled");
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
+    /// The other order: the writer committed the row and sent its id, and the
+    /// future is dropped without being polled again, so the id sits unread in
+    /// the reply. The future's own guard reads it and settles the row.
+    #[test]
+    fn a_begin_dropped_after_the_writer_replied_is_settled_by_the_future() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Ledger::open(&dir.path().join("l.sqlite")).expect("open");
+        let begin = ledger.begin_async("test", Protocol::Inclusive, "m", "a", "t");
+        // The barrier returns once the writer has committed and replied.
+        ledger.read_barrier();
+        drop(begin);
+        let id = only_call(&ledger);
+        assert_eq!(raw_settlement(&ledger, &id), "unreconciled");
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
+    /// An in-memory ledger writes on the caller's thread, so the id is known
+    /// before the future is ever polled; dropped unpolled, it still settles.
+    #[test]
+    fn an_in_memory_begin_dropped_unpolled_still_settles_the_row() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        drop(ledger.begin_async("test", Protocol::Inclusive, "m", "a", "t"));
+        let id = only_call(&ledger);
+        assert_eq!(raw_settlement(&ledger, &id), "unreconciled");
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
+    /// The same, for a begin future polled once (waiting on the writer) and
+    /// then dropped, the shape a cancelled `select!` arm leaves.
+    #[test]
+    fn a_begin_future_dropped_while_pending_still_settles_the_row() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Ledger::open(&dir.path().join("l.sqlite")).expect("open");
+        let mut begin = Box::pin(ledger.begin_async("test", Protocol::Inclusive, "m", "a", "t"));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        // Usually pending (the writer has not committed yet). If it is ready,
+        // the token is dropped here, and its own guard settles the row.
+        let _ = std::future::Future::poll(begin.as_mut(), &mut cx);
+        drop(begin);
+        let id = only_call(&ledger);
+        assert_eq!(raw_settlement(&ledger, &id), "unreconciled");
     }
 
     #[test]

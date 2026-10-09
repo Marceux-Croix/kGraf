@@ -25,6 +25,14 @@
 //! was. A write that fails does not reset, so a worker repeating a failing edit
 //! still stalls. Repeating one successful write is bounded by the step budget.
 //!
+//! **A passing build or test does not start a new count.** It changes nothing an
+//! identical read or run would see, so counting it as progress would let a
+//! worker cycle read, failed edit, passing test without end (the passing test
+//! itself would never count either), bounded only by the step budget. A worker
+//! that delivered a passing tree and then loops on a cosmetic edit is still
+//! ended here; the orchestrator verifies the tree it left (decision 0009,
+//! amendment of 2026-10-09), so the stop costs the delivery nothing.
+//!
 //! **A compaction starts a new count.** After a worker's context is compacted
 //! (decision 0095) none of the earlier results is in it, so the worker calls
 //! [`StallDetector::reset`] there too, and a resume resets at the same round.

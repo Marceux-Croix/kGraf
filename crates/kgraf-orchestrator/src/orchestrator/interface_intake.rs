@@ -306,6 +306,9 @@ impl RunLoop {
                     self.config.max_contracts_per_plan,
                     self.bypass_git_files(),
                 )?;
+                if let Some(refusal) = crate::plan::writeless_refusal(&specs) {
+                    return Err(refusal.into());
+                }
                 Ok(Some(specs))
             }
             Err(e) => {
@@ -392,6 +395,11 @@ impl RunLoop {
         let mut declared: Vec<(String, Vec<String>)> = Vec::new();
         let mut behavior: Vec<InterfaceContract> = Vec::new();
         let mut previous: Option<PreviousAsk> = None;
+        // What the last answer was refused for, per interface, and the edges
+        // whose interface the planner repeated: those are asked no more.
+        let mut refused_before: Vec<RefusedRecord> = Vec::new();
+        let mut repeated: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut asked = asked;
         let mut last_refusal: Option<String> = None;
         for ask in 1..=MAX_INTERFACE_ASKS {
             // Nothing to ask: every asked edge is bound, or every consumed edge
@@ -418,8 +426,27 @@ impl RunLoop {
                 Ok(None) => return Ok(None),
                 Ok(Some(reply)) => {
                     let taken = self
-                        .take_interfaces(&reply.text, specs, outer, &mut behavior, &derived)
+                        .take_interfaces(
+                            &reply.text,
+                            specs,
+                            outer,
+                            &mut behavior,
+                            &derived,
+                            &refused_before,
+                        )
                         .await?;
+                    refused_before = taken.records;
+                    for r in taken.repeated {
+                        for (consumer, producer) in r.edges {
+                            for (c, ps) in &mut asked {
+                                if *c == consumer {
+                                    ps.retain(|p| *p != producer);
+                                }
+                            }
+                            repeated.insert((consumer, producer), r.reason.clone());
+                        }
+                    }
+                    asked.retain(|(_, ps)| !ps.is_empty());
                     let mut reasons = taken.refusals;
                     for (consumer, producer) in taken.implied {
                         add_edge(&mut declared, &consumer, &producer);
@@ -492,6 +519,13 @@ impl RunLoop {
                     .map_or("no compile check was derived", |d| d.compile_note.as_str());
                 let why = match skipped.get(producer) {
                     Some(why) => format!("behavior check not run: {why}"),
+                    None if repeated.contains_key(&(consumer.clone(), producer.clone())) => {
+                        format!(
+                            "behavior check not run: the planner repeated an answer refused for \
+                             the same reason ({})",
+                            repeated[&(consumer.clone(), producer.clone())]
+                        )
+                    }
                     None => format!(
                         "no behavior interface the planner wrote was accepted ({})",
                         one_line(
@@ -669,6 +703,7 @@ impl RunLoop {
         outer: &BTreeSet<String>,
         accepted: &mut Vec<InterfaceContract>,
         derived: &[Derived],
+        previous: &[RefusedRecord],
     ) -> Result<Taken, OrchestratorError> {
         let mut taken = Taken::default();
         let drafts = match crate::interface_plan::parse_interfaces(text) {
@@ -704,15 +739,17 @@ impl RunLoop {
                         .iter()
                         .map(|p| crate::plan::sanitize_id(p))
                         .collect();
-                    taken.implied.extend(declared_edges(&raw, &writes_of, &ids));
-                    if let Some(note) =
-                        unasked_refusal(&raw, &[e.to_string()], &writes_of, &ids, derived)
+                    let edges = declared_edges(&raw, &writes_of, &ids);
+                    taken.implied.extend(edges.iter().cloned());
+                    let problems = [e.to_string()];
+                    if let Some(note) = unasked_refusal(&raw, &problems, &writes_of, &ids, derived)
                     {
                         self.intake_notice(note);
                         continue;
                     }
-                    taken.refusals.push(e.to_string());
-                    taken.failed.push(index);
+                    if let Some(note) = taken.refuse(&raw.id, edges, &problems, index, previous) {
+                        self.intake_notice(note);
+                    }
                     continue;
                 }
             };
@@ -786,13 +823,15 @@ impl RunLoop {
             if problems.is_empty() {
                 accepted.push(ic);
             } else {
-                taken.implied.extend(declared_edges(&ic, &writes_of, &ids));
+                let edges = declared_edges(&ic, &writes_of, &ids);
+                taken.implied.extend(edges.iter().cloned());
                 if let Some(note) = unasked_refusal(&ic, &problems, &writes_of, &ids, derived) {
                     self.intake_notice(note);
                     continue;
                 }
-                taken.refusals.extend(problems);
-                taken.failed.push(index);
+                if let Some(note) = taken.refuse(&ic.id, edges, &problems, index, previous) {
+                    self.intake_notice(note);
+                }
             }
         }
         Ok(taken)
@@ -973,9 +1012,11 @@ impl RunLoop {
                 Ok(Some(text)) => file.content = text,
                 Ok(None) => problems.push(format!(
                     "interface `{}`: the {list} entry `{}` gives no content, and the repository \
-                     has no such file; a file named by path alone must already exist, so give a \
-                     new file's content",
-                    ic.id, file.path
+                     has no file at that path (a file named by path alone is read from the \
+                     repository). Do one of two things: give the file's content, as an object \
+                     {{\"path\": \"{}\", \"content\": \"...\"}} (a bare string is a path alone), \
+                     or name a file that exists in the repository",
+                    ic.id, file.path, file.path
                 )),
                 Err(e) => problems.push(format!(
                     "interface `{}`: the {list} entry `{}` could not be read from the repository \
@@ -1470,6 +1511,77 @@ struct Taken {
     failed: Vec<usize>,
     /// The answer could not be read as a list of interfaces.
     unparsed: bool,
+    /// Every interface refused and kept for the next ask, with its reasons.
+    records: Vec<RefusedRecord>,
+    /// The interfaces refused for the same reasons as their previous answer:
+    /// not asked for again.
+    repeated: Vec<Repeated>,
+}
+
+/// One refused interface, as the next ask compares its answer with it.
+#[derive(Clone)]
+struct RefusedRecord {
+    id: String,
+    /// The `(consumer, producer)` edges it declared.
+    edges: Vec<(String, String)>,
+    /// Its refusals with the interface id taken out ([`normalized`]).
+    reasons: BTreeSet<String>,
+}
+
+/// An interface the planner answered again with nothing new to refuse.
+struct Repeated {
+    edges: Vec<(String, String)>,
+    /// The refusals, as the planner saw them.
+    reason: String,
+}
+
+/// A refusal with the interface's id taken out, so the same cause is the
+/// same text when the planner renames the interface between asks.
+fn normalized(problem: &str, id: &str) -> String {
+    let flat = problem.split_whitespace().collect::<Vec<_>>().join(" ");
+    if id.is_empty() {
+        flat
+    } else {
+        flat.replace(id, "<interface>")
+    }
+}
+
+impl Taken {
+    /// Take one refused interface. When its previous answer was refused for
+    /// at least these reasons (the same interface: its id, or the same
+    /// edges), asking again gives the planner nothing it has not been told:
+    /// the interface is recorded as repeated and a notice is returned.
+    /// Otherwise its reasons go to the next ask.
+    fn refuse(
+        &mut self,
+        id: &str,
+        edges: Vec<(String, String)>,
+        problems: &[String],
+        index: usize,
+        previous: &[RefusedRecord],
+    ) -> Option<String> {
+        let reasons: BTreeSet<String> = problems.iter().map(|p| normalized(p, id)).collect();
+        let before = previous
+            .iter()
+            .find(|r| r.id == id || (!edges.is_empty() && r.edges == edges));
+        if before.is_some_and(|r| reasons.is_subset(&r.reasons)) {
+            let reason = kgraf_secrets::scrub_persist_owned(one_line(&problems.join("; "), 600));
+            let note = kgraf_secrets::scrub_persist_owned(format!(
+                "interface `{id}` was refused again for the same reason as its previous answer \
+                 ({reason}); it is not asked for again, and its behavior check does not run"
+            ));
+            self.repeated.push(Repeated { edges, reason });
+            return Some(note);
+        }
+        self.records.push(RefusedRecord {
+            id: id.to_owned(),
+            edges,
+            reasons,
+        });
+        self.refusals.extend(problems.iter().cloned());
+        self.failed.push(index);
+        None
+    }
 }
 
 /// The most names kGraf fills into an interface from a producer's files.
@@ -1735,4 +1847,66 @@ async fn contract_facts(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod refusal_memory_tests {
+    use super::*;
+
+    fn edges() -> Vec<(String, String)> {
+        vec![("c2".into(), "c1".into())]
+    }
+
+    fn no_content(id: &str, path: &str) -> String {
+        format!("interface `{id}`: the consumer entry `{path}` gives no content")
+    }
+
+    fn first_ask() -> Vec<RefusedRecord> {
+        let mut taken = Taken::default();
+        let note = taken.refuse("i_a", edges(), &[no_content("i_a", "x.sh")], 0, &[]);
+        assert!(note.is_none(), "nothing precedes the first ask");
+        assert_eq!(taken.failed, vec![0]);
+        taken.records
+    }
+
+    #[test]
+    fn the_same_reason_under_a_renamed_interface_is_repeated() {
+        let before = first_ask();
+        let mut taken = Taken::default();
+        let note = taken.refuse("i_b", edges(), &[no_content("i_b", "x.sh")], 0, &before);
+        assert!(note.is_some_and(|n| n.contains("refused again")));
+        assert_eq!(taken.repeated.len(), 1);
+        assert!(taken.refusals.is_empty(), "a repeat buys no ask");
+        assert!(taken.failed.is_empty(), "a repeat is not quoted back");
+    }
+
+    #[test]
+    fn a_new_reason_or_a_new_path_is_asked_again() {
+        let before = first_ask();
+        for problem in [
+            no_content("i_a", "y.sh"),
+            "interface `i_a` failed its pre-dispatch check: compile".to_owned(),
+            // One old reason and one new: the new one is information.
+        ] {
+            let mut taken = Taken::default();
+            let note = taken.refuse("i_a", edges(), &[problem], 0, &before);
+            assert!(note.is_none());
+            assert_eq!(taken.refusals.len(), 1);
+            assert!(taken.repeated.is_empty());
+        }
+        let mut taken = Taken::default();
+        let both = [no_content("i_a", "x.sh"), no_content("i_a", "y.sh")];
+        assert!(taken.refuse("i_a", edges(), &both, 0, &before).is_none());
+        assert_eq!(taken.refusals.len(), 2);
+    }
+
+    #[test]
+    fn another_interface_is_not_measured_against_it() {
+        let before = first_ask();
+        let mut taken = Taken::default();
+        let other = vec![("c3".to_owned(), "c2".to_owned())];
+        let note = taken.refuse("i_z", other, &[no_content("i_z", "x.sh")], 0, &before);
+        assert!(note.is_none());
+        assert_eq!(taken.refusals.len(), 1);
+    }
 }

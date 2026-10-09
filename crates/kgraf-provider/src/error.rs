@@ -269,6 +269,17 @@ impl ProviderError {
         )
     }
 
+    /// The HTTP status the server sent, when the error is an answer from one
+    /// ([`Self::Http`], [`Self::ModelOutputMalformed`]; the latter is 200 when
+    /// the server reported the failure in the stream).
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            ProviderError::Http { status, .. }
+            | ProviderError::ModelOutputMalformed { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
     /// Whether the server failed to parse the model's own output, so a fresh
     /// sample of the same request is worth sending (see
     /// [`Self::ModelOutputMalformed`]). No other error kind is retried on this

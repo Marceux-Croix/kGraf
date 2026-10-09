@@ -203,3 +203,60 @@ async fn contracts_sharing_a_file_under_a_whole_check_are_left_alone() {
     assert!(refusals(&events).is_empty());
     assert_eq!(accepted_ids(&events).len(), 8);
 }
+
+/// A greenfield run's second answer (after a refusal for an unwritten
+/// workspace member) declared no writes in any of its four contracts, while
+/// every instruction creates files. kGraf accepted it: a worker may change only
+/// its contract's files, so c1's worker was refused on `Cargo.toml` and the
+/// contract was held as a plan-shape error, and every write-based intake rule
+/// passed because the plan named no file. The answer is refused with a reason
+/// the planner can act on, and the corrected answer is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contracts_that_declare_no_writes_are_refused_and_asked_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let writeless = recorded("greenfield-writeless.txt");
+    let mut fixed: serde_json::Value = serde_json::from_str(&writeless).expect("json");
+    let files = [
+        vec!["Cargo.toml"],
+        vec!["wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+        vec!["wcl/Cargo.toml", "wcl/src/main.rs"],
+        vec!["wcl-core/tests/count.rs"],
+    ];
+    for (c, paths) in fixed["contracts"]
+        .as_array_mut()
+        .expect("contracts")
+        .iter_mut()
+        .zip(files)
+    {
+        c["writes"] = paths
+            .iter()
+            .map(|p| serde_json::json!({ "path": p }))
+            .collect();
+    }
+    let fixed = fixed.to_string();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            if prompt.contains("<plan_refused>") {
+                fixed.clone()
+            } else {
+                writeless.clone()
+            }
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(20),
+    );
+    plan_then_stop(orchestrator(&p)).await;
+    let events = trace(dir.path()).await;
+    let refused = refusals(&events);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains("contracts `c1`, `c2`, `c3`, `c4` declare no writes"),
+        "{}",
+        refused[0]
+    );
+    let prompts = p.planner.prompts();
+    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
+    assert!(prompts[1].contains("declare no writes"), "{}", prompts[1]);
+    assert_eq!(accepted_ids(&events), ["c1", "c2", "c3", "c4"]);
+}

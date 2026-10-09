@@ -165,3 +165,29 @@ because it forfeits the one regime with strong published evidence behind
 it.
 
 **Isolated worktrees with verifier selection.** Chosen.
+
+## Amendment (2026-10-09): a worker stopped before it finished still has its tree verified
+
+A worker's claim of completion is not progress, and the lack of one is not failure: the
+verifier's verdict on the tree is. A worker that the stall check or the round budget ended
+used to be an error attempt before any verifier saw its tree. A worker whose tree passed the
+contract's own check, and that then looped on a cosmetic edit until the stall check ended
+it, had its delivery discarded and the run reported as failing verification.
+
+- **Rule.** An attempt that ended stalled or out of rounds and changed files goes to the same
+  verification a completed attempt does, with the same scope check first. A pass accepts the
+  tree as verified and adds a notice that the worker was stopped before it finished. A
+  failure fails the attempt as the stop alone did; the live tally follows the verdict.
+- **A check that checks nothing cannot accept it.** With a vacuous acceptance (`true`) and
+  no gate command, the pass becomes a failure: the worker made no claim, so nothing would
+  stand behind the tree.
+- **A verifier that cannot run** leaves the attempt failed on its stop, counted as before,
+  and not retried as a verifier outage.
+- **Not applied** to a failed worker (it can end inside a round whose calls ran only in part,
+  and is mostly a provider or environment fault with its own retry), a handed-back worker
+  (continued by a fresh one), or a cancelled one. Both covered endings stop at a round
+  boundary.
+- **The stall check is unchanged.** A passing build or test since the last write does not
+  reset its count: it changes nothing an identical call would see, and counting it would let
+  a worker cycle read, failed edit, passing test until the step budget ran out.
+- **Cost.** One verify run per such attempt, the same run a completed attempt gets.

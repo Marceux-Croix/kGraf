@@ -1,0 +1,50 @@
+{
+  "interfaces": [
+    {
+      "id": "i_c1",
+      "parties": ["c1", "c2"],
+      "symbols": ["setup.py", "vectorops/__init__.py"],
+      "stub": [
+        {"path": "setup.py", "content": "from setuptools import setup\nsetup(name='vectorops', version='0.1.0')"},
+        {"path": "vectorops/__init__.py", "content": "def dotproduct(a, b):\n    return 0"}
+      ],
+      "reference": [
+        {"path": "setup.py", "content": "from setuptools import setup\nsetup(\n    name='vectorops',\n    version='0.1.0',\n)"},
+        {"path": "vectorops/__init__.py", "content": "def dotproduct(a, b):\n    return sum(x * y for x, y in zip(a, b))"}
+      ],
+      "consumer": [
+        {"path": "server_script.sh"}
+      ],
+      "tests": [
+        {
+          "path": "test_i_c1.py",
+          "content": "import sys\nsys.path.insert(0, '.')\nfrom vectorops import dotproduct\nassert dotproduct([1, 1], [0, 1]) == 1\n"
+        }
+      ],
+      "compile": ["sh", "-n", "server_script.sh"],
+      "test": ["python3", "test_i_c1.py"]
+    },
+    {
+      "id": "i_c2",
+      "parties": ["c2", "c3"],
+      "symbols": ["server_script.sh"],
+      "stub": [
+        {"path": "server_script.sh", "content": "#!/bin/bash\necho 'Stubbed'\nexit 1\n"}
+      ],
+      "reference": [
+        {"path": "server_script.sh", "content": "#! /usr/bin/env bash\nset -e\npython3 setup.py sdist bdist_wheel\nmkdir -p simple/vectorops\ncp dist/*.whl simple/vendorops/\npython3 -m http.server 8080 --directory . &\necho $! > server.pid\n"}
+      ],
+      "consumer": [
+        {"path": "verify_vectorops.sh"}
+      ],
+      "tests": [
+        {
+          "path": "test_i_c2.sh",
+          "content": "#!/bin/bash\nif ! grep -q \"mkdir -p simple\" server_script.sh; then exit 1; fi\nexit 0\n"
+        }
+      ],
+      "compile": ["sh", "-n", "verify_vectorops.sh"],
+      "test": ["bash", "test_i_c2.sh"]
+    }
+  ]
+}

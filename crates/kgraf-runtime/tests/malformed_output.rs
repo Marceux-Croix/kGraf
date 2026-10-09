@@ -172,6 +172,65 @@ async fn one_malformed_generation_is_sent_again_and_the_attempt_completes() {
     assert_eq!(first["tools"], second["tools"]);
     let note = text_of(m2.last().unwrap());
     assert!(note.contains("malformed tool call"), "{note}");
+
+    // The retried round's row settles unreconciled with no usage and no
+    // request id, so the transcript keeps the server's answer: its status and
+    // its parse error. Without them a reader cannot tell this server fault
+    // from a call dropped mid-flight.
+    let reasons = abandon_reasons(&events);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].starts_with(kgraf_runtime::MALFORMED_OUTPUT_ABANDON_REASON),
+        "{reasons:?}"
+    );
+    assert!(reasons[0].contains("HTTP 500"), "{reasons:?}");
+    assert!(
+        reasons[0].contains("XML syntax error on line 8"),
+        "{reasons:?}"
+    );
+}
+
+/// The `RoundAbandoned` reasons, in order.
+fn abandon_reasons(events: &[WorkerEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::RoundAbandoned { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A server that quotes the whole unparsed call (Ollama's `error parsing tool
+/// call: raw='...'`) does not put that whole call in the transcript: the
+/// reason keeps the status and the head of the body, and marks the cut. The
+/// raw text is two-byte characters, so a cut at a fixed byte count would
+/// split one without the boundary check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_parse_error_is_kept_bounded_in_the_abandon_reason() {
+    let raw = "\u{e9}".repeat(20_000);
+    let body = format!(
+        r#"{{"error":{{"message":"error parsing tool call: raw='{raw}', err=unexpected end","type":"api_error"}}}}"#
+    );
+    let server = MockServer::start().await;
+    fail_n_times(&server, 1, 500, &body).await;
+    serve_ok(&server).await;
+    let (env, _) = env(&server.uri());
+
+    let (events, result) = run(env, 6).await;
+
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    let reasons = abandon_reasons(&events);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    let reason = &reasons[0];
+    assert!(reason.contains("HTTP 500"), "{reason}");
+    assert!(reason.contains("error parsing tool call"), "{reason}");
+    assert!(reason.contains("more bytes omitted]"), "{reason}");
+    assert!(
+        reason.len() < 2048 + 200,
+        "the reason is bounded: {} bytes",
+        reason.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

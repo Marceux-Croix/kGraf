@@ -1480,6 +1480,12 @@ struct InFlight {
     /// (decision 0093, amended 2026-10-02): a pass merges it, a failure
     /// leaves the hold as it was.
     held_verify: BTreeSet<AgentId>,
+    /// Workers whose attempt ended stalled or out of rounds with changes in
+    /// its tree, which is being verified as it stands
+    /// ([`crate::verify::verifies_unfinished`]), each with the note of what
+    /// stopped it: a pass accepts the tree with a notice, a failure fails the
+    /// attempt as the stop alone did.
+    unfinished_verify: BTreeMap<AgentId, String>,
     /// A worktree could not be provided: the retry gets fresh workers.
     renew_workers: bool,
     /// With `renew_workers`: the renewed attempts' worktrees are removed too,
@@ -3097,6 +3103,34 @@ impl RunLoop {
                 .record(queued)
                 .await
                 .map_err(|e| OrchestratorError::Trace(e.to_string()))?;
+        }
+        // Then the calls this run asked again, with what the provider said:
+        // their ledger rows carry no error text (`ModelCaller::ask_json`).
+        let kept = self
+            .s
+            .ledger
+            .take_call_errors(&format!("orchestrator:{}", self.run_id()));
+        let at_ms = self.now();
+        for e in kept.errors {
+            self.trace
+                .record(TraceEvent::CallRetried {
+                    at_ms,
+                    call: e.call.to_string(),
+                    agent: e.agent,
+                    what: e.what,
+                    status: e.status,
+                    server_parse: e.server_parse,
+                    error: e.error,
+                })
+                .await
+                .map_err(|e| OrchestratorError::Trace(e.to_string()))?;
+        }
+        if kept.dropped > 0 {
+            self.notices.insert(format!(
+                "{} retried-call record(s) were dropped for lack of room; \
+                 the ledger still holds every call",
+                kept.dropped
+            ));
         }
         self.trace
             .record(event)
@@ -5653,6 +5687,7 @@ impl RunLoop {
             lease_lost: false,
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
+            unfinished_verify: BTreeMap::new(),
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),
@@ -6693,8 +6728,25 @@ impl RunLoop {
             }
             return self.finish_attempt(contract, flight).await;
         }
+        // A worker stopped by the stall check or out of rounds may have
+        // delivered before it stopped: its tree goes to the same verification
+        // a completed attempt's does (`verify::verifies_unfinished`). One more
+        // verify run per such attempt, counted in the trace as every verdict is.
+        let verify_unfinished = !verify_held && crate::verify::verifies_unfinished(&f.result);
+        if verify_unfinished {
+            if let Some(i) = idx {
+                flight.attempts[i].status = AttemptStatus::Success;
+            }
+            let stop = stop_note_of(f.worker.as_str(), &f.result)
+                .unwrap_or_else(|| outcome_name(&f.result.outcome).to_owned());
+            flight.unfinished_verify.insert(f.worker.clone(), stop);
+        }
         match &f.result.outcome {
-            outcome if verify_held || matches!(outcome, WorkerOutcome::Completed) => {
+            outcome
+                if verify_held
+                    || verify_unfinished
+                    || matches!(outcome, WorkerOutcome::Completed) =>
+            {
                 // Merge-back scope: a write outside the contract's set fails
                 // the attempt before any verifier sees it.
                 let outside = outside_declared_scope(
@@ -7246,6 +7298,17 @@ impl RunLoop {
         } else {
             verdict
         };
+        let unfinished = flight.unfinished_verify.remove(&worker);
+        let verdict = match &unfinished {
+            Some(stop) => {
+                self.settle_unfinished_verify(&contract, &worker, verdict, stop, &mut flight)
+            }
+            None => verdict,
+        };
+        // A stopped worker's tree the verifier could not judge fails on the
+        // stop alone, as it did before its tree was verified: counted against
+        // the attempt, not retried as a verifier outage.
+        let infrastructure = infrastructure && unfinished.is_none();
         let passed = verdict.passed();
         // Live recording (decision 0075): the one write path for
         // `Source::Live` tallies. Wired here, not inside `finalize`/
@@ -7320,6 +7383,66 @@ impl RunLoop {
             a.infrastructure = infrastructure;
         }
         self.finish_attempt(contract, flight).await
+    }
+
+    /// The verdict on the tree of a worker that was stopped before it finished
+    /// (stalled, or out of rounds), verified as it stands.
+    ///
+    /// - A pass on a check that checks something: the tree is accepted as
+    ///   verified, and a notice says the worker was stopped after it delivered.
+    /// - A pass on a check that checks nothing (`true`, with no gate command):
+    ///   a failure. The worker made no claim of completion, so nothing would
+    ///   stand behind the tree.
+    /// - A failure: the attempt fails as the stop alone made it fail, with the
+    ///   same report.
+    fn settle_unfinished_verify(
+        &mut self,
+        contract: &OpenContract,
+        worker: &AgentId,
+        verdict: Verdict,
+        stop: &str,
+        flight: &mut InFlight,
+    ) -> Verdict {
+        // The first line names the stop; the rest lists refusals.
+        let what = stop.lines().next().unwrap_or(stop).trim();
+        let verdict = match verdict {
+            Verdict::Pass { by, .. }
+                if contract.gate_commands.is_empty() && crate::shortfall::vacuous_check(&by) =>
+            {
+                Verdict::Fail {
+                    reason: format!(
+                        "the worker was stopped before it finished ({what}), and the check `{}` \
+                         checks nothing, so it cannot accept the tree the worker left",
+                        by.trim()
+                    ),
+                }
+            }
+            Verdict::Pass {
+                by,
+                commit,
+                mut notices,
+            } => {
+                notices.push(kgraf_secrets::scrub_persist_owned(format!(
+                    "contract {}: the worker was stopped before it finished ({what}); the tree \
+                     it had delivered passed `{}`, so the attempt is accepted as verified",
+                    contract.contract,
+                    by.trim()
+                )));
+                Verdict::Pass {
+                    by,
+                    commit,
+                    notices,
+                }
+            }
+            fail => fail,
+        };
+        if !verdict.passed() {
+            if let Some(a) = flight.attempts.iter_mut().find(|a| a.worker == *worker) {
+                a.status = AttemptStatus::Error;
+            }
+            self.submit_report(contract, Some(worker), ReportKind::Stuck, stop);
+        }
+        verdict
     }
 
     /// One attempt is done: start a throttled one, or finalize when none run.
@@ -8683,6 +8806,10 @@ fn stop_note_of(worker: &str, r: &WorkerResult) -> Option<String> {
 fn last_stop_note(attempts: &[Attempt]) -> Option<String> {
     let notes: Vec<String> = attempts
         .iter()
+        // An attempt the verifier judged reached verification: its refusal is
+        // carried by `last_refusal`, and the brief's "ended before
+        // verification" would not be true of it.
+        .filter(|a| a.verdict.is_none())
         .filter_map(|a| stop_note_of(a.worker.as_str(), a.result.as_ref()?))
         .collect();
     if notes.is_empty() {
@@ -9593,6 +9720,7 @@ mod tests {
             lease_lost: false,
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
+            unfinished_verify: BTreeMap::new(),
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),

@@ -20,6 +20,7 @@
 //! [`Ledger::unreconciled`] reports, rather than as spend that silently vanished.
 
 pub mod accounting;
+pub mod call_errors;
 pub mod capability;
 pub mod crosslimit;
 pub mod error;
@@ -35,6 +36,9 @@ pub use accounting::{
     CallRecord, CallToken, CallTrace, GroupBy, GroupKey, Ledger, LedgerAck, LedgerError, McpCall,
     McpCallRecord, ROUTE_STATS_MIN_ROUNDS, RouteRoundStats, Settlement, SpendGroup, SpendOf,
     TaskUsage,
+};
+pub use call_errors::{
+    CallError, CallErrorLog, Drained as DrainedCallErrors, ERROR_KEEP_BYTES, bounded_error_text,
 };
 pub use capability::{CacheControl, Capabilities, Reasoning, StreamEvent, Streaming};
 pub use crosslimit::{CrossLimitError, SharedLimiterStore, default_store_path, key_id};

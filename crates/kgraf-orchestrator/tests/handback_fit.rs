@@ -30,12 +30,20 @@ use support::*;
 const WINDOW: u64 = 10_000;
 /// Half the stop point: what a brief is planned to fit under.
 const TARGET: u64 = 4_000;
-const SCAFFOLD_SYMBOLS: usize = 4;
+/// Eight functions: each slice shows its own function once (a brief's slices
+/// show each line once), so the parent is over the target on its own text, not
+/// on the same file repeated in every slice.
+const SCAFFOLD_SYMBOLS: usize = 8;
 
-/// Six functions of about 500 tokens each: together 3,000, which the plan-time
+/// Eight functions of about 470 tokens each: together about 3,800, which the plan-time
 /// write-file slicing gives a worker whole.
 fn scaffold() -> String {
-    (0..SCAFFOLD_SYMBOLS)
+    scaffold_of(SCAFFOLD_SYMBOLS)
+}
+
+/// `symbols` functions of about 470 tokens each.
+fn scaffold_of(symbols: usize) -> String {
+    (0..symbols)
         .map(|i| {
             let body = format!("    // {}\n", "scaffold line ".repeat(100));
             format!("pub fn f{i}() -> u32 {{\n{body}    {i}\n}}\n\n")
@@ -66,7 +74,7 @@ async fn run(instruction: &str) -> Measured {
 
 /// `run` with the window and the most tokens one slice renders at.
 async fn run_in(instruction: &str, window: u64, slice_budget: u64) -> Measured {
-    run_with(instruction, window, slice_budget, false).await
+    run_with(instruction, window, slice_budget, false, SCAFFOLD_SYMBOLS).await
 }
 
 /// The scaffold with every function's signature changed: each symbol gets a
@@ -85,10 +93,11 @@ async fn run_with(
     window: u64,
     slice_budget: u64,
     reindex_during_first_child: bool,
+    symbols: usize,
 ) -> Measured {
     let dir = tempfile::tempdir().expect("dir");
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-    std::fs::write(dir.path().join("src/big.rs"), scaffold()).expect("write");
+    std::fs::write(dir.path().join("src/big.rs"), scaffold_of(symbols)).expect("write");
     {
         let g =
             kgraf_graph::GraphStore::open(&dir.path().join("graph.db"), dir.path()).expect("graph");
@@ -258,11 +267,12 @@ async fn a_contract_whose_child_could_not_fit_compacts_instead_of_handing_back()
     // bound of 3,700 tokens: with the hand-back wrapper, the brief lines and the
     // prefix the child's fixed part is over the 3,200-token target of an 8,000-token
     // window (stop point 6,400). No child can fit, so the first stop point compacts.
+    // Four functions: with eight, the parent itself would reach the stop point.
     let long = format!(
         "ALWAYSBIG part. {} WRITE src/big.rs",
         "Keep the sections apart. ".repeat(296)
     );
-    let m = run_in(&long, 8_000, 500).await;
+    let m = run_with(&long, 8_000, 500, false, 4).await;
     assert_eq!(m.status, RunStatus::Completed, "{:?}", m.status);
     let handbacks = m
         .trace
@@ -293,7 +303,7 @@ async fn a_contract_whose_child_could_not_fit_compacts_instead_of_handing_back()
 /// fails on the slice count and the size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_childs_slices_resolved_again_at_dispatch_still_fit_its_cap() {
-    let m = run_with(&long_instruction(), WINDOW, 1_000, true).await;
+    let m = run_with(&long_instruction(), WINDOW, 1_000, true, SCAFFOLD_SYMBOLS).await;
     assert_eq!(m.status, RunStatus::Completed, "{:?}", m.status);
     let children: Vec<&String> = m
         .openings

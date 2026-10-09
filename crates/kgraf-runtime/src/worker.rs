@@ -1077,6 +1077,24 @@ pub const MAX_MALFORMED_OUTPUT_RETRIES: u32 = kgraf_provider::MAX_MALFORMED_OUTP
 pub const MALFORMED_OUTPUT_ABANDON_REASON: &str =
     "the server could not parse the model's tool call";
 
+/// The `RoundAbandoned` reason for a malformed round that is sent again:
+/// [`MALFORMED_OUTPUT_ABANDON_REASON`], then the provider's error (its HTTP
+/// status and the server's body), cut to `kgraf_provider::ERROR_KEEP_BYTES`
+/// with the cut marked.
+///
+/// The error is kept because the round's ledger row settles unreconciled
+/// with no usage and no request id, and the transcript is the only record
+/// of why: without the status, a reader cannot tell a server fault from a
+/// call that was dropped mid-flight. The reason is never sent to the model
+/// (the rebuild only compares it), and it is scrubbed on both paths like
+/// every `RoundAbandoned` reason.
+pub fn malformed_output_abandon_reason(error: &str) -> String {
+    format!(
+        "{MALFORMED_OUTPUT_ABANDON_REASON}: {}",
+        kgraf_provider::bounded_error_text(error)
+    )
+}
+
 /// The notice that follows such a failure. It is appended at the end of the
 /// transcript, after every earlier message, so the request prefix the
 /// provider caches is unchanged and the retry still hits it.
@@ -1778,7 +1796,7 @@ impl Worker {
                         ep,
                         CancelPhase::ModelStream,
                         None,
-                        MALFORMED_OUTPUT_ABANDON_REASON,
+                        &malformed_output_abandon_reason(&text),
                     )
                     .await?;
                     self.emit(

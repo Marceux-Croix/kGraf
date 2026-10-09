@@ -2548,6 +2548,60 @@ async fn a_test_run_after_each_edit_is_not_a_stall() {
     assert_eq!(result.outcome, WorkerOutcome::Completed);
 }
 
+/// A passing build or test run since the last write is not progress for the
+/// stall check: it changes nothing an identical read would see. A worker that
+/// delivered, then re-reads the same file between passing builds and edits
+/// that never land, is looping (read, test, build, read, two failed patches,
+/// read) and is still ended. That attempt's tree is judged by the
+/// orchestrator's verifier instead (`verifies_unfinished`).
+#[tokio::test]
+async fn passing_builds_between_identical_reads_do_not_reset_the_stall_count() {
+    let dir = tempfile::tempdir().expect("dir");
+    let probe = Arc::new(Probe::default());
+    let provider = Fake::new(false, |request| {
+        let n = round_of(request);
+        let id: &'static str = format!("t{n}").leak();
+        match n {
+            0 => Round::tool(vec![(
+                id,
+                "write_file",
+                json!({"path": "a.txt", "content": "delivered"}),
+            )]),
+            2 | 4 => Round::tool(vec![(id, "build", json!({}))]),
+            _ => Round::tool(vec![(id, "probe", json!({"node": "a.txt"}))]),
+        }
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(WriteFile), Arc::new(SandboxedBuild), probe.clone()],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "deliver, then loop", dir.path(), 20),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(
+        matches!(result.outcome, WorkerOutcome::Stalled { repeats: 3, .. }),
+        "{:?}",
+        result.outcome
+    );
+    // write, read, build, read, build, read: the third read is the stall.
+    assert_eq!(result.steps, 6);
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        2,
+        "the third read never ran"
+    );
+    assert_eq!(
+        result.changed_paths,
+        vec![std::path::PathBuf::from("a.txt")]
+    );
+}
+
 /// With no write between them, the same two reads alternating are still a loop.
 #[tokio::test]
 async fn alternating_identical_calls_with_no_write_between_still_stall() {

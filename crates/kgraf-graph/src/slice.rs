@@ -17,10 +17,22 @@
 //! requested symbol first, then its enclosing element, then its callees, then
 //! its callers, then its siblings. A budget large enough for the symbol alone
 //! yields the symbol alone rather than three arbitrary neighbors.
+//!
+//! **No line is shown twice** ([`ShownRanges`]). A top-level symbol's enclosing
+//! element is its whole file, which holds the symbol and every sibling, and a
+//! brief of several slices of one file would repeat that file once per slice.
+//! A member whose lines an earlier member (of this slice, or of an earlier
+//! slice of the same brief) already shows is one line naming it when it is the
+//! requested symbol or a callee or caller, and is left out otherwise; a member
+//! that holds lines shown earlier shows them as one line naming them. Measured
+//! case: six slices of one Python module and its test file (3,413 bytes of
+//! source) rendered as 23,952 bytes, and the worker's pinned context reached
+//! its stop point before its first round.
 
 use crate::error::{GraphError, Result};
 use crate::store::{EdgeKind, GraphStore, NodeRecord};
 use kgraf_core::budget::{TokenBudget, estimate_tokens};
+use std::collections::BTreeMap;
 
 /// Why a node is in a slice. Ordered by priority: lower comes first, and the
 /// budget is spent in this order.
@@ -60,7 +72,8 @@ impl SliceReason {
 pub struct SliceMember {
     pub node: NodeRecord,
     pub reason: SliceReason,
-    /// The source, read from disk at slice time.
+    /// The source, read from disk at slice time. Empty for a member whose lines
+    /// an earlier member of the slice shows: it renders as one line naming them.
     pub source: String,
     /// The estimated token cost this member charged to the budget.
     pub estimated_tokens: u64,
@@ -96,6 +109,14 @@ impl ContextSlice {
 
     /// Render the slice as the text a worker would receive.
     pub fn render(&self) -> String {
+        self.render_after(&mut ShownRanges::default())
+    }
+
+    /// Render the slice after the text `shown` records (the earlier slices of
+    /// one brief), and record what this one shows. A member whose lines are
+    /// all shown already is one line naming it; lines shown already inside a
+    /// member are one line naming them ([`ShownRanges`]).
+    pub fn render_after(&self, shown: &mut ShownRanges) -> String {
         let mut out = String::new();
         for member in &self.members {
             // A tags-tier member says so: its nodes and edges come from the
@@ -106,16 +127,21 @@ impl ContextSlice {
                 Some(crate::lang::Tier::Tags) => " [tags tier: calls resolved by name only]",
                 _ => "",
             };
+            if shown.covering(&member.node).is_some() {
+                if member.reason.named_when_shown() {
+                    out.push_str(&shown_line(&member.node, member.reason));
+                    out.push_str("\n\n");
+                }
+                continue;
+            }
             out.push_str(&format!(
-                "// {} {}:{}-{} ({}){fidelity}\n",
-                member.reason.as_str(),
-                member.node.path,
-                member.node.start_line,
-                member.node.end_line,
-                member.node.qualified_name
+                "{}{fidelity}",
+                member_header(&member.node, member.reason)
             ));
-            out.push_str(&member.source);
+            out.push('\n');
+            out.push_str(&shown.elide(&member.node, &member.source));
             out.push_str("\n\n");
+            shown.add(&member.node);
         }
         if !self.omitted.is_empty() {
             out.push_str(&format!(
@@ -144,6 +170,124 @@ impl ContextSlice {
             ));
         }
         out
+    }
+}
+
+impl SliceReason {
+    /// Whether a member of this reason whose lines are shown already is still
+    /// named in one line: the symbol asked for, and a call relation, which say
+    /// something its place in the file does not. An enclosing element or a
+    /// sibling shown already adds nothing.
+    fn named_when_shown(self) -> bool {
+        matches!(
+            self,
+            SliceReason::Requested | SliceReason::Callee | SliceReason::Caller
+        )
+    }
+}
+
+/// The line that opens a member: its reason, file, lines and name.
+fn member_header(node: &NodeRecord, reason: SliceReason) -> String {
+    format!(
+        "// {} {}:{}-{} ({})",
+        reason.as_str(),
+        node.path,
+        node.start_line,
+        node.end_line,
+        node.qualified_name
+    )
+}
+
+/// The one line a member whose lines are shown already is rendered as: its
+/// header names the file and the lines, which is where to look.
+fn shown_line(node: &NodeRecord, reason: SliceReason) -> String {
+    format!("{}: shown above", member_header(node, reason))
+}
+
+/// One line range of a file a rendering shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownRange {
+    pub start: u32,
+    pub end: u32,
+    /// The qualified name of the member that showed it.
+    pub name: String,
+}
+
+/// The line ranges of each file a rendering has shown, so that no line is
+/// shown twice: in one slice (the enclosing file holds the requested symbol
+/// and its siblings) or across the slices of one brief (two symbols of one
+/// file each bring that file). A member's text is whole lines
+/// (`GraphStore::source_of_in`), so lines are the unit.
+#[derive(Clone, Debug, Default)]
+pub struct ShownRanges {
+    by_path: BTreeMap<String, Vec<ShownRange>>,
+}
+
+impl ShownRanges {
+    /// The shown range that holds every line of `node`, if one does.
+    pub fn covering(&self, node: &NodeRecord) -> Option<&ShownRange> {
+        self.by_path
+            .get(&node.path)?
+            .iter()
+            .find(|r| r.start <= node.start_line && node.end_line <= r.end)
+    }
+
+    /// Record `node`'s lines as shown.
+    pub fn add(&mut self, node: &NodeRecord) {
+        self.by_path
+            .entry(node.path.clone())
+            .or_default()
+            .push(ShownRange {
+                start: node.start_line,
+                end: node.end_line,
+                name: node.qualified_name.clone(),
+            });
+    }
+
+    /// `source`, the lines `node.start_line..=node.end_line`, with each shown
+    /// range inside it replaced by one line naming it, at that range's
+    /// indentation. Of nested shown ranges the outermost is named.
+    pub fn elide(&self, node: &NodeRecord, source: &str) -> String {
+        let Some(ranges) = self.by_path.get(&node.path) else {
+            return source.to_owned();
+        };
+        let mut inside: Vec<&ShownRange> = ranges
+            .iter()
+            .filter(|r| node.start_line <= r.start && r.end <= node.end_line)
+            .collect();
+        if inside.is_empty() {
+            return source.to_owned();
+        }
+        // Outermost first at each start, then drop the ranges nested in a kept one.
+        inside.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
+        let mut kept: Vec<&ShownRange> = Vec::new();
+        for r in inside {
+            if kept.last().is_none_or(|k| r.start > k.end) {
+                kept.push(r);
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut next = kept.iter().peekable();
+        for (i, line) in source.lines().enumerate() {
+            let number = node.start_line + i as u32;
+            while next.peek().is_some_and(|r| r.end < number) {
+                next.next();
+            }
+            match next.peek() {
+                Some(r) if r.start <= number => {
+                    if r.start == number {
+                        let indent: String =
+                            line.chars().take_while(|c| c.is_whitespace()).collect();
+                        out.push(format!(
+                            "{indent}// lines {}-{} ({}): shown above",
+                            r.start, r.end, r.name
+                        ));
+                    }
+                }
+                _ => out.push(line.to_owned()),
+            }
+        }
+        out.join("\n")
     }
 }
 
@@ -251,7 +395,30 @@ pub fn slice_for_node_in(
     let mut members = Vec::new();
     let mut omitted = Vec::new();
     let mut unreadable = Vec::new();
+    // The lines this slice shows so far: a sibling inside the enclosing file
+    // is shown already, and the enclosing file costs only what it adds.
+    let mut shown = ShownRanges::default();
     for (node, reason) in candidates {
+        // A neighbor whose lines are shown already costs one line naming it
+        // when its relation says something (a call), and nothing otherwise.
+        if shown.covering(&node).is_some() {
+            if reason.named_when_shown() {
+                let line = shown_line(&node, reason);
+                if budget.try_spend(&line) {
+                    // Its lines are in the member that covers it; it is never read.
+                    let source = String::new();
+                    members.push(SliceMember {
+                        node,
+                        reason,
+                        source,
+                        estimated_tokens: estimate_tokens(&line),
+                    });
+                } else {
+                    omitted.push((node, reason));
+                }
+            }
+            continue;
+        }
         // The requested node failing is the slice failing: an empty slice that
         // exits 0 would read as "nothing to know". A neighbor whose file has
         // moved on is listed as unreadable with the cause (not as a budget
@@ -264,8 +431,10 @@ pub fn slice_for_node_in(
                 continue;
             }
         };
-        let cost = estimate_tokens(&source);
-        if budget.try_spend(&source) {
+        let text = shown.elide(&node, &source);
+        let cost = estimate_tokens(&text);
+        if budget.try_spend(&text) {
+            shown.add(&node);
             members.push(SliceMember {
                 node,
                 reason,
@@ -507,6 +676,120 @@ pub fn unrelated() {
         // The bare name matches the free function's qualified name exactly.
         let node = resolve_unambiguous(&store, "go").expect("exact wins");
         assert_eq!(node.qualified_name, "go");
+    }
+
+    /// A top-level symbol's enclosing element is its whole file, which holds
+    /// the symbol and every sibling. With a budget for all of it, the slice
+    /// shows each line of the file once: the symbol, then the file with the
+    /// symbol's lines named, and no sibling again. It costs about the file,
+    /// not the file plus each member a second time.
+    #[test]
+    fn a_generous_slice_shows_each_line_of_its_file_once() {
+        let (dir, store) = fixture();
+        let whole = fs::read_to_string(dir.path().join("src/lib.rs")).expect("read");
+        let slice = slice_for_symbol(&store, "target", 10_000).expect("slice");
+        let rendered = slice.render();
+        assert!(
+            slice
+                .members
+                .iter()
+                .any(|m| m.reason == SliceReason::Enclosing),
+            "{rendered}"
+        );
+        assert!(
+            !slice
+                .members
+                .iter()
+                .any(|m| m.reason == SliceReason::Sibling),
+            "a sibling inside the enclosing file is shown by it: {rendered}"
+        );
+        for line in [
+            "pub fn target() {",
+            "pub fn helper() {",
+            "pub fn unrelated() {",
+        ] {
+            assert_eq!(rendered.matches(line).count(), 1, "`{line}`:\n{rendered}");
+        }
+        assert!(
+            rendered.contains("// lines 1-3 (target): shown above"),
+            "{rendered}"
+        );
+        // The callee and the caller are in the file: each is one line naming
+        // it, and the text read from disk costs the file once, plus the one
+        // line naming `target`'s range inside it.
+        let named: Vec<&str> = slice
+            .members
+            .iter()
+            .filter(|m| m.source.is_empty())
+            .map(|m| m.node.name.as_str())
+            .collect();
+        assert_eq!(named, ["helper", "caller"], "{rendered}");
+        assert!(
+            rendered.contains("// callee src/lib.rs:5-8 (helper): shown above"),
+            "{rendered}"
+        );
+        let read: u64 = slice
+            .members
+            .iter()
+            .filter(|m| !m.source.is_empty())
+            .map(|m| m.estimated_tokens)
+            .sum();
+        assert!(
+            read <= estimate_tokens(&whole) + 15,
+            "read cost {read} against whole-file {}",
+            estimate_tokens(&whole)
+        );
+    }
+
+    /// Across slices, a requested symbol an earlier slice showed is one line
+    /// naming where, and a neighbor shown already is left out.
+    #[test]
+    fn a_second_slice_names_what_the_first_showed() {
+        let (_dir, store) = fixture();
+        let mut shown = ShownRanges::default();
+        let first = slice_for_symbol(&store, "target", 10_000)
+            .expect("slice")
+            .render_after(&mut shown);
+        let second = slice_for_symbol(&store, "unrelated", 10_000)
+            .expect("slice")
+            .render_after(&mut shown);
+        assert!(first.contains("let _ = 2;"), "{first}");
+        assert!(!second.contains("let _ = 2;"), "{second}");
+        assert!(
+            second.contains("// requested src/lib.rs:14-16 (unrelated): shown above"),
+            "{second}"
+        );
+        assert!(!second.contains("// enclosing"), "{second}");
+    }
+
+    /// Of nested shown ranges the outermost is named, once, at its indentation.
+    #[test]
+    fn elide_names_the_outermost_shown_range_once() {
+        let (_dir, store) = fixture();
+        let file = store
+            .nodes_in_file("src/lib.rs")
+            .expect("nodes")
+            .into_iter()
+            .find(|n| n.kind == crate::NodeKind::File)
+            .expect("file node");
+        let source = store.source_of(&file).expect("source");
+        let mut inner = file.clone();
+        let mut shown = ShownRanges::default();
+        for (start, end, name) in [(5, 8, "helper"), (6, 7, "helper.body")] {
+            inner.start_line = start;
+            inner.end_line = end;
+            inner.qualified_name = name.into();
+            shown.add(&inner);
+        }
+        let text = shown.elide(&file, &source);
+        assert_eq!(text.matches("shown above").count(), 1, "{text}");
+        assert!(
+            text.contains("// lines 5-8 (helper): shown above"),
+            "{text}"
+        );
+        assert!(!text.contains("a helper with a body"), "{text}");
+        assert!(text.contains("pub fn caller() {"), "{text}");
+        assert_eq!(text.lines().count(), source.lines().count() - 3, "{text}");
     }
 
     #[test]

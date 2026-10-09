@@ -1,0 +1,44 @@
+{
+ "contracts": [
+  {
+   "id": "c1",
+   "instruction": "Create a root `Cargo.toml` manifest at the repository root to define the workspace structure. Include `[workspace]` and `members = [\"wcl-core\", \"wcl\"]`. Do not write any Rust source files yet.",
+   "acceptance": "grep -q 'members.*=.*\\[\"wcl-core\".*\"wcl\"\\]' Cargo.toml || grep -q 'members.*=.*\\[\"wcl\".*\"wcl-core\"\\]' Cargo.toml",
+   "writes": [],
+   "depends_on": [],
+   "task_kind": "interface"
+  },
+  {
+   "id": "c2",
+   "instruction": "Create the `wcl-core` library crate. Create `wcl-core/Cargo.toml` with package name `wcl-core`, version `0.1.0`, and edition `2021`. Create `wcl-core/src/lib.rs` containing a public struct `Counts` with public fields `lines: usize`, `words: usize`, and `bytes: usize`. Implement the function `pub fn count(text: &str) -> Counts` that computes counts using standard library methods.",
+   "acceptance": "cargo check -p wcl-core",
+   "writes": [],
+   "depends_on": [
+    "c1"
+   ],
+   "task_kind": "implementation"
+  },
+  {
+   "id": "c3",
+   "instruction": "Create the `wcl` binary crate. Create `wcl/Cargo.toml` with package name `wcl`, version `0.1.0`, edition `2021`, and a `[dependencies]` section pointing to `wcl-core = { path = \"../wcl-core\" }`. Create `wcl/src/main.rs` containing the logic to read from files or stdin, call `wcl_core::count`, and print results in the format `<lines> <words> <bytes>` (append filename if provided).",
+   "acceptance": "cargo check -p wcl",
+   "writes": [],
+   "depends_on": [
+    "c1",
+    "c2"
+   ],
+   "task_kind": "implementation"
+  },
+  {
+   "id": "c4",
+   "instruction": "Add test coverage to `wcl-core`. Update or append code in `wcl-core/src/lib.rs` to include a `#[cfg(test)] mod tests` block. Write at least two unit tests for the `count` function that verify lines, words, and byte counts correctly (e.g., using multiline strings and whitespace variations). Ensure these tests pass without external network dependencies.",
+   "acceptance": "cargo test --workspace",
+   "writes": [],
+   "depends_on": [
+    "c2",
+    "c3"
+   ],
+   "task_kind": "tests"
+  }
+ ]
+}

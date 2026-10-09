@@ -1,0 +1,49 @@
+```json
+{
+  "contracts": [
+    {
+      "id": "c1",
+      "instruction": "Create the source files for the 'vectorops' package. Write `vectorops/__init__.py` containing the `dotproduct(a, b)` function, which computes the dot product of two lists. Create `setup.py` in the repository root to configure the build with package name 'vectorops' and version '0.1.0'.",
+      "acceptance": "Verify that `vectorops/__init__.py` exists and contains the correct implementation logic for `dotproduct`. Verify `setup.py` exists and correctly specifies metadata.",
+      "writes": [
+        {"path": "vectorops/__init__.py"},
+        {"path": "setup.py"}
+      ],
+      "depends_on": [],
+      "slices": [],
+      "tools": ["apply_patch"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "implementation"
+    },
+    {
+      "id": "c2",
+      "instruction": "Create a shell script named `server_script.sh`. This script must perform the following actions when run: build the wheel and sdist using `python setup.py`, organize the distribution files into the directory structure required for a local PyPI index (`simple/vectorops/`), and start a Python HTTP server on port 8080 rooted at the current directory.",
+      "acceptance": "Verify that `server_script.sh` is created, contains logic to build the dist, sets up the `simple` directory structure correctly, and starts `http.server` on port 8080.",
+      "writes": [
+        {"path": "server_script.sh"}
+      ],
+      "depends_on": ["c1"],
+      "slices": [],
+      "tools": ["apply_patch", "shell"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "scripting"
+    },
+    {
+      "id": "c3",
+      "instruction": "Create a verification script named `verify_vectorops.sh`. This script should: 1) Run `server_script.sh` to launch the index. 2) Execute `pip install --index-url http://localhost:8080/simple vectorops==0.1.0` to test installation. 3) Assert that the installed package contains the expected `dotproduct` behavior.",
+      "acceptance": "Verify that `verify_vectorops.sh` exists and includes the exact pip install command requested by the user along with functional verification logic.",
+      "writes": [
+        {"path": "verify_vectorops.sh"}
+      ],
+      "depends_on": ["c2"],
+      "slices": [],
+      "tools": ["apply_patch", "shell"],
+      "route": null,
+      "attempts": 1,
+      "task_kind": "tests"
+    }
+  ]
+}
+```

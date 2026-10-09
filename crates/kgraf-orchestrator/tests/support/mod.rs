@@ -569,6 +569,18 @@ impl Provider for ScriptFake {
             std::future::pending::<()>().await;
         }
         let text = (self.reply)(&prompt);
+        // `SERVER_PARSE_ERROR:<status>:<body>`: the server answered with the
+        // status and could not parse the model's output. The row is left
+        // unreconciled, as every real adapter leaves a 5xx.
+        if let Some(rest) = text.strip_prefix("SERVER_PARSE_ERROR:") {
+            let (status, body) = rest.split_once(':').expect("status:body");
+            token.leave_unreconciled(None)?;
+            return Err(ProviderError::ModelOutputMalformed {
+                adapter: "fake-plan",
+                status: status.parse().expect("status"),
+                body: body.to_owned(),
+            });
+        }
         let usage = TokenUsage {
             uncached_input: 200,
             text_output: 50,
@@ -1394,12 +1406,13 @@ pub fn config() -> OrchestratorConfig {
 }
 
 /// A worker model that never answers: every round issues the identical
-/// `write_file` call, which the runtime's stall detector (three repeats,
+/// `read_file` call, which the runtime's stall detector (three repeats,
 /// `kgraf-runtime/src/worker.rs`) turns into `WorkerOutcome::Stalled` well
-/// inside `config()`'s six-round budget. This is the harness's route to
-/// `on_finished`'s live-recording branch (BudgetExhausted or Stalled); the
-/// `WorkerFake` in `support` always answers by round 1 and can only reach
-/// `on_verified`'s branch.
+/// inside `config()`'s six-round budget. It writes nothing, so its tree has
+/// nothing for the verifier to judge (`verify::verifies_unfinished`): this is
+/// the harness's route to `on_finished`'s live-recording branch
+/// (BudgetExhausted or Stalled); the `WorkerFake` in `support` always answers
+/// by round 1 and can only reach `on_verified`'s branch.
 #[derive(Default)]
 pub struct StallFake {
     pub calls: AtomicUsize,
@@ -1432,8 +1445,8 @@ impl Provider for StallFake {
             model: request.model.clone(),
             content: vec![Content::ToolUse {
                 id: "t1".into(),
-                name: "write_file".into(),
-                input: json!({"path": "src/b.rs", "content": "same"}),
+                name: "read_file".into(),
+                input: json!({"path": "src/b.rs"}),
                 signature: None,
             }],
             stop_reason: StopReason::ToolUse,

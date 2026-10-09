@@ -718,6 +718,42 @@ pub fn sanitize_plan(contracts: Vec<ContractSpec>) -> Result<Vec<ContractSpec>, 
         .collect())
 }
 
+/// The refusal of a planner's answer in which a contract declares no writes.
+///
+/// A worker may change only the files its contract lists (`write_scope`, every
+/// other write is refused), so a contract with an empty `writes` can change
+/// nothing: its worker is refused on every edit, asks for a scope the plan
+/// never assigned, and the contract is held as a plan-shape error after the
+/// attempts are spent. Every write-based intake rule (an unwritten workspace
+/// member, a stub no contract writes, a shared test file) is also vacuously
+/// met by a plan that declares no files, so an answer that drops its writes
+/// after such a refusal would pass them all. Refused here, so the planner is
+/// asked again with the reason instead.
+///
+/// Applied to planner answers only: a corpus plan was approved by the user as
+/// it stands, and its intake is its own.
+pub fn writeless_refusal(contracts: &[ContractSpec]) -> Option<PlanError> {
+    let ids: Vec<String> = contracts
+        .iter()
+        .filter(|c| c.writes.is_empty())
+        .map(|c| format!("`{}`", c.id))
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    let (subject, verb) = if ids.len() == 1 {
+        (format!("contract {}", ids[0]), "declares")
+    } else {
+        (format!("contracts {}", ids.join(", ")), "declare")
+    };
+    Some(PlanError::Invalid(format!(
+        "{subject} {verb} no writes; a worker may change only the files its contract lists in \
+         \"writes\", so such a contract can change nothing and its every edit is refused. List \
+         each file the contract creates or edits, one object per file: \
+         {{\"path\":\"src/x.rs\"}}"
+    )))
+}
+
 /// Two or more contracts of one plan that declare the same write set, which
 /// the verifier checks with one test file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1191,6 +1227,7 @@ impl ModelCaller {
         loop {
             let (result, call) = self.ask_keeping_call(kind, system, prompt).await;
             let answered = call.is_some();
+            let this_call = call.clone();
             calls.extend(call);
             let failure = match result {
                 Ok(text) if answered => match parse(&text) {
@@ -1222,6 +1259,11 @@ impl ModelCaller {
                     },
                 ));
             }
+            // The failed call's row settles unreconciled with no error text,
+            // so what the provider said is kept now, before the retry hides it.
+            if let Some(id) = &this_call {
+                self.keep_retried_failure(kind, id, &failure);
+            }
             retries += 1;
             prompt = match failure {
                 // The server's parse failure says nothing the model can act
@@ -1234,6 +1276,26 @@ impl ModelCaller {
                 ),
             };
         }
+    }
+
+    /// Keep what a failed call said, for the run's trace
+    /// ([`kgraf_provider::Ledger::take_call_errors`]). The status and the
+    /// parse flag come from the provider's error kind, never from its text,
+    /// so a model's quoted "HTTP 500" in a refused answer is not a server
+    /// fault. The text is bounded; the trace scrubs it when it writes it.
+    fn keep_retried_failure(&self, kind: &str, call: &CallId, failure: &PlanError) {
+        let (status, server_parse) = match failure {
+            PlanError::Provider(e) => (e.http_status(), e.is_malformed_model_output()),
+            _ => (None, false),
+        };
+        self.ledger.note_call_error(kgraf_provider::CallError {
+            call: call.clone(),
+            agent: self.agent.clone(),
+            what: kind.to_owned(),
+            status,
+            server_parse,
+            error: kgraf_provider::bounded_error_text(&failure.to_string()),
+        });
     }
 
     /// The call and its ledger row id, which is kept on failure too, so a caller
@@ -2055,6 +2117,21 @@ mod tests {
             attempts: 1,
             task_kind: None,
         }
+    }
+
+    /// A contract with an empty write set is refused by name, with the shape
+    /// of a write; a plan whose every contract declares a file passes.
+    #[test]
+    fn a_contract_that_declares_no_writes_is_refused_by_name() {
+        let mut empty = spec("c2", &["c1"]);
+        empty.writes.clear();
+        let plan = vec![spec("c1", &[]), empty];
+        let Some(PlanError::Invalid(why)) = writeless_refusal(&plan) else {
+            panic!("refused");
+        };
+        assert!(why.starts_with("contract `c2` declares no writes"), "{why}");
+        assert!(why.contains("{\"path\":\"src/x.rs\"}"), "{why}");
+        assert!(writeless_refusal(&plan[..1]).is_none());
     }
 
     /// A contract built from a spec stores the scrubbed

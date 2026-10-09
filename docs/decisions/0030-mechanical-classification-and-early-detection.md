@@ -938,3 +938,26 @@ causes, files left alone, docstrings), `derive_interface.rs`
 the run, verbatim, in `tests/fixtures/planner-answers/tb-pypi-*.txt`: without the three rules
 they spend three asks and accept nothing, as the run did; with them, two asks and
 `i_pkg_create` accepted; with any one rule removed, three asks).
+
+## Amendment (2026-10-09): a contract that declares no writes is refused
+
+A greenfield plan was refused for a workspace member no earlier contract wrote. The planner's
+second answer kept the four contracts and their instructions (create `Cargo.toml`, create the
+`wcl-core` crate, create the `wcl` binary, add tests) and declared no writes in any of them.
+Every check this decision keys on declared writes (a listed member whose manifest comes late, a
+package the workspace does not list, a stub no contract writes, contracts sharing one file and
+one test) found nothing to judge, and the answer was accepted. A worker may change only the
+files its contract lists, so c1's worker was refused on `Cargo.toml`, asked for it, and the
+contract was held as a plan-shape error; the run ended blocked with no `Cargo.toml`.
+
+- **A contract that declares no writes is refused** (`plan::writeless_refusal`, applied to
+  every contracts answer of the planner, a split's included). The planner is asked again with
+  the contracts named and the shape of a write (`{"path":"src/x.rs"}`). With an empty write
+  scope a contract can change nothing, so no task kind needs one. A corpus plan is not judged
+  here: the user approved it as it stands, and its intake is its own.
+
+Tests: `kgraf-orchestrator` `plan.rs` `a_contract_that_declares_no_writes_is_refused_by_name`;
+`plan_intake.rs` `contracts_that_declare_no_writes_are_refused_and_asked_again` (the contracts
+of the run as kGraf's trace recorded them, `tests/fixtures/planner-answers/greenfield-writeless.txt`:
+without the rule the answer is accepted on the first ask; with it, refused once with the reason,
+and the corrected answer is accepted).
