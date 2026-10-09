@@ -1410,3 +1410,68 @@ async fn a_member_manifest_a_later_contract_writes_holds_for_a_replan() {
         outcome.report
     );
 }
+
+/// The stack a hosted run needs on the thread that polls it, held under a
+/// bound. Measured in a debug build on macOS: 1.83 MB before the run path
+/// built its large futures on the heap (`kgraf_core::heap_future`), 0.45 MB
+/// after. Rust's test threads and tokio's worker threads get 2 MiB; a Windows
+/// build overflowed it in this scenario. The run goes on a thread with 1 MiB,
+/// half of that: a change that brings back the old depth overflows here,
+/// which ends the test binary with "has overflowed its stack" and fails the
+/// run, as it would on Windows.
+#[test]
+fn a_hosted_run_fits_in_half_a_test_threads_stack() {
+    const STACK: usize = 1024 * 1024;
+    let outcome = std::thread::Builder::new()
+        .name("hosted-run-1mib".into())
+        .stack_size(STACK)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let allowing = control_with(
+                    kgraf_tools::PermissionMode::Auto,
+                    kgraf_tools::permissions::AllowSet::default()
+                        .with_programs(["mkdir", "cp"])
+                        .expect("allow"),
+                    false,
+                );
+                let (report, trace, _) =
+                    run(Worker::RunsScript, allowing, "test -f a.txt", "sf-stack").await;
+                (report.status, trace)
+            })
+        })
+        .expect("spawn")
+        .join()
+        .expect("the run's thread");
+    assert_eq!(
+        outcome.0,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{}",
+        outcome.1
+    );
+}
+
+/// The future of a prepared run is a pointer and a few fields, not the run's
+/// whole state: a caller that awaits it, or spawns it, holds kilobytes, not
+/// the 64 KB it held when the run's future was built inline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prepared_runs_future_is_small() {
+    let (_dir, mut config) = project();
+    config.routes = vec!["mine:llama3".into()];
+    config.verify = "test -f a.txt".into();
+    let host = Host::open(config)
+        .expect("open")
+        .with_route_provider("mine", Script::new(Worker::Writes))
+        .expect("a used route");
+    let prepared = host
+        .prepare(RunId::new("sf-size"), None, &mut |_| {})
+        .await
+        .expect("prepare");
+    let running = prepared.run(RunStart::Instruction("copy README.md to a.txt".into()));
+    let size = std::mem::size_of_val(&running);
+    assert!(size < 4096, "the prepared run's future is {size} bytes");
+}

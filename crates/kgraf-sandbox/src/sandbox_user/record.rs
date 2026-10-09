@@ -20,6 +20,7 @@
 //! rule kgraf-sandbox-1a2b3c4d-block-outbound
 //! closed S-1-5-21-...-1003 0xd0156 0x0 C:\ProgramData
 //! wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b
+//! dns-refused wfp-filter-name-cache-v4 WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)
 //! ```
 //!
 //! A `closed` line names a folder where setup denied the sandbox group the
@@ -28,6 +29,12 @@
 //! even after the group is gone and even after a later version of kGraf
 //! writes a different mask. Removal matches the mask and the flags exactly:
 //! it never takes off an entry wider than the one it wrote.
+//!
+//! A `dns-refused` line is not an undo entry: it names a DNS filter that
+//! Windows did not add at the last setup, with why. Setup goes on without
+//! that filter (the users, the firewall rules and the folder denies are the
+//! main confinement), and `kgraf sandbox status` reads these lines to show
+//! the gap as a failed line, never as a filter that is merely missing.
 
 use super::acl::{ACE_INHERITANCE_FLAGS, WRITE_RIGHTS};
 use super::names::is_sid_string;
@@ -91,6 +98,9 @@ pub struct Record {
     pub owner_sid: String,
     pub tag: Option<String>,
     pub entries: Vec<UndoEntry>,
+    /// The DNS filters the last setup could not add, each with why
+    /// (`dns-refused` lines). Replaced as a whole by each setup's DNS step.
+    pub dns_refused: Vec<(WfpObject, String)>,
 }
 
 impl Record {
@@ -99,6 +109,7 @@ impl Record {
             owner_sid: owner_sid.to_owned(),
             tag: tag.map(str::to_owned),
             entries: Vec::new(),
+            dns_refused: Vec::new(),
         }
     }
 
@@ -154,6 +165,9 @@ impl Record {
             out.push_str(&line);
             out.push('\n');
         }
+        for (object, why) in &self.dns_refused {
+            out.push_str(&format!("dns-refused {} {}\n", object.key(), one_line(why)));
+        }
         out
     }
 
@@ -166,6 +180,7 @@ impl Record {
         let mut owner = None;
         let mut tag = None;
         let mut entries = Vec::new();
+        let mut dns_refused = Vec::new();
         for (i, raw) in lines {
             let line = raw.trim_end();
             if line.is_empty() {
@@ -230,6 +245,16 @@ impl Record {
                         rights,
                     });
                 }
+                "dns-refused" => {
+                    let (object, why) = rest.split_once(' ').ok_or_else(bad)?;
+                    let object = WfpObject::from_key(object)
+                        .filter(|o| o.is_filter())
+                        .ok_or_else(bad)?;
+                    if why.trim().is_empty() {
+                        return Err(bad());
+                    }
+                    dns_refused.push((object, why.to_owned()));
+                }
                 k => {
                     let object = WfpObject::from_key(k).ok_or_else(bad)?;
                     let key = parse_guid(rest).ok_or_else(bad)?;
@@ -241,8 +266,17 @@ impl Record {
             owner_sid: owner.ok_or(RecordError::NoOwner)?,
             tag,
             entries,
+            dns_refused,
         })
     }
+}
+
+/// `s` on one line: a line break or other control character becomes a
+/// space, so a reason never splits a record line.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -296,6 +330,38 @@ mod tests {
             );
         }
         assert!(text.contains("wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a10\n"));
+    }
+
+    /// The DNS filters a setup could not add come back with their reasons,
+    /// and a reason with a line break stays on its own line.
+    #[test]
+    fn refused_dns_filters_round_trip_and_stay_on_one_line() {
+        let mut r = sample();
+        r.dns_refused = vec![
+            (
+                WfpObject::NameCacheFilterV4,
+                "WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)".into(),
+            ),
+            (WfpObject::NameCacheFilterV6, "two\nlines".into()),
+        ];
+        let text = r.to_text();
+        assert!(
+            text.contains(
+                "dns-refused wfp-filter-name-cache-v4 WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)\n"
+            ),
+            "{text}"
+        );
+        let back = Record::parse(&text).unwrap();
+        assert_eq!(back.entries, r.entries);
+        assert_eq!(back.dns_refused[0], r.dns_refused[0]);
+        assert_eq!(
+            back.dns_refused[1],
+            (WfpObject::NameCacheFilterV6, "two lines".to_owned())
+        );
+        // Not an undo entry: a record that holds only these lines is empty.
+        let mut only = Record::new("S-1-5-18", None);
+        only.dns_refused = r.dns_refused.clone();
+        assert!(only.is_empty());
     }
 
     #[test]
@@ -384,6 +450,11 @@ mod tests {
             "wfp-filter not-a-guid",
             "wfp-filter 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b extra",
             "wfp-callout 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b",
+            // Only a filter can be refused, and a reason is required.
+            "dns-refused wfp-provider WFP error 0x1",
+            "dns-refused wfp-filter-name-cache-v4",
+            "dns-refused wfp-filter-name-cache-v4  ",
+            "dns-refused name-cache WFP error 0x1",
         ] {
             let text = format!("{RECORD_HEADER}\nowner S-1-5-18\n{bad}\n");
             assert!(

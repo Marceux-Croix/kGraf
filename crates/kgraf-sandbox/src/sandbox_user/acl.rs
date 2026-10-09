@@ -488,9 +488,59 @@ pub fn closed_folder_of(root: &Path, loc: &Locations) -> Option<PathBuf> {
         .find(|p| p.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
 }
 
+/// `SE_DACL_AUTO_INHERIT_REQ`: asks the system to treat the list as one that
+/// takes part in automatic inheritance.
+pub const SE_DACL_AUTO_INHERIT_REQ: u16 = 0x0100;
+/// `SE_DACL_AUTO_INHERITED`: the list is set up for automatic inheritance.
+pub const SE_DACL_AUTO_INHERITED: u16 = 0x0400;
+/// `SE_DACL_PROTECTED`: the list takes nothing from its parent.
+pub const SE_DACL_PROTECTED: u16 = 0x1000;
+
+/// The control bits a lone write of a folder's list sets
+/// (`windows::secure::write_dacl`), from the bits the folder had: which bits
+/// it sets (the first value, for `SetSecurityDescriptorControl`'s bits of
+/// interest) and to what (the second).
+///
+/// The protected and auto-inherited bits are carried as they were. A folder
+/// that was auto-inherited also gets `SE_DACL_AUTO_INHERIT_REQ`: on Windows
+/// Server 2025 a list written with `SE_DACL_AUTO_INHERITED` alone through
+/// `SetKernelObjectSecurity` kept its entries and its protected bit but lost
+/// the auto-inherited bit (`0x1400` became `0x1000`, `0x0400` became `0`),
+/// which the read-back refused, and the roll-back, written the same way,
+/// could not put back either. The request bit is how a caller that is not
+/// propagating asks for the bit to be kept; that it keeps it on this path is
+/// not documented and not yet measured, so the read-back still decides. A
+/// folder that was not auto-inherited gets neither bit, as before, which
+/// Windows kept.
+pub fn lone_write_control(before: u16) -> (u16, u16) {
+    let interest = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+    let carried = before & (SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED);
+    let request = if before & SE_DACL_AUTO_INHERITED != 0 {
+        SE_DACL_AUTO_INHERIT_REQ
+    } else {
+        0
+    };
+    (interest, carried | request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two cases Windows Server 2025 showed: an auto-inherited list (with
+    /// or without protection) asks for the bit to be kept; a list without it
+    /// is written as before. No other bit is ever set.
+    #[test]
+    fn a_lone_write_asks_to_keep_the_auto_inherited_bit() {
+        let all = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+        assert_eq!(lone_write_control(0x1400), (all, 0x1500));
+        assert_eq!(lone_write_control(0x0400), (all, 0x0500));
+        assert_eq!(lone_write_control(0x1000), (all, 0x1000));
+        assert_eq!(lone_write_control(0x0000), (all, 0x0000));
+        // Other control bits of the folder (here SE_DACL_PRESENT and
+        // SE_SELF_RELATIVE) are not written.
+        assert_eq!(lone_write_control(0x8404), (all, 0x0500));
+    }
 
     const ME: &str = "S-1-5-21-1-2-3-500";
 

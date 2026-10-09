@@ -40,7 +40,7 @@ pub fn release_free_memory() {
 }
 
 #[cfg(target_os = "macos")]
-pub fn sample(except: Option<u32>) -> Option<Sample> {
+fn sample_with(except: Option<u32>, pids: &[u32]) -> Option<Sample> {
     use std::mem::size_of;
     let pid = std::process::id() as libc::pid_t;
     // SAFETY: each libproc call writes into a caller-owned, correctly sized buffer for our own
@@ -84,18 +84,7 @@ pub fn sample(except: Option<u32>) -> Option<Sample> {
         if used < 0 {
             return None;
         }
-        // Child pids: the buffer is zeroed, so the filled entries are the nonzero ones. The
-        // return value is a count on some releases and a byte size on others.
-        let mut kids = vec![0 as libc::pid_t; 4096];
-        libc::proc_listchildpids(
-            pid,
-            kids.as_mut_ptr().cast(),
-            (kids.len() * size_of::<libc::pid_t>()) as libc::c_int,
-        );
-        let children = kids
-            .iter()
-            .filter(|&&k| k > 0 && Some(k as u32) != except)
-            .count() as u64;
+        let children = count_excluding(pids, except);
         Some(Sample {
             mem_bytes: info.ri_phys_footprint,
             mem_metric: "phys_footprint",
@@ -107,8 +96,53 @@ pub fn sample(except: Option<u32>) -> Option<Sample> {
     }
 }
 
+/// Direct children of this process, in one listing. A child that is mid-spawn can appear in a
+/// listing and be gone from the next, so a caller that needs a stable answer takes one listing.
+#[cfg(target_os = "macos")]
+fn child_pids() -> Vec<u32> {
+    // The buffer is zeroed, so the filled entries are the nonzero ones. The return value is a
+    // count on some releases and a byte size on others.
+    let mut kids = vec![0 as libc::pid_t; 4096];
+    // SAFETY: the call writes at most the given byte size into the caller-owned buffer.
+    unsafe {
+        libc::proc_listchildpids(
+            std::process::id() as libc::pid_t,
+            kids.as_mut_ptr().cast(),
+            (kids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        );
+    }
+    kids.into_iter()
+        .filter(|&k| k > 0)
+        .map(|k| k as u32)
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
+fn child_pids() -> Vec<u32> {
+    let me = std::process::id();
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&p| p != me && parent_of(p) == Some(me))
+        .collect()
+}
+
+/// A reading of this process, with the children counted from one listing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn sample(except: Option<u32>) -> Option<Sample> {
+    sample_with(except, &child_pids())
+}
+
+/// The number of pids in `pids`, not counting `except`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn count_excluding(pids: &[u32], except: Option<u32>) -> u64 {
+    pids.iter().filter(|&&p| Some(p) != except).count() as u64
+}
+
+#[cfg(target_os = "linux")]
+fn sample_with(except: Option<u32>, pids: &[u32]) -> Option<Sample> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let rss_kb: u64 = status
         .lines()
@@ -120,14 +154,7 @@ pub fn sample(except: Option<u32>) -> Option<Sample> {
     // `read_dir` holds its own descriptor while it lists `/proc/self/fd`.
     let fds = (std::fs::read_dir("/proc/self/fd").ok()?.count() as u64).saturating_sub(1);
     let threads = std::fs::read_dir("/proc/self/task").ok()?.count() as u64;
-    let me = std::process::id();
-    let children = std::fs::read_dir("/proc")
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&p| Some(p) != except && p != me)
-        .filter(|&p| parent_of(p) == Some(me))
-        .count() as u64;
+    let children = count_excluding(pids, except);
     Some(Sample {
         mem_bytes: rss_kb * 1024,
         mem_metric: "rss",
@@ -177,17 +204,32 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn");
+        let known = child.id();
         let during = sample(None).expect("during");
         assert_eq!(during.fds, before.fds + 1, "{before:?} {during:?}");
-        assert_eq!(during.children, before.children + 1);
-        // The child the caller names is not counted.
-        let excluded = sample(Some(child.id())).expect("excluded");
-        assert_eq!(excluded.children, before.children);
+        // Children are checked by pid, not by total: a child mid-spawn (seen on a loaded macOS
+        // host as an extra pid beside the sleep that is gone one listing later) or any other
+        // unrelated child must not change the claim. One listing is taken, so the three
+        // readings below describe the same set.
+        let listing = child_pids();
+        assert!(listing.contains(&known), "{listing:?} lacks {known}");
+        assert_eq!(
+            count_excluding(&listing, Some(known)) + 1,
+            count_excluding(&listing, None),
+            "{listing:?}"
+        );
+        // The named child is left out of the count, and only that one.
+        let with = sample_with(None, &listing).expect("with");
+        let without = sample_with(Some(known), &listing).expect("without");
+        assert_eq!(with.children, without.children + 1);
         child.kill().expect("kill");
         child.wait().expect("wait");
         drop(file);
         let after = sample(None).expect("after");
         assert_eq!(after.fds, before.fds);
-        assert_eq!(after.children, before.children);
+        assert!(
+            !child_pids().contains(&known),
+            "a reaped child is not listed"
+        );
     }
 }

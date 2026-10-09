@@ -81,6 +81,7 @@ use crate::store::{RunFiles, RunStore, SharedGraph, StoreError};
 use crate::stub_land::{stub_left_in_place, stub_left_in_place_failure};
 use crate::trace::{DeferReason, LoopDetector, LoopKind, TraceEvent, TraceLog};
 use crate::verify::{Attempt, AttemptStatus, Verdict, Verifier, select, status_of};
+use kgraf_core::heap_future::on_heap;
 use kgraf_core::session::{InboxKind, InboxSource, InjectMode, SessionOutcome, SessionRecords};
 use kgraf_core::{AgentId, CallId, Money, NodeId, PriceTable, RunId, TokenUsage, estimate_tokens};
 use kgraf_graph::{Acquisition, LeaseRegistry, MixedAcquisition, NodeLease, WriteLease};
@@ -2271,9 +2272,11 @@ impl Orchestrator {
         self.check_plan_review()?;
         let now = self.services.clock.now_ms();
         let record = RunStateRecord::new(run, instruction, now);
-        let mut state = RunLoop::open(self, record, false).await?;
-        let planned = state.plan().await;
-        state.run_reviewed(planned).await
+        // Each on the heap: the run loop's futures are hundreds of
+        // kilobytes in a debug build (`kgraf_core::heap_future`).
+        let mut state = on_heap(|| RunLoop::open(self, record, false)).await?;
+        let planned = on_heap(|| state.plan()).await;
+        on_heap(|| state.run_reviewed(planned)).await
     }
 
     /// Run a plan the user approved, to its end. The plan is seeded into
@@ -2288,9 +2291,11 @@ impl Orchestrator {
     ) -> Result<RunReport, OrchestratorError> {
         self.check_plan_review()?;
         let record = crate::intake::seeded_record(&self, run, &plan)?;
-        let mut state = RunLoop::open(self, record, false).await?;
-        let planned = state.plan().await;
-        state.run_reviewed(planned).await
+        // Each on the heap: the run loop's futures are hundreds of
+        // kilobytes in a debug build (`kgraf_core::heap_future`).
+        let mut state = on_heap(|| RunLoop::open(self, record, false)).await?;
+        let planned = on_heap(|| state.plan()).await;
+        on_heap(|| state.run_reviewed(planned)).await
     }
 
     /// Resume a run from its record.
@@ -2308,13 +2313,13 @@ impl Orchestrator {
         if record.plan_approved.is_none() {
             self.check_plan_review()?;
         }
-        let mut state = RunLoop::open(self, record, true).await?;
+        let mut state = on_heap(|| RunLoop::open(self, record, true)).await?;
         let result = if planned {
             Ok(true)
         } else {
-            state.plan().await
+            on_heap(|| state.plan()).await
         };
-        state.run_reviewed(result).await
+        on_heap(|| state.run_reviewed(result)).await
     }
 }
 
@@ -4129,11 +4134,11 @@ impl RunLoop {
         planned: Result<bool, OrchestratorError>,
     ) -> Result<RunReport, OrchestratorError> {
         match planned {
-            Ok(_) => self.run().await,
+            Ok(_) => on_heap(|| self.run()).await,
             Err(e) => {
                 // A resumed run can hold notes an earlier process left
                 // waiting: reported as at any run's end (decision 0067).
-                self.report_undelivered_on_error().await;
+                on_heap(|| self.report_undelivered_on_error()).await;
                 // The planning error is the one the caller needs: a failure to
                 // release is printed, never returned in its place.
                 if let Err(release) = self.shutdown() {
@@ -4143,7 +4148,7 @@ impl RunLoop {
                     );
                 }
                 // A run that never got a plan is still measured.
-                if let Err(analytics) = self.close_frugality(true).await {
+                if let Err(analytics) = on_heap(|| self.close_frugality(true)).await {
                     return Err(OrchestratorError::WithAnalyticsFailure {
                         error: Box::new(e),
                         analytics: analytics.to_string(),
@@ -4170,11 +4175,13 @@ impl RunLoop {
     /// admission gate and its `MachineGate` are process-wide, so a leak here
     /// would shrink every later run in this process.
     async fn run(mut self) -> Result<RunReport, OrchestratorError> {
-        if let Err(e) = self.run_loop().await {
+        // On the heap, as every large call on this path
+        // (`kgraf_core::heap_future`).
+        if let Err(e) = on_heap(|| self.run_loop()).await {
             self.release_on_error();
-            self.report_undelivered_on_error().await;
+            on_heap(|| self.report_undelivered_on_error()).await;
             // A run that failed after planning is still measured.
-            if let Err(analytics) = self.close_frugality(false).await {
+            if let Err(analytics) = on_heap(|| self.close_frugality(false)).await {
                 return Err(OrchestratorError::WithAnalyticsFailure {
                     error: Box::new(e),
                     analytics: analytics.to_string(),
@@ -4200,7 +4207,7 @@ impl RunLoop {
         self.store.checkpoint_wal();
         // Analytics: a failure is reported with the run, never allowed to
         // turn a finished run into an error.
-        let analytics = self.analytics_outcome().await;
+        let analytics = on_heap(|| self.analytics_outcome()).await;
         let mut report = self.report();
         report.analytics_error = analytics;
         Ok(report)
@@ -4268,9 +4275,9 @@ impl RunLoop {
     async fn run_loop(&mut self) -> Result<(), OrchestratorError> {
         loop {
             if !self.stopping {
-                self.dispatch_ready().await?;
+                on_heap(|| self.dispatch_ready()).await?;
             }
-            self.deliver_reports().await?;
+            on_heap(|| self.deliver_reports()).await?;
             self.flush_coord().await?;
             // Decision 0067: question deadlines, the next connection
             // judgment batch, and inbox rows that came due or wait for an
@@ -4291,7 +4298,9 @@ impl RunLoop {
                     // A plan its interface checks held before any work
                     // started goes back to the planner once before the run
                     // ends on the hold.
-                    if matches!(status, RunStatus::Blocked { .. }) && self.replan().await? {
+                    if matches!(status, RunStatus::Blocked { .. })
+                        && on_heap(|| self.replan()).await?
+                    {
                         continue;
                     }
                     self.record.status = status;
@@ -4310,8 +4319,11 @@ impl RunLoop {
                     }
                 }
             };
+            // Every handler on the heap: each one's future is built in its
+            // own short frame, not in this loop's poll frame
+            // (`kgraf_core::heap_future`).
             match msg {
-                Some(LoopMsg::Finished(f)) => self.on_finished(*f).await?,
+                Some(LoopMsg::Finished(f)) => on_heap(|| self.on_finished(*f)).await?,
                 Some(LoopMsg::Verified {
                     contract,
                     worker,
@@ -4320,28 +4332,32 @@ impl RunLoop {
                     review,
                     producer_challenge,
                 }) => {
-                    self.on_verified(
-                        contract,
-                        worker,
-                        verdict,
-                        infrastructure,
-                        review,
-                        producer_challenge,
-                    )
+                    on_heap(|| {
+                        self.on_verified(
+                            contract,
+                            worker,
+                            verdict,
+                            infrastructure,
+                            review,
+                            producer_challenge,
+                        )
+                    })
                     .await?
                 }
                 Some(LoopMsg::LeaseLost {
                     holder,
                     path,
                     generation,
-                }) => self.on_lease_lost(holder, path, generation).await?,
-                Some(LoopMsg::Control(c)) => self.on_control(c).await?,
-                Some(LoopMsg::ContractWork(w)) => self.on_contract_work(*w).await?,
-                Some(LoopMsg::Inbound(m, port)) => self.on_inbound(m, port).await?,
-                Some(LoopMsg::GateFinished(done)) => self.on_gate_finished(*done).await?,
-                Some(LoopMsg::Session(w)) => self.on_session_work(*w).await?,
-                Some(LoopMsg::Subagent(m)) => self.on_subagent(*m).await?,
-                Some(LoopMsg::Speculated(done)) => self.on_speculated(*done).await?,
+                }) => on_heap(|| self.on_lease_lost(holder, path, generation)).await?,
+                Some(LoopMsg::Control(c)) => on_heap(|| self.on_control(c)).await?,
+                Some(LoopMsg::ContractWork(w)) => on_heap(|| self.on_contract_work(*w)).await?,
+                Some(LoopMsg::Inbound(m, port)) => on_heap(|| self.on_inbound(m, port)).await?,
+                Some(LoopMsg::GateFinished(done)) => {
+                    on_heap(|| self.on_gate_finished(*done)).await?
+                }
+                Some(LoopMsg::Session(w)) => on_heap(|| self.on_session_work(*w)).await?,
+                Some(LoopMsg::Subagent(m)) => on_heap(|| self.on_subagent(*m)).await?,
+                Some(LoopMsg::Speculated(done)) => on_heap(|| self.on_speculated(*done)).await?,
                 Some(LoopMsg::PortError(e)) => {
                     let at = self.now();
                     self.trace(TraceEvent::Deferred {
@@ -4356,8 +4372,8 @@ impl RunLoop {
             }
             let now = self.now();
             self.s.admission.budget().renew_due(now);
-            self.subagent_tick().await?;
-            self.pump_permissions().await?;
+            on_heap(|| self.subagent_tick()).await?;
+            on_heap(|| self.pump_permissions()).await?;
         }
         // The run's own end: `Completed` claims every verified
         // contract's commit is on `kgraf/<run>`. Everything upstream of here
@@ -4367,7 +4383,7 @@ impl RunLoop {
         // provider's own ground truth right before it goes out -- catching a
         // branch that moved after the fact (a force-reset, a bug upstream, a
         // provider that lied) rather than trusting bookkeeping alone.
-        self.verify_completion_landed().await
+        on_heap(|| self.verify_completion_landed()).await
     }
 
     /// Send a plan that its interfaces' pre-dispatch checks held before any
@@ -6410,7 +6426,8 @@ impl RunLoop {
     // ------------------------------------------------------------- completion
 
     async fn on_finished(&mut self, f: Finished) -> Result<(), OrchestratorError> {
-        let Some(f) = self.hold_for_subagents(f).await? else {
+        // Large calls on the heap (`kgraf_core::heap_future`).
+        let Some(f) = on_heap(|| self.hold_for_subagents(f)).await? else {
             return Ok(());
         };
         // Its subagents' reports it never reached a boundary for are known
@@ -6471,7 +6488,7 @@ impl RunLoop {
         Arc::make_mut(&mut self.seeded).extend(f.result.calls.iter().cloned());
         Arc::make_mut(&mut self.seeded).extend(tool_calls);
         if let Some(o) = overrun {
-            self.on_overrun(o).await?;
+            on_heap(|| self.on_overrun(o)).await?;
         }
         flight.cancels.remove(&f.worker);
         // A user stop of one attempt (decision 0067, point 2) frees that
@@ -6589,9 +6606,9 @@ impl RunLoop {
             now,
         )
         .await?;
-        self.observe_route_health(&f.contract, &f.worker, &route_name, &f.result, now)
+        on_heap(|| self.observe_route_health(&f.contract, &f.worker, &route_name, &f.result, now))
             .await?;
-        self.trace_spend().await?;
+        on_heap(|| self.trace_spend()).await?;
         let notices: Vec<&kgraf_runtime::CompactionNotice> = f
             .result
             .compaction
@@ -6599,15 +6616,13 @@ impl RunLoop {
             .chain(&f.result.later_compactions)
             .collect();
         if !notices.is_empty() {
-            self.record_compactions(&contract, &f.worker, &notices)
-                .await?;
+            on_heap(|| self.record_compactions(&contract, &f.worker, &notices)).await?;
         }
         if let Some(blocks) = &f.result.round_blocks {
             // One miss per worker: a hand-back or a stop-point compaction
             // counted it already.
             let counted = handed_back || compacted_at_stop;
-            self.record_checkpoints(&contract, &f.worker, blocks, counted, now)
-                .await?;
+            on_heap(|| self.record_checkpoints(&contract, &f.worker, blocks, counted, now)).await?;
         }
 
         // Loop shapes.
@@ -6666,7 +6681,7 @@ impl RunLoop {
         let mut verify_held = false;
         if f.merged.is_none() && self.take_shortfall(&f.contract, &f.worker, &mut flight) {
             if !self.verify_before_hold(&f.contract, &f.result) {
-                return self.finish_attempt(contract, flight).await;
+                return on_heap(|| self.finish_attempt(contract, flight)).await;
             }
             if let Some(i) = idx {
                 flight.attempts[i].status = AttemptStatus::Success;
@@ -6675,7 +6690,7 @@ impl RunLoop {
             verify_held = true;
         }
         if f.merged.is_none() && self.take_shortfall_stuck(&f.contract, &f.worker, &mut flight) {
-            return self.finish_attempt(contract, flight).await;
+            return on_heap(|| self.finish_attempt(contract, flight)).await;
         }
         // Merged before the kill: verified by the merge that already happened.
         if let Some(commit) = &f.merged {
@@ -6726,7 +6741,7 @@ impl RunLoop {
                     }
                 }
             }
-            return self.finish_attempt(contract, flight).await;
+            return on_heap(|| self.finish_attempt(contract, flight)).await;
         }
         // A worker stopped by the stall check or out of rounds may have
         // delivered before it stopped: its tree goes to the same verification
@@ -6765,8 +6780,8 @@ impl RunLoop {
                     // write the model's: only the second is a tally.
                     let withdrawn = flight.lease_lost;
                     self.in_flight.insert(f.contract.clone(), flight);
-                    return self
-                        .on_verified(
+                    return on_heap(|| {
+                        self.on_verified(
                             f.contract.clone(),
                             f.worker.clone(),
                             Verdict::Fail { reason },
@@ -6774,7 +6789,8 @@ impl RunLoop {
                             None,
                             None,
                         )
-                        .await;
+                    })
+                    .await;
                 }
                 // Numbered and saved before it starts: a verification of this
                 // contract after a resume or a voided pass takes the next number.
@@ -6824,7 +6840,7 @@ impl RunLoop {
                 // attempt spawn above: a panic anywhere in verification must
                 // still reach the loop as a `Verified` message, or the
                 // contract's slot in `in_flight` never clears.
-                let verify_task = tokio::spawn(async move {
+                let verify_task = tokio::spawn(on_heap(|| async move {
                     let mut infrastructure = false;
                     let mut verdict = match verifier
                         .verify_among(&c, &workspace, &result, &unmerged)
@@ -6997,7 +7013,7 @@ impl RunLoop {
                         None
                     };
                     (verdict, infrastructure, review, producer_challenge)
-                });
+                }));
                 tokio::spawn(async move {
                     let (verdict, infrastructure, review, producer_challenge) =
                         match verify_task.await {

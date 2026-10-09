@@ -1,6 +1,6 @@
 //! The DNS filter of the sandbox user setup (decision 0097): the Windows
-//! Filtering Platform (WFP) filters that make the DNS Client service refuse
-//! name lookups from the users whose network is blocked.
+//! Filtering Platform (WFP) filters meant to make the DNS Client service
+//! refuse name lookups from the users whose network is blocked.
 //!
 //! A name lookup does not leave the calling process as a packet. The process
 //! asks the DNS Client service (Dnscache) over local RPC, and the service
@@ -18,7 +18,8 @@
 //!   interface and `FWPM_CONDITION_REMOTE_USER_TOKEN`. That layer is reached
 //!   only for a remote DCE/RPC caller, never for a local ALPC call, so it
 //!   cannot cover the local path; it is kept for a caller that reaches the
-//!   interface over a network transport.
+//!   interface over a network transport, and only where Windows takes it
+//!   without an error.
 //!
 //! ```text
 //!   offline or slot user process          Dnscache (NETWORK SERVICE)
@@ -30,18 +31,39 @@
 //!                                          remote token match -> block]
 //! ```
 //!
-//! **Not known without a Windows run.** Whether a block at the name
-//! resolution cache layers makes the lookup fail, or only keeps the service
-//! from using and filling its cache while the query still leaves the machine.
-//! Microsoft documents the layer in one sentence, "This filtering layer
-//! allows for querying the names recently resolved by the system", and says
-//! nothing about the effect of a block there. `kgraf sandbox selfcheck` is
-//! the only proof: it judges the filters by their effect, never by their
-//! presence.
+//! **Windows may refuse the name resolution cache filter.** On Windows
+//! Server 2025 (24H2, build 26100) `FwpmFilterAdd0` refused the IPv4 filter
+//! with `FWP_E_OUT_OF_BOUNDS` (0x80320028), after the RPC filter had been
+//! taken in the same transaction (the abort then rolled the RPC filter back
+//! too). openai/codex records the same refusal for "ordinary static filter
+//! shapes" at these layers and leaves them out. What is known about the
+//! cause: the RPC filter took the same descriptor through a condition of the
+//! same data type (`FWP_SECURITY_DESCRIPTOR_TYPE`) in the same sublayer, so
+//! neither the descriptor's bytes nor the sublayer weight explains it; every
+//! filter leaves its own weight to the engine (`FWP_EMPTY`); and the engine
+//! has distinct codes for a condition the layer does not have
+//! (`FWP_E_CONDITION_NOT_FOUND`), a value of the wrong type
+//! (`FWP_E_TYPE_MISMATCH`), an action (`FWP_E_INVALID_ACTION_TYPE`) and a
+//! weight (`FWP_E_INVALID_WEIGHT`), and returned none of them. Whether the
+//! layer refuses the user condition, the block action, or every static
+//! filter is not known: when a layer refuses kGraf's filter, setup adds two
+//! probe filters in a transaction it always aborts and reports what they
+//! show ([`probe_reading`]).
+//!
+//! A refused filter does not stop setup: each filter is added in its own
+//! transaction, setup goes on without the refused one, records it with its
+//! error, and ends with a notice that DNS is not confined on this machine;
+//! `kgraf sandbox status` shows it as a failed line. A filter that is added
+//! is still not proved: whether a block at the name resolution cache layers
+//! makes the lookup fail, or only keeps the service from its cache while the
+//! query still leaves the machine, is not documented. Microsoft describes
+//! the layer in one sentence, "This filtering layer allows for querying the
+//! names recently resolved by the system". `kgraf sandbox selfcheck` judges
+//! the filters by their effect, never by their presence.
 //!
 //! Everything here is platform-neutral: the keys, the names, the matching
-//! security descriptor and the interface identifier are tested on every
-//! host. The WFP calls are in `windows::wfp`.
+//! security descriptor, the interface identifier and the reading of a
+//! refusal are tested on every host. The WFP calls are in `windows::wfp`.
 //!
 //! **Keys.** WFP names its objects by GUID. The provider, sublayer and the
 //! three filter keys are each derived from the owner's SID and the tag, as
@@ -309,6 +331,72 @@ pub fn guid_bytes(v: u128) -> [u8; 16] {
     out
 }
 
+/// `FWP_E_OUT_OF_BOUNDS`: "The value is out of bounds." What
+/// `FwpmFilterAdd0` returned for the name resolution cache filter on Windows
+/// Server 2025.
+pub const FWP_E_OUT_OF_BOUNDS: u32 = 0x8032_0028;
+
+/// A WFP status as text: its number, and its name where it is one a DNS
+/// filter has met or is likely to meet (values as `windows-sys` gives them).
+pub fn wfp_code_text(code: u32) -> String {
+    let name = match code {
+        FWP_E_OUT_OF_BOUNDS => Some("FWP_E_OUT_OF_BOUNDS"),
+        0x8032_0002 => Some("FWP_E_CONDITION_NOT_FOUND"),
+        0x8032_0004 => Some("FWP_E_LAYER_NOT_FOUND"),
+        0x8032_0009 => Some("FWP_E_ALREADY_EXISTS"),
+        0x8032_000A => Some("FWP_E_IN_USE"),
+        0x8032_0014 => Some("FWP_E_INCOMPATIBLE_LAYER"),
+        0x8032_001E => Some("FWP_E_INVALID_FLAGS"),
+        0x8032_0024 => Some("FWP_E_INVALID_ACTION_TYPE"),
+        0x8032_0025 => Some("FWP_E_INVALID_WEIGHT"),
+        0x8032_0027 => Some("FWP_E_TYPE_MISMATCH"),
+        0x8007_0005 => Some("E_ACCESSDENIED"),
+        _ => None,
+    };
+    match name {
+        Some(n) => format!("WFP error 0x{code:08X} ({n})"),
+        None => format!("WFP error 0x{code:08X}"),
+    }
+}
+
+/// What two probe filters at a layer that refused kGraf's filter showed.
+/// Each is a permit, which changes no traffic, added in a transaction that
+/// is always aborted, so neither ever takes effect. `Err` carries the status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerProbe {
+    /// A permit with no condition, at the same layer and sublayer, with the
+    /// same weight as kGraf's filter.
+    pub bare_permit: Result<(), u32>,
+    /// A permit with kGraf's user condition (`FWPM_CONDITION_ALE_USER_ID`,
+    /// the same descriptor), otherwise as `bare_permit`.
+    pub user_permit: Result<(), u32>,
+}
+
+/// What a [`LayerProbe`] says about the cause of a refusal, in words for the
+/// setup's notice and the undo record. Each answer names only what the two
+/// probes separate: the layer itself, the user condition, or the rest of
+/// kGraf's filter (the block action and its flags).
+pub fn probe_reading(p: &LayerProbe) -> String {
+    match (p.bare_permit, p.user_permit) {
+        (Err(code), _) => format!(
+            "probe: a permit with no condition at the same layer was refused too ({}), so \
+             this layer takes no static filter of this shape and the user condition is not \
+             the cause",
+            wfp_code_text(code)
+        ),
+        (Ok(()), Err(code)) => format!(
+            "probe: a permit with no condition at the same layer was taken and a permit with \
+             the same user condition was refused ({}), so the cause is the user condition \
+             (FWPM_CONDITION_ALE_USER_ID with this descriptor) at this layer",
+            wfp_code_text(code)
+        ),
+        (Ok(()), Ok(())) => "probe: permits with and without the same user condition were \
+                             taken at the same layer, so the cause is the block action or the \
+                             flags of kGraf's filter"
+            .to_owned(),
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MatchError {
     #[error("the DNS filter needs at least one user to match")]
@@ -385,8 +473,8 @@ pub fn description(object: WfpObject) -> &'static str {
         WfpObject::Sublayer => "Holds kGraf's sandbox filters.",
         WfpObject::RpcFilter => {
             "Blocks calls to the DNS Client service's RPC interface from kGraf's offline \
-             and worker slot sandbox users. This layer sees a remote caller only, so the \
-             name resolution cache filters cover a lookup on this machine."
+             and worker slot sandbox users. This layer sees a remote caller only; it does \
+             not cover a lookup on this machine."
         }
         WfpObject::NameCacheFilterV4 => {
             "Blocks IPv4 name resolution for kGraf's offline and worker slot sandbox users, \
@@ -499,6 +587,48 @@ mod tests {
         assert!(state.disabled.is_subset(&state.present));
         assert_eq!(WfpState::default(), WfpState::default());
         assert!(WfpState::default().present.is_empty());
+    }
+
+    /// Each probe result names one cause, and the refusal's code is written
+    /// with its name.
+    #[test]
+    fn a_refusal_is_read_from_the_two_probes() {
+        assert_eq!(
+            wfp_code_text(FWP_E_OUT_OF_BOUNDS),
+            "WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)"
+        );
+        assert_eq!(wfp_code_text(0x8032_00FF), "WFP error 0x803200FF");
+        let layer = probe_reading(&LayerProbe {
+            bare_permit: Err(FWP_E_OUT_OF_BOUNDS),
+            user_permit: Err(FWP_E_OUT_OF_BOUNDS),
+        });
+        assert!(layer.contains("no static filter"), "{layer}");
+        assert!(layer.contains("not the cause"), "{layer}");
+        assert!(layer.contains("FWP_E_OUT_OF_BOUNDS"), "{layer}");
+        // The bare probe decides first: its refusal says the layer, whatever
+        // the user probe did.
+        assert_eq!(
+            probe_reading(&LayerProbe {
+                bare_permit: Err(FWP_E_OUT_OF_BOUNDS),
+                user_permit: Ok(()),
+            }),
+            layer
+        );
+        let condition = probe_reading(&LayerProbe {
+            bare_permit: Ok(()),
+            user_permit: Err(FWP_E_OUT_OF_BOUNDS),
+        });
+        assert!(
+            condition.contains("FWPM_CONDITION_ALE_USER_ID"),
+            "{condition}"
+        );
+        let action = probe_reading(&LayerProbe {
+            bare_permit: Ok(()),
+            user_permit: Ok(()),
+        });
+        assert!(action.contains("block action"), "{action}");
+        assert_ne!(layer, condition);
+        assert_ne!(condition, action);
     }
 
     #[test]

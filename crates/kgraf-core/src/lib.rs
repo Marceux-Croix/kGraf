@@ -8,6 +8,7 @@ pub mod budget;
 pub mod child_run;
 pub mod cost;
 pub mod flock;
+pub mod heap_future;
 pub mod host_git;
 pub mod ids;
 pub mod legacy;

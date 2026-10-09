@@ -1,15 +1,28 @@
 //! The DNS filter's Windows Filtering Platform calls ([`super::super::wfp`]
 //! holds the keys, names and descriptor, tested on every host).
 //!
-//! Setup adds five persistent objects in one transaction: kGraf's provider,
-//! its sublayer and three filters (the name resolution cache layers for IPv4
-//! and IPv6, and the user-mode RPC layer). A re-run deletes each filter and
-//! the sublayer and adds them again, the filters from the current list of
-//! blocked users, so a setup with more slots refreshes them and a machine set
-//! up by an earlier version picks up the current sublayer weight. Removal
-//! deletes each listed key and treats "not found" as done. Changing objects needs administrator rights; reading them
-//! can too, and a read that is refused is reported as unreadable, never as
-//! absent.
+//! Setup adds up to five persistent objects: kGraf's provider, its sublayer
+//! and three filters (the name resolution cache layers for IPv4 and IPv6, and
+//! the user-mode RPC layer). The provider and the sublayer go in one
+//! transaction, which also deletes every earlier copy of the filters; each
+//! filter then goes in a transaction of its own. A filter Windows refuses is
+//! reported with its status and does not take the others with it: on Windows
+//! Server 2025 the name resolution cache layer refused its filter with
+//! `FWP_E_OUT_OF_BOUNDS`, and with one transaction for everything that
+//! refusal also rolled back the RPC filter added before it. A re-run deletes
+//! each filter and the sublayer and adds them again, the filters from the
+//! current list of blocked users, so a setup with more slots refreshes them
+//! and a machine set up by an earlier version picks up the current sublayer
+//! weight. Removal deletes each listed key and treats "not found" as done, so
+//! a record that lists a filter Windows never added removes the rest.
+//! Changing objects needs administrator rights; reading them can too, and a
+//! read that is refused is reported as unreadable, never as absent.
+//!
+//! When a name resolution cache layer refuses kGraf's filter, setup adds two
+//! probe filters at that layer, each a permit in a transaction it always
+//! aborts, so neither ever takes effect: one with no condition and one with
+//! kGraf's user condition. What they show is reported with the refusal
+//! ([`probe_reading`]).
 //!
 //! **Layers and conditions.** From Microsoft's "Filtering conditions
 //! available at each filtering layer" (Fwpmu.h, ms.date 05/02/2024):
@@ -49,17 +62,18 @@ use windows_sys::Win32::Foundation::{
     FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE, HLOCAL, LocalFree,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_ACTION_BLOCK, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_VALUE0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_REMOTE_USER_TOKEN,
-    FWPM_CONDITION_RPC_IF_UUID, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0,
-    FWPM_LAYER_NAME_RESOLUTION_CACHE_V4, FWPM_LAYER_NAME_RESOLUTION_CACHE_V6, FWPM_LAYER_RPC_UM,
-    FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT,
-    FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
-    FwpmFilterGetByKey0, FwpmFreeMemory0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
-    FwpmProviderGetByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmSubLayerGetByKey0,
-    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL,
+    FWP_SECURITY_DESCRIPTOR_TYPE, FWP_VALUE0, FWPM_ACTION0, FWPM_ACTION0_0,
+    FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_REMOTE_USER_TOKEN, FWPM_CONDITION_RPC_IF_UUID,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+    FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0, FWPM_LAYER_NAME_RESOLUTION_CACHE_V4,
+    FWPM_LAYER_NAME_RESOLUTION_CACHE_V6, FWPM_LAYER_RPC_UM, FWPM_PROVIDER_FLAG_PERSISTENT,
+    FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
+    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFilterGetByKey0, FwpmFreeMemory0,
+    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmProviderGetByKey0, FwpmSubLayerAdd0,
+    FwpmSubLayerDeleteByKey0, FwpmSubLayerGetByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+    FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
@@ -67,9 +81,10 @@ use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::core::GUID;
 
 use super::super::names::OwnerNames;
+use super::super::plan::FilterOutcome;
 use super::super::wfp::{
-    DNS_RESOLVER_INTERFACE, SUBLAYER_WEIGHT, WfpKeys, WfpObject, WfpState, description,
-    display_name, filter_is_disabled, guid_bytes, match_sddl,
+    DNS_RESOLVER_INTERFACE, LayerProbe, SUBLAYER_WEIGHT, WfpKeys, WfpObject, WfpState, description,
+    display_name, filter_is_disabled, guid_bytes, match_sddl, probe_reading, wfp_code_text,
 };
 use super::wide;
 use crate::error::SandboxError;
@@ -325,26 +340,32 @@ pub fn existing(keys: &WfpKeys) -> Result<WfpState, String> {
     Ok(state)
 }
 
-/// The layer of one filter, and the step name an error carries.
-fn layer_of(object: WfpObject) -> (GUID, &'static str) {
+/// The layer of one filter.
+fn layer_of(object: WfpObject) -> GUID {
     match object {
-        WfpObject::NameCacheFilterV4 => (
-            FWPM_LAYER_NAME_RESOLUTION_CACHE_V4,
-            "add the DNS filter (name resolution cache, IPv4)",
-        ),
-        WfpObject::NameCacheFilterV6 => (
-            FWPM_LAYER_NAME_RESOLUTION_CACHE_V6,
-            "add the DNS filter (name resolution cache, IPv6)",
-        ),
+        WfpObject::NameCacheFilterV4 => FWPM_LAYER_NAME_RESOLUTION_CACHE_V4,
+        WfpObject::NameCacheFilterV6 => FWPM_LAYER_NAME_RESOLUTION_CACHE_V6,
         // The provider and the sublayer are not filters; `put` only ever
         // passes a filter here, and the RPC layer is the safe fallback
         // because its two conditions never match a local lookup.
-        _ => (FWPM_LAYER_RPC_UM, "add the DNS filter (user-mode RPC)"),
+        _ => FWPM_LAYER_RPC_UM,
     }
 }
 
-/// Add one of kGraf's filters: a block, with the user conditions its layer
-/// takes, inside the open transaction of `engine`.
+/// What [`add_filter`] adds: kGraf's own block, or one of the two probes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// The filter kGraf keeps: a persistent block with the layer's user
+    /// conditions, its action right cleared.
+    Block,
+    /// A probe: a permit with no condition, not persistent.
+    BarePermit,
+    /// A probe: a permit with the layer's user condition, not persistent.
+    UserPermit,
+}
+
+/// Add one filter of `shape` for `object`'s layer inside the open
+/// transaction of `engine`. Returns the raw status, 0 on success.
 ///
 /// Every pointer the filter holds points at a local of this function, which
 /// lives until `FwpmFilterAdd0` has returned and copied the data.
@@ -354,8 +375,9 @@ fn add_filter(
     keys: &WfpKeys,
     object: WfpObject,
     descriptor: &Descriptor,
-) -> Result<(), SandboxError> {
-    let (layer, step) = layer_of(object);
+    shape: Shape,
+) -> u32 {
+    let layer = layer_of(object);
     let mut provider_key = guid(keys.provider);
     let mut interface = FWP_BYTE_ARRAY16 {
         byteArray16: guid_bytes(DNS_RESOLVER_INTERFACE),
@@ -375,8 +397,9 @@ fn add_filter(
     // The RPC layer needs the interface as well, so that the filter does not
     // block every remote RPC call by a blocked user; the name resolution
     // cache layers have no interface and take the local user alone.
-    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = match object {
-        WfpObject::RpcFilter => vec![
+    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = match (shape, object) {
+        (Shape::BarePermit, _) => Vec::new(),
+        (_, WfpObject::RpcFilter) => vec![
             FWPM_FILTER_CONDITION0 {
                 fieldKey: FWPM_CONDITION_RPC_IF_UUID,
                 matchType: FWP_MATCH_EQUAL,
@@ -393,25 +416,40 @@ fn add_filter(
     };
     let filter_name = wide(&display_name(names, object));
     let filter_text = wide(description(object));
+    let (key, flags, action) = match shape {
+        // Persistent: it stays across restarts until `remove`. The action
+        // right is cleared, so no lower-weight sublayer can permit over the
+        // block (only a veto callout can).
+        Shape::Block => (
+            guid(keys.get(object)),
+            FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+            FWP_ACTION_BLOCK,
+        ),
+        // A zero key asks the engine for one. Not persistent, a permit, and
+        // in a transaction that is always aborted: a probe never takes
+        // effect.
+        Shape::BarePermit | Shape::UserPermit => (guid(0), 0, FWP_ACTION_PERMIT),
+    };
     let filter = FWPM_FILTER0 {
-        filterKey: guid(keys.get(object)),
+        filterKey: key,
         displayData: FWPM_DISPLAY_DATA0 {
             name: filter_name.as_ptr().cast_mut(),
             description: filter_text.as_ptr().cast_mut(),
         },
-        // Persistent: it stays across restarts until `remove`. The action
-        // right is cleared, so no lower-weight sublayer can permit over the
-        // block (only a veto callout can).
-        flags: FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        flags,
         providerKey: &raw mut provider_key,
         providerData: empty_blob(),
         layerKey: layer,
         subLayerKey: guid(keys.sublayer),
         weight: empty_value(),
         numFilterConditions: conditions.len() as u32,
-        filterCondition: conditions.as_mut_ptr(),
+        filterCondition: if conditions.is_empty() {
+            null_mut()
+        } else {
+            conditions.as_mut_ptr()
+        },
         action: FWPM_ACTION0 {
-            r#type: FWP_ACTION_BLOCK,
+            r#type: action,
             Anonymous: FWPM_ACTION0_0 {
                 filterType: guid(0),
             },
@@ -424,14 +462,57 @@ fn add_filter(
     let mut id = 0u64;
     // SAFETY: a valid engine handle; every pointer in `filter` points at a
     // local that lives until after the call.
-    let code = unsafe { FwpmFilterAdd0(engine.handle, &filter, null_mut(), &mut id) };
-    check(code, step, &[])
+    unsafe { FwpmFilterAdd0(engine.handle, &filter, null_mut(), &mut id) }
 }
 
-/// Add kGraf's provider and sublayer where missing, and add each DNS filter
-/// for the users `sids`, replacing any earlier copy. One transaction: a
-/// failure leaves the machine as it was.
-pub fn put(names: &OwnerNames, sids: &[&str]) -> Result<(), SandboxError> {
+/// Add one probe filter of `shape` for `object`'s layer in a transaction of
+/// its own, then abort that transaction whatever the add returned.
+fn probe_once(
+    engine: &Engine,
+    names: &OwnerNames,
+    keys: &WfpKeys,
+    object: WfpObject,
+    descriptor: &Descriptor,
+    shape: Shape,
+) -> Result<(), u32> {
+    // A transaction that does not begin probes nothing; its status is the
+    // answer, which says so.
+    let txn = engine.begin().map_err(|_| u32::MAX)?;
+    let code = add_filter(engine, names, keys, object, descriptor, shape);
+    // Never committed: the drop aborts it.
+    drop(txn);
+    if code == 0 { Ok(()) } else { Err(code) }
+}
+
+/// Why a name resolution cache layer refused kGraf's filter, as far as the
+/// two probes can tell ([`LayerProbe`]).
+fn probe_layer(
+    engine: &Engine,
+    names: &OwnerNames,
+    keys: &WfpKeys,
+    object: WfpObject,
+    descriptor: &Descriptor,
+) -> LayerProbe {
+    LayerProbe {
+        bare_permit: probe_once(engine, names, keys, object, descriptor, Shape::BarePermit),
+        user_permit: probe_once(engine, names, keys, object, descriptor, Shape::UserPermit),
+    }
+}
+
+/// Add kGraf's provider and sublayer where missing, then each DNS filter for
+/// the users `sids`, replacing any earlier copy, and say what happened to
+/// each filter.
+///
+/// The provider, the sublayer and the deletion of every earlier filter go in
+/// one transaction; each filter is then added in a transaction of its own,
+/// so a filter Windows refuses is reported ([`FilterOutcome::NotAdded`],
+/// with the status and what the probes showed) and the others still go in.
+/// `Err` only when the descriptor, the engine or that first transaction
+/// fails; then no filter was added.
+pub fn put(
+    names: &OwnerNames,
+    sids: &[&str],
+) -> Result<Vec<(WfpObject, FilterOutcome)>, SandboxError> {
     let keys = WfpKeys::derive(names);
     let sddl = match_sddl(sids).map_err(|e| SandboxError::PlatformSetup {
         step: "build the DNS filter's user match descriptor",
@@ -466,7 +547,7 @@ pub fn put(names: &OwnerNames, sids: &[&str]) -> Result<(), SandboxError> {
     // Every filter goes first: a sublayer an object still names cannot be
     // deleted, and the sublayer is deleted and added again below so that a
     // machine set up by an earlier version picks up the current weight. Each
-    // filter is added again from the current user list at the end.
+    // filter is added again from the current user list afterwards.
     for (_, key) in keys.filters() {
         let filter_key = guid(key);
         // SAFETY: a valid engine handle and key.
@@ -506,11 +587,32 @@ pub fn put(names: &OwnerNames, sids: &[&str]) -> Result<(), SandboxError> {
         "add kGraf's WFP sublayer",
         &[FWP_E_ALREADY_EXISTS as u32],
     )?;
+    txn.commit()?;
 
+    let mut outcomes = Vec::new();
     for (object, _) in keys.filters() {
-        add_filter(&engine, names, &keys, object, &descriptor)?;
+        let outcome = match engine.begin() {
+            Err(e) => FilterOutcome::NotAdded(e.to_string()),
+            Ok(txn) => match add_filter(&engine, names, &keys, object, &descriptor, Shape::Block) {
+                0 => match txn.commit() {
+                    Ok(()) => FilterOutcome::Added,
+                    Err(e) => FilterOutcome::NotAdded(e.to_string()),
+                },
+                code => {
+                    drop(txn);
+                    let refused = wfp_code_text(code);
+                    if object == WfpObject::RpcFilter {
+                        FilterOutcome::NotAdded(refused)
+                    } else {
+                        let probe = probe_layer(&engine, names, &keys, object, &descriptor);
+                        FilterOutcome::NotAdded(format!("{refused}; {}", probe_reading(&probe)))
+                    }
+                }
+            },
+        };
+        outcomes.push((object, outcome));
     }
-    txn.commit()
+    Ok(outcomes)
 }
 
 /// Delete the object `key` of kind `object`. `Ok(false)` when it was already

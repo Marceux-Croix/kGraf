@@ -1330,7 +1330,9 @@ on the next Windows run.
   with `MAXIMUM_ALLOWED` on a folder that administrators control fully is given every
   right, `DELETE` and the data rights among them, and those rights take part in sharing
   checks. Windows and its services hold those three folders open without
-  `FILE_SHARE_DELETE` (a current folder, a change notification), and the elevated step held
+  `FILE_SHARE_DELETE` (a change notification or a service's own handle; a current folder
+  was named here too, and a later run measured that a current folder alone does not do it,
+  see the amendment on that run), and the elevated step held
   ProgramData itself the same way while it ran. The handle now asks for
   `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES`, none of which takes part in a sharing
   check, with full sharing; the link check runs on the same handle as before. That handle is
@@ -1344,8 +1346,8 @@ on the next Windows run.
   list and bits are written back, read back again, and the step fails with what it found.
   The write needs none of the inheritance work the documentation warns about, because the
   one entry it adds or takes off carries no inheritance flag. Windows tests:
-  `a_folder_held_open_without_delete_sharing_is_closed_and_opened_again` (a folder held as
-  a current folder is, and as the elevated step holds the record's folders),
+  `a_folder_held_open_without_delete_sharing_is_closed_and_opened_again` (a folder held by
+  a handle without delete sharing, as the elevated step holds the record's folders),
   `a_protected_folder_keeps_its_protection_and_its_list`, and the existing
   `closing_a_folder_changes_no_child_and_keeps_the_protection`.
 - **ProgramData is checked, not held.** The record's base folder is opened for its check
@@ -1402,6 +1404,13 @@ on the next Windows run.
 
 
 ## Amendment (2026-10-09): a current folder in a granted tree no longer stops a grant or a revoke
+
+Correction (2026-10-09): this amendment's premise, that Windows holds every process's current
+folder open without `FILE_SHARE_DELETE`, is wrong. A later Windows run measured that a folder
+`ping.exe` has as its current folder still opens with `MAXIMUM_ALLOWED`. Error 32 needs a
+handle held without `FILE_SHARE_DELETE`, such as the ones Windows and its services held on
+`C:\` and `C:\Windows\Tasks`. The behavior changes below stand; their tests now create the
+condition with such a handle (the amendment on that run).
 
 The worktree grant, deny and removal passes opened every folder and file with
 `MAXIMUM_ALLOWED`, because a handle opened that way is the one documented switch that keeps
@@ -1464,8 +1473,9 @@ What the next Windows run must show, in `1-sandbox-lib.txt`:
   inheritable entry written on the held folder reaches neither the file nor the folder below
   it. A failure here means `SetKernelObjectSecurity` propagated, and the second handle must
   not be used.
-- `a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree` passes: a grant and a
-  revoke with `ping.exe` holding the root and a folder below it as current folders, no child
+- `a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree` (since renamed
+  `a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing`) passes: a grant
+  and a revoke with the root and a folder below it held, no child
   blocked, the held folder holding the pass's one entry and no inherited copy, and no object
   naming the user after the revoke.
 - `a_revoke_through_a_lone_write_drops_the_inherited_copy` passes.
@@ -1474,3 +1484,138 @@ What the next Windows run must show, in `1-sandbox-lib.txt`:
   result.
 - `MEASURE maximum-allowed-suppresses-propagation: suppressed true` still holds, and the
   existing propagation tests still pass.
+
+## Amendment (2026-10-09): what the second Windows run of setup found
+
+A hosted Windows Server 2025 run (Datacenter 24H2, build 26100.33438) ran setup again. Nothing
+below has run on Windows since; each bullet says what is proved on the host and what stays
+unproved. Each bullet is one behavior change.
+
+- **A DNS filter Windows refuses no longer stops setup.** `kgraf sandbox setup --slots 4`
+  failed at step `dns-filter`: `FwpmFilterAdd0` refused the filter on
+  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` with 0x80320028 (`FWP_E_OUT_OF_BOUNDS`).
+  openai/codex leaves these filters out for the same refusal. Because setup stopped there, no password was stored, so selfcheck ran on the
+  token sandbox and the sandbox user phase stopped at its gate: the DNS step cost the whole
+  phase. The gap is now kept and reported as a failed line, never a pass. Setup now adds the provider and the sublayer in one transaction (which also deletes
+  every earlier copy of the filters) and each filter in a transaction of its own. A filter
+  Windows refuses is sent to the owner's process as a `gap` line with its name, key and
+  Windows' status, the step's outcome is `partial`, the undo record keeps a `dns-refused`
+  line per refused filter with the reason, and setup stores the passwords and ends with a
+  notice that DNS is not confined on this machine (`plan::dns_step_report`,
+  `plan::dns_notice`). A failure of the provider or sublayer transaction marks every filter
+  not added, the same way. `kgraf sandbox status` shows a filter the record lists as refused
+  as `FAILED` with the reason, not `MISSING`, and when the refused filters are the only gap
+  it ends with "DNS is not confined on this machine" instead of asking for setup again, and
+  exits non-zero. Selfcheck is unchanged: its `dns:` line still judges the effect and can
+  only say `not confined` or `not proved` on such a machine. The gaps text keeps DNS and now
+  names the refusal. Removal needed no change of plan: every WFP key stays in the undo list,
+  and a key Windows never added is removed as already gone; a host test pins a partial set,
+  and a removal clears the `dns-refused` lines. The self-test parser reads `FAILED` as a
+  problem. Host tests: `a_refused_dns_filter_makes_the_step_partial_not_failed`,
+  `status_shows_a_refused_dns_filter_as_failed`, `remove_takes_off_a_partial_dns_filter_set`,
+  `refused_dns_filters_round_trip_and_stay_on_one_line`, `a_failed_status_line_is_a_problem`,
+  `a_refusal_is_read_from_the_two_probes`.
+- **What the RPC filter did.** It was added first, and `FwpmFilterAdd0` returned success for
+  it inside the transaction; the IPv4 refusal then aborted the transaction, which rolled the
+  RPC filter back, so status listed it `MISSING`. With a transaction per filter it is kept
+  when it adds without an error. It covers remote callers of the DNS Client interface only:
+  `FWPM_LAYER_RPC_UM` is not reached by a local ALPC call, so it confines nothing on this
+  machine, and status says so on its line.
+- **What the refusal says about its cause, and what stays open.** The RPC filter took the
+  same security descriptor through a condition of the same data type
+  (`FWP_SECURITY_DESCRIPTOR_TYPE`, `FWPM_CONDITION_REMOTE_USER_TOKEN`) in the same sublayer,
+  so neither the descriptor's bytes nor the sublayer weight explains it; every filter leaves
+  its own weight to the engine (`FWP_EMPTY`). The engine has distinct statuses for a
+  condition the layer does not have (`FWP_E_CONDITION_NOT_FOUND`), a value of the wrong type
+  (`FWP_E_TYPE_MISMATCH`), an action (`FWP_E_INVALID_ACTION_TYPE`) and a weight
+  (`FWP_E_INVALID_WEIGHT`), and returned none of them; codex reports the refusal for
+  "ordinary static filter shapes" at these layers, which points at the layer rather than at
+  kGraf's condition. That is an inference, not a measurement. So the next run measures it:
+  when a name resolution cache layer refuses kGraf's filter, setup adds two probe filters at
+  that layer, each a non-persistent permit in a transaction it always aborts (one with no
+  condition, one with kGraf's `FWPM_CONDITION_ALE_USER_ID` condition), and the refusal's
+  reason carries what they show (`wfp::probe_reading`): the layer refuses any static filter
+  of this shape, or the user condition is the cause, or the block action and its flags are.
+  Options for a later Windows run, none shipped as working: if the user condition is the
+  cause, `FWPM_CONDITION_ALE_APP_ID`, `FWPM_CONDITION_IP_REMOTE_ADDRESS` and
+  `FWPM_CONDITION_PEER_NAME` are the other conditions Microsoft lists at these layers, and
+  none names a user, so none alone fits a per-user filter; if the layer refuses every static filter, the remaining routes are a
+  callout driver (out of scope for kGraf), the RPC filter on `ncalrpc` (unproved, because
+  the RPC layer is documented for remote calls), or the gap kept as now.
+- **The hosted run's stack.** `kgraf-host`
+  `tests::shortfall::auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow`
+  overflowed its stack on Windows. Measured on the host (debug, macOS, a probe allocator
+  that records the deepest stack seen on the test thread): the hosted run path took
+  1,829,360 bytes before this change and 1,804,736 bytes at the previous Windows run's
+  commit, against 2 MiB for a test thread. Nothing large was added between the two: about 22 KB of frame growth spread
+  over the chain, the most in `RunLoop::on_finished` (+6 KB) and `RunLoop::run_loop`
+  (+5 KB), on a path that already used 86% of 2 MiB on macOS. That it crossed the limit on
+  Windows, and not on macOS, fits larger frames there; Windows frames were not measured. The
+  cause is structural: in a build without optimizations each `async
+  fn` builds the future of every call it awaits in a stack slot of its own poll frame, so
+  frames grow with the futures they await and add up along the chain (frames measured from
+  the binary's prologues: `PreparedRun::run_inner` 359 KB, `RunLoop::on_finished` 242 KB,
+  `RunLoop::run_loop` 203 KB, `Orchestrator::start` 166 KB, and six more). The fix moves the
+  large futures off the poll frames: `kgraf_core::heap_future::on_heap` builds a future in
+  its own short-lived frame and returns it boxed, and the hosted run path uses it at every
+  large await (`PreparedRun::run` and `run_inner`, `Orchestrator::start`, `start_from_plan`
+  and `resume`, the plan review, `run_after`, `run`, every handler of `run_loop`, the large
+  calls of `on_finished`, and the verifier task it spawns). The same path now takes 449,128
+  bytes; the test passes with a 512 KiB stack, where it overflowed at 1.75 MiB before. The
+  stack size was not raised. The same path runs outside tests: the desktop shell polls the
+  run on tokio worker threads of 2 MiB, so a debug build of the shell could overflow the
+  same way; the CLI's `orchestrate` runs it on the main thread, which has 8 MB on Windows
+  (`/STACK`). Release builds have far smaller frames. Tests:
+  `a_hosted_run_fits_in_half_a_test_threads_stack` (the scenario on a 1 MiB thread; reverted,
+  it overflows) and `a_prepared_runs_future_is_small` (reverted, the future is 64,160
+  bytes), and `heap_future`'s own test.
+- **Correction: a process's current folder does not cause error 32.** The amendment before
+  this one, and the one on the first Windows run's setup, named a process's current folder
+  as a holder that makes a `MAXIMUM_ALLOWED` open fail with `ERROR_SHARING_VIOLATION`. This
+  run measured otherwise: the three propagation tests started `ping.exe` with its current folder
+  in the tree, and the folder still opened with `MAXIMUM_ALLOWED` ("the condition under test
+  is absent"); a test in `confined.rs` had already found the same for `ping` and `cmd`. The
+  error needs a handle held without `FILE_SHARE_DELETE`, as Windows and its services held
+  `C:\` and `C:\Windows\Tasks` in the first Windows run of setup. The tests now open that handle themselves
+  (`CreateFileW`, `FILE_FLAG_BACKUP_SEMANTICS`, list and traverse, read and write shared,
+  delete not; sharing is checked per handle, not per process) and still refuse to pass when a
+  `MAXIMUM_ALLOWED` open of the held folder does not fail with 32. The grant test is renamed
+  `a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing`. The code comments
+  that named a current folder are corrected. The second open, the lone write and the
+  removal behavior are unchanged.
+- **A lone write asks Windows to keep the auto-inherited bit.**
+  `closing_a_folder_changes_no_child_and_keeps_the_protection` and
+  `a_protected_folder_keeps_its_protection_and_its_list` failed with "did not keep the list
+  as written (protection bits 0x0400 before, 0x0000 after; entries as written)" and "0x1400
+  before, 0x1000 after". `SetKernelObjectSecurity` kept the entries and the protected bit and
+  dropped `SE_DACL_AUTO_INHERITED`; the read-back refused it, as designed, and the roll-back,
+  written the same way, could not put the bit back. Both tests had run `icacls` first, which
+  sets that bit; the tests on a bare temporary folder and setup's own folders passed. A
+  folder whose list had the bit is now written with `SE_DACL_AUTO_INHERIT_REQ` as well
+  (`acl::lone_write_control`, host test `a_lone_write_asks_to_keep_the_auto_inherited_bit`);
+  a folder without it is written as before. That the request bit keeps the bit on this path
+  is not documented and not measured; the read-back and the roll-back still decide, and a
+  folder that loses the bit still fails the write loud.
+
+What the next Windows run must show:
+
+- Setup: exit 0 on a machine that refuses the name resolution cache filter, a `refused` line
+  per refused filter whose reason carries `FWP_E_OUT_OF_BOUNDS` and a `probe:` reading, the
+  step line `partial`, a received password for every user, and the closing notice that DNS
+  is not confined. The probe reading decides which option above is worth a try.
+- Status (c): `present` for the RPC filter if Windows took it, `FAILED` with the reason for
+  each refused filter, every other line `present`, and the closing sentence about DNS.
+- Selfcheck (d): backend `Windows sandbox user`, every line but `dns:` a pass, and `dns:
+  not confined` or `dns: not proved`; the phase then runs the re-run (e) as a DNS-only
+  failure.
+- Remove (f): every WFP key removed or already gone, and status after it all `MISSING`.
+- `a_lone_write_on_a_held_folder_changes_no_child`,
+  `a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing` and
+  `a_revoke_through_a_lone_write_drops_the_inherited_copy` pass, with no "condition under
+  test is absent" panic.
+- `closing_a_folder_changes_no_child_and_keeps_the_protection` and
+  `a_protected_folder_keeps_its_protection_and_its_list` pass. A failure that still reports
+  the auto-inherited bit dropped means the request bit does not keep it on this path.
+- `tests::shortfall::auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_allow`
+  and `a_hosted_run_fits_in_half_a_test_threads_stack` pass, and no `kgraf_host` binary ends
+  with "has overflowed its stack".

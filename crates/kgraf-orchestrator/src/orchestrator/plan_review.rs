@@ -52,14 +52,16 @@ impl RunLoop {
     ) -> Result<RunReport, OrchestratorError> {
         let desk = self.perms.desk.clone();
         let planned = match planned {
-            Ok(true) => self.review_plan().await,
+            Ok(true) => on_heap(|| self.review_plan()).await,
             other => other,
         };
         let planned = match planned {
-            Ok(p) => self.open_permissions().await.map(|()| p),
+            Ok(p) => on_heap(|| self.open_permissions()).await.map(|()| p),
             Err(e) => Err(e),
         };
-        let report = self.run_after(planned).await;
+        // On the heap (`kgraf_core::heap_future`); `run_after` takes the
+        // loop by value, so the desk is cloned first.
+        let report = on_heap(|| self.run_after(planned)).await;
         desk.close();
         report
     }

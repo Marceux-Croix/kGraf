@@ -1713,12 +1713,18 @@ What `setup` creates, for the Windows user who runs it:
 - four Windows Firewall block rules for the offline user: everything off this
   machine, inbound from off this machine, local TCP except kGraf's proxy ports
   47100 to 47131, and local UDP;
-- a DNS filter for the users the firewall rules block (the offline user and each worker
-  slot's user without the network, below): a Windows Filtering Platform (WFP) filter
-  that makes the DNS Client service refuse their name lookups. A lookup goes through
+- DNS filters for the users the firewall rules block (the offline user and each worker
+  slot's user without the network, below): Windows Filtering Platform (WFP) filters
+  meant to make the DNS Client service refuse their name lookups. A lookup goes through
   that service, which sends it as its own account, so the firewall rules
-  do not see it. The filter, its provider and its sublayer are named "kGraf sandbox"
-  and stay after a restart. The online users and your own account are not filtered;
+  do not see it. There are three: one on each name resolution cache layer (IPv4 and
+  IPv6), which see a lookup on this machine, and one on the user-mode RPC layer, which
+  sees a remote caller only. The filters, their provider and their sublayer are named
+  "kGraf sandbox" and stay after a restart. The online users and your own account are
+  not filtered. Windows can refuse a filter: some versions refuse the name resolution
+  cache filter (Windows Server 2025 answers `FWP_E_OUT_OF_BOUNDS`). Setup then goes on
+  without it, names each refused filter with Windows' error, and ends with a notice
+  that DNS is not confined on this machine;
 - an undo record under `%ProgramData%\kGraf\sandbox\`.
 
 The users' passwords are random, 40 characters long, and stored only for your
@@ -1749,13 +1755,16 @@ also revokes the folder permissions that kGraf added for the users, and deletes 
 filter, its sublayer and its provider by the keys the undo record lists. It does not touch
 other WFP filters.
 
-`kgraf sandbox status` shows the DNS filter on one line, with its key:
+`kgraf sandbox status` shows each DNS filter on its own line, with its layer and key:
 
 ```
-  present  DNS filter <key> (WFP; the DNS Client service refuses the offline users; `kgraf sandbox selfcheck` proves the effect)
+  present  DNS filter on the user-mode RPC layer <key> (remote callers of the DNS Client service only; a lookup on this machine does not pass this layer)
+  FAILED   DNS filter on the name resolution cache layer, IPv4 <key> (meant to refuse the offline users' lookups; `kgraf sandbox selfcheck` proves the effect): Windows refused it at setup: WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS); ...
 ```
 
-`MISSING` there means setup has not added it; run `kgraf sandbox setup` again. `unknown`
+`FAILED` means Windows refused that filter at setup: DNS is not confined on this machine,
+and running setup again does not change that; status then ends with a non-zero exit.
+`MISSING` means setup has not added it; run `kgraf sandbox setup` again. `unknown`
 means Windows did not let your account read WFP filters; run `status` as an administrator
 to see it. `present` says only that the filter exists. Only `kgraf sandbox selfcheck`
 shows that it works (below). Until a selfcheck on your machine prints `dns: confined`,

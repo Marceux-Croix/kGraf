@@ -15,14 +15,14 @@ use super::super::handshake::{Event, Message, Receiver, StepOutcome, new_nonce, 
 use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
-    Action, CredentialCheck, Credentials, Observed, RemoveAction, StatusReport, StepId,
-    check_passwords, elevated_params, failure_leaves, plan_remove, plan_setup, removal_outcome,
-    stale_closed_entries, status_report, undo_key,
+    Action, CredentialCheck, Credentials, DnsStepReport, FilterOutcome, Observed, RemoveAction,
+    StatusReport, StepId, check_passwords, dns_step_report, elevated_params, failure_leaves,
+    plan_remove, plan_setup, removal_outcome, stale_closed_entries, status_report, undo_key,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
 use super::super::slots::roots_in_text;
 use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
-use super::super::wfp::{WfpKeys, filter_users};
+use super::super::wfp::{WfpKeys, WfpObject, filter_users};
 use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure, wfp};
 use crate::error::SandboxError;
 
@@ -301,11 +301,13 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
     };
     for step in &steps {
         let key = step.id.key();
-        let outcome = match step.action {
+        let mut outcome = match step.action {
             Action::Create => StepOutcome::Created,
             Action::Update => StepOutcome::Updated,
             Action::Verify => StepOutcome::Verified,
         };
+        // What the DNS filter step did with each filter, once it ran.
+        let mut dns: Option<DnsStepReport> = None;
         let done: Result<(), SandboxError> = match step.id {
             StepId::CheckFirewall => Ok(()),
             StepId::User(role) => {
@@ -353,9 +355,20 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                     .and_then(|spec| firewall::put(&spec))
             }),
             StepId::CloseFolders => close_folders(names, &observed, &mut record, &path),
-            StepId::DnsFilter => sids_of(&filter_users(names)).and_then(|sids| {
+            // A filter Windows refuses does not fail the step: setup goes on
+            // with the users, the firewall rules and the folder denies, and
+            // the refusal is reported and recorded ([`dns_step_report`]).
+            StepId::DnsFilter => sids_of(&filter_users(names)).map(|sids| {
                 let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
-                wfp::put(names, &refs)
+                let results = wfp::put(names, &refs).unwrap_or_else(|e| {
+                    // The provider or the sublayer could not be put in place,
+                    // so no filter was added.
+                    WfpObject::FILTERS
+                        .into_iter()
+                        .map(|o| (o, FilterOutcome::NotAdded(e.to_string())))
+                        .collect()
+                });
+                dns = Some(dns_step_report(step.action, &results));
             }),
             StepId::Record => Ok(()),
         };
@@ -372,6 +385,20 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
         })?;
         for entry in &step.undo {
             record.add(entry.clone());
+        }
+        if let Some(report) = dns {
+            // Every key is still in the undo list: removal treats a key
+            // Windows never added as already gone.
+            for (object, why) in &report.refused {
+                if !send(Message::Gap {
+                    key: object.key().to_owned(),
+                    message: why.clone(),
+                }) {
+                    return Err(fail("pipe", &"the user's process stopped listening"));
+                }
+            }
+            record.dns_refused = report.refused;
+            outcome = report.outcome;
         }
         write_record(&path, &record).map_err(|e| fail("record", &e))?;
         if !send(Message::Step { key, outcome }) {
@@ -400,6 +427,9 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
         Ok(None) => return Ok(()),
         Err(e) => return Err(fail("record", &e)),
     };
+    // What the last setup could not add says nothing once the filters are
+    // being removed.
+    record.dns_refused.clear();
     let observed = observe(names, true).map_err(|e| fail("observe", &e))?;
     let steps = plan_remove(names, &record, &observed, &accounts::sid_resolves)
         .map_err(|e| fail("plan", &e))?;
@@ -574,13 +604,32 @@ fn sids_of(users: &[String]) -> Result<Vec<String>, SandboxError> {
 
 /// `kgraf sandbox setup`: create or refresh the sandbox users and rules, then
 /// store their passwords for this user at `store`.
+///
+/// Returns the DNS filters Windows did not add, each with why: setup goes on
+/// without them, and the caller ends with
+/// [`super::super::plan::dns_notice`].
 pub fn setup(
     names: &OwnerNames,
     launch: &Launch<'_>,
     store: &Path,
     on_event: &mut dyn FnMut(&Event),
-) -> Result<(), SandboxError> {
+) -> Result<Vec<(WfpObject, String)>, SandboxError> {
     let receiver = drive(names, launch, ElevatedAction::Setup, on_event)?;
+    let gaps = receiver
+        .gaps()
+        .iter()
+        .map(|(key, why)| {
+            WfpObject::from_key(key)
+                .filter(|o| o.is_filter())
+                .map(|o| (o, why.clone()))
+                .ok_or_else(|| {
+                    setup_error(
+                        "read the setup pipe",
+                        format!("the elevated step reported a gap kGraf does not know: {key}"),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let passwords = receiver
         .into_passwords()
         .map_err(|e| setup_error("receive the sandbox passwords", e))?;
@@ -609,7 +658,8 @@ pub fn setup(
     }
     let tmp = store.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| setup_error("store the passwords", e))?;
-    std::fs::rename(&tmp, store).map_err(|e| setup_error("store the passwords", e))
+    std::fs::rename(&tmp, store).map_err(|e| setup_error("store the passwords", e))?;
+    Ok(gaps)
 }
 
 /// `kgraf sandbox remove`: undo what the record lists, then delete the stored

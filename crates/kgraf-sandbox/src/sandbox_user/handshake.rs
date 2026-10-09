@@ -7,6 +7,8 @@
 //! ```text
 //! kgraf-sandbox-pipe 1 <nonce>        first: the nonce from the command line
 //! step <key> <outcome>                each step that ran
+//! note <key> <message>                left alone, with why; the run goes on
+//! gap <key> <message>                 a part Windows refused; the run goes on
 //! fail <key> <message>                the step that failed; nothing follows
 //! password <role> <password>          setup only, one per user
 //! end                                 last, after success
@@ -49,6 +51,9 @@ pub enum StepOutcome {
     Verified,
     Removed,
     AlreadyGone,
+    /// The step ran and part of it was refused; the `gap` lines before it
+    /// say which part and why.
+    Partial,
 }
 
 impl StepOutcome {
@@ -59,6 +64,7 @@ impl StepOutcome {
             StepOutcome::Verified => "verified",
             StepOutcome::Removed => "removed",
             StepOutcome::AlreadyGone => "already-gone",
+            StepOutcome::Partial => "partial",
         }
     }
 
@@ -69,6 +75,7 @@ impl StepOutcome {
             StepOutcome::Verified,
             StepOutcome::Removed,
             StepOutcome::AlreadyGone,
+            StepOutcome::Partial,
         ]
         .into_iter()
         .find(|o| o.word() == w)
@@ -94,6 +101,13 @@ pub enum Message {
     /// run goes on: a removal that cannot undo one entry still undoes the
     /// rest, and the entry stays in the undo record.
     Note {
+        key: String,
+        message: String,
+    },
+    /// A part of a step that Windows refused (a DNS filter), with why. The
+    /// run goes on without it, and the owner's process reports it as a gap
+    /// at the end ([`Receiver::gaps`]).
+    Gap {
         key: String,
         message: String,
     },
@@ -244,6 +258,9 @@ impl Message {
             Message::Note { key, message } => {
                 format!("note {} {}\n", escape_key(key), one_line(message))
             }
+            Message::Gap { key, message } => {
+                format!("gap {} {}\n", escape_key(key), one_line(message))
+            }
             Message::Fail { key, message } => {
                 format!("fail {} {}\n", escape_key(key), one_line(message))
             }
@@ -282,6 +299,10 @@ impl Message {
                 outcome: StepOutcome::from_word(word).ok_or(HandshakeError::Malformed)?,
             }),
             ("note", Some(key), message) => Ok(Message::Note {
+                key: unescape_key(key).ok_or(HandshakeError::Malformed)?,
+                message: message.unwrap_or_default().to_owned(),
+            }),
+            ("gap", Some(key), message) => Ok(Message::Gap {
                 key: unescape_key(key).ok_or(HandshakeError::Malformed)?,
                 message: message.unwrap_or_default().to_owned(),
             }),
@@ -413,6 +434,8 @@ impl<R: Read> Iterator for SecretLines<R> {
 pub struct Receiver {
     state: ReceiverState,
     passwords: Vec<(Role, Password)>,
+    /// Each part a step reported as refused ([`Message::Gap`]), in order.
+    gaps: Vec<(String, String)>,
     /// The name of each line after the greeting that did not parse
     /// ([`unparsed_name`]), in order.
     unparsed: Vec<String>,
@@ -441,6 +464,11 @@ pub enum Event {
         key: String,
         message: String,
     },
+    /// Refused by Windows, with why; the run goes on without it.
+    Gap {
+        key: String,
+        message: String,
+    },
     Failed {
         key: String,
         message: String,
@@ -465,7 +493,7 @@ pub fn unparsed_name(line: &str) -> String {
     let mut words = line.splitn(3, ' ');
     let kind = words.next().unwrap_or_default();
     match kind {
-        "step" | "note" | "fail" => {
+        "step" | "note" | "gap" | "fail" => {
             let key = one_line(words.next().unwrap_or_default());
             let mut end = key.len().min(MAX_KEY);
             while !key.is_char_boundary(end) {
@@ -510,6 +538,10 @@ impl Receiver {
             }
             (S::Steps, Message::Step { key, outcome }) => Ok(Event::Step { key, outcome }),
             (S::Steps, Message::Note { key, message }) => Ok(Event::Note { key, message }),
+            (S::Steps, Message::Gap { key, message }) => {
+                self.gaps.push((key.clone(), message.clone()));
+                Ok(Event::Gap { key, message })
+            }
             (S::Steps | S::Passwords, Message::Fail { key, message }) => {
                 self.state = S::Failed;
                 Ok(Event::Failed { key, message })
@@ -542,6 +574,11 @@ impl Receiver {
     /// run with any is a failed run, whatever else it reported.
     pub fn unparsed(&self) -> &[String] {
         &self.unparsed
+    }
+
+    /// Each part a step reported as refused, by key, with why.
+    pub fn gaps(&self) -> &[(String, String)] {
+        &self.gaps
     }
 
     /// The passwords, once the run finished.
@@ -928,6 +965,7 @@ mod tests {
             StepOutcome::Verified,
             StepOutcome::Removed,
             StepOutcome::AlreadyGone,
+            StepOutcome::Partial,
         ];
         for key in &keys {
             for outcome in outcomes {
@@ -955,6 +993,33 @@ mod tests {
                 "{line:?}"
             );
         }
+        // Every DNS filter Windows can refuse reaches the owner as a gap,
+        // with its reason on one line, and the receiver keeps each.
+        for object in super::super::wfp::WfpObject::FILTERS {
+            let line = Message::Gap {
+                key: object.key().to_owned(),
+                message: "WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS);\r\nprobe: x".to_owned(),
+            }
+            .encode();
+            assert_eq!(
+                r.take(&line, &nonce).unwrap(),
+                Event::Gap {
+                    key: object.key().to_owned(),
+                    message: "WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS);  probe: x".to_owned(),
+                },
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            r.gaps()
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<&str>>(),
+            super::super::wfp::WfpObject::FILTERS
+                .iter()
+                .map(|o| o.key())
+                .collect::<Vec<&str>>()
+        );
         for role in n.roles() {
             let line = Message::Password {
                 role,

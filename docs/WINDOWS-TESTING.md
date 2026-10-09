@@ -136,8 +136,8 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | Step | Command | What it checks |
 |---|---|---|
 | (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
-| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the three DNS filters, with no tag. The output lists a received password for every one of these users. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines included. Every stored password logs on. |
+| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the three DNS filters, with no tag. The output lists a received password for every one of these users. A DNS filter Windows refuses does not stop setup: a `refused` line names it with Windows' error and a `probe:` reading, the DNS step's line says `partial`, and setup exits 0 with a closing notice that DNS is not confined on this machine. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines included, except a DNS filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
 | (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. Any other failure stops the phase: step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
@@ -225,9 +225,17 @@ What the phase collects about the DNS filter, and what to read in the report:
   A `dns: not proved` line names the status the probe got: a timeout, a status the check
   does not know, or output cut off before the probe's `KGRAF-DNS-END` line. Send that
   status back; it decides whether the next change is a longer wait or another layer.
-- The three DNS filter lines of status (c) and of status after removal (f): `present`,
-  then `MISSING`. There is one line per filter, each naming its layer (the user-mode RPC
-  layer, and the name resolution cache layer for IPv4 and for IPv6) and its own key.
+- The three DNS filter lines of status (c) and of status after removal (f): `present`
+  (or `FAILED`, for a filter Windows refused at setup), then `MISSING`. There is one line
+  per filter, each naming its layer (the user-mode RPC layer, and the name resolution cache
+  layer for IPv4 and for IPv6) and its own key.
+- For each refused filter, the `refused` line of setup (b). Its reason carries Windows'
+  status (Windows Server 2025 answered `FWP_E_OUT_OF_BOUNDS` for the IPv4 name resolution
+  cache filter) and, for a name resolution cache layer, a `probe:` reading: setup added two
+  permit filters at that layer, one with no condition and one with kGraf's user condition,
+  each in a transaction it aborted, and the reading says which of them Windows took. It
+  tells whether the layer refuses any static filter, the user condition, or the block
+  action. Send the line whole; it decides what the next change to the DNS filter is.
 - The test binary `dns_windows`, in the baseline (each test returns at once, because no
   sandbox user is set up) and in the re-run (e). In the re-run it checks each filter's
   `netsh wfp show filters` entry (name, layer `FWPM_LAYER_RPC_UM`,
@@ -373,15 +381,25 @@ process environment.
      any note that names a file a grant left alone: a build that writes such a file in
      place fails with an access error.
    - The tests `a_lone_write_on_a_held_folder_changes_no_child`,
-     `a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree` and
-     `a_revoke_through_a_lone_write_drops_the_inherited_copy` start `ping.exe` with its
-     current folder inside the tree, which Windows holds open without delete sharing. Each
+     `a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing` and
+     `a_revoke_through_a_lone_write_drops_the_inherited_copy` open a folder of the tree
+     themselves with a handle that does not share delete (`CreateFileW`,
+     `FILE_FLAG_BACKUP_SEMANTICS`), as other programs held `C:\` and `C:\Windows\Tasks`.
+     A process's current folder does not do this: on Windows Server 2025 a folder that
+     `ping.exe` had as its current folder still opened with `MAXIMUM_ALLOWED`. Each
      first checks that an open with `MAXIMUM_ALLOWED` is refused there with os error 32;
      a panic that says "the condition under test is absent" means this build does not
      refuse it, and the other results say nothing. Otherwise the first says whether the
      write that replaces the refused open changes no child, the second whether a grant
-     and a revoke succeed with a current folder at the root and one below it, and the
-     third whether a revoke on such a folder also drops the entry it had inherited. A
+     and a revoke succeed with the root and a folder below it held, and the
+     third whether a revoke on such a folder also drops the entry it had inherited.
+   - The tests `closing_a_folder_changes_no_child_and_keeps_the_protection` and
+     `a_protected_folder_keeps_its_protection_and_its_list` write a folder's list alone and
+     read it back. On Windows Server 2025 both failed with "protection bits 0x0400 before,
+     0x0000 after" and "0x1400 before, 0x1000 after": the write dropped the
+     auto-inherited bit. The write now also sets `SE_DACL_AUTO_INHERIT_REQ` for a folder
+     that had the bit. A pass says that keeps it; the same failure says it does not, and
+     the step stays refused with the old list written back where Windows allows it. A
      failed precondition in the third ("the folder holds an inherited copy") means a
      folder written by the grant pass took in no inherited entry on this build; send
      the line.
@@ -919,7 +937,8 @@ cargo test -p kgraf-sandbox --test dns_windows -- --test-threads=1 --nocapture 2
 
 What to expect:
 
-1. `wfp-kgraf.txt` shows three filters, each with the action block. One is on the layer
+1. `wfp-kgraf.txt` shows three filters, each with the action block, less any filter
+   setup reported as refused (a `refused` line in its output, `FAILED` in status). One is on the layer
    `FWPM_LAYER_RPC_UM`, with two conditions: the RPC interface
    `45776b01-5956-4485-9f80-f428f7d60129` and the caller's token. One is on
    `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` and one on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`,
@@ -929,7 +948,10 @@ What to expect:
    whether any filter carries `FWPM_FILTER_FLAG_DISABLED`, decide what the next change is.
 2. Three status lines start with `present  DNS filter on`, one per layer. A line that says
    `WRONG` with "the Base Filtering Engine has it disabled" means the filter exists and
-   does not run.
+   does not run. A line that says `FAILED` names a filter Windows refused at setup, with
+   its error and the probe reading: DNS is not confined on that machine, and step 3 and
+   the offline lookup of `dns_windows` are expected to fail there. The filter's netsh
+   check in `dns_windows` fails too, with "netsh does not list the DNS filter".
 3. `dns-cache.txt` lists one `kgraf-probe-...` name: the one your own process looked up.
    A second name means the DNS Client service looked the sandbox user's name up: the
    filter does not work. No name at all means the cache does not keep "does not exist"

@@ -177,7 +177,8 @@ pub trait Exec {
 /// One line of `kgraf sandbox status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StatusLine {
-    /// `present`, `MISSING`, `WRONG` or `unknown`.
+    /// `present`, `MISSING`, `WRONG`, `FAILED` or `unknown`. `FAILED` is a
+    /// part Windows refused at setup, such as a DNS filter.
     pub word: String,
     pub item: String,
 }
@@ -194,9 +195,11 @@ pub fn parse_status(out: &str) -> Vec<StatusLine> {
         .filter_map(|l| {
             let t = l.strip_prefix("  ")?;
             let (word, item) = t.split_once(' ')?;
-            matches!(word, "present" | "MISSING" | "WRONG" | "unknown").then(|| StatusLine {
-                word: word.to_owned(),
-                item: item.trim().to_owned(),
+            matches!(word, "present" | "MISSING" | "WRONG" | "FAILED" | "unknown").then(|| {
+                StatusLine {
+                    word: word.to_owned(),
+                    item: item.trim().to_owned(),
+                }
             })
         })
         .collect()
@@ -228,7 +231,7 @@ pub fn check_ready(out: &str, code: Option<i32>) -> StatusCheck {
     }
     for l in &lines {
         match l.word.as_str() {
-            "MISSING" | "WRONG" => c.problems.push(format!("{} {}", l.word, l.item)),
+            "MISSING" | "WRONG" | "FAILED" => c.problems.push(format!("{} {}", l.word, l.item)),
             "unknown" => c.unknown.push(l.item.clone()),
             _ => {}
         }
@@ -1100,6 +1103,28 @@ mod tests {
         assert!(check_gone(STATUS_GONE).ok);
         assert!(!check_gone(STATUS_OK).ok);
         assert!(!check_gone("").ok);
+    }
+
+    /// A DNS filter Windows refused at setup is a `FAILED` status line: a
+    /// problem after setup, never read past as an unknown word, and a line
+    /// that is not `MISSING` after a removal.
+    #[test]
+    fn a_failed_status_line_is_a_problem() {
+        let failed = format!(
+            "{STATUS_OK}\n  FAILED   DNS filter on the name resolution cache layer, IPv4 x: \
+             Windows refused it at setup"
+        );
+        let lines = parse_status(&failed);
+        assert!(lines.iter().any(|l| l.word == "FAILED"), "{lines:?}");
+        let c = check_ready(&failed, Some(1));
+        assert!(
+            !c.ok
+                && c.problems
+                    .iter()
+                    .any(|p| p.starts_with("FAILED DNS filter")),
+            "{c:?}"
+        );
+        assert!(!check_gone(&failed).ok);
     }
 
     #[test]

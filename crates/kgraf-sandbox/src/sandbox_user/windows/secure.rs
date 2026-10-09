@@ -60,7 +60,7 @@ use windows_sys::Win32::UI::Shell::{
 
 use super::super::acl::{
     ACE_INHERITANCE_FLAGS, AceView, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS, Locations,
-    closed_folders, distrust,
+    closed_folders, distrust, lone_write_control,
 };
 use crate::error::SandboxError;
 
@@ -871,11 +871,13 @@ fn refuse_links_above(path: &Path) -> Result<(), SandboxError> {
 /// processes hold the folder open with. The open this replaced asked for
 /// `MAXIMUM_ALLOWED`, which on a folder an administrator controls fully is
 /// resolved to every right, `DELETE` and the data rights among them. Windows
-/// and its services always hold `C:\`, `C:\ProgramData` and
-/// `C:\Windows\Tasks` open without `FILE_SHARE_DELETE` (a current folder, a
-/// change notification; and the elevated step's own hold on ProgramData), so
-/// that open failed there with `ERROR_SHARING_VIOLATION` and no setup could
-/// finish.
+/// and its services hold `C:\`, `C:\ProgramData` and `C:\Windows\Tasks`
+/// open without `FILE_SHARE_DELETE` (a change notification or a service's
+/// own handle; and the elevated step's own hold on ProgramData), so that open
+/// failed there with `ERROR_SHARING_VIOLATION` and no setup could finish. A
+/// process's current folder alone does not do this: on Windows Server 2025 a
+/// folder `ping.exe` had as its current folder still opened with
+/// `MAXIMUM_ALLOWED`.
 ///
 /// A folder whose list an administrator may not write (one TrustedInstaller
 /// owns, say) is refused here with `ERROR_ACCESS_DENIED`, which
@@ -926,8 +928,11 @@ fn ace_bytes(acl: *const ACL) -> Vec<Vec<u8>> {
 }
 
 /// Write `acl` as the list of the folder behind `h`, with the protected and
-/// auto-inherited bits of `control`, by one call on the handle.
+/// auto-inherited bits of `control`, by one call on the handle. An
+/// auto-inherited list is written with `SE_DACL_AUTO_INHERIT_REQ` as well
+/// ([`lone_write_control`] says why).
 fn write_dacl(h: &OwnedHandle, acl: *const ACL, control: u16) -> io::Result<()> {
+    let (interest, bits) = lone_write_control(control);
     // SAFETY: zeroed is a valid value of this plain struct, initialized next.
     let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let psd: PSECURITY_DESCRIPTOR = ptr::addr_of_mut!(sd).cast();
@@ -936,8 +941,7 @@ fn write_dacl(h: &OwnedHandle, acl: *const ACL, control: u16) -> io::Result<()> 
     let ok = unsafe {
         InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) != 0
             && SetSecurityDescriptorDacl(psd, 1, acl, 0) != 0
-            && SetSecurityDescriptorControl(psd, DACL_INHERIT_BITS, control & DACL_INHERIT_BITS)
-                != 0
+            && SetSecurityDescriptorControl(psd, interest, bits) != 0
             && SetKernelObjectSecurity(h.as_raw_handle() as HANDLE, DACL_SECURITY_INFORMATION, psd)
                 != 0
     };
@@ -969,9 +973,13 @@ fn write_dacl(h: &OwnedHandle, acl: *const ACL, control: u16) -> io::Result<()> 
 /// none: it adds or takes off one entry that carries no inheritance flag, so
 /// no child's inherited entries change, and it carries the rest of the list,
 /// inherited entries included, as it was read. The descriptor is built here
-/// with the folder's own protected and auto-inherited bits, without
-/// `SE_DACL_AUTO_INHERIT_REQ`, so Windows takes the list as given and merges
-/// nothing in from the parent.
+/// with the folder's own protected and auto-inherited bits. Written that way,
+/// Windows Server 2025 kept the list and the protected bit and dropped the
+/// auto-inherited bit, so a folder that had it is written with
+/// `SE_DACL_AUTO_INHERIT_REQ` too ([`lone_write_control`]). The kernel's own
+/// handling of that bit takes the inherited entries from the object's current
+/// list, which is the list written here, and walks no child; neither is
+/// documented for this call, so the read-back below is what decides.
 ///
 /// **What would go wrong, and how it is caught.** Had Windows dropped the
 /// protected bit, `C:\ProgramData` would be open to inheritance from `C:\`,
@@ -1034,9 +1042,9 @@ fn set_folder_dacl(
 /// says why). The caller checks what it reached.
 ///
 /// For the worktree grant pass in `sandbox::windows`, where an open with
-/// `MAXIMUM_ALLOWED` met a sharing violation: a process with its current
-/// folder in the worktree holds that folder open without
-/// `FILE_SHARE_DELETE`, and `MAXIMUM_ALLOWED` is given `DELETE` there.
+/// `MAXIMUM_ALLOWED` met a sharing violation: another handle holds the object
+/// open without `FILE_SHARE_DELETE`, and `MAXIMUM_ALLOWED` is given `DELETE`
+/// there.
 pub(crate) fn open_for_lone_write(path: &Path) -> io::Result<OwnedHandle> {
     open_no_follow(path, FOLDER_DACL_ACCESS)
 }
@@ -1406,18 +1414,18 @@ mod tests {
         assert_eq!(dacl_of(&grandchild).unwrap(), leaf_before);
     }
 
-    /// A folder another process holds open without `FILE_SHARE_DELETE`, as
-    /// Windows holds `C:\`, `C:\ProgramData` and `C:\Windows\Tasks` (a
-    /// current folder, a change notification) and as the elevated step holds
-    /// the record's folders ([`open_held`]), is still closed and opened again.
+    /// A folder another handle holds open without `FILE_SHARE_DELETE`, as
+    /// Windows and its services hold `C:\`, `C:\ProgramData` and
+    /// `C:\Windows\Tasks` and as the elevated step holds the record's folders
+    /// ([`open_held`]), is still closed and opened again.
     /// The open that asked for `MAXIMUM_ALLOWED` was given `DELETE` here and
     /// failed with `ERROR_SHARING_VIOLATION` (os error 32).
     #[test]
     fn a_folder_held_open_without_delete_sharing_is_closed_and_opened_again() {
         const GROUP: &str = "S-1-5-21-1-2-3-6";
         let dir = tempfile::tempdir().unwrap();
-        // What a process's current folder holds: list and traverse, sharing
-        // read and write but not delete.
+        // A handle that lists and traverses, sharing read and write but not
+        // delete.
         let cwd_like = open_no_follow_shared(
             dir.path(),
             0x0000_0001 | 0x0000_0020,

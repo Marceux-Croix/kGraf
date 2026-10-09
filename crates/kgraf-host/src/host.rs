@@ -39,6 +39,7 @@ use crate::worker::config::WorkerConfig;
 use crate::workspaces::{
     GitWorkspaces, clean_stale_worktrees, ensure_integration_branch, state_dir,
 };
+use kgraf_core::heap_future::on_heap;
 use kgraf_core::{ParallelismLimits, PriceTable, RunId};
 use kgraf_graph::{GraphStore, Indexer};
 use kgraf_interpret::ApprovedPlan;
@@ -3146,7 +3147,10 @@ impl PreparedRun {
         kgraf_diag::record(kgraf_diag::DiagEvent::RunStarted {
             run: run_id.clone(),
         });
-        let outcome = self.run_inner(start).await;
+        // On the heap: the run's futures are hundreds of kilobytes in a debug
+        // build, and a caller on a 2 MiB thread overflowed with them on its
+        // stack (`kgraf_core::heap_future`).
+        let outcome = on_heap(|| self.run_inner(start)).await;
         kgraf_diag::record(kgraf_diag::DiagEvent::RunFinished {
             run: run_id,
             ok: outcome.is_ok(),
@@ -3157,9 +3161,7 @@ impl PreparedRun {
     async fn run_inner(self, start: RunStart) -> Result<RunOutcome> {
         let report = match (start, self.plan_id.as_deref()) {
             (RunStart::Plan(plan), Some(built)) if built == plan.plan_id() => {
-                self.orchestrator
-                    .start_from_plan(self.run.clone(), *plan)
-                    .await?
+                on_heap(|| self.orchestrator.start_from_plan(self.run.clone(), *plan)).await?
             }
             (RunStart::Plan(plan), built) => {
                 return Err(Error::Invalid(format!(
@@ -3175,12 +3177,14 @@ impl PreparedRun {
                     self.run
                 )));
             }
-            (RunStart::Resume, None) => self.orchestrator.resume(self.run.clone()).await?,
+            (RunStart::Resume, None) => {
+                on_heap(|| self.orchestrator.resume(self.run.clone())).await?
+            }
             (RunStart::Instruction(text), None) => {
                 if text.trim().is_empty() {
                     return Err(Error::Invalid("the instruction is empty".into()));
                 }
-                self.orchestrator.start(self.run.clone(), text).await?
+                on_heap(|| self.orchestrator.start(self.run.clone(), text)).await?
             }
         };
         let housekeeping = self.end.finish();

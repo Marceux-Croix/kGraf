@@ -442,6 +442,12 @@ fn print_event(
         }
         // Left alone, with why: the run goes on, so this is not an error.
         Event::Note { key, message } => println!("  kept         {key}: {message}"),
+        // Refused by Windows; setup goes on and ends with a notice.
+        Event::Gap { key, message } => {
+            let what = kgraf_sandbox::sandbox_user::WfpObject::from_key(key)
+                .map_or_else(|| key.clone(), |o| o.noun().to_owned());
+            eprintln!("  refused      {what}: {message}");
+        }
         Event::Failed { key, message } => eprintln!("  failed       {key}: {message}"),
         Event::PasswordReceived(role) => println!("  received     the {role} user's password"),
         // Read past, and the run fails at the end with every name listed.
@@ -470,7 +476,7 @@ pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
         println!(
             "kGraf asks Windows for administrator rights once, to create its sandbox users, firewall rules and DNS filter."
         );
-        setup(
+        let refused = setup(
             &names,
             &Launch {
                 exe: &exe,
@@ -495,6 +501,10 @@ pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
                  up to {slots} commands in different folders run at the same time, each as its \
                  own user. Another is refused until one ends."
             );
+        }
+        // Last, so it is the line the owner reads: the gap Windows left.
+        if let Some(notice) = kgraf_sandbox::sandbox_user::plan::dns_notice(&refused) {
+            eprintln!("{notice}");
         }
         Ok(())
     }
@@ -558,6 +568,9 @@ pub fn status(tag: Option<&str>) -> Result<()> {
         let store = credentials_path(tag)?;
         let report = kgraf_sandbox::sandbox_user::windows::setup::status(&names, &store)?;
         println!("{report}");
+        if report.only_refused_gaps() {
+            bail!("DNS is not confined on this machine: Windows refused a DNS filter at setup");
+        }
         if !report.ready {
             bail!("the Windows sandbox user is not fully set up");
         }

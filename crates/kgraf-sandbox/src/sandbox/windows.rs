@@ -232,7 +232,8 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
     git_config_freezable: false,
     // Each clause is one gap; `user_gaps_name_each_known_gap` pins them.
     // The DNS clause stays until a Windows run proves the DNS filter: the
-    // proof is the `dns:` line of `kgraf sandbox selfcheck`.
+    // proof is the `dns:` line of `kgraf sandbox selfcheck`. Where Windows
+    // refuses the filter at setup, the gap stays for good on that machine.
     gaps: "the sandbox user can read whatever every local user can read (other drives, \
            Program Files, world-readable folders), though not the owner's profile; it can \
            still write where every local user may write below the folders setup closes to \
@@ -245,15 +246,18 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            sandbox user: `kgraf sandbox setup` adds WFP filters meant to refuse that \
            service to the slot users without the network, but no Windows run has proved \
            them, so until `kgraf sandbox selfcheck` prints `dns: confined` on this machine \
-           a name lookup can leave the machine; it is also not known whether a block at \
-           the name resolution cache layers makes a lookup fail or only keeps the service \
-           from its cache while the query still leaves the machine, because Microsoft \
-           documents no effect for a block there; a command's launch does not check that \
-           the filters are still on the machine, because reading a Windows Filtering \
-           Platform object can need administrator rights and a launch is a standard user's, \
-           so a setup whose DNS step failed after an earlier setup had stored the passwords \
-           runs commands as the sandbox user with no filter until `kgraf sandbox status` or \
-           `kgraf sandbox selfcheck` is run (the failing setup says so in its error); \
+           a name lookup can leave the machine; Windows can refuse the filter at the name \
+           resolution cache layers (Windows Server 2025 refused it with \
+           FWP_E_OUT_OF_BOUNDS), and setup then goes on without it, says at its end that \
+           DNS is not confined on this machine, and `kgraf sandbox status` shows the filter \
+           as FAILED; where Windows takes it, it is not known whether a block at the name \
+           resolution cache layers makes a lookup fail or only keeps the service from its \
+           cache while the query still leaves the machine, because Microsoft documents no \
+           effect for a block there; a command's launch does not check that the filters are \
+           still on the machine, because reading a Windows Filtering Platform object can \
+           need administrator rights and a launch is a standard user's, so commands run as \
+           the sandbox user with whatever filters the machine has, and only \
+           `kgraf sandbox status` and `kgraf sandbox selfcheck` show which; \
            traffic Windows sends on the user's behalf \
            is not proved blocked: a UNC path (\\\\host\\share) makes the kernel's SMB \
            client connect, the WebClient service carries WebDAV, and ICMP \
@@ -310,6 +314,8 @@ mod user_gaps_tests {
             "DNS",
             "`dns: confined`",
             "name resolution cache layers",
+            "FWP_E_OUT_OF_BOUNDS",
+            "shows the filter as FAILED",
             "does not check that the filters are still on the machine",
             "UNC path",
             "WebDAV",
@@ -1029,11 +1035,14 @@ pub(super) enum ListWrite {
     /// Windows, decision 0097), so a removal that writes a child this way
     /// also drops the inherited copies of an entry its parent lost.
     SetSecurityInfo,
-    /// The `MAXIMUM_ALLOWED` open met `ERROR_SHARING_VIOLATION`: another
-    /// process holds the object open without `FILE_SHARE_DELETE`, as Windows
-    /// does for every process's current folder, and `MAXIMUM_ALLOWED` on an
-    /// object kGraf controls is given `DELETE`, which takes part in sharing
-    /// checks. The second handle holds only
+    /// The `MAXIMUM_ALLOWED` open met `ERROR_SHARING_VIOLATION`: a handle on
+    /// the object is open without `FILE_SHARE_DELETE` (Windows and its
+    /// services held `C:\` and `C:\Windows\Tasks` that way; an editor, an
+    /// indexer or a watcher can do the same in a worktree), and
+    /// `MAXIMUM_ALLOWED` on an object kGraf controls is given `DELETE`, which
+    /// takes part in sharing checks. A process whose current folder is the
+    /// folder does not cause it: on Windows Server 2025 a folder that `ping`
+    /// had as its current folder still opened with `MAXIMUM_ALLOWED`. The second handle holds only
     /// `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES`, none of which does.
     /// `SetSecurityInfo` would propagate through such a handle (the same
     /// page: "the system automatically propagates any inheritable access
@@ -1085,7 +1094,7 @@ pub(super) struct EntryFacts {
 /// `SetSecurityInfo` would have dropped that copy as it took in the parent's
 /// list again, and the lone write takes nothing in, so it must drop the copy
 /// itself ([`removal_keeps`]), or the slot user would keep its write access
-/// to a folder that a process had as its current folder.
+/// to a folder that another program held open.
 ///
 /// Through [`ListWrite::SetSecurityInfo`] a child that holds only inherited
 /// entries is still skipped, as before: whether its inherited copy goes when
@@ -2466,11 +2475,13 @@ mod imp {
     /// **Then, on a sharing violation, a handle no other open refuses.**
     /// `MAXIMUM_ALLOWED` on an object kGraf controls is given every right,
     /// `DELETE` and the data rights among them, and those take part in
-    /// sharing checks. Windows holds every process's current folder open
-    /// without `FILE_SHARE_DELETE`, so a worker, a build or a test with its
-    /// current folder in the worktree made this open fail with
+    /// sharing checks. A program that holds a folder or file of the worktree
+    /// open without `FILE_SHARE_DELETE` therefore makes this open fail with
     /// `ERROR_SHARING_VIOLATION` (os error 32), and a grant, or a revoke
-    /// during `kgraf sandbox remove` or a slot move, failed with it. The
+    /// during `kgraf sandbox remove` or a slot move, failed with it. Windows
+    /// and its services hold `C:\` and `C:\Windows\Tasks` that way (the
+    /// setup's shared folders met it there); a process's current folder
+    /// alone does not (measured on Windows Server 2025). The
     /// object is then opened again with
     /// `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES` and full sharing
     /// ([`secure::open_for_lone_write`]), and its list is written with
@@ -2839,8 +2850,8 @@ mod imp {
     /// A child is written only when [`super::removal_writes`] says so: a
     /// removal walks the whole tree, and a worktree with a built `target`
     /// folder holds hundreds of thousands of files whose lists have nothing
-    /// to do with this user. Through a lone write (a child a process holds
-    /// as its current folder) the inherited copies of the removed entries go
+    /// to do with this user. Through a lone write (a child another handle
+    /// holds without delete sharing) the inherited copies of the removed entries go
     /// too ([`super::removal_keeps`]), because that write, unlike
     /// `SetSecurityInfo`, takes nothing in from the parent.
     fn remove_child_entries(
@@ -3775,47 +3786,62 @@ mod imp {
             apply(root.path(), &dacl, &[]).expect("kGraf can write the tree's list");
         }
 
-        /// A process whose current folder is `dir`, killed when dropped.
-        /// Windows holds a current folder open without `FILE_SHARE_DELETE`,
-        /// which is what made the `MAXIMUM_ALLOWED` open of a worktree fail
-        /// with os error 32.
-        struct CwdHolder(std::process::Child);
+        /// A handle on the folder `dir`, opened by this test without
+        /// `FILE_SHARE_DELETE` and closed when dropped: the condition that
+        /// makes an open with `MAXIMUM_ALLOWED` fail with os error 32
+        /// (`ERROR_SHARING_VIOLATION`), as other programs' handles made it
+        /// fail on `C:\` and `C:\Windows\Tasks`. Sharing is checked per open
+        /// handle, not per process, so a handle in this process meets the
+        /// same refusal as one in another. A child process's current folder
+        /// is not used: on Windows Server 2025 a folder `ping.exe` had as its
+        /// current folder still opened with `MAXIMUM_ALLOWED`, so the
+        /// condition never formed.
+        struct DeleteShareHolder(#[allow(dead_code)] OwnedHandle);
 
-        impl CwdHolder {
-            /// Start the process and wait until the condition holds: an
-            /// open of `dir` with `MAXIMUM_ALLOWED` fails with a sharing
+        impl DeleteShareHolder {
+            /// Open the handle, then check that the condition holds: an open
+            /// of `dir` with `MAXIMUM_ALLOWED` fails with a sharing
             /// violation. Without that the tests below would prove nothing.
             fn start(dir: &Path) -> Self {
-                let child = std::process::Command::new("ping.exe")
-                    .args(["-n", "120", "127.0.0.1"])
-                    .current_dir(dir)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .expect("start a process in the folder");
-                let holder = Self(child);
-                let started = std::time::Instant::now();
-                loop {
-                    match open_maximum_allowed(dir) {
-                        Err(32) => return holder,
-                        _ if started.elapsed() > std::time::Duration::from_secs(10) => {
-                            panic!(
-                                "{} held as a current folder still opens with \
-                                 MAXIMUM_ALLOWED; the condition under test is absent",
-                                dir.display()
-                            )
-                        }
-                        _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-                    }
+                use super::super::ERROR_SHARING_VIOLATION;
+                use windows_sys::Win32::Storage::FileSystem::{FILE_LIST_DIRECTORY, FILE_TRAVERSE};
+                let name = wide(dir.as_os_str());
+                // List and traverse, the access a folder's open handle
+                // usually has; read and write shared, delete not.
+                // SAFETY: `name` is NUL-terminated; the call returns a handle
+                // or an invalid-handle value.
+                let h = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        ptr::null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS,
+                        ptr::null_mut(),
+                    )
+                };
+                assert!(
+                    !h.is_null() && h != INVALID_HANDLE_VALUE,
+                    "open {} without delete sharing: {}",
+                    dir.display(),
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: a valid handle this test now owns alone.
+                let holder = Self(unsafe { OwnedHandle::from_raw_handle(h) });
+                match open_maximum_allowed(dir) {
+                    Err(ERROR_SHARING_VIOLATION) => holder,
+                    Ok(_) => panic!(
+                        "{} held without delete sharing still opens with MAXIMUM_ALLOWED; \
+                         the condition under test is absent",
+                        dir.display()
+                    ),
+                    Err(code) => panic!(
+                        "{} held without delete sharing fails a MAXIMUM_ALLOWED open with \
+                         {code}, not 32; the condition under test is absent",
+                        dir.display()
+                    ),
                 }
-            }
-        }
-
-        impl Drop for CwdHolder {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
             }
         }
 
@@ -3836,7 +3862,7 @@ mod imp {
             std::fs::write(&child, "x").unwrap();
             let sub = dir.path().join("sub");
             std::fs::create_dir_all(&sub).unwrap();
-            let _held = CwdHolder::start(dir.path());
+            let _held = DeleteShareHolder::start(dir.path());
             assert_eq!(
                 open_for_security(dir.path()).unwrap().write,
                 super::super::ListWrite::KernelObjectAlone
@@ -3853,15 +3879,15 @@ mod imp {
             assert!(!mentions(&sub, &sid), "the folder below took the entry");
         }
 
-        /// A grant and a revoke on a worktree while processes have their
-        /// current folders at its root and in a folder of it: both succeed,
+        /// A grant and a revoke on a worktree while its root and a folder of
+        /// it are held open without delete sharing: both succeed,
         /// every object holds the entries the pass wrote, the held child
         /// folder holds exactly the pass's own entry (its lone write took no
         /// inherited copy in, and the root's write carried nothing down),
         /// and after the revoke no object names the user.
         /// Windows only; compile-checked on the development host.
         #[test]
-        fn a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree() {
+        fn a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing() {
             let sid = Sid::from_string(SID).unwrap();
             let root = tempfile::tempdir().unwrap();
             let src = root.path().join("src");
@@ -3871,10 +3897,10 @@ mod imp {
             std::fs::write(&main, "fn main() {}").unwrap();
             let leaf = deep.join("leaf.txt");
             std::fs::write(&leaf, "x").unwrap();
-            let _at_root = CwdHolder::start(root.path());
-            let _at_src = CwdHolder::start(&src);
+            let _at_root = DeleteShareHolder::start(root.path());
+            let _at_src = DeleteShareHolder::start(&src);
             let skipped = grant_writable_root(root.path(), &sid, &[], &[], false)
-                .expect("a grant with current folders in the tree");
+                .expect("a grant with held folders in the tree");
             assert_eq!(skipped.blocked, 0, "{:?}", skipped.first_blocked);
             for path in [root.path(), &src, &deep, &main, &leaf] {
                 let own = entries_for(path, &sid)
@@ -3888,7 +3914,7 @@ mod imp {
                 vec![(ACCESS_ALLOWED_ACE_TYPE, CHILD_INHERIT)],
                 "the held folder holds the pass's entry alone"
             );
-            let notes = revoke(root.path(), &[SID]).expect("a revoke with current folders");
+            let notes = revoke(root.path(), &[SID]).expect("a revoke with held folders");
             assert!(notes.is_empty(), "{notes:?}");
             for path in [root.path(), &src, &deep, &main, &leaf] {
                 assert!(
@@ -3918,8 +3944,8 @@ mod imp {
                 before.iter().any(|(_, flags)| flags & INHERITED_ACE != 0),
                 "precondition: the folder holds an inherited copy: {before:?}"
             );
-            let _held = CwdHolder::start(&src);
-            revoke(root.path(), &[SID]).expect("a revoke with a current folder");
+            let _held = DeleteShareHolder::start(&src);
+            revoke(root.path(), &[SID]).expect("a revoke with a held folder");
             assert!(
                 !mentions(&src, &sid),
                 "the held folder keeps {:?}",
@@ -3994,8 +4020,8 @@ mod imp {
     /// entry of its own ([`write_child_entry`]), not as an inherited copy
     /// that would disappear when the folder's list is rewritten.
     ///
-    /// **A current folder in the tree does not stop it.** A worker, a build
-    /// or a test whose current folder is the folder or one below it used to
+    /// **A folder another program holds does not stop it.** A handle open
+    /// on the folder, or one below it, without `FILE_SHARE_DELETE` used to
     /// make the folder's open fail with `ERROR_SHARING_VIOLATION`, and the
     /// whole removal with it. Such a folder is now written through a handle
     /// no open refuses, with a write that propagates nothing

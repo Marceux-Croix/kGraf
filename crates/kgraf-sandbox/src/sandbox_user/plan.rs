@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::firewall::RulePurpose;
+use super::handshake::StepOutcome;
 use super::names::{OwnerNames, Role};
 use super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
 use super::wfp::{WfpKeys, WfpObject, guid_text};
@@ -163,7 +164,7 @@ impl StepId {
                                      ProgramData, Public and the Windows temporary folders"
                 .into(),
             StepId::DnsFilter => format!(
-                "WFP filters: the DNS Client service refuses lookups from the offline users ({})",
+                "WFP filters meant to refuse the offline users' DNS lookups ({})",
                 WfpKeys::derive(names)
                     .filters()
                     .iter()
@@ -178,6 +179,10 @@ impl StepId {
 
 /// What a failure of `id` leaves on the machine, as a clause the setup's
 /// error carries. Empty where the failure leaves nothing that matters.
+///
+/// A DNS filter that Windows refuses is not a failure of the step
+/// ([`dns_step_report`]); the step fails only when kGraf cannot name the
+/// users the filters match.
 ///
 /// A first setup that fails stores no passwords, so no command runs as a
 /// sandbox user. A re-run is different: the credential store from the earlier
@@ -197,6 +202,92 @@ pub fn failure_leaves(id: StepId) -> &'static str {
         }
         _ => "",
     }
+}
+
+/// What the DNS filter step did with one filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilterOutcome {
+    Added,
+    /// Not added, with why: Windows' status, and what the probe filters
+    /// showed when the layer refused it.
+    NotAdded(String),
+}
+
+/// What the DNS filter step reports: the step's outcome, and each filter
+/// that was not added, with why, in the order the filters are added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsStepReport {
+    pub outcome: StepOutcome,
+    pub refused: Vec<(WfpObject, String)>,
+}
+
+/// The DNS filter step's report from what happened to each filter.
+///
+/// A filter Windows refuses does not fail setup (owner's ruling: keep the
+/// gap, and report it as a failed line, never a pass). The users, the
+/// firewall rules and the folder denies are the main confinement, and a
+/// setup that stopped at the DNS step stored no passwords, so no command ran
+/// as a sandbox user at all. The step's outcome is then `partial`, each
+/// refused filter is listed with why, and setup ends with
+/// [`dns_notice`]. A filter missing from `results` is listed as not tried,
+/// so a result list that lost one never reads as a full set.
+pub fn dns_step_report(action: Action, results: &[(WfpObject, FilterOutcome)]) -> DnsStepReport {
+    let refused: Vec<(WfpObject, String)> = WfpObject::FILTERS
+        .into_iter()
+        .filter_map(|object| match results.iter().find(|(o, _)| *o == object) {
+            Some((_, FilterOutcome::Added)) => None,
+            Some((_, FilterOutcome::NotAdded(why))) => Some((object, why.clone())),
+            None => Some((object, "setup did not try to add it".to_owned())),
+        })
+        .collect();
+    let outcome = if !refused.is_empty() {
+        StepOutcome::Partial
+    } else if action == Action::Update {
+        StepOutcome::Updated
+    } else {
+        StepOutcome::Created
+    };
+    DnsStepReport { outcome, refused }
+}
+
+/// Whether a refused filter leaves a lookup on this machine without a
+/// filter: one of the name resolution cache layers. The RPC layer sees a
+/// remote caller only.
+fn leaves_local_lookups_open(object: WfpObject) -> bool {
+    matches!(
+        object,
+        WfpObject::NameCacheFilterV4 | WfpObject::NameCacheFilterV6
+    )
+}
+
+/// The notice setup ends with when a DNS filter was not added, or `None`
+/// when every filter was.
+pub fn dns_notice(refused: &[(WfpObject, String)]) -> Option<String> {
+    if refused.is_empty() {
+        return None;
+    }
+    let list = refused
+        .iter()
+        .map(|(object, why)| format!("the filter on {} ({why})", object.layer_words()))
+        .collect::<Vec<String>>()
+        .join("; ");
+    Some(
+        if refused.iter().any(|(o, _)| leaves_local_lookups_open(*o)) {
+            format!(
+                "DNS is not confined on this machine. Windows did not add {list}. A name lookup \
+                 by a sandbox user without the network goes through the DNS Client service and \
+                 can leave the machine. The sandbox users, the firewall rules and the folder \
+                 denies are in place. `kgraf sandbox status` shows the gap as FAILED, and \
+                 `kgraf sandbox selfcheck` prints a `dns:` line that is not a pass."
+            )
+        } else {
+            format!(
+                "Windows did not add {list}. That filter covers remote callers of the DNS \
+                 Client service only; a lookup on this machine is judged by \
+                 `kgraf sandbox selfcheck`. `kgraf sandbox status` shows the gap as FAILED."
+            )
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -770,6 +861,9 @@ pub enum ItemState {
     Wrong(String),
     /// Could not be read.
     Unknown(String),
+    /// Windows refused it at setup, so running setup again does not add it:
+    /// a gap, shown as a failed line.
+    Failed(String),
 }
 
 impl ItemState {
@@ -779,6 +873,7 @@ impl ItemState {
             ItemState::Missing => "MISSING",
             ItemState::Wrong(_) => "WRONG",
             ItemState::Unknown(_) => "unknown",
+            ItemState::Failed(_) => "FAILED",
         }
     }
 }
@@ -809,9 +904,23 @@ pub enum Credentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusReport {
     pub lines: Vec<StatusLine>,
-    /// Nothing is missing or wrong. A line that could not be read does not
-    /// count against it, but is shown.
+    /// Nothing is missing, wrong or failed. A line that could not be read
+    /// does not count against it, but is shown.
     pub ready: bool,
+}
+
+impl StatusReport {
+    /// Not ready, and only because of lines Windows refused at setup (the
+    /// DNS filters): running setup again would not change it.
+    pub fn only_refused_gaps(&self) -> bool {
+        !self.ready
+            && self.lines.iter().all(|l| {
+                matches!(
+                    l.state,
+                    ItemState::Present | ItemState::Unknown(_) | ItemState::Failed(_)
+                )
+            })
+    }
 }
 
 impl fmt::Display for StatusReport {
@@ -819,12 +928,21 @@ impl fmt::Display for StatusReport {
         for l in &self.lines {
             write!(f, "  {:<8} {}", l.state.word(), l.item)?;
             match &l.state {
-                ItemState::Wrong(why) | ItemState::Unknown(why) => writeln!(f, ": {why}")?,
+                ItemState::Wrong(why) | ItemState::Unknown(why) | ItemState::Failed(why) => {
+                    writeln!(f, ": {why}")?
+                }
                 _ => writeln!(f)?,
             }
         }
         if self.ready {
             write!(f, "The Windows sandbox user is set up.")
+        } else if self.only_refused_gaps() {
+            write!(
+                f,
+                "The Windows sandbox user is set up, but DNS is not confined on this machine: \
+                 Windows refused a DNS filter at setup, and running setup again does not \
+                 change that."
+            )
         } else {
             write!(
                 f,
@@ -946,9 +1064,26 @@ pub fn status_report(
             state,
         );
     }
+    let refused_at_setup = |object: WfpObject| {
+        record
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .and_then(|r| r.dns_refused.iter().find(|(o, _)| *o == object))
+            .map(|(_, why)| why.clone())
+    };
     for (object, key) in WfpKeys::derive(names).filters() {
         let state = match &observed.wfp_unreadable {
-            Some(why) => ItemState::Unknown(why.clone()),
+            Some(why) => match refused_at_setup(object) {
+                // The record says it was never added, whatever a read that
+                // was refused would have shown.
+                Some(refused) => ItemState::Failed(format!(
+                    "Windows refused it at setup: {refused}; {}",
+                    gap_words(object)
+                )),
+                None => ItemState::Unknown(why.clone()),
+            },
             // Present is not effective: a filter the Base Filtering Engine
             // has disabled is listed and read like any other.
             None if observed.wfp_disabled.contains(&key) => ItemState::Wrong(
@@ -956,14 +1091,26 @@ pub fn status_report(
                     .to_owned(),
             ),
             None if observed.wfp.contains(&key) => ItemState::Present,
-            None => ItemState::Missing,
+            None => match refused_at_setup(object) {
+                Some(refused) => ItemState::Failed(format!(
+                    "Windows refused it at setup: {refused}; {}",
+                    gap_words(object)
+                )),
+                None => ItemState::Missing,
+            },
         };
         // Present is not proved: only `kgraf sandbox selfcheck` shows the
         // effect.
+        let what = if leaves_local_lookups_open(object) {
+            "meant to refuse the offline users' lookups; `kgraf sandbox selfcheck` proves the \
+             effect"
+        } else {
+            "remote callers of the DNS Client service only; a lookup on this machine does not \
+             pass this layer"
+        };
         push(
             format!(
-                "DNS filter on {} {} (the DNS Client service refuses the offline users; \
-                 `kgraf sandbox selfcheck` proves the effect)",
+                "DNS filter on {} {} ({what})",
                 object.layer_words(),
                 guid_text(key)
             ),
@@ -1003,6 +1150,16 @@ pub fn status_report(
         .iter()
         .all(|l| matches!(l.state, ItemState::Present | ItemState::Unknown(_)));
     StatusReport { lines, ready }
+}
+
+/// What a refused filter leaves open, for its status line.
+fn gap_words(object: WfpObject) -> &'static str {
+    if leaves_local_lookups_open(object) {
+        "DNS is not confined on this machine: a name lookup by a sandbox user without the \
+         network can leave it"
+    } else {
+        "remote callers of the DNS Client service are not filtered"
+    }
 }
 
 #[cfg(test)]
@@ -1905,6 +2062,190 @@ mod tests {
             lines(&unread)
                 .iter()
                 .all(|l| matches!(l.state, ItemState::Unknown(_)))
+        );
+    }
+
+    /// The refusal Windows Server 2025 gave the name resolution cache filter.
+    const OUT_OF_BOUNDS: &str = "WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)";
+
+    /// A filter Windows refuses does not fail the DNS step: the step is
+    /// `partial`, each refused filter is listed with why, and only a step
+    /// that added every filter reads as created or updated.
+    #[test]
+    fn a_refused_dns_filter_makes_the_step_partial_not_failed() {
+        let added = |o: WfpObject| (o, FilterOutcome::Added);
+        let refused = |o: WfpObject| (o, FilterOutcome::NotAdded(OUT_OF_BOUNDS.into()));
+        // Every filter added: as planned.
+        let all: Vec<_> = WfpObject::FILTERS.into_iter().map(added).collect();
+        let r = dns_step_report(Action::Create, &all);
+        assert_eq!(r.outcome, StepOutcome::Created);
+        assert!(r.refused.is_empty());
+        assert_eq!(dns_notice(&r.refused), None);
+        assert_eq!(
+            dns_step_report(Action::Update, &all).outcome,
+            StepOutcome::Updated
+        );
+        // The run on Windows Server 2025: the RPC filter taken, the IPv4
+        // name resolution cache filter refused, and so on.
+        let server_2025 = vec![
+            added(WfpObject::RpcFilter),
+            refused(WfpObject::NameCacheFilterV4),
+            refused(WfpObject::NameCacheFilterV6),
+        ];
+        let r = dns_step_report(Action::Create, &server_2025);
+        assert_eq!(r.outcome, StepOutcome::Partial);
+        assert_eq!(
+            r.refused,
+            vec![
+                (WfpObject::NameCacheFilterV4, OUT_OF_BOUNDS.to_owned()),
+                (WfpObject::NameCacheFilterV6, OUT_OF_BOUNDS.to_owned()),
+            ]
+        );
+        let notice = dns_notice(&r.refused).expect("a notice");
+        assert!(
+            notice.starts_with("DNS is not confined on this machine."),
+            "{notice}"
+        );
+        for needle in [
+            "the name resolution cache layer, IPv4",
+            "FWP_E_OUT_OF_BOUNDS",
+            "can leave the machine",
+            "firewall rules",
+            "FAILED",
+            "`dns:` line that is not a pass",
+        ] {
+            assert!(notice.contains(needle), "{needle:?}: {notice}");
+        }
+        // Only the RPC filter refused: lookups on this machine are not
+        // claimed open or closed; selfcheck judges them.
+        let rpc_only = dns_step_report(
+            Action::Create,
+            &[
+                refused(WfpObject::RpcFilter),
+                added(WfpObject::NameCacheFilterV4),
+                added(WfpObject::NameCacheFilterV6),
+            ],
+        );
+        assert_eq!(rpc_only.outcome, StepOutcome::Partial);
+        let notice = dns_notice(&rpc_only.refused).unwrap();
+        assert!(!notice.contains("not confined"), "{notice}");
+        assert!(notice.contains("remote callers"), "{notice}");
+        // A filter the result list lost counts as not added, never as added.
+        let lost = dns_step_report(Action::Create, &all[..2]);
+        assert_eq!(lost.outcome, StepOutcome::Partial);
+        assert_eq!(lost.refused.len(), 1);
+        assert_eq!(lost.refused[0].0, WfpObject::NameCacheFilterV6);
+    }
+
+    /// A filter the last setup recorded as refused is a FAILED status line
+    /// with the reason, not a MISSING one that `kgraf sandbox setup` would
+    /// fix; the setup is not ready, and the closing sentence says DNS is not
+    /// confined instead of asking for setup again.
+    #[test]
+    fn status_shows_a_refused_dns_filter_as_failed() {
+        let n = names();
+        let mut o = full(&n);
+        let keys = WfpKeys::derive(&n);
+        o.wfp.remove(&keys.name_cache_v4);
+        o.wfp.remove(&keys.name_cache_v6);
+        let mut r = record_from(&plan_setup(&n, &full(&n)).unwrap(), &n);
+        r.dns_refused = vec![
+            (WfpObject::NameCacheFilterV4, OUT_OF_BOUNDS.into()),
+            (WfpObject::NameCacheFilterV6, OUT_OF_BOUNDS.into()),
+        ];
+        let report = status_report(&n, &o, Ok(Some(&r)), &all_stored(&n));
+        let dns: Vec<&StatusLine> = report
+            .lines
+            .iter()
+            .filter(|l| l.item.contains("DNS filter"))
+            .collect();
+        for object in [WfpObject::NameCacheFilterV4, WfpObject::NameCacheFilterV6] {
+            let line = dns
+                .iter()
+                .find(|l| l.item.contains(object.layer_words()))
+                .unwrap();
+            let ItemState::Failed(why) = &line.state else {
+                panic!("{line:?}");
+            };
+            assert!(why.contains(OUT_OF_BOUNDS), "{why}");
+            assert!(why.contains("DNS is not confined"), "{why}");
+        }
+        let rpc = dns
+            .iter()
+            .find(|l| l.item.contains(WfpObject::RpcFilter.layer_words()))
+            .unwrap();
+        assert_eq!(rpc.state, ItemState::Present);
+        assert!(rpc.item.contains("remote callers"), "{}", rpc.item);
+        assert!(!report.ready);
+        assert!(report.only_refused_gaps());
+        let text = report.to_string();
+        assert!(text.contains("  FAILED   DNS filter on"), "{text}");
+        assert!(
+            text.ends_with("running setup again does not change that."),
+            "{text}"
+        );
+        assert!(!text.contains("run `kgraf sandbox setup`"), "{text}");
+        // A missing filter the record does not name stays MISSING, and asks
+        // for setup.
+        let mut plain = r.clone();
+        plain.dns_refused.clear();
+        let report = status_report(&n, &o, Ok(Some(&plain)), &all_stored(&n));
+        assert!(!report.only_refused_gaps());
+        assert!(report.to_string().contains("run `kgraf sandbox setup`"));
+        // A refused filter with another gap beside it: setup is still asked
+        // for, and the DNS line still says FAILED.
+        let mut worse = o.clone();
+        worse.rules.clear();
+        let report = status_report(&n, &worse, Ok(Some(&r)), &all_stored(&n));
+        assert!(!report.only_refused_gaps());
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| matches!(l.state, ItemState::Failed(_)))
+        );
+        // Unreadable WFP state: the record still says what setup could not
+        // add.
+        let mut unread = o.clone();
+        unread.wfp.clear();
+        unread.wfp_unreadable = Some("needs administrator rights".into());
+        let report = status_report(&n, &unread, Ok(Some(&r)), &all_stored(&n));
+        let failed = report
+            .lines
+            .iter()
+            .filter(|l| matches!(l.state, ItemState::Failed(_)))
+            .count();
+        assert_eq!(failed, 2);
+    }
+
+    /// The record lists every WFP key whatever Windows added, and a removal
+    /// takes off the ones that exist and passes over the ones Windows never
+    /// added, so a partial set is removed in full.
+    #[test]
+    fn remove_takes_off_a_partial_dns_filter_set() {
+        let n = names();
+        let keys = WfpKeys::derive(&n);
+        let mut o = full(&n);
+        o.wfp.remove(&keys.name_cache_v4);
+        o.wfp.remove(&keys.name_cache_v6);
+        let r = record_from(&plan_setup(&n, &full(&n)).unwrap(), &n);
+        let wfp: Vec<(WfpObject, RemoveAction)> = plan_remove(&n, &r, &o, &all_gone)
+            .unwrap()
+            .into_iter()
+            .filter_map(|s| match s.entry {
+                UndoEntry::Wfp { object, .. } => Some((object, s.action)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wfp,
+            vec![
+                (WfpObject::RpcFilter, RemoveAction::Remove),
+                (WfpObject::NameCacheFilterV4, RemoveAction::AlreadyGone),
+                (WfpObject::NameCacheFilterV6, RemoveAction::AlreadyGone),
+                (WfpObject::Sublayer, RemoveAction::Remove),
+                (WfpObject::Provider, RemoveAction::Remove),
+            ]
         );
     }
 
