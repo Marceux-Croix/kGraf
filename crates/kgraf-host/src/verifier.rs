@@ -108,7 +108,9 @@ fn quiesce_retrying(
     }
 }
 
-/// Output a failed check's reason keeps, from the end.
+/// Output a failed check's reason keeps: its end, and, when the output is
+/// longer, up to half of it for the error lines of the cut part with their
+/// files (`gates::read_log`).
 const CHECK_OUTPUT_CAP: usize = 1_000;
 
 /// The build folder a check's own cargo target folder starts from: the

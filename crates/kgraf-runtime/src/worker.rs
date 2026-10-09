@@ -1276,15 +1276,29 @@ impl Worker {
     /// Why the call is refused before it runs, and the path that refused it
     /// when one path did.
     fn scope_violation(&self, access: &kgraf_tools::Access) -> Option<(String, Option<String>)> {
-        if access.is_exclusive() && !access.is_sandboxed_build() && self.brief.write_scope.is_some()
+        /// The rest of the refusal of a write by a contract that declares no
+        /// writes, after the path.
+        const WRITELESS_SCOPE: &str = " is outside the declared write scope: this contract \
+             declares no writes, so the plan made it a check-only contract (it may run checks \
+             and read files, and changes no file). A file the work needs belongs to the \
+             contract of the plan that lists it in its writes; if no contract lists it, the \
+             plan is missing that write";
+        if access.is_exclusive()
+            && !access.is_sandboxed_build()
+            && let Some(scope) = &self.brief.write_scope
         {
-            return Some((
+            let mut why = String::from(
                 "the call may write anywhere (it declares no paths) and this worker has a declared \
                  write scope; with a write scope, the shell runs only the build and test \
-                 allowlist named in its description, and files change only through apply_patch"
-                    .into(),
-                None,
-            ));
+                 allowlist named in its description, and files change only through apply_patch",
+            );
+            if scope.is_empty() {
+                why.push_str(
+                    "; this contract declares no writes, so the plan made it a check-only \
+                     contract that changes no file",
+                );
+            }
+            return Some((why, None));
         }
         for path in access.writes_paths() {
             if let Some(why) = kgraf_core::paths::forbidden_reason(path) {
@@ -1313,10 +1327,18 @@ impl Worker {
             if let Some(scope) = &self.brief.write_scope {
                 let inside = scope.iter().any(|s| crate::paths::same_path(s, path));
                 if !inside {
-                    return Some((
-                        format!("{} is outside the declared write scope", path.display()),
-                        Some(repo_path_text(path)),
-                    ));
+                    // An empty scope is the plan's choice, not a missing
+                    // path: plan intake accepts a contract with no writes
+                    // next to contracts that write (one that only installs
+                    // and verifies). Said so, so the worker does not ask for
+                    // a scope the plan never meant to give, and a contract
+                    // whose instruction needs a file names the plan shape.
+                    let why = if scope.is_empty() {
+                        format!("{}{WRITELESS_SCOPE}", path.display())
+                    } else {
+                        format!("{} is outside the declared write scope", path.display())
+                    };
+                    return Some((why, Some(repo_path_text(path))));
                 }
             }
         }

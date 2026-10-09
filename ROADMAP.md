@@ -84,8 +84,11 @@ what is planned next, as things you can do or expect, not as an internal project
   worker is dispatched to reconcile them before falling back to a plain re-dispatch.
 - A live call on each route that is built but not yet run against the real service, starting
   with the cloud routes (Gemini, Vertex AI, Bedrock and Azure OpenAI).
-- Full sandbox confinement on Windows. It is compiled today but not yet exercised on
-  Windows; macOS and Linux confinement is in daily use.
+- Full sandbox confinement on Windows. Sandboxed commands are to run as dedicated
+  low-privilege local users (decision 0097), set up once with `kgraf sandbox setup`.
+  Setup and removal run on a hosted Windows machine; the command path has not yet run
+  there, and the DNS filter is refused by Windows Server 2025 and reported as a gap.
+  macOS and Linux confinement is in daily use.
 - Signed, notarized installers for macOS, Linux and Windows. Local packaging scripts
   already build the app and the command line for all three platforms; the packages are
   unsigned today, so expect a security warning on first launch.

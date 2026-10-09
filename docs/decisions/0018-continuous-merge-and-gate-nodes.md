@@ -415,3 +415,39 @@ offline and writes its lock there.
 Not run against a real Gradle installation; the layout follows the wrapper's own lookup.
 
 Test: `kgraf-host` `go_maven_gradle_and_dotnet_gates_need_their_tool_and_their_installs`.
+
+## Amendment (2026-10-09): a cut check output keeps its error lines, and a note's span is not an error's
+
+A contract that writes `pricing_engine/src/lib.rs` failed `cargo build --workspace` with six
+errors in that file, and the check passed at the dispatch base, so the attempt's change caused
+it (the verdict said so). The verdict kept only the last 1,000 bytes of the output. The one
+`-->` line left was a `note: method defined here` in `iface/src/lib.rs`, the scaffold's trait
+that the last error called; no error header and no file of the contract survived. The retry's
+brief quoted that text, and a reader of the verdict could only place the failure in a file no
+contract writes. The retry amendment above did not fire (no error header preceded the note's
+span), but it could: an own error cut from the head and an outside error left in the tail
+would read as "every located error is outside".
+
+- **A cut output keeps its error lines** (`kgraf-host` `gates::read_log`, every check and gate
+  output). When the output is longer than its cap, the lines of the cut part that name an error
+  are kept first, under `[the error lines of the cut part:]`, then the end under
+  `[the end of the output:]`: an error header (a line that begins with `error`, `fail:` or
+  `failed `, in any case, or that holds `: error`, as gcc, clang, Go and tsc print it) and the
+  `-->` span within two lines after it. Repeats are kept once. They take at most half the cap,
+  from the end's share, so the whole stays within the cap. At most the first 8 MiB of the cut
+  part is read for them.
+- **A note's span is not an error's** (`outside_error`). The span read for an error is the line
+  right after its header; any other line between clears it, so a later `note:` span (or another
+  crate's, interleaved by cargo after `error: could not compile`) is never taken as the
+  location of an error outside the contract's files.
+
+The attribution itself is unchanged: a whole check that fails on an attempt and passes at its
+dispatch base was broken by the attempt, whichever file the compiler names, and the retry is
+told so; one that fails at the base too, with contracts of the plan not merged, is deferred to
+the root gate.
+
+Tests: `kgraf-host` `gates.rs`
+`a_cut_compile_failure_keeps_its_error_lines_and_their_files` (the recorded shape: without the
+error lines, the kept text names only `iface/src/lib.rs`) and
+`located_lines_keep_headers_and_their_spans_within_the_budget`; `kgraf-orchestrator`
+`outside_error` `a_notes_span_is_never_read_as_an_error_outside`.

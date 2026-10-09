@@ -718,38 +718,52 @@ pub fn sanitize_plan(contracts: Vec<ContractSpec>) -> Result<Vec<ContractSpec>, 
         .collect())
 }
 
-/// The refusal of a planner's answer in which a contract declares no writes.
+/// The refusal of a planner's answer in which no contract declares a write.
 ///
 /// A worker may change only the files its contract lists (`write_scope`, every
-/// other write is refused), so a contract with an empty `writes` can change
-/// nothing: its worker is refused on every edit, asks for a scope the plan
-/// never assigned, and the contract is held as a plan-shape error after the
-/// attempts are spent. Every write-based intake rule (an unwritten workspace
-/// member, a stub no contract writes, a shared test file) is also vacuously
-/// met by a plan that declares no files, so an answer that drops its writes
-/// after such a refusal would pass them all. Refused here, so the planner is
-/// asked again with the reason instead.
+/// other write is refused), so a plan with no declared write can change no
+/// file: each worker is refused on every edit, asks for a scope the plan never
+/// assigned, and is held as a plan-shape error after its attempts are spent.
+/// Every write-based intake rule (an unwritten workspace member, a stub no
+/// contract writes, a shared test file) is also vacuously met by such a plan,
+/// so an answer that drops its writes after such a refusal would pass them
+/// all. Refused here, so the planner is asked again with the reason instead.
 ///
-/// Applied to planner answers only: a corpus plan was approved by the user as
-/// it stands, and its intake is its own.
+/// One contract with no writes next to contracts that write is not refused: a
+/// contract that only installs and verifies what the others built (`pip
+/// install`, then an import check) legitimately changes no file. Whether a
+/// writeless contract's instruction asks it to create a file is not decided
+/// from the text: an instruction is free prose, and verbs such as "write" or
+/// "create" also name what a check-only contract does (create a virtualenv,
+/// write to stdout), so a refusal on them would cost an ask on a correct
+/// plan. Such a contract meets its empty scope at run time instead: a write it
+/// attempts is refused with a reason that names the plan shape.
+///
+/// Applied to every contracts answer of the planner, a split's included (a
+/// split of a contract into children that write nothing delivers nothing). A
+/// corpus plan is not judged here: the user approved it as it stands, and its
+/// intake is its own.
 pub fn writeless_refusal(contracts: &[ContractSpec]) -> Option<PlanError> {
-    let ids: Vec<String> = contracts
-        .iter()
-        .filter(|c| c.writes.is_empty())
-        .map(|c| format!("`{}`", c.id))
-        .collect();
-    if ids.is_empty() {
+    if contracts.is_empty() || contracts.iter().any(|c| !c.writes.is_empty()) {
         return None;
     }
-    let (subject, verb) = if ids.len() == 1 {
-        (format!("contract {}", ids[0]), "declares")
+    let ids: Vec<String> = contracts.iter().map(|c| format!("`{}`", c.id)).collect();
+    let subject = if ids.len() == 1 {
+        format!(
+            "contract {} declares no writes, and it is the plan's only contract",
+            ids[0]
+        )
     } else {
-        (format!("contracts {}", ids.join(", ")), "declare")
+        format!(
+            "contracts {} declare no writes, and no contract of the plan does",
+            ids.join(", ")
+        )
     };
     Some(PlanError::Invalid(format!(
-        "{subject} {verb} no writes; a worker may change only the files its contract lists in \
-         \"writes\", so such a contract can change nothing and its every edit is refused. List \
-         each file the contract creates or edits, one object per file: \
+        "{subject}; a worker may change only the files its contract lists in \"writes\", so this \
+         plan can change no file and every edit is refused. A contract that only runs checks (an \
+         install, a verification) may declare none, but each file the work creates or edits must \
+         be listed by the contract that writes it, one object per file: \
          {{\"path\":\"src/x.rs\"}}"
     )))
 }
@@ -2119,19 +2133,35 @@ mod tests {
         }
     }
 
-    /// A contract with an empty write set is refused by name, with the shape
-    /// of a write; a plan whose every contract declares a file passes.
+    /// A plan in which no contract declares a write is refused, the contracts
+    /// named, with the shape of a write. One contract with no writes next to
+    /// contracts that write is accepted: it may only run checks.
     #[test]
-    fn a_contract_that_declares_no_writes_is_refused_by_name() {
-        let mut empty = spec("c2", &["c1"]);
-        empty.writes.clear();
-        let plan = vec![spec("c1", &[]), empty];
-        let Some(PlanError::Invalid(why)) = writeless_refusal(&plan) else {
+    fn a_plan_in_which_no_contract_declares_a_write_is_refused_by_name() {
+        let writeless = |id: &str, deps: &[&str]| {
+            let mut c = spec(id, deps);
+            c.writes.clear();
+            c
+        };
+        let none = vec![writeless("c1", &[]), writeless("c2", &["c1"])];
+        let Some(PlanError::Invalid(why)) = writeless_refusal(&none) else {
             panic!("refused");
         };
-        assert!(why.starts_with("contract `c2` declares no writes"), "{why}");
+        assert!(
+            why.starts_with("contracts `c1`, `c2` declare no writes, and no contract"),
+            "{why}"
+        );
         assert!(why.contains("{\"path\":\"src/x.rs\"}"), "{why}");
-        assert!(writeless_refusal(&plan[..1]).is_none());
+        let Some(PlanError::Invalid(why)) = writeless_refusal(&none[..1]) else {
+            panic!("refused");
+        };
+        assert!(
+            why.starts_with("contract `c1` declares no writes, and it is"),
+            "{why}"
+        );
+        let verify_only = vec![spec("c1", &[]), writeless("c2", &["c1"])];
+        assert!(writeless_refusal(&verify_only).is_none());
+        assert!(writeless_refusal(&[]).is_none());
     }
 
     /// A contract built from a spec stores the scrubbed

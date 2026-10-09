@@ -391,9 +391,11 @@ pub(crate) struct CommandGateRunner {
 /// (decision 0083). Opened no-follow, non-blocking, and read only when it is
 /// a regular file with one link; anything else reads as a note saying so.
 ///
-/// Only the last `cap` bytes are read: a runaway log is bounded by seeking
+/// Only the last `cap` bytes are kept: a runaway log is bounded by seeking
 /// to its end, so it never sits whole in the host's memory. A cut log starts
-/// with a `[N bytes cut]` line.
+/// with a `[N bytes cut]` line. When the cut part holds error lines
+/// ([`located_lines`]), up to half the cap goes to them, under a line that
+/// says so, and the end follows its own line; the whole stays within the cap.
 fn read_log(log: &Path, cap: usize) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let mut opts = std::fs::OpenOptions::new();
@@ -450,7 +452,94 @@ fn read_log(log: &Path, cap: usize) -> String {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    format!("[{} bytes cut]\n{}", skipped + start as u64, &text[start..])
+    let cut = skipped + start as u64;
+    // The error lines of the cut part, read from the start of the log; up to
+    // half the cap, taken from the tail's share so the whole stays in the cap.
+    let located = if reader.seek(SeekFrom::Start(0)).is_ok() {
+        located_lines(reader.take(cut.min(LOCATE_SCAN_LIMIT)), cap / 2)
+    } else {
+        String::new()
+    };
+    if located.is_empty() {
+        return format!("[{cut} bytes cut]\n{}", &text[start..]);
+    }
+    let mut start = text.len().saturating_sub(cap.saturating_sub(located.len()));
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[{} bytes cut]\n[the error lines of the cut part:]\n{located}[the end of the output:]\n{}",
+        skipped + start as u64,
+        &text[start..]
+    )
+}
+
+/// How much of a log's cut part [`located_lines`] reads, from its start. A
+/// compiler or test runner reports its errors as it meets them; a runaway log
+/// is not read whole for them.
+const LOCATE_SCAN_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// A line of a log longer than this is kept cut to this length.
+const LOCATE_LINE_CAP: usize = 300;
+
+/// The lines of `log` that name an error and where it is, at most `budget`
+/// bytes, each ending in a newline; empty when there are none.
+///
+/// A check's output is kept from its end, and a long compiler output then
+/// keeps only its last error: rustc prints each error's header with its
+/// primary span (`error[E0425]: ...` then `--> src/lib.rs:20:5`) and later a
+/// `note: ... --> other/src/lib.rs:57:8` for a related item. With the head cut,
+/// the only file such an output names can be a file the attempt never touched,
+/// and both the next attempt and a reader of the verdict are sent there. The
+/// lines kept: an error header (a line that begins with `error`, `fail:` or
+/// `failed ` in any case, or that holds `: error` as gcc, clang, Go and tsc
+/// print it), and a `-->` span line within two lines after a kept header.
+/// Repeats are kept once.
+fn located_lines(log: impl std::io::Read, budget: usize) -> String {
+    use std::io::BufRead;
+    let mut out = String::new();
+    let mut seen = std::collections::BTreeSet::new();
+    // Lines since the last kept header; a span line counts only near it.
+    let mut since_header = usize::MAX;
+    let mut reader = std::io::BufReader::new(log);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        // A line with no newline in 8 MiB is read whole once and cut below;
+        // the read is bounded by the caller's `take`.
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.trim_end();
+        let mut end = line.len().min(LOCATE_LINE_CAP);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let line = &line[..end];
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        let header = lower.starts_with("error")
+            || lower.starts_with("fail:")
+            || lower.starts_with("failed ")
+            || lower.contains(": error");
+        let span = !header && since_header <= 2 && trimmed.starts_with("--> ");
+        since_header = if header {
+            0
+        } else {
+            since_header.saturating_add(1)
+        };
+        if !(header || span) || !seen.insert(line.to_owned()) {
+            continue;
+        }
+        if out.len() + line.len() + 1 > budget {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 fn tail(text: &str, cap: usize) -> String {
@@ -1087,6 +1176,89 @@ mod tests {
         assert!(text.len() < 4096 + 64, "{}", text.len());
         assert!(text.starts_with("[") && text.contains("bytes cut]"));
         assert!(text.ends_with("h\u{e9}llo END\n"));
+    }
+
+    /// A compile failure longer than the cap keeps its error lines with their
+    /// primary spans. The shape of a recorded failure: six errors in
+    /// `pricing_engine/src/lib.rs`, and an output whose last 1,000 bytes name
+    /// only `iface/src/lib.rs` (a `note: method defined here`, the trait the
+    /// last error calls). Kept from the end alone, the verdict sent the next
+    /// attempt, and a reader, to a file no contract writes.
+    #[test]
+    fn a_cut_compile_failure_keeps_its_error_lines_and_their_files() {
+        let mut log =
+            String::from("   Compiling iface v0.1.0\n   Compiling pricing_engine v0.1.0\n");
+        for (n, line) in [12, 14, 16, 18, 20].iter().enumerate() {
+            log.push_str(&format!(
+                "error[E0425]: cannot find value `rate{n}` in this scope\n  --> \
+                 pricing_engine/src/lib.rs:{line}:9\n   |\n{line} |     let x = rate{n};\n   \
+                 |             ^^^^^ not found in this scope\n   |\nhelp: a local variable \
+                 with a similar name exists\n{}\n\n",
+                "   |".repeat(40)
+            ));
+        }
+        log.push_str(
+            "error[E0061]: this method takes 1 argument but 2 arguments were supplied\n  --> \
+             pricing_engine/src/lib.rs:28:43\n   |\n28 |     let shipping_cents = \
+             StandardShipping.shipping_cents(&StandardShipping, order);\n   |                    \
+             ^^^^^^^^^^^^^^ unexpected argument #2\n   |\n",
+        );
+        log.push_str(&" ".repeat(900));
+        log.push_str(
+            "\nnote: method defined here\n  --> iface/src/lib.rs:57:8\n   |\n57 |     fn \
+             shipping_cents(&self, order: &Order) -> i64;\n\nSome errors have detailed \
+             explanations: E0061, E0425.\nerror: could not compile `pricing_engine` (lib) due to \
+             6 previous errors\n",
+        );
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("gate-1.log");
+        std::fs::write(&path, &log).expect("write");
+        let text = read_log(&path, 1_000);
+        assert!(text.len() <= 1_000 + 120, "{}", text.len());
+        // Before: the kept part named iface/src/lib.rs and no file of the attempt.
+        assert!(text.contains("--> iface/src/lib.rs:57:8"), "{text}");
+        for line in [12, 14, 16, 18, 20] {
+            assert!(
+                text.contains(&format!("--> pricing_engine/src/lib.rs:{line}:9")),
+                "{text}"
+            );
+        }
+        assert!(
+            text.contains("error[E0425]: cannot find value `rate0`"),
+            "{text}"
+        );
+        assert!(text.ends_with("due to 6 previous errors\n"), "{text}");
+        // The count of cut bytes still says how much of the end was left out.
+        let cut: u64 = text
+            .strip_prefix('[')
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("a cut count");
+        let end = text
+            .split("[the end of the output:]\n")
+            .nth(1)
+            .expect("end");
+        assert_eq!(cut as usize + end.len(), log.len());
+        // A note's span is not an error's: kept only from the end.
+        assert_eq!(text.matches("iface/src/lib.rs").count(), 1, "{text}");
+    }
+
+    /// The error lines kept are bounded by the budget, are kept once each, and
+    /// a span line is kept only right after an error header.
+    #[test]
+    fn located_lines_keep_headers_and_their_spans_within_the_budget() {
+        let log = "warning: unused\n  --> a.rs:1:1\nerror: bad\n  --> b.rs:2:2\nerror: bad\n  \
+                   --> b.rs:2:2\nFAIL: test_x (t.T)\nsrc/x.ts(3,5): error TS2322: no\n\
+                   note: here\n   |\n   |\n  --> c.rs:3:3\n";
+        assert_eq!(
+            super::located_lines(log.as_bytes(), 1_000),
+            "error: bad\n  --> b.rs:2:2\nFAIL: test_x (t.T)\nsrc/x.ts(3,5): error TS2322: no\n"
+        );
+        assert_eq!(
+            super::located_lines(log.as_bytes(), 26),
+            "error: bad\n  --> b.rs:2:2\n"
+        );
+        assert_eq!(super::located_lines("all good\n".as_bytes(), 1_000), "");
     }
 
     /// The refused reads are lines for the check's output, one each.

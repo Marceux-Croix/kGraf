@@ -961,3 +961,35 @@ Tests: `kgraf-orchestrator` `plan.rs` `a_contract_that_declares_no_writes_is_ref
 of the run as kGraf's trace recorded them, `tests/fixtures/planner-answers/greenfield-writeless.txt`:
 without the rule the answer is accepted on the first ask; with it, refused once with the reason,
 and the corrected answer is accepted).
+
+## Amendment (2026-10-09, second): only a plan in which no contract declares a write is refused
+
+The amendment above refused every answer in which any contract declared no writes. That also
+refused a correct plan: a Terminal-Bench `pypi-server` answer of three contracts, the first
+writing the package, the second writing the server script, and the third (`c3-install-verify`)
+installing the package from the server and checking an import. A contract that only installs
+and verifies changes no file. The answer was refused, the next answer came back malformed, and
+the run failed planning.
+
+- **The rule now refuses only a plan in which no contract declares a write**
+  (`plan::writeless_refusal`): such a plan can change no file, and every check keyed on declared
+  writes passes it unjudged. The refusal names the contracts, says that a check-only contract
+  may declare none, and gives the shape of a write. One contract with no writes next to
+  contracts that write is accepted. Still applied to every contracts answer, a split's included.
+- **A writeless contract whose instruction needs a file is met at run time, not at intake.**
+  Whether an instruction asks for a file is not decided from its text: instructions are prose,
+  and "write" and "create" also name what a check-only contract does (create a virtualenv,
+  write to stdout), so a text rule would refuse correct plans. A write such a contract attempts
+  is refused, as any write outside a declared scope is, with a reason that names the plan
+  shape: the contract declares no writes, so it may run checks and change no file; a file the
+  work needs belongs to the contract that lists it, and if none does, the plan is missing that
+  write. A shell call that may write anywhere says the same.
+
+Tests: `kgraf-orchestrator` `plan.rs`
+`a_plan_in_which_no_contract_declares_a_write_is_refused_by_name`; `plan_intake.rs`
+`a_verify_only_contract_next_to_contracts_that_write_is_accepted` (the answer verbatim,
+`tests/fixtures/planner-answers/tb-pypi-verify-only.txt`: refused on every ask with the previous
+rule, taken on the first ask now) and
+`contracts_that_declare_no_writes_are_refused_and_asked_again` (still refused once without its
+writes; with the rule disabled, accepted on the first ask); `kgraf-runtime` `worker_loop.rs`
+`a_write_by_a_contract_that_declares_no_writes_names_the_plan_shape`.

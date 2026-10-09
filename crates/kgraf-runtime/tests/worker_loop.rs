@@ -2921,6 +2921,70 @@ async fn a_tool_that_may_write_anywhere_is_refused_under_a_declared_scope() {
     assert!(!worktree.path().join("outside.rs").exists());
 }
 
+/// A contract that declares no writes is a check-only contract of its plan
+/// (plan intake accepts one next to contracts that write). A write it attempts
+/// is refused, and the refusal says why in terms of the plan: the contract
+/// declares no writes, and a file the work needs belongs to the contract that
+/// lists it. A shell call that may write anywhere says so too.
+#[tokio::test]
+async fn a_write_by_a_contract_that_declares_no_writes_names_the_plan_shape() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round::tool(vec![
+            (
+                "t1",
+                "write_file",
+                json!({"path": "dist/index.html", "content": "x"}),
+            ),
+            ("t2", "anywhere", json!({})),
+        ]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile), Arc::new(Anywhere)],
+        CallMode::Stream,
+    ));
+    let mut b = brief("w1", "install and verify", worktree.path(), 6);
+    b.write_scope = Some(Vec::new());
+    let handle = spawn_worker(env, b, SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.denied, 2);
+    assert!(!worktree.path().join("dist/index.html").exists());
+    assert!(!worktree.path().join("outside.rs").exists());
+    let refusals: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::ToolCallFinished {
+                output, is_error, ..
+            } if *is_error => Some(output.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    let write = refusals
+        .iter()
+        .find(|o| o.contains("dist/index.html"))
+        .unwrap_or_else(|| panic!("{refusals:?}"));
+    // The phrase other readers key on stays.
+    assert!(
+        write.contains("is outside the declared write scope"),
+        "{write}"
+    );
+    assert!(
+        write.contains("this contract declares no writes"),
+        "{write}"
+    );
+    assert!(write.contains("lists it in its writes"), "{write}");
+    let shell = refusals
+        .iter()
+        .find(|o| o.contains("may write anywhere"))
+        .unwrap_or_else(|| panic!("{refusals:?}"));
+    assert!(shell.contains("declares no writes"), "{shell}");
+}
+
 /// Stands in for the orchestrator's `report_shortfall` tool: only its name
 /// matters to the worker loop's refusal text.
 struct ShortfallStandIn;

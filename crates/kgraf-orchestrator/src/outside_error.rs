@@ -38,8 +38,6 @@ pub fn outside_compile_error(refusal: &str, writes: &[WriteTarget]) -> Option<Ou
         let trimmed = line.trim_start();
         if trimmed.starts_with("error") {
             message = Some(trimmed);
-        } else if trimmed.starts_with("warning") {
-            message = None;
         } else if let Some(at) = trimmed.strip_prefix("--> ")
             && let Some(msg) = message.take()
             && let Some(file) = located_file(at)
@@ -52,6 +50,13 @@ pub fn outside_compile_error(refusal: &str, writes: &[WriteTarget]) -> Option<Ou
                 symbol: backticked(msg),
                 message: msg.to_owned(),
             });
+        } else {
+            // rustc prints an error's own span on the line right after its
+            // header. A span further down belongs to something else: a
+            // `note: method defined here` names the item a wrong call calls
+            // (a trait in a file nobody writes), not where the error is, and
+            // `error: could not compile` has no span of its own.
+            message = None;
         }
     }
     first_outside
@@ -147,6 +152,39 @@ mod tests {
         assert_eq!(outside_compile_error(panic, &writes(&["a.rs"])), None);
         let warning = "warning: unused import: `x`\n --> src/other.rs:1:5\n";
         assert_eq!(outside_compile_error(warning, &writes(&["a.rs"])), None);
+    }
+
+    /// A recorded refusal of a contract that writes `pricing_engine/src/lib.rs`:
+    /// six errors in its own file, the head of the output cut, and the one
+    /// `-->` left a note's, in the scaffold's `iface/src/lib.rs`. A note's span
+    /// is not an error's, so nothing is read as outside; with the cut part's
+    /// error lines kept (the host's check output now keeps them), the errors
+    /// are the worker's own.
+    #[test]
+    fn a_notes_span_is_never_read_as_an_error_outside() {
+        let own = writes(&["pricing_engine/src/lib.rs"]);
+        let recorded = "`cargo build --workspace` failed: $ cargo build --workspace\n\
+            [4695 bytes cut]\n\
+            let shipping_cents = StandardShipping.shipping_cents(&StandardShipping, order);\n\
+            \x20  |                                           ^^^^^^^^^^^^^^ unexpected argument #2\n\
+            \x20  = note: expected reference `&Order`\n\
+            note: method defined here\n\
+            \x20 --> iface/src/lib.rs:57:8\n\
+            error: could not compile `pricing_engine` (lib) due to 6 previous errors\n";
+        assert_eq!(outside_compile_error(recorded, &own), None);
+        let kept = recorded.replace(
+            "[4695 bytes cut]\n",
+            "[4695 bytes cut]\n[the error lines of the cut part:]\n\
+             error[E0425]: cannot find value `tax_cents` in this scope\n\
+             \x20 --> pricing_engine/src/lib.rs:20:9\n[the end of the output:]\n",
+        );
+        assert_eq!(outside_compile_error(&kept, &own), None);
+        // Cargo interleaves the crates it builds: a `could not compile` line,
+        // then another crate's note. The note's span is not that error's.
+        let interleaved = "error: could not compile `pricing_engine` (lib)\n\
+            note: method defined here\n\
+            \x20 --> iface/src/lib.rs:57:8\n";
+        assert_eq!(outside_compile_error(interleaved, &own), None);
     }
 
     #[test]
