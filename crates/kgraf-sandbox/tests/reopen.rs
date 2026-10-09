@@ -1379,3 +1379,90 @@ fn a_process_that_leaves_its_session_is_seen_only_through_a_pid_namespace() {
          ({quiet:?}); update decision 0084 and this test"
     );
 }
+
+/// While a quiesce guard holds a worktree exclusively, a sandboxed command
+/// started in it waits, and starts once the guard is dropped; another spawn
+/// in flight meanwhile is not delayed.
+///
+/// std learns that a spawned child has exec'd when the write end of a
+/// close-on-exec pipe closes: the parent drops its copy right after its fork,
+/// the child's copy closes at exec. A process forked by another thread in
+/// between keeps a copy too, and the spawn then waits until that process
+/// execs or exits. The window is a few microseconds and cannot be hit on
+/// purpose through std, so the test opens the same kind of pipe and keeps
+/// its write end across the sandboxed spawn, as such a spawn would. A
+/// sandboxed child that forked and then waited for the hold before exec
+/// would keep that write end until the guard is dropped.
+#[cfg(unix)]
+#[test]
+fn a_spawn_waiting_for_a_quiesced_worktree_does_not_delay_other_spawns() {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // Far above the time a pipe or a plain spawn takes on a loaded host, and
+    // far below the time the guard is held when a spawn is stalled.
+    const BOUND: Duration = Duration::from_secs(4);
+
+    let e = env();
+    let ws = create(&e, "w1");
+    let mut sandboxed =
+        kgraf_sandbox::workspace_command(&ws, kgraf_sandbox::Network::Deny, "/bin/sh").unwrap();
+    sandboxed.args(["-c", "exit 0"]);
+    let guard = e.mgr.quiesce(&ws).unwrap();
+
+    // The status pipe of a spawn in flight: std opens it close-on-exec.
+    let (mut status_read, status_write) = std::io::pipe().unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let status = sandboxed.spawn().map(|mut c| c.wait());
+        let _ = held_tx.send((Instant::now(), status));
+    });
+    // Time for the sandboxed spawn to fork, had it forked before the hold.
+    std::thread::sleep(Duration::from_millis(300));
+    // The spawn in flight finishes: its parent's copy closes.
+    drop(status_write);
+    let (pipe_tx, pipe_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut rest = Vec::new();
+        let read = status_read.read_to_end(&mut rest);
+        let _ = pipe_tx.send((started.elapsed(), read));
+    });
+    // And a plain spawn started while the sandboxed one waits.
+    let (plain_tx, plain_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status();
+        let _ = plain_tx.send((started.elapsed(), status));
+    });
+
+    // Both waited for with the guard still held: a stalled one ends only
+    // once the guard is dropped, so it times out here.
+    let pipe = pipe_rx.recv_timeout(BOUND);
+    let plain = plain_rx.recv_timeout(BOUND);
+    let early = held_rx.try_recv();
+    let released = Instant::now();
+    drop(guard);
+
+    let (took, read) = pipe.expect(
+        "the in-flight spawn's status pipe closed while the guard was held: a sandboxed \
+         spawn waiting for the hold must not keep another spawn's pipe",
+    );
+    assert_eq!(read.unwrap(), 0, "nothing was written; took {took:?}");
+    let (took, status) =
+        plain.expect("a plain spawn returned while the guard was held, within the bound");
+    assert!(status.unwrap().success(), "took {took:?}");
+    assert!(
+        early.is_err(),
+        "the sandboxed command started while the worktree was quiesced: {early:?}"
+    );
+    let (ended, status) = held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the sandboxed command started once the guard was dropped");
+    let status = status.expect("spawned").expect("waited");
+    assert!(status.success(), "{status:?}");
+    assert!(ended >= released);
+}

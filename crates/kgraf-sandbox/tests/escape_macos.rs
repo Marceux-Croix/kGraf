@@ -317,7 +317,6 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
     let out = workspace_command(&e.ws, Network::Deny, &cargo)
         .unwrap()
         .args(["run", "--offline", "-q"])
-        .command_mut()
         .env_remove("CARGO_TARGET_DIR")
         .output()
         .unwrap();
@@ -446,7 +445,6 @@ fn cargo_fetch_of_one_dependency_works_with_network_allowed() {
     let out = workspace_command(&e.ws, Network::Allow, &cargo)
         .unwrap()
         .args(["fetch", "--quiet"])
-        .command_mut()
         .env("CARGO_HOME", &cargo_home)
         .env_remove("CARGO_TARGET_DIR")
         .output()

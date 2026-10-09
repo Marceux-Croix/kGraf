@@ -776,7 +776,7 @@ impl SandboxRunner {
         let err_path = self.scratch.join(format!("{name}.err"));
         let out = std::fs::File::create(&out_path).map_err(io(&out_path))?;
         let err = std::fs::File::create(&err_path).map_err(io(&err_path))?;
-        let (mut std_cmd, _probe) = cmd.into_parts();
+        let (mut std_cmd, probe, hold) = cmd.into_parts();
         std_cmd
             .stdin(Stdio::null())
             .stdout(Stdio::from(out))
@@ -803,21 +803,39 @@ impl SandboxRunner {
         unsafe {
             kgraf_sandbox::lifecycle::limit_cpu_seconds(&mut std_cmd, limits.cpu_seconds);
         }
-        let mut child = tokio::process::Command::from(std_cmd)
+        // The run's hold is taken in this process before the fork, never in
+        // the child, where a wait would stall other concurrent spawns. On a
+        // blocking thread, since it may wait; a dropped check stops the wait.
+        let stop = StopOnDrop::default();
+        let stopped = std::sync::Arc::clone(&stop.0);
+        let held = tokio::task::spawn_blocking(move || {
+            hold.take_until(|| stopped.load(std::sync::atomic::Ordering::Relaxed))
+        })
+        .await
+        .map_err(|e| CheckError::Sandbox(format!("the wait for the run's hold failed: {e}")))?
+        .map_err(|e| CheckError::Sandbox(e.to_string()))?
+        .ok_or_else(|| CheckError::Sandbox("the wait for the run's hold was stopped".into()))?;
+        drop(stop);
+        let spawned = tokio::process::Command::from(std_cmd)
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                // Linux execs the program itself after confining the child:
-                // absent, or not executable under the policy, is a missing
-                // program, not a sandbox failure and not a verdict.
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-                    CheckError::ProgramMissing {
-                        program: program.clone(),
-                        detail: format!("the sandboxed exec failed: {e}"),
-                    }
+            .spawn();
+        // The command keeps the lock through its own descriptor.
+        drop(held);
+        let mut child = spawned.map_err(|e| match e.kind() {
+            // Linux execs the program itself after confining the child:
+            // absent, or not executable under the policy, is a missing
+            // program, not a sandbox failure and not a verdict.
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                CheckError::ProgramMissing {
+                    program: program.clone(),
+                    detail: format!("the sandboxed exec failed: {e}"),
                 }
-                _ => CheckError::Sandbox(format!("cannot spawn: {e}")),
-            })?;
+            }
+            _ => match probe.reason() {
+                Some(reason) => CheckError::Sandbox(format!("cannot spawn: {reason} ({e})")),
+                None => CheckError::Sandbox(format!("cannot spawn: {e}")),
+            },
+        })?;
         // The gates' lifecycle : the group is killed
         // while its leader is still unreaped, so its id cannot name another
         // program's group, until the hold file shows every member gone; only
@@ -1210,6 +1228,19 @@ impl Drop for GroupKill {
                 libc::kill(-pid, libc::SIGKILL);
             }
         }
+    }
+}
+
+/// Sets its flag on drop: a dropped check stops its wait for the run's hold,
+/// so no blocking thread keeps waiting for a run nobody awaits.
+#[cfg(unix)]
+#[derive(Default)]
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(unix)]
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

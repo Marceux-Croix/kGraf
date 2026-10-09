@@ -2044,17 +2044,32 @@ async fn run_sandboxed(
     // "Permission denied" alone does not say why a file was refused.
     let mut refused = sandboxed.refused_reads().to_vec();
     refused.extend(notes.iter().cloned());
-    let (std_cmd, _probe) = sandboxed.into_parts();
+    let (std_cmd, probe, hold) = sandboxed.into_parts();
     let mut tokio_cmd = tokio::process::Command::from(std_cmd);
     tokio_cmd.kill_on_drop(true);
-    // Decision 0067: the cancel check that keeps a stopped round
-    // from spawning is at the top of `ShellTool::call`. Nothing between it
-    // and this spawn awaits, so a second check here would only narrow a
-    // cross-thread race by the synchronous setup time; a cancel that lands
-    // in that window is caught by the select below, which kills the group.
-    let mut child = tokio_cmd
-        .spawn()
-        .map_err(|e| internal(format!("spawn failed: {e}")))?;
+    // The worktree hold is taken here, before the fork, and not in the child:
+    // a child that waited between fork and exec would keep copies of the
+    // pipes other concurrent spawns use to report their exec, and stall them.
+    // It waits while a removal, reopen or quiesce holds the worktree, so on a
+    // blocking thread; a cancel ends the wait (decision 0067: a stopped round
+    // does not spawn). From the hold to the spawn nothing awaits.
+    let stop = ctx.cancel.clone();
+    let held = tokio::task::spawn_blocking(move || hold.take_until(|| stop.is_cancelled()))
+        .await
+        .map_err(|e| internal(format!("the wait for the worktree hold failed: {e}")))?
+        .map_err(|e| internal(format!("cannot start the command: {e}")))?;
+    let Some(held) = held else {
+        return Err(ToolError::Cancelled {
+            tool: "shell".into(),
+        });
+    };
+    let spawned = tokio_cmd.spawn();
+    // The command keeps the lock through its own descriptor.
+    drop(held);
+    let mut child = spawned.map_err(|e| match probe.reason() {
+        Some(reason) => internal(format!("spawn failed: {reason} ({e})")),
+        None => internal(format!("spawn failed: {e}")),
+    })?;
     // Captured before any `wait()`: some runtimes stop reporting a child's id
     // once it has been reaped, and the process group must still be killable
     // after that (a timeout races the wait, so the wait may already have

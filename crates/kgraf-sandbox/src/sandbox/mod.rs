@@ -1411,6 +1411,9 @@ pub struct SandboxedCommand {
     handoff: Option<linux::Handoff>,
     #[cfg(unix)]
     probe: child::SetupProbe,
+    /// The worktree hold, taken in this process before each spawn.
+    #[cfg(unix)]
+    hold: child::HoldGate,
     #[cfg(windows)]
     prepared: windows::Prepared,
     /// Explicit stdin, stdout, stderr; `None` takes the per-method default.
@@ -1440,7 +1443,10 @@ impl SandboxedCommand {
     /// The underlying command, for arguments, stdio and extra environment.
     /// A variable set here is passed even if the scrub would remove it.
     /// Unix only: on Windows the command is a builder whose stdio and
-    /// `env_clear` would be silently ignored, so it is not exposed.
+    /// `env_clear` would be silently ignored, so it is not exposed. Start it
+    /// through this type's `spawn`, `output` or `status`, which take the
+    /// worktree hold first: a command spawned from here directly with a hold
+    /// in its policy fails to start, and says why.
     #[cfg(unix)]
     pub fn command_mut(&mut self) -> &mut Command {
         &mut self.cmd
@@ -1531,9 +1537,14 @@ impl SandboxedCommand {
         self
     }
 
+    /// Takes the worktree hold first, waiting while the worktree is held
+    /// exclusively (see [`HoldGate`]).
     #[cfg(unix)]
     pub fn spawn(&mut self) -> Result<Child, SandboxError> {
+        let held = self.hold.take()?;
         let result = self.cmd.spawn();
+        // The command keeps the lock through its own descriptor.
+        drop(held);
         result.map_err(|e| self.explain(e))
     }
 
@@ -1555,6 +1566,10 @@ impl SandboxedCommand {
         }
         #[cfg(not(windows))]
         {
+            // Held to the end of the call: std spawns and waits in one call,
+            // and the command holds the lock that long anyway.
+            #[cfg(unix)]
+            let _held = self.hold.take()?;
             let result = self.cmd.output();
             result.map_err(|e| self.explain(e))
         }
@@ -1567,6 +1582,9 @@ impl SandboxedCommand {
         }
         #[cfg(not(windows))]
         {
+            // As in `output`.
+            #[cfg(unix)]
+            let _held = self.hold.take()?;
             let result = self.cmd.status();
             result.map_err(|e| self.explain(e))
         }
@@ -1593,12 +1611,14 @@ impl SandboxedCommand {
         }
     }
 
-    /// For async callers (`tokio::process::Command::from`): the command plus
-    /// a probe that recovers the child's setup-failure reason after a failed
-    /// spawn.
+    /// For async callers (`tokio::process::Command::from`): the command, a
+    /// probe that recovers the child's setup-failure reason after a failed
+    /// spawn, and the gate of its worktree hold. Take the hold on a blocking
+    /// thread ([`HoldGate::take_until`]), spawn, then drop it; a command
+    /// spawned without it fails to start and says why.
     #[cfg(unix)]
-    pub fn into_parts(self) -> (Command, child::SetupProbe) {
-        (self.cmd, self.probe)
+    pub fn into_parts(self) -> (Command, child::SetupProbe, child::HoldGate) {
+        (self.cmd, self.probe, self.hold)
     }
 
     #[cfg(not(windows))]
@@ -1612,7 +1632,7 @@ impl SandboxedCommand {
 }
 
 #[cfg(unix)]
-pub use child::SetupProbe;
+pub use child::{HoldGate, SetupProbe, SpawnHold};
 /// What the running Linux kernel offers the backend (probed once).
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxConfinement, confinement as linux_confinement};
@@ -1708,8 +1728,14 @@ pub fn sandboxed_command(
                     std::ffi::CString::new(p.as_os_str().as_bytes())
                         .map_err(|_| SandboxError::InvalidPolicy("hold path has a NUL".into()))
                 };
-                Some(child::Hold {
-                    lock: c(file)?,
+                let fd = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                let gate = child::HoldGate::new(
+                    file.clone(),
+                    std::sync::Arc::clone(&fd),
+                    child::HOLD_WAIT,
+                );
+                let hold = child::Hold {
+                    fd,
                     sessions: c(&crate::workspace::session_log(file))?,
                     host: {
                         let here = crate::workspace::HostId::current();
@@ -1722,11 +1748,13 @@ pub fn sandboxed_command(
                         )
                         .into_bytes()
                     },
-                    wait: child::HOLD_WAIT,
-                })
+                };
+                (Some(hold), gate)
             }
-            None => None,
+            None => (None, child::HoldGate::default()),
         };
+        #[cfg(unix)]
+        let (hold, hold_gate) = hold;
         #[cfg(unix)]
         let probe = child::install(&mut cmd, hold, setup)?;
         cmd.current_dir(cwd);
@@ -1879,6 +1907,8 @@ pub fn sandboxed_command(
             handoff,
             #[cfg(unix)]
             probe,
+            #[cfg(unix)]
+            hold: hold_gate,
             #[cfg(windows)]
             prepared,
             #[cfg(windows)]

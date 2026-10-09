@@ -560,3 +560,16 @@ the close-on-exec status pipes of other spawns in flight among them, so a spawn 
 was in flight at that fork waits for that child as well (now at most `HOLD_WAIT`).
 Taking the shared hold in the parent before the fork would remove the wait from the
 child, but the async spawn path builds its own process in another crate.
+
+**Closed (2026-10-08):** the shared hold is now taken in the parent, before the fork
+(`HoldGate`, in the Unix child module). The parent opens the hold file close-on-exec and
+waits for `LOCK_SH` with a try-lock and a sleep, at most `HOLD_WAIT`, then fails with
+`SandboxError::HoldTimeout`, which names the hold file. The child only marks the
+inherited descriptor to survive exec; `flock` belongs to the open file, so the parent's
+copy and the command's are one lock, and the parent closes its copy after the spawn and
+never unlocks it. A child forked without a taken hold fails with `ENOLCK` and says so.
+`SandboxedCommand::spawn`, `output` and `status` take the hold themselves; `into_parts`
+returns the gate as well, and the two async callers (the shell tool and the check
+runner) take it on a blocking thread, stopped by a cancel or a dropped check. Test:
+`a_spawn_waiting_for_a_quiesced_worktree_does_not_delay_other_spawns`
+(`kgraf-sandbox/tests/reopen.rs`).

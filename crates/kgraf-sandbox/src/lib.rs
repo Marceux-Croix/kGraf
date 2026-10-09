@@ -68,14 +68,14 @@ pub use package_stores::{
 };
 #[cfg(windows)]
 pub use sandbox::SandboxedChild;
-#[cfg(unix)]
-pub use sandbox::SetupProbe;
 pub use sandbox::{
     Backend, CheckNetwork, FROZEN_GIT_FILES, FrozenGit, IsolationStrength, NETWORK_OPEN_NOTICE,
     Network, ReadConfinement, Redirect, SHELL_NETWORK_OPEN_NOTICE, SandboxPolicy, SandboxedCommand,
     TLS_UNAVAILABLE_HINT, WINDOWS_BASE_VARS, WorkerSlot, is_git_config_entry_var,
     platform_isolation, sandboxed_command, tls_unavailable_hint, worker_slot, workspace_command,
 };
+#[cfg(unix)]
+pub use sandbox::{HoldGate, SetupProbe, SpawnHold};
 #[cfg(target_os = "linux")]
 pub use sandbox::{LinuxConfinement, linux_confinement};
 pub use win_command_line::windows_command_line;

@@ -1,4 +1,5 @@
-//! Child-side setup between fork and exec, shared by the Unix backends.
+//! Child-side setup between fork and exec, shared by the Unix backends, and
+//! the worktree hold the parent takes before the fork.
 //!
 //! Every child calls `setsid()` first: a new session has no controlling
 //! terminal, so the child cannot inject input into the user's terminal with
@@ -8,18 +9,31 @@
 //! also writes a fixed message into a close-on-exec pipe. The parent reads it
 //! back through [`SetupProbe`] after a failed spawn. A successful exec closes
 //! the child's end, so a probe on a running command reads nothing.
+//!
+//! Nothing between fork and exec waits. A child that waits there keeps its
+//! copies of every descriptor the parent had open at the fork, among them
+//! the close-on-exec pipe through which another thread's concurrent spawn
+//! learns that its own exec succeeded, so that spawn would wait as long as
+//! this child. The worktree hold, which can wait, is taken in the parent
+//! ([`HoldGate`]).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use std::os::unix::process::CommandExt;
 
 use crate::error::SandboxError;
 
-/// A worktree's hold: its lock file and its session log (see [`install`]).
+/// A worktree's hold as the forked child sees it (see [`install`]).
 pub(super) struct Hold {
-    pub(super) lock: std::ffi::CString,
+    /// The descriptor this spawn's shared lock was taken on in the parent
+    /// ([`HoldGate::take_until`]), or -1 while no spawn holds it.
+    pub(super) fd: Arc<AtomicI32>,
     pub(super) sessions: std::ffi::CString,
     /// `<boot id> <pid ns> <time ns>` of the spawning process (`-` for an
     /// unreadable part), written with each session: the boot tells a log from
@@ -27,8 +41,6 @@ pub(super) struct Hold {
     /// cannot check, and the time namespace tells when start times compare.
     /// The child logs before it enters any namespace, so these are its own.
     pub(super) host: Vec<u8>,
-    /// How long the child waits for its shared lock ([`HOLD_WAIT`]).
-    pub(super) wait: std::time::Duration,
 }
 
 /// The longest a starting command waits for its worktree's hold. It is held
@@ -37,61 +49,122 @@ pub(super) struct Hold {
 /// remove` and the deletion of the tree, a reopen or startup cleanup. One
 /// such holder may wait 30 minutes for the worktree-admin lock and then run
 /// git commands bounded at 10 minutes each, or delete a large build folder;
-/// an hour covers it, so a wait this long means a holder that is stuck. The
-/// parent's `spawn` waits as long, since std waits for the child's exec.
-pub(super) const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// an hour covers it, so a wait this long means a holder that is stuck.
+pub(super) const HOLD_WAIT: Duration = Duration::from_secs(60 * 60);
 
-/// The message of a child that gave up waiting for its hold.
-const HOLD_TIMEOUT: &str =
-    "timed out waiting for the worktree hold: a removal, reopen or quiesce held it exclusively";
+/// The message of a child forked with a hold its parent did not take.
+const HOLD_NOT_TAKEN: &str =
+    "the worktree hold was not taken before the spawn; take it with the command's hold gate";
 
-/// Take a shared `flock` on `fd`, waiting at most `bound_ms` milliseconds.
-/// `Err(errno)`: `ETIMEDOUT` at the bound, else the lock's own error.
+/// The longest pause between two tries for a hold.
+const HOLD_POLL_MAX: Duration = Duration::from_millis(20);
+
+/// Takes a command's worktree hold in the parent, before the fork.
 ///
-/// Runs in the forked child, so only async-signal-safe calls: `flock` with
-/// `LOCK_NB` (a system call, as the blocking form was), `clock_gettime` and
-/// `select` with no descriptors as the pause (both on the POSIX list). No
-/// allocation, no lock.
-fn lock_shared_within(fd: libc::c_int, bound_ms: u64) -> Result<(), i32> {
-    fn now_ms() -> u64 {
-        // SAFETY: zeroed is a valid timespec; clock_gettime writes it.
-        let mut t: libc::timespec = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out-pointer; async-signal-safe.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
-        (t.tv_sec as u64) * 1000 + (t.tv_nsec as u64) / 1_000_000
+/// A shared `flock` belongs to the open file, not to a process: the parent's
+/// descriptor and the copy the child inherits carry one lock. The child
+/// keeps its copy across exec ([`install`]), so the command and every process
+/// it starts hold the lock until the last of them exits. The parent closes
+/// its own copy once the spawn returns ([`SpawnHold`]) and never unlocks it:
+/// an unlock would release the command's lock as well.
+///
+/// The wait is a sleeping thread of the parent that holds no descriptor of
+/// another spawn, so a hold held exclusively delays only the commands that
+/// start in its worktree.
+#[derive(Debug, Clone, Default)]
+pub struct HoldGate(Option<Gate>);
+
+#[derive(Debug, Clone)]
+struct Gate {
+    path: PathBuf,
+    fd: Arc<AtomicI32>,
+    wait: Duration,
+}
+
+impl HoldGate {
+    pub(super) fn new(path: PathBuf, fd: Arc<AtomicI32>, wait: Duration) -> Self {
+        Self(Some(Gate { path, fd, wait }))
     }
-    let start = now_ms();
-    let mut pause_ms: u64 = 1;
-    loop {
-        // SAFETY: flock on a descriptor the caller opened.
-        if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-            return Ok(());
-        }
-        let errno = last_errno();
-        if errno != libc::EWOULDBLOCK && errno != libc::EINTR {
-            return Err(errno);
-        }
-        let waited = now_ms().saturating_sub(start);
-        if waited >= bound_ms {
-            return Err(libc::ETIMEDOUT);
-        }
-        let step = pause_ms.min(bound_ms - waited);
-        let mut tv = libc::timeval {
-            tv_sec: (step / 1000) as libc::time_t,
-            tv_usec: ((step % 1000) * 1000) as libc::suseconds_t,
+
+    /// Take the hold shared for one spawn of the command, waiting at most
+    /// [`HOLD_WAIT`] while another process holds it exclusively, then fail
+    /// with [`SandboxError::HoldTimeout`], which names the hold file. Blocks
+    /// the calling thread: from async code, call it on a blocking thread.
+    ///
+    /// `Ok(None)` once `stop` returns true, checked between tries (every
+    /// 20 ms at most), so a cancelled caller does not leave a thread waiting.
+    /// A command without a hold gets an empty [`SpawnHold`] at once.
+    pub fn take_until(&self, stop: impl Fn() -> bool) -> Result<Option<SpawnHold>, SandboxError> {
+        let Some(gate) = &self.0 else {
+            return Ok(Some(SpawnHold(None)));
         };
-        // SAFETY: no descriptor sets; a pause of `tv`. An interruption only
-        // shortens it.
-        unsafe {
-            libc::select(
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut tv,
-            )
+        let io_err = |source| SandboxError::Io {
+            path: gate.path.clone(),
+            source,
         };
-        pause_ms = (pause_ms * 2).min(20);
+        // std opens with O_CLOEXEC: a child forked by another thread in this
+        // window drops its copy at its own exec.
+        let file = std::fs::File::open(&gate.path).map_err(io_err)?;
+        let start = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(io_err(e)),
+            }
+            if stop() {
+                return Ok(None);
+            }
+            let waited = start.elapsed();
+            if waited >= gate.wait {
+                return Err(SandboxError::HoldTimeout {
+                    path: gate.path.clone(),
+                    waited,
+                });
+            }
+            std::thread::sleep(pause.min(gate.wait - waited));
+            pause = (pause * 2).min(HOLD_POLL_MAX);
+        }
+        // One spawn at a time: the child reads the one slot.
+        if gate
+            .fd
+            .compare_exchange(-1, file.as_raw_fd(), Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SandboxError::Spawn(io::Error::other(
+                "the command's worktree hold is already taken for another spawn",
+            )));
+        }
+        Ok(Some(SpawnHold(Some((file, Arc::clone(&gate.fd))))))
+    }
+
+    /// [`Self::take_until`] with no stop.
+    pub fn take(&self) -> Result<SpawnHold, SandboxError> {
+        match self.take_until(|| false)? {
+            Some(held) => Ok(held),
+            // Unreachable: the stop never fires. Named, not assumed.
+            None => Err(SandboxError::Spawn(io::Error::other(
+                "the wait for the worktree hold stopped with no stop asked",
+            ))),
+        }
+    }
+}
+
+/// A hold taken for one spawn ([`HoldGate::take_until`]). Drop it once the
+/// spawn has returned: the started command keeps the lock through its own
+/// descriptor. Dropping closes this process's descriptor and never unlocks.
+#[derive(Debug)]
+pub struct SpawnHold(Option<(std::fs::File, Arc<AtomicI32>)>);
+
+impl Drop for SpawnHold {
+    fn drop(&mut self) {
+        if let Some((file, fd)) = self.0.take() {
+            // Cleared before the close, so a later fork of this command
+            // never reads a number that may name another file.
+            fd.store(-1, Ordering::Release);
+            drop(file);
+        }
     }
 }
 
@@ -175,26 +248,24 @@ fn pipe_io_error(source: io::Error) -> SandboxError {
     }
 }
 
-/// Install `setsid`, the hold on `hold` (when given), then `step` as the
-/// command's pre-exec hook. The hook consumes nothing, but a Linux step
-/// consumes its ruleset: spawn once.
+/// Install `setsid`, the hold (when given), then `step` as the command's
+/// pre-exec hook. The hook consumes nothing, but a Linux step consumes its
+/// ruleset: spawn once.
 ///
-/// **The hold.** The child opens `hold` without close-on-exec and takes a
-/// shared `flock` on it, so the descriptor, and the lock, pass to the program
-/// and to every process it starts. The lock is released only when the last of
-/// them exits. `setsid` detaches a child from its parent's death (macOS has no
-/// `PR_SET_PDEATHSIG`), so after the orchestrator is killed the command, and on
-/// macOS any orphan it leaves, can keep writing its worktree;
-/// `WorkspaceManager::reopen` takes the lock exclusively first and refuses
-/// while any holder lives. The child waits at most [`Hold::wait`] for its
-/// shared lock while another process holds it exclusively, then fails the
-/// spawn with `ETIMEDOUT` and a reason saying so. On Linux with namespaces
-/// the command is PID 1 of
-/// its own PID namespace, so an orphan cannot outlive the command: the kernel
-/// kills everything left in the namespace when the command exits. The command
-/// itself still outlives a killed orchestrator there, and so do its children
-/// while it runs. Opened in the child, not the parent, so no descriptor of the
-/// orchestrator's own keeps the lock.
+/// **The hold.** The parent takes a shared `flock` on the hold file before the
+/// fork ([`HoldGate`]); the child keeps the inherited descriptor open across
+/// exec, so the lock passes to the program and to every process it starts. It
+/// is released only when the last of them exits. A child whose parent did not
+/// take the hold fails its spawn with `ENOLCK` and says so: a command never
+/// runs in a worktree unheld. `setsid` detaches a child from its parent's
+/// death (macOS has no `PR_SET_PDEATHSIG`), so after the orchestrator is
+/// killed the command, and on macOS any orphan it leaves, can keep writing
+/// its worktree; `WorkspaceManager::reopen` takes the lock exclusively first
+/// and refuses while any holder lives. On Linux with namespaces the command
+/// is PID 1 of its own PID namespace, so an orphan cannot outlive the
+/// command: the kernel kills everything left in the namespace when the
+/// command exits. The command itself still outlives a killed orchestrator
+/// there, and so do its children while it runs.
 ///
 /// **The session log.** A descriptor is escaped by any program that closes
 /// the ones it inherits (Python's `subprocess` with `close_fds=True`, which is
@@ -240,9 +311,9 @@ pub(super) fn install(
 
     // SAFETY: the hook runs in the forked child before exec and calls only
     // setsid, write and the step (documented async-signal-safe by each
-    // backend), plus open, flock, clock_gettime and select for the hold's
-    // bounded wait (`lock_shared_within`). It touches no process locks
-    // and does not allocate.
+    // backend), plus an atomic load, open, getpid, close and fcntl for the
+    // hold. It waits for nothing, touches no process locks and does not
+    // allocate.
     unsafe {
         cmd.pre_exec(move || {
             let reporter = Reporter(write.as_raw_fd());
@@ -254,21 +325,9 @@ pub(super) fn install(
             }
             let mut hold_fd: libc::c_int = -1;
             if let Some(hold) = hold.as_ref() {
-                // No O_CLOEXEC: the descriptor must survive exec.
-                let fd = libc::open(hold.lock.as_ptr(), libc::O_RDONLY);
-                hold_fd = fd;
-                if fd < 0 {
-                    return Err(reporter.fail("cannot open the worktree hold file", last_errno()));
-                }
-                let bound_ms = u64::try_from(hold.wait.as_millis()).unwrap_or(u64::MAX);
-                match lock_shared_within(fd, bound_ms) {
-                    Ok(()) => {}
-                    Err(libc::ETIMEDOUT) => {
-                        return Err(reporter.fail(HOLD_TIMEOUT, libc::ETIMEDOUT));
-                    }
-                    Err(errno) => {
-                        return Err(reporter.fail("cannot take the worktree hold", errno));
-                    }
+                hold_fd = hold.fd.load(Ordering::Acquire);
+                if hold_fd < 0 {
+                    return Err(reporter.fail(HOLD_NOT_TAKEN, libc::ENOLCK));
                 }
                 // `<session id> <leader start time> <boot> <pid ns> <time ns>`:
                 // this PID is the session id after setsid; the start time and
@@ -306,12 +365,13 @@ pub(super) fn install(
             if let Some(step) = step.as_mut() {
                 step(&reporter)?;
             }
-            // A backend step may mark every inherited descriptor close-on-exec
-            // (Linux does, so no leaked descriptor passes the sandbox); the
-            // hold alone is kept open across exec. It is a read-only
+            // The parent opened the hold close-on-exec, and a backend step may
+            // mark every inherited descriptor close-on-exec (Linux does, so no
+            // leaked descriptor passes the sandbox); the hold alone is kept
+            // open across exec, in this child only. It is a read-only
             // descriptor of an empty lock file under the state directory:
             // nothing to read, and a lock is all it carries. Its number is
-            // whatever `open` returned; nothing assumes it is low.
+            // whatever the parent's `open` returned; nothing assumes it is low.
             if hold_fd >= 0 && libc::fcntl(hold_fd, libc::F_SETFD, 0) != 0 {
                 return Err(
                     reporter.fail("cannot keep the worktree hold across exec", last_errno())
@@ -346,79 +406,125 @@ mod tests {
         assert_eq!(probe.reason(), None);
     }
 
-    fn hold_in(dir: &std::path::Path, wait: std::time::Duration) -> Hold {
+    /// A hold in `dir`, its gate waiting at most `wait`.
+    fn hold_in(dir: &std::path::Path, wait: Duration) -> (Hold, HoldGate) {
         use std::os::unix::ffi::OsStrExt;
-        let c = |p: std::path::PathBuf| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-        Hold {
-            lock: c(dir.join("hold")),
-            sessions: c(dir.join("sessions")),
+        let lock = dir.join("hold");
+        std::fs::File::create(&lock).unwrap();
+        let fd = Arc::new(AtomicI32::new(-1));
+        let hold = Hold {
+            fd: Arc::clone(&fd),
+            sessions: std::ffi::CString::new(dir.join("sessions").as_os_str().as_bytes()).unwrap(),
             host: b"- - -".to_vec(),
-            wait,
-        }
+        };
+        (hold, HoldGate::new(lock, fd, wait))
     }
 
-    /// Spawn on a thread, so a child that never takes its hold fails the
-    /// test instead of hanging it.
-    fn spawn_within(
-        mut cmd: Command,
-        bound: std::time::Duration,
-    ) -> io::Result<std::process::ExitStatus> {
+    /// Run `f` on a thread, so a wait that never ends fails the test instead
+    /// of hanging it.
+    fn within<T: Send + 'static>(bound: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(cmd.spawn().and_then(|mut c| c.wait()));
+            let _ = tx.send(f());
         });
         rx.recv_timeout(bound)
-            .expect("the spawn returned within the bound")
+            .expect("the call returned within the bound")
     }
 
     #[test]
-    fn a_hold_held_exclusively_fails_the_spawn_at_its_bound_with_its_reason() {
+    fn a_hold_held_exclusively_fails_the_take_at_its_bound_naming_the_hold() {
         let dir = tempfile::tempdir().unwrap();
-        let holder = std::fs::File::create(dir.path().join("hold")).unwrap();
+        let wait = Duration::from_millis(300);
+        let (_hold, gate) = hold_in(dir.path(), wait);
+        let holder = std::fs::File::open(dir.path().join("hold")).unwrap();
         holder.lock().unwrap();
-        let mut cmd = Command::new("/usr/bin/true");
-        let wait = std::time::Duration::from_millis(300);
-        let probe = install(&mut cmd, Some(hold_in(dir.path(), wait)), None).unwrap();
-        let started = std::time::Instant::now();
-        let err = spawn_within(cmd, std::time::Duration::from_secs(20)).unwrap_err();
+        let started = Instant::now();
+        let taken = {
+            let gate = gate.clone();
+            within(Duration::from_secs(20), move || gate.take())
+        };
+        let err = taken.unwrap_err();
         assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
-        assert_eq!(err.raw_os_error(), Some(libc::ETIMEDOUT), "{err}");
-        assert_eq!(probe.reason().as_deref(), Some(HOLD_TIMEOUT));
+        match &err {
+            SandboxError::HoldTimeout { path, .. } => {
+                assert_eq!(path, &dir.path().join("hold"));
+            }
+            other => panic!("expected a hold timeout, got {other:?}"),
+        }
+        assert!(err.to_string().contains("hold"), "{err}");
 
         // Free again: the next command takes its shared hold and runs.
         holder.unlock().unwrap();
+        let (hold, gate) = hold_in(dir.path(), Duration::from_secs(5));
         let mut cmd = Command::new("/usr/bin/true");
-        let probe = install(
-            &mut cmd,
-            Some(hold_in(dir.path(), std::time::Duration::from_secs(5))),
-            None,
-        )
-        .unwrap();
-        assert!(
-            spawn_within(cmd, std::time::Duration::from_secs(20))
-                .unwrap()
-                .success()
-        );
+        let probe = install(&mut cmd, Some(hold), None).unwrap();
+        let held = gate.take().unwrap();
+        let status = cmd.status().unwrap();
+        drop(held);
+        assert!(status.success());
         assert_eq!(probe.reason(), None);
+    }
+
+    #[test]
+    fn a_stop_ends_the_wait_without_the_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_hold, gate) = hold_in(dir.path(), Duration::from_secs(600));
+        let holder = std::fs::File::open(dir.path().join("hold")).unwrap();
+        holder.lock().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || gate.take_until(|| stop.load(Ordering::Relaxed)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        let taken = within(Duration::from_secs(20), move || waiting.join().unwrap());
+        assert!(matches!(taken, Ok(None)), "{taken:?}");
     }
 
     #[test]
     fn a_shared_hold_does_not_wait_for_another_shared_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let other = std::fs::File::create(dir.path().join("hold")).unwrap();
+        let (hold, gate) = hold_in(dir.path(), Duration::from_millis(300));
+        let other = std::fs::File::open(dir.path().join("hold")).unwrap();
         other.lock_shared().unwrap();
         let mut cmd = Command::new("/usr/bin/true");
-        let probe = install(
-            &mut cmd,
-            Some(hold_in(dir.path(), std::time::Duration::from_millis(300))),
-            None,
-        )
-        .unwrap();
-        assert!(
-            spawn_within(cmd, std::time::Duration::from_secs(20))
-                .unwrap()
-                .success()
-        );
+        let probe = install(&mut cmd, Some(hold), None).unwrap();
+        let held = gate.take().unwrap();
+        assert!(cmd.status().unwrap().success());
+        drop(held);
         assert_eq!(probe.reason(), None);
+    }
+
+    #[test]
+    fn a_spawn_whose_hold_was_not_taken_fails_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hold, _gate) = hold_in(dir.path(), Duration::from_millis(300));
+        let mut cmd = Command::new("/usr/bin/true");
+        let probe = install(&mut cmd, Some(hold), None).unwrap();
+        let err = cmd.spawn().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOLCK), "{err}");
+        assert_eq!(probe.reason().as_deref(), Some(HOLD_NOT_TAKEN));
+    }
+
+    /// The command keeps the lock after the parent drops its copy, and the
+    /// lock goes when the command exits.
+    #[test]
+    fn the_command_keeps_the_hold_after_the_parent_drops_its_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hold, gate) = hold_in(dir.path(), Duration::from_secs(5));
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("2");
+        let _probe = install(&mut cmd, Some(hold), None).unwrap();
+        let held = gate.take().unwrap();
+        let mut child = cmd.spawn().unwrap();
+        drop(held);
+        let probe = std::fs::File::open(dir.path().join("hold")).unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the running command holds the hold"
+        );
+        child.wait().unwrap();
+        probe.try_lock().expect("free once the command exited");
     }
 }

@@ -183,6 +183,16 @@ pub enum SandboxError {
         #[source]
         source: std::io::Error,
     },
+    /// The command's worktree hold stayed held exclusively (a removal, reopen
+    /// or quiesce of the worktree) for the whole wait; nothing was started.
+    #[error(
+        "timed out after {waited:?} waiting for the worktree hold {path}: a removal, reopen or \
+         quiesce held it exclusively"
+    )]
+    HoldTimeout {
+        path: PathBuf,
+        waited: std::time::Duration,
+    },
     /// Spawning failed for a reason other than sandbox setup.
     #[error("spawn failed: {0}")]
     Spawn(#[source] std::io::Error),

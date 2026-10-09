@@ -661,7 +661,6 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
     let out = workspace_command(&e.ws, Network::Deny, &cargo)
         .unwrap()
         .args(["run", "--offline", "-q"])
-        .command_mut()
         .env_remove("CARGO_TARGET_DIR")
         .output()
         .unwrap();
