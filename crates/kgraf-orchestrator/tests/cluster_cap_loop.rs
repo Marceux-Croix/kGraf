@@ -236,3 +236,100 @@ async fn a_deferred_contract_is_admitted_once_the_cluster_drains() {
     );
     assert!(record.counters.cluster_cap_refusals >= 2);
 }
+
+/// A contract refused first at the work-item ceiling and then held at its
+/// cluster cap gets a deferral record and a wait record for each cause. Both
+/// are traced as `Capacity`; keyed by contract and reason alone, the
+/// cluster-cap hold left no record, and the trace named the ceiling as the
+/// cause of the whole wait (one run held a contract about 800 s at its
+/// cluster cap while its only record said "3 agents are live").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_refusal_then_a_cluster_cap_hold_are_both_traced() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "edit a", "a.txt", &[]),
+        c("b", "edit b", "b.txt", &[]),
+        c("x", "edit x", "c.txt", &[]),
+    ]);
+    // Workers long enough that the first two still run when the third,
+    // refused at the ceiling, asks again.
+    let mut p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(1500),
+    );
+    p.admission = admission(Limits::new(3, 3).expect("limits"));
+    seed_cochange(&p, &["a.txt", "b.txt", "c.txt"]);
+    // Another run's work item: with it the ceiling of 3 is full once two of
+    // the three coupled contracts run, so the third is refused at the ceiling.
+    let other = p
+        .admission
+        .gate()
+        .try_admit(1)
+        .expect("the other run's slot");
+    let services = p.services(WINDOW);
+    let o = kgraf_orchestrator::Orchestrator::new(config(2), services).expect("orchestrator");
+    let gate = p.admission.clone();
+    let free_the_other_slot = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (items, agents) = gate.gate().refusals();
+            if items + agents > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no ceiling refusal in 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Room at the ceiling again while the first two still run: the third
+        // now meets its cluster cap.
+        gate.gate().release(other);
+    };
+    let (report, ()) = tokio::join!(
+        o.start(RunId::new("r1"), "edits".into()),
+        free_the_other_slot
+    );
+    let report = report.expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+
+    let deferrals = deferred_events(&p).await;
+    let both: Vec<&str> = ["a", "b", "x"]
+        .into_iter()
+        .filter(|id| {
+            let mine: Vec<&String> = deferrals
+                .iter()
+                .filter(|(c, r, _)| c == id && *r == DeferReason::Capacity)
+                .map(|(_, _, d)| d)
+                .collect();
+            mine.iter().any(|d| !d.starts_with("cluster cap:"))
+                && mine.iter().any(|d| d.starts_with("cluster cap:"))
+        })
+        .collect();
+    assert_eq!(
+        both.len(),
+        1,
+        "one contract has a record of each cause: {deferrals:?}"
+    );
+
+    let waits: Vec<String> = TraceLog::open(&p.dir.join("runs").join("r1").join("trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load")
+        .into_iter()
+        .filter_map(|e| match e {
+            TraceEvent::Wait {
+                contract, detail, ..
+            } if contract == both[0] => Some(detail),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        waits.iter().any(|d| d.starts_with("cluster cap:")),
+        "a wait record names the cluster cap: {waits:?}"
+    );
+}

@@ -42,11 +42,25 @@ pub fn effective_cap(configured: usize) -> usize {
     configured.max(1)
 }
 
+/// The prefix of a cluster-cap deferral's detail. The deferral is traced under
+/// `DeferReason::Capacity`, like a work-item or agent ceiling refusal, so this
+/// prefix is what tells the two causes apart: in the trace, and where the
+/// orchestrator records a deferral or a wait once per cause. Keyed on the
+/// reason alone, a contract first refused at the ceiling and later held at its
+/// cluster cap left only the ceiling record, and the trace named the wrong
+/// cause for the whole hold.
+pub const DETAIL_PREFIX: &str = "cluster cap:";
+
+/// Whether a capacity deferral's detail is a cluster-cap hold.
+pub fn is_hold_detail(detail: &str) -> bool {
+    detail.starts_with(DETAIL_PREFIX)
+}
+
 /// Why a contract is held at the cluster cap, for the caller's trace. The
-/// caller traces it under `trace::DeferReason::Capacity` (the exhaustive
-/// match in `orchestrator/coord.rs::wait_of_defer` is out of this build
-/// item's edit scope) with a `"cluster cap: "`-prefixed detail, rather than a
-/// new `DeferReason` variant.
+/// caller traces it under `trace::DeferReason::Capacity` with a
+/// [`DETAIL_PREFIX`]-prefixed detail, rather than a new `DeferReason` variant
+/// (which every exhaustive match on it, `orchestrator/coord.rs::wait_of_defer`
+/// among them, and every trace reader would have to learn).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClusterCapHold {
     /// The cluster index (`routing::cluster_contracts`'s dense id).

@@ -147,15 +147,25 @@ pub fn one_line(waits: &BTreeMap<String, WaitState>) -> String {
         .join("; ")
 }
 
-/// Record `state` for `contract`. Returns whether its kind changed, which is when
-/// a trace record is due.
+/// Record `state` for `contract`. Returns whether its cause changed, which is
+/// when a trace record is due: its kind, or, for a capacity wait, whether it is
+/// a cluster-cap hold. Both are `Capacity`, told apart by the detail's prefix
+/// ([`crate::cluster_cap::is_hold_detail`]); compared by kind alone, a contract
+/// that waited at the agent ceiling and then at its cluster cap kept the
+/// ceiling record for the whole wait.
 pub fn set(waits: &mut BTreeMap<String, WaitState>, contract: &str, state: WaitState) -> bool {
-    let changed = waits.get(contract).map(WaitState::kind) != Some(state.kind());
+    let changed = waits.get(contract).map(WaitState::cause) != Some(state.cause());
     waits.insert(contract.to_owned(), state.scrubbed());
     changed
 }
 
 impl WaitState {
+    /// The kind, and for a capacity wait whether it is a cluster-cap hold.
+    fn cause(&self) -> (WaitKind, bool) {
+        let cluster = matches!(self, WaitState::Capacity { detail } if crate::cluster_cap::is_hold_detail(detail));
+        (self.kind(), cluster)
+    }
+
     /// A detail can quote an error from a provider, a server or a lease
     /// holder, and is stored and shown: persist-scrubbed.
     fn scrubbed(self) -> Self {
@@ -234,5 +244,27 @@ mod tests {
         assert!(!set(&mut w, "a", lease(2)));
         assert_eq!(w["a"], lease(2), "the latest detail is kept");
         assert!(set(&mut w, "a", WaitState::Running));
+    }
+
+    /// A contract waited at the agent ceiling, then for about 800 s at its
+    /// cluster cap, and the trace kept the ceiling record for the whole wait.
+    /// Both are `Capacity`; the cluster cap is a cause of its own.
+    #[test]
+    fn a_ceiling_wait_turning_into_a_cluster_cap_hold_is_a_new_trace_record() {
+        let mut w = BTreeMap::new();
+        let ceiling = || WaitState::Capacity {
+            detail: "3 agents are live and 1 more were asked for; the ceiling is 3".into(),
+        };
+        let cluster = |ids: &str| WaitState::Capacity {
+            detail: format!("cluster cap: cluster 0: 2 already in flight ({ids}), cap 2"),
+        };
+        assert!(set(&mut w, "c6", ceiling()));
+        assert!(!set(&mut w, "c6", ceiling()), "the same cause again");
+        assert!(set(&mut w, "c6", cluster("c5, c8")), "a new cause");
+        assert!(
+            !set(&mut w, "c6", cluster("c5, c7")),
+            "the same cause, other members"
+        );
+        assert!(set(&mut w, "c6", ceiling()), "back at the ceiling");
     }
 }

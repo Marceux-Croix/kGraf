@@ -456,7 +456,7 @@ impl RunLoop {
         }
         if !released.is_empty() {
             self.deferred_logged
-                .retain(|(c, _)| !released.iter().any(|r| r == c));
+                .retain(|(c, _, _)| !released.iter().any(|r| r == c));
         }
         released
     }

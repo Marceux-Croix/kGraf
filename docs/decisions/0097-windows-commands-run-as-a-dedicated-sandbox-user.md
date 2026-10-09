@@ -573,3 +573,67 @@ returns the gate as well, and the two async callers (the shell tool and the chec
 runner) take it on a blocking thread, stopped by a cancel or a dropped check. Test:
 `a_spawn_waiting_for_a_quiesced_worktree_does_not_delay_other_spawns`
 (`kgraf-sandbox/tests/reopen.rs`).
+
+**Amendment (2026-10-08): the record folder, the shared folders, links before a first
+grant, and Java behind the proxy.** Four fixes from a review of the setup and the
+backend. None of it has run on Windows yet.
+
+- **The undo record's folder is trusted only when administrators alone can change
+  it.** Every local user may create a folder under ProgramData and holds full
+  control of what it creates. A sandboxed command could create kGraf's record folder
+  first and put a link in it, and the administrator step would then write a file that
+  the command chose. Setup now creates the folder with a protected access list (owner
+  Administrators; full control for SYSTEM and Administrators; read and list for Users,
+  because `kgraf sandbox status` reads the record without administrator rights;
+  `TRUSTED_FOLDER_SDDL`). It refuses a folder that exists already when its owner is
+  not SYSTEM, Administrators, TrustedInstaller or the elevated user, when another
+  principal may change it, or when it is a link. It takes ProgramData from the
+  known-folder call, not from the environment. It opens, writes and deletes the record
+  without following a reparse point. Remove refuses an untrusted folder before it reads
+  or writes in it.
+- **The folders every local user may write are closed to the sandbox group.** The
+  sandbox users could write wherever every local user may. Setup writes a deny entry
+  for the sandbox group on each folder of that kind: create a file or a folder in it,
+  and change it (`CLOSED_FOLDER_DENY`); reading stays. The entry is on that folder
+  alone, never inherited: an inherited entry on a drive root would rewrite the access
+  list of every file on the drive, and an administrator cannot write the lists of the
+  system's own files. Setup lists each folder in the undo record with the group's SID;
+  remove takes exactly that entry off before the group goes; status reports each
+  folder. **Not closed, and stated in the backend's gaps text:** folders that exist
+  below these and already grant every user write stay writable (many do below
+  ProgramData).
+- **No first grant on a tree while a link in it leads outside it.** Writing an
+  inheritable entry on a folder makes Windows write it on everything that already
+  exists below, and whether that walk enters a junction is not documented. An earlier
+  command could plant a junction that points at the owner's files, and the next grant
+  for a new SID (another sandbox user, a new capability) would carry write access onto
+  them. Before the first write grant or read grant for a SID on a tree, kGraf walks the
+  tree without entering links (`first_outside_link`) and refuses while a link resolves
+  outside the tree or does not resolve. A link that stays inside is allowed (pnpm lays
+  out `node_modules` with such junctions). A Windows test plants a junction and checks
+  the target's list; another measures whether the propagation follows a junction.
+  **Not closed:** a command of another sandbox user in the same folder could plant a
+  link between the walk and the write. The first grant for a SID on a folder comes
+  before any command of that SID runs there.
+- **The proxy secret is kept out of `JAVA_TOOL_OPTIONS`.** Every JVM prints that
+  variable on start ("Picked up JAVA_TOOL_OPTIONS: ..."), so the secret went into the
+  command's output and transcript. The JDK also refuses Basic proxy authentication for
+  HTTPS tunnels by default (`jdk.http.auth.tunneling.disabledSchemes`), so the secret
+  did not get a Maven or Gradle download through. Java now gets the proxy host and port
+  without the secret; only the URL variables (`HTTP_PROXY`, `HTTPS_PROXY`) carry it. A
+  request without the secret gets the proxy's 407 with a text that says Java dependency
+  installs through the proxy are not supported on Windows, and
+  `EgressProxy::refused_without_secret` lists each such request for the caller's
+  report, so a 407 is never the only trace. Java installs on Windows fail loudly, not
+  by a firewall timeout.
+
+Choices made with this amendment:
+
+- (q) The closed folders: the root of each fixed local drive whose file system keeps
+  access lists, ProgramData, Public and the folders directly in it, and the
+  `Temp`, `Tasks` and `tracing` folders of the Windows folder (`closed_folders`,
+  `WINDOWS_CHILDREN`). These are where every user may create entries by default and
+  no program of a sandbox user needs to: each command gets its own `TMP` and `TEMP`.
+  Other folders of that kind under the Windows folder belong to TrustedInstaller,
+  whose lists an administrator cannot change without taking ownership, so they stay
+  open, and the gaps text says so.

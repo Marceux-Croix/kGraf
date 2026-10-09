@@ -272,6 +272,18 @@ fn ace_views(acl: *const ACL) -> Result<Option<Vec<AceView>>, SandboxError> {
     Ok(Some(out))
 }
 
+/// The access list of the file or folder at `path`, as the judgments in
+/// `acl.rs` read it; `None` for a null list, which grants everyone
+/// everything. Read without following a link.
+pub fn dacl_of(path: &Path) -> Result<Option<Vec<AceView>>, SandboxError> {
+    let h = open_no_follow(path, READ_CONTROL).map_err(|source| SandboxError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let sec = security_of(&h, path)?;
+    ace_views(sec.dacl)
+}
+
 // ---- the undo record's folder ------------------------------------------------
 
 /// Why the folder at `path` cannot hold the undo record, or `None` when it

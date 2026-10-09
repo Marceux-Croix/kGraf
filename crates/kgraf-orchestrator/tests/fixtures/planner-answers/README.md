@@ -13,7 +13,14 @@ not against an answer written to fit the fix.
 | `d6-replan-unclosed-string.txt` | order pricing, re-plan | a file's `content` string never closed, so a line break falls inside it (line 107) |
 | `d8-ask3-empty-shells.txt` | order pricing, third ask | empty `reference` and `tests`, and the producer's file in both `stub` and `consumer` |
 | `d1-contracts-order-pricing.txt` | order pricing, contracts ask | six contracts over the scaffolded workspace: c4 depends on c3, c5 on c1 to c4, c6 on c5; the shape every interface ask of the benchmark ran on |
+| `tb-pypi-contracts.txt` | Terminal-Bench `pypi-server`, contracts ask (2026-10-08) | three contracts: write the `vectorops` package, build its wheel and source archive (`.whl`, `.tar.gz` only), serve and install them |
+| `tb-pypi-ask1.txt` to `tb-pypi-ask3.txt` | the same run, the three interface asks | test files that define `def test_...` and never call them, run as `python test_x.py`; the build contract's interface with no stub, then text placeholders for the wheel |
 | `long-run-one-file.txt` | eight classes in one file | eight chained contracts that all write `shapes/library.py`, checked by one test file |
 
 The order-pricing task is a Cargo workspace with one crate per contract; the
 long-run task is a Python package with one module and one test file.
+
+The `tb-pypi-*` answers were recorded inside a Terminal-Bench container, where `python` is the
+interpreter. The test that serves them replaces the program `python` in their commands with the
+host's interpreter, and nothing else: a check whose program is missing does not run, and the
+interface would be accepted unchecked.

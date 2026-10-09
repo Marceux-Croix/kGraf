@@ -880,3 +880,61 @@ Tests: `kgraf-orchestrator` `plan_repo.rs`
 `the_check_agrees_with_cargo` (the refused plan fails in a real cargo run, its remedy passes),
 `a_toml_member_list_wins_over_prose`, `this_repository_with_ordinary_plans_is_not_refused`;
 `shortfall.rs` `a_hold_for_a_file_no_contract_writes_asks_for_a_replan`.
+
+## Amendment (2026-10-08, second): an ask the planner cannot win is not made, and a script test gets its call
+
+A three-contract Python packaging plan (write the package, build its wheel and source archive,
+serve and install them) spent all three asks of the interface call, about 100 s each on a local
+model, and accepted no interface. Three faults, each enough to spend an ask:
+
+- **The test ran no assertion.** Every test file the planner wrote defined `def test_...`
+  functions and never called them, and the test command was `python test_x.py`. The file exits
+  0 against the stub and against the reference alike. The vacuity check refused it for passing
+  against the stub, which names the symptom; the planner made the assertion stricter and kept
+  the shape on every ask.
+- **The build contract was asked about.** Its declared writes were a `.whl` and a `.tar.gz`. A
+  stub and a reference are text the planner writes, and a text file is not a wheel, so no
+  reference of it can exist. Its answers were refused for an empty stub and reference, then
+  for a reference too small to be a wheel.
+- **A refusal the planner was not asked to fix bought a re-ask.** Any refused interface sent
+  the call back to the planner, including one for a producer kGraf would not have asked about.
+
+The rules:
+
+- **A script test gets its call** (`script_tests`). When an interface's test command runs a
+  test file of the answer as a script (`python`, `python3` or `python3.N`, no `-m`, no `-c`),
+  and the file's top level only defines tests (`def test_...` functions, `unittest.TestCase`
+  classes) without calling them, kGraf appends the calls under `if __name__ == "__main__":`
+  (the functions in order, then `unittest.main()`), says so in a notice, and checks the
+  interface with the calls. This is the same kind of repair as a compile command that does not
+  build the files being replaced. When a test cannot be called with certainty (it takes
+  arguments such as pytest fixtures, is async or decorated, or is a pytest class), the
+  interface is refused with that cause and the remedy instead. A top level that could already
+  run its tests (an `if`, a loop, `with`, `try`, a top-level `assert`, a line naming a test,
+  `globals()`, `unittest.main`, `pytest.main`) is left alone, and so is a test file named by
+  path alone from the repository.
+- **A producer of binary build outputs only is not asked about**
+  (`derive_interface::binary_outputs_only`). When every file a producer declares is a package
+  archive, compiled object or library (`.whl`, `.tar.gz`, `.zip`, `.jar`, `.so`, `.dll`,
+  `.pyc`, `.class`, `.wasm` and the others in `BINARY_OUTPUTS`), its behavior check is
+  recorded as not run, `behavior check not run: <producer> writes only binary build outputs
+  (...)`, like the two existing skips. A producer that also writes one source file is asked
+  about as before.
+- **A refused interface whose producer is skipped does not buy a re-ask.** Its refusal goes
+  into a notice, and its edges keep the skip reason as their unchecked reason. An interface for
+  a skipped producer that passes its checks is still accepted.
+
+Accepting an interface has a cost of its own: its gate states a handshake per open party, one
+model call each, made one after the other before the parties dispatch. An ask this amendment
+saves can be spent there instead, so it claims no time saved; it claims asks that can succeed.
+
+Tests: `kgraf-orchestrator` `script_tests.rs` (the script argument, the repair, the refusal
+causes, files left alone, docstrings), `derive_interface.rs`
+`a_producer_of_binary_build_outputs_only_is_not_asked_about`; `contract_flow.rs`
+`a_script_test_that_never_calls_its_test_gets_the_call_added`,
+`a_script_test_kgraf_cannot_call_is_refused_with_the_cause`,
+`a_producer_of_binary_build_outputs_is_not_asked_about`, and
+`the_recorded_pypi_server_answers_are_accepted_on_the_second_ask` (the four planner answers of
+the run, verbatim, in `tests/fixtures/planner-answers/tb-pypi-*.txt`: without the three rules
+they spend three asks and accept nothing, as the run did; with them, two asks and
+`i_pkg_create` accepted; with any one rule removed, three asks).

@@ -11,15 +11,9 @@ use common::{fixture, git};
 use kgraf_sandbox::git::Git;
 use kgraf_sandbox::{
     Attempt, AttemptGroup, AttemptState, CommitOutcome, FinishOutcome, GeneratedKind, Identity,
-    Limits, MergeBack, MergeError, MergeOutcome, MergedWorktree, RefusalReason, WorkspaceManager,
-    WorkspaceSpec,
+    Limits, MergeBack, MergeError, MergeOutcome, MergedWorktree, RefusalReason, WorkspaceError,
+    WorkspaceManager, WorkspaceSpec,
 };
-// Only referenced by the `#[cfg(unix)]` gitlink-tampering test below (planting a
-// symlinked `.git` file is a unix-specific attack shape here); a plain, unconditional
-// import left this "unused" on a non-unix `--all-targets` build (found by Windows
-// cross-compilation under `-D warnings`).
-#[cfg(unix)]
-use kgraf_sandbox::WorkspaceError;
 
 const BRANCH: &str = "integration";
 
@@ -1403,7 +1397,21 @@ fn a_hung_git_is_killed_at_the_timeout() {
 fn attempt_names_that_are_not_valid_refs_are_refused() {
     let e = env();
     let mb = merger(&e);
-    for name in ["x.lock", "a..b", "trail."] {
+    // "trail." is not a valid ref either, but Windows cannot make a folder of
+    // it, so no workspace of that name is made on any platform.
+    let unportable = e
+        .mgr
+        .create(&WorkspaceSpec {
+            name: "trail.",
+            base: BRANCH,
+            branch: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(unportable, WorkspaceError::UnportableName { .. }),
+        "{unportable}"
+    );
+    for name in ["x.lock", "a..b"] {
         let ws = e
             .mgr
             .create(&WorkspaceSpec {

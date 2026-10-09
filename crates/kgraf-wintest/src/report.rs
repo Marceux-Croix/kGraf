@@ -48,6 +48,19 @@ pub struct BinaryResult {
     /// Output tail when the binary did not end with a test summary.
     pub tail: Option<String>,
     pub skipped: Vec<String>,
+    /// Every line the binary printed that starts with `measurement:`.
+    pub measurements: Vec<Measurement>,
+}
+
+/// One `measurement:` line of a test binary's output.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Measurement {
+    /// The test that printed it, when the output says which.
+    pub test: Option<String>,
+    /// The test's time as the runner measured it: from the result of the
+    /// test before it (or the binary's start) to its own result.
+    pub secs: Option<f64>,
+    pub line: String,
 }
 
 impl BinaryResult {
@@ -524,6 +537,7 @@ mod tests {
             rerun_skipped: vec![],
             tail: None,
             skipped: vec![],
+            measurements: vec![],
         }
     }
 

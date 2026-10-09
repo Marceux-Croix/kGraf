@@ -109,6 +109,21 @@ runner account is an administrator, so the sandbox and firewall checks run eleva
 the runner has Git for Windows, so the worker shell finds `sh`. A result from the runner
 does not replace a run on a standard-user machine without Git for Windows.
 
+Before the run, the workflow does three things, and each one fails the job if it does not
+work:
+
+- It copies the bundle to `C:\kgraf-wintest` and gives that folder a protected access
+  list: full control for SYSTEM and Administrators, read and execute for Users. The
+  sandbox users cannot read the runner account's profile. The checkout folder
+  (`GITHUB_WORKSPACE`, on the hosted image usually under `D:\a\`) is not in the profile,
+  but its access list comes from the image. The step logs both paths, whether the build
+  folder is inside the profile, and the `icacls` lists of the build folder and of the copy.
+  The baseline and the sandbox user phase both run from the copy.
+- It starts the OpenSSH agent service (`Set-Service ssh-agent -StartupType Manual`, then
+  `Start-Service ssh-agent`). The service is off on the hosted image, and an escape test
+  probes its pipe.
+- It checks that Git for Windows is installed (`C:\Program Files\Git\bin\bash.exe`).
+
 #### The sandbox user phase
 
 The workflow has one input, `sandbox_user`, on by default. It adds `--sandbox-user` to the
@@ -121,10 +136,10 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | Step | Command | What it checks |
 |---|---|---|
 | (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
-| (b) | `kgraf sandbox setup` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the DNS filter, with no tag. The output lists a received password for every one of these users. |
+| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the DNS filter, with no tag. The output lists a received password for every one of these users. |
 | (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the DNS filter line included. Every stored password logs on. |
 | (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`. Any other failure stops the phase: step (e) does not run. |
-| (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. |
+| (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
 
 Rules of the phase:
@@ -137,8 +152,31 @@ Rules of the phase:
   window is not elevated and a step fails.
 - `kgraf-sandbox-runner.exe` must be in `programs\` of the bundle. The phase puts a copy in
   `tests\` for the test binaries, and removes it at the end.
+- The sandbox users must be able to read and run the programs in `tests\`. Before setup,
+  the phase checks that `tests\` is not inside the profile of the user who runs it, and
+  that each program there grants read and execute to Everyone, Authenticated Users or
+  Users with no deny entry before that grant. If not, the phase does not start, and the
+  report names the sandbox group (`kgraf-sandbox-<hex>`), the folder and the reason. Unzip
+  the bundle to a folder such as `C:\kgraf-wintest`, not to Downloads or the Desktop.
+- Setup gets `--slots 4` (the default, passed explicitly). The escape tests need two slot
+  users or more to check that two worktrees run as two users.
 - `KGRAF_SANDBOX_SETUP_TEST=1` stays only for the tagged setup test in the baseline. The
   phase does not use a tag.
+- Step (e) sets `KGRAF_REQUIRE_SANDBOX_USER=1`; the baseline suite does not. The runner
+  keeps every `KGRAF_` variable of its own environment from the test binaries and sets
+  this one only in the environment of the re-run, so a value in the shell that started
+  the runner reaches neither half. The baseline is the token sandbox on purpose. With the switch set to 1, a test in `escape_windows.rs`,
+  `runner_windows.rs` or `tls_windows.rs` that would take the token sandbox branch, or skip,
+  fails instead, and its message says to run `kgraf sandbox setup`. The switch takes `1` or
+  `0`. Any other value is an error. Without it, a machine where setup did not take effect
+  passes every test and measures nothing.
+- The escape tests (`escape_windows`) run with a console of their own, in the baseline and
+  in the re-run: the runner starts that binary with `CREATE_NEW_CONSOLE` and still reads
+  its output through pipes. `the_sandbox_cannot_attach_to_the_host_console` measures that
+  a command cannot attach to its host's console, and a redirected run has no console to
+  attach to. In the re-run, with the switch set, that test fails if the binary still has
+  no console; it never passes without the measurement. On a desktop an empty console
+  window opens while the binary runs.
 - The status command prints no words "logon works". A stored password line that is
   `present` means that a real logon with that password worked, and the report counts them.
 
@@ -151,6 +189,13 @@ What the report part "Sandbox user phase" shows:
 - A table with the baseline and the sandbox user side by side for each re-run binary. A
   second table lists each test that failed in the baseline and ran again: `passed`,
   `failed`, `hung` or `not reached`. The tail of each is below the table.
+- "Measurements of the re-run": every output line of the re-run that starts with
+  `measurement:`, with its binary, its test and the test's time. The runner measures that
+  time from the result of the test before it, or from the start of the binary, to the
+  test's own result: with one test thread a test starts when the one before it ends. The re-run passes `--show-output`, so libtest prints
+  the output of passing tests in its summary. A binary that hung or crashed never prints
+  that summary: the section names each such binary, because the lines of its passing
+  tests are missing.
 - The end-to-end checks with the baseline status and the sandbox user status.
 - The confirmation after (f). If anything is left, the runner exits with a non-zero code.
 
@@ -309,6 +354,77 @@ process environment.
    ```powershell
    cargo test -p kgraf-sandbox --test escape_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3-escape-windows.txt"
    ```
+
+   The probe is the test binary itself. A sandbox user cannot read the owner's profile, so
+   the build output must be outside it, or every probe dies with no result. Set
+   `CARGO_TARGET_DIR` to a folder outside the profile (for example `C:\kgraf-target`) before
+   you build and run the Windows test binaries, here and in steps 3a and 3b:
+
+   ```powershell
+   $env:CARGO_TARGET_DIR = "C:\kgraf-target"
+   ```
+
+   The tests fail loud with a message that names `CARGO_TARGET_DIR` when the binary is under
+   the profile. To test the sandbox user (after `kgraf sandbox setup`), also set
+   `$env:KGRAF_REQUIRE_SANDBOX_USER = "1"`. Leave it unset for the token sandbox.
+
+   The tests branch on the backend in use. Several report a measurement, not the block of an
+   attack. A run must collect these:
+
+   - `the_strength_indicator_matches_the_backend_in_use`: which backend the run measured.
+   - `a_write_into_an_everyone_writable_directory_matches_what_the_backend_claims`: whether a
+     sandbox user can write an Everyone-writable folder under ProgramData. The gaps text of
+     the sandbox user backend says it can. A denial means the claim must be narrowed.
+   - `reads_outside_the_workspace_are_not_confined`: whether a sandbox user reads a file
+     under ProgramData (outside the owner's profile).
+   - `a_command_without_the_network_reaches_the_proxy_ports_and_nothing_else`: three
+     results, in this order. A listener on a port outside 47100-47131 is unreachable. A
+     listener on a port inside that range is reachable (the positive control: without it the
+     first result proves nothing). An address outside loopback (192.0.2.1:80, TEST-NET-1) is
+     unreachable.
+   - `a_unc_path_outside_loopback_is_measured_not_blocked`: a measurement, not a block. The
+     test prints lines that start with `measurement:` for `\\192.0.2.1\x` and
+     `\\192.0.2.1@80\x`. Record those lines with how long the test took. Traffic
+     that the kernel's SMB client or the WebClient service sends does not run as the sandbox
+     user, so the firewall rules scoped to that user do not cover it. Nothing in the test
+     watches the wire.
+   - `one_sandbox_cannot_open_another_sandboxs_process_for_write`: three outcomes, each with
+     its own meaning. Access denied: the two folders ran as different users. The open
+     succeeded: a defect. The second command was refused a sandbox user of its own because
+     setup made no slot users: also confinement.
+
+   - `the_command_runs_on_its_own_desktop_without_a_console` and
+     `user_interface_objects_are_shared_the_way_the_backend_shares_them`: the window station
+     name of each command. As a sandbox user each command gets its own station,
+     `kgraf-sandbox-<hex>`, with one desktop called `Default` on it, and no two commands
+     share a station.
+   - `send_input_reaches_nothing_of_the_owners`: how many events `SendInput` injected, and
+     the station it ran on, in one line from one command. A count above zero on a private
+     station reaches nothing, so the count is a measurement there, not a failure.
+   - `the_ssh_agent_pipe_cannot_be_opened`: whether a command opened the agent's pipe. As a
+     sandbox user that is a measurement: the pipe admits authenticated users, and the gaps
+     text concedes that named objects every user may write are not closed. Start the agent
+     service first, or the test fails with the switch set.
+   - `a_hard_link_to_an_outside_file_cannot_escape`,
+     `a_junction_inside_the_root_cannot_escape` and
+     `the_owner_cannot_rewrite_the_dacl_of_an_outside_file`: each runs a second phase
+     against an Everyone-writable folder under ProgramData, where the target's own access
+     list decides and not the owner's profile, and prints a `measurement:` line.
+
+   In a manual run, add `--show-output` to the command above (libtest prints the output of
+   a passing test only then) and copy every line that starts with `measurement:` into the
+   report. The self-test runner does this in the re-run of its sandbox user phase (section
+   0). The tests fail where a thing they probe is absent and `KGRAF_REQUIRE_SANDBOX_USER=1`
+   is set: the OpenSSH agent service (`Start-Service ssh-agent`), a console window for the
+   test binary (run it from a PowerShell window, not with its output redirected by a
+   program that gives it no console), Git for Windows for the TLS test, and two offline
+   slot users for the linked-dependency test (`kgraf sandbox setup --slots 2` or more).
+   Start or install each one before the run instead of reading a skip as a pass.
+
+   The probes run under both kinds of sandbox user where it matters (the slot user without
+   the network and the one with it), so a failure message names which kind. The runner tests
+   (step 3b) check `PROCESS_VM_READ` and `PROCESS_VM_WRITE` against the runner process, so
+   the escape tests do not repeat them.
 
    **3a.** HTTPS inside the sandbox, with a listener on 127.0.0.1 (no internet needed). The
    test runs three checks: `curl.exe` from System32 (Schannel) outside the sandbox, the curl of

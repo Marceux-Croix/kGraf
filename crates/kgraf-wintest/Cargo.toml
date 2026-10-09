@@ -29,6 +29,9 @@ sysinfo.workspace = true
 kgraf-secrets.workspace = true
 # `sandbox-run` and the Git Bash search use kGraf's own code, not a copy.
 kgraf-sandbox.workspace = true
+# The plain-form path resolution the workspace uses instead of the standard
+# one (clippy.toml): the access check compares the bundle path to the profile.
+kgraf-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # MIT OR Apache-2.0; the same windows-sys release kgraf-sandbox pins. Job Object

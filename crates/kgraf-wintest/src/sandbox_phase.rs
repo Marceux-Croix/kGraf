@@ -76,6 +76,21 @@ fn dns_only_failure(step: &StepRun) -> Option<String> {
 }
 pub const REMOVE_LIMIT: Duration = Duration::from_secs(300);
 
+/// The worker slots setup makes users for, passed explicitly so the run
+/// does not depend on the default. Two or more: the escape tests check that
+/// two worktrees run as two different users, and with one slot or none that
+/// check only sees the refusal.
+pub const SETUP_SLOTS: u8 = kgraf_sandbox::sandbox_user::DEFAULT_SLOTS;
+
+/// The arguments of step (b).
+pub fn setup_args() -> Vec<String> {
+    ["sandbox", "setup", "--slots"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(std::iter::once(SETUP_SLOTS.to_string()))
+        .collect()
+}
+
 /// Test binaries that always re-run with the sandbox user active (ids without
 /// the `#core` or `#rest` suffix).
 pub const ALWAYS: &[&str] = &[
@@ -395,7 +410,9 @@ pub fn run_phase(
         SELFCHECK_LIMIT,
         true,
     ));
-    let setup = ex.cli("(b) setup", &["sandbox", "setup"], SETUP_LIMIT, true);
+    let args = setup_args();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let setup = ex.cli("(b) setup", &args, SETUP_LIMIT, true);
     if !setup.ok() {
         p.notes.push(format!("Setup {}.", setup.how()));
         if elevated.is_none() {
@@ -535,6 +552,53 @@ fn e2e_word(c: Option<&Check>) -> String {
     c.map_or("not run".into(), |c| format!("{:?}", c.status))
 }
 
+/// The `measurement:` lines of the re-run (e), each with its binary, test
+/// and the test's time. libtest prints a passing test's output only in its
+/// summary (`--show-output`), so a binary that ended without one lost the
+/// lines of its passing tests; the section says which.
+pub fn render_measurements(reruns: &[Rerun]) -> String {
+    let mut md = String::from("#### Measurements of the re-run\n\n");
+    let all: Vec<(&str, &crate::report::Measurement)> = reruns
+        .iter()
+        .flat_map(|r| {
+            r.result
+                .measurements
+                .iter()
+                .map(move |m| (r.result.id.as_str(), m))
+        })
+        .collect();
+    if all.is_empty() {
+        md.push_str("No re-run test printed a line that starts with `measurement:`.\n\n");
+    } else {
+        md.push_str("| Binary | Test | Duration | Line |\n|---|---|---|---|\n");
+        for (id, m) in &all {
+            md.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                crate::report::md_escape(id),
+                m.test
+                    .as_deref()
+                    .map_or("unknown".to_owned(), crate::report::md_escape),
+                m.secs.map_or("unknown".to_owned(), |s| format!("{s:.1} s")),
+                crate::report::md_escape(&m.line)
+            ));
+        }
+        md.push('\n');
+    }
+    let lost: Vec<&str> = reruns
+        .iter()
+        .filter(|r| r.result.tail.is_some())
+        .map(|r| r.result.id.as_str())
+        .collect();
+    if !lost.is_empty() {
+        md.push_str(&format!(
+            "Ended without a test summary, so the lines of their passing tests are missing: \
+             {}.\n\n",
+            lost.join(", ")
+        ));
+    }
+    md
+}
+
 /// The report part for the phase: baseline and sandbox user side by side.
 pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> String {
     let mut md = String::from("\n## Sandbox user phase\n\n");
@@ -635,6 +699,7 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
                 md.push('\n');
             }
         }
+        md.push_str(&render_measurements(&p.reruns));
         md.push_str(
             "#### End-to-end checks\n\n| Check | Baseline | Sandbox user |\n|---|---|---|\n",
         );
@@ -714,6 +779,7 @@ mod tests {
             rerun_skipped: vec![],
             tail: None,
             skipped: vec![],
+            measurements: vec![],
         }
     }
 
@@ -1069,6 +1135,78 @@ mod tests {
             ]
         );
         assert_eq!(cmp[1].tail, "still broken");
+    }
+
+    #[test]
+    fn setup_passes_two_or_more_slots_explicitly() {
+        let args = setup_args();
+        assert_eq!(&args[..3], ["sandbox", "setup", "--slots"]);
+        let n: u8 = args[3].parse().unwrap();
+        assert!(n >= 2, "{n}");
+        let mut ex = Fake::default();
+        run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(
+            ex.calls
+                .iter()
+                .any(|c| c == &format!("sandbox setup --slots {n} cancel=true")),
+            "{:?}",
+            ex.calls
+        );
+    }
+
+    /// Every measurement line of the re-run is in the report, with its
+    /// binary, test and time; a binary that lost its summary is named.
+    #[test]
+    fn the_report_lists_the_measurements_of_the_rerun() {
+        use crate::report::Measurement;
+        let mut a = bin("kgraf-sandbox/test/escape_windows", &[]);
+        a.measurements = vec![
+            Measurement {
+                test: Some("a_unc_path_outside_loopback_is_measured_not_blocked".into()),
+                secs: Some(61.24),
+                line: "measurement: 192.0.2.1 as the offline slot user: exit 53, x|y".into(),
+            },
+            Measurement {
+                test: None,
+                secs: None,
+                line: "measurement: loose".into(),
+            },
+        ];
+        let mut cut = bin("kgraf-sandbox/test/tls_windows", &[]);
+        cut.tail = Some("killed".into());
+        let reruns = vec![
+            Rerun {
+                why: "w".into(),
+                result: a,
+            },
+            Rerun {
+                why: "w".into(),
+                result: cut,
+            },
+        ];
+        let md = render_measurements(&reruns);
+        assert!(md.contains("#### Measurements of the re-run"), "{md}");
+        assert!(
+            md.contains(
+                "| kgraf-sandbox/test/escape_windows | \
+                 a_unc_path_outside_loopback_is_measured_not_blocked | 61.2 s | "
+            ),
+            "{md}"
+        );
+        assert!(md.contains(r"exit 53, x\|y |"), "{md}");
+        assert!(
+            md.contains("| unknown | unknown | measurement: loose |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("missing: kgraf-sandbox/test/tls_windows"),
+            "{md}"
+        );
+        assert!(render_measurements(&[]).contains("No re-run test printed"));
+        // The section is part of the phase's report.
+        let mut ex = Fake::default();
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(render(&baseline(), &[], &p).contains("#### Measurements of the re-run"));
     }
 
     #[test]

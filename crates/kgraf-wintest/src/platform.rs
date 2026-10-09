@@ -389,6 +389,43 @@ mod imp {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    /// `Ok` when the sandbox group can read and run every program in
+    /// `tests`, or why not, naming the group (`crate::sandbox_access`).
+    pub fn sandbox_group_can_run(tests: &Path) -> Result<(), String> {
+        use crate::sandbox_access::{Binary, judge};
+        use kgraf_sandbox::sandbox_user::OwnerNames;
+        use kgraf_sandbox::sandbox_user::windows::{accounts, secure};
+        let group = accounts::current_user_sid()
+            .ok()
+            .and_then(|sid| OwnerNames::derive(&sid, None).ok())
+            .map_or_else(|| "of this Windows user".to_owned(), |n| n.group());
+        let resolved =
+            kgraf_core::plain_path::canonicalize(tests).unwrap_or_else(|_| tests.to_path_buf());
+        let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let profile = profile.map(|p| kgraf_core::plain_path::canonicalize(&p).unwrap_or(p));
+        let mut binaries = Vec::new();
+        let entries = std::fs::read_dir(tests)
+            .map_err(|e| format!("cannot list the test binaries in {}: {e}", tests.display()))?;
+        for e in entries.flatten() {
+            let path = e.path();
+            let is_exe = path
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("exe"));
+            if is_exe && path.is_file() {
+                binaries.push(Binary {
+                    path: path.display().to_string(),
+                    dacl: secure::dacl_of(&path).map_err(|e| e.to_string()),
+                });
+            }
+        }
+        judge(
+            &resolved.display().to_string(),
+            profile.as_ref().map(|p| p.display().to_string()).as_deref(),
+            &group,
+            &binaries,
+        )
+    }
 }
 
 #[cfg(not(windows))]
@@ -429,6 +466,9 @@ mod imp {
     }
     pub fn schedule_folder_removal(_dir: &Path) -> Result<(), String> {
         Err("Windows only".into())
+    }
+    pub fn sandbox_group_can_run(_tests: &Path) -> Result<(), String> {
+        Err("the sandbox user exists only on Windows".into())
     }
 }
 

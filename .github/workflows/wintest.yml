@@ -6,12 +6,16 @@
 # What it runs:
 #   1. Builds the self-test bundle natively with scripts/package-wintest.sh
 #      (every workspace test binary, kgraf.exe, the kgraf-wintest runner).
-#   2. Runs the bundle with `kgraf-wintest.exe --all --no-wait`, and with the
+#   2. Copies the bundle to C:\kgraf-wintest, outside the runner account's
+#      profile, where every local user may read and run it; starts the
+#      OpenSSH agent service; checks Git for Windows.
+#   3. Runs the copy with `kgraf-wintest.exe --all --no-wait`, and with the
 #      sandbox_user input on (the default) also `--sandbox-user`: after the
 #      suite, which runs with no sandbox user as the baseline, the runner sets
-#      the Windows sandbox user up, re-runs the parts it changes and removes it.
-#   3. Runs the Windows Firewall network test (scripts/wintest-firewall.ps1).
-#   4. Uploads the report and the firewall output as one artifact.
+#      the Windows sandbox user up (`--slots 4`), re-runs the parts it changes
+#      with KGRAF_REQUIRE_SANDBOX_USER=1 and removes it.
+#   4. Runs the Windows Firewall network test (scripts/wintest-firewall.ps1).
+#   5. Uploads the report and the firewall output as one artifact.
 #
 # Cost: this bills Windows minutes, at twice the Linux rate on a private
 # repository. The job stops after 120 minutes.
@@ -72,6 +76,54 @@ jobs:
           JOBS: "4"
         run: scripts/package-wintest.sh
 
+      # The sandbox user phase starts the test binaries as local sandbox
+      # users, which cannot read the runner account's profile. The checkout
+      # (GITHUB_WORKSPACE) is normally outside the profile, but its access
+      # list is the image's, not ours. So the bundle runs from a copy in
+      # C:\kgraf-wintest with a protected list: full control for SYSTEM and
+      # Administrators, read and execute for Users (every local user, the
+      # sandbox users included). The runner's preflight checks the list again
+      # and names the sandbox group if it cannot read the binaries. The
+      # baseline runs from the same copy, so both halves run the same files.
+      - name: Place the bundle outside the profile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = (Get-ChildItem target/wintest/bundle -Directory -Filter 'kgraf-wintest-*' | Select-Object -First 1).FullName
+          Write-Output "GITHUB_WORKSPACE: $env:GITHUB_WORKSPACE"
+          Write-Output "USERPROFILE: $env:USERPROFILE"
+          $inProfile = $stage.ToLower().StartsWith(($env:USERPROFILE.TrimEnd('\') + '\').ToLower())
+          Write-Output "bundle built at $stage; inside the profile: $inProfile"
+          Write-Output "access list of the built tests folder:"
+          icacls (Join-Path $stage 'tests')
+          $dest = 'C:\kgraf-wintest'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          New-Item -ItemType Directory $dest | Out-Null
+          icacls $dest /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+          if ($LASTEXITCODE -ne 0) { throw "icacls could not set the access list of $dest" }
+          Copy-Item -Recurse (Join-Path $stage '*') $dest
+          Write-Output "access list of the copy's tests folder:"
+          icacls (Join-Path $dest 'tests')
+
+      # What the sandbox user phase needs on the machine. Each fails the job
+      # loudly: a missing piece would turn a test into a skip or a failure
+      # that measures nothing.
+      - name: Start the OpenSSH agent and check Git for Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The escape tests probe the agent's pipe; the service is disabled
+          # on the hosted image.
+          Set-Service ssh-agent -StartupType Manual
+          Start-Service ssh-agent
+          $s = Get-Service ssh-agent
+          if ($s.Status -ne 'Running') { throw "the ssh-agent service did not start: $($s.Status)" }
+          Write-Output "ssh-agent: $($s.Status)"
+          # Git for Windows, for Git Bash and the TLS test.
+          $bash = 'C:\Program Files\Git\bin\bash.exe'
+          if (-not (Test-Path $bash)) { throw "Git for Windows is not installed: no $bash" }
+          git --version
+
       - name: Run the bundle
         shell: bash
         env:
@@ -81,7 +133,7 @@ jobs:
           SANDBOX_USER: ${{ inputs.sandbox_user }}
         run: |
           set -u
-          stage="$(ls -d target/wintest/bundle/kgraf-wintest-*/ | head -1)"
+          stage="/c/kgraf-wintest"
           report_dir="$GITHUB_WORKSPACE/wintest-out/report"
           mkdir -p "$report_dir"
           cd "$stage"

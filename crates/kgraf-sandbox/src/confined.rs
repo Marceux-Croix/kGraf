@@ -711,9 +711,9 @@ mod nt_data {
 /// short names a list could predict.
 ///
 /// **Removal and other processes.** A folder on the way to a removal is
-/// opened to list and enter it only, never for deletion: a process whose
-/// current folder is on the path holds it without sharing deletion, and an
-/// open for deletion would fail. The empty-parent tidy-up opens each parent
+/// opened to list and enter it only, never for deletion: another process
+/// that holds a folder on the path open without sharing deletion would make
+/// an open for deletion fail. The empty-parent tidy-up opens each parent
 /// for deletion again, by name relative to its own parent, and goes on only
 /// when that is the same folder the walk held (volume serial and file id).
 ///
@@ -775,7 +775,7 @@ mod win {
     };
 
     /// What a folder on the way is opened for: entering and listing it. Never
-    /// deletion: another process's current folder on the path would refuse
+    /// deletion: a folder another process holds without sharing deletion would refuse
     /// that open.
     pub(super) const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE;
     /// What an entry to remove is opened for: listing it when it is a folder,
@@ -1404,7 +1404,7 @@ mod win {
             return Err(invalid("an empty path names the worktree root".into()));
         };
         // chain[i] is the folder that holds names[i], open to list and enter
-        // only (DIR_ACCESS): another process's current folder on the path
+        // only (DIR_ACCESS): a folder another process holds without sharing deletion
         // must not make the removal fail.
         let mut chain: Vec<File> = vec![root.try_clone()?];
         let mut walked = PathBuf::new();
@@ -2303,57 +2303,48 @@ mod windows_tests {
         );
     }
 
-    /// Another process has its current folder in `tree\a` (Windows holds it
-    /// open without sharing deletion). Removing `a\b\c` opens `a` only to
-    /// enter it, so the removal goes on: `c` and its emptied parent `b` go,
-    /// and `a` stays, as the tidy-up stops at the folder it cannot delete.
+    /// `tree\a` is held open without sharing deletion, as another process
+    /// can hold a folder. Removing `a\b\c` opens `a` only to enter it, so the
+    /// removal goes on: `c` and its emptied parent `b` go, and `a` stays, as
+    /// the tidy-up stops at the folder it cannot delete.
+    ///
+    /// The hold is a handle this test opens: sharing is checked per open
+    /// handle, not per process, so the walk meets the same refusal. A child
+    /// process's current folder is not used as the hold: on Windows Server
+    /// 2025, `ping` and `cmd` both left their current folder open for
+    /// deletion, so the precondition never formed.
     #[test]
-    fn a_removal_goes_on_while_another_process_has_its_current_folder_on_the_path() {
+    fn a_removal_goes_on_while_a_folder_on_the_path_is_held_without_delete_sharing() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS};
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        };
         let t = tree();
         std::fs::create_dir_all(t.root.join("a/b")).expect("mkdir");
         std::fs::write(t.root.join("a/b/c"), "x").expect("write");
-        // `cmd /d /c pause` keeps its current folder for as long as its input
-        // stays open, and needs no network or console of its own.
-        let mut child = std::process::Command::new("cmd")
-            .args(["/d", "/c", "pause"])
-            .current_dir(t.root.join("a"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("start a process in tree\\a");
-        // Held once an open for deletion meets a sharing violation.
-        let mut last = String::from("no open tried");
-        let held = (0..100).any(|_| {
-            let open = std::fs::OpenOptions::new()
-                .access_mode(DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(t.root.join("a"));
-            match open {
-                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => true,
-                other => {
-                    last = format!("{other:?}");
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    false
-                }
-            }
-        });
-        let removed = remove_confined(&t.root, Path::new("a/b/c"));
-        let _ = child.kill();
-        let _ = child.wait();
+        let hold = std::fs::OpenOptions::new()
+            .access_mode(FILE_TRAVERSE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(t.root.join("a"))
+            .expect("hold tree\\a without sharing deletion");
+        let open_for_delete = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(t.root.join("a"));
         assert!(
-            held,
-            "the process never held tree\\a as its current folder; last open: {last}"
+            matches!(&open_for_delete, Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)),
+            "the hold must refuse an open for deletion: {open_for_delete:?}"
         );
+        let removed = remove_confined(&t.root, Path::new("a/b/c"));
+        drop(hold);
         assert!(removed.expect("removal with tree\\a held"), "removed");
         assert!(
             !t.root.join("a/b").exists(),
             "c and its emptied parent b went"
         );
-        assert!(t.root.join("a").is_dir(), "a, held by the process, stays");
+        assert!(t.root.join("a").is_dir(), "a, held, stays");
     }
 
     /// The short (8.3) name of `path`'s last component, or `None` when it

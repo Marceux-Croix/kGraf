@@ -43,8 +43,16 @@ pub struct Parser {
     pub failure_text: Vec<(String, String)>,
     /// The test whose result has not been printed yet.
     pub open: Option<String>,
+    /// Lines that start with [`MEASUREMENT`], as (test name, line). A line in
+    /// a `---- name stdout ----` section belongs to that test; one outside a
+    /// section to the open test, or to none.
+    pub measurements: Vec<(Option<String>, String)>,
     section: Option<(String, Vec<String>)>,
 }
+
+/// The start of a line a test prints to record what it measured, where a
+/// pass or a failure alone would not say it (decision 0097).
+pub const MEASUREMENT: &str = "measurement:";
 
 /// What one line changed, for the progress display.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,9 +69,15 @@ impl Parser {
     pub fn feed(&mut self, raw: &str) -> Event {
         let line = raw.trim_end_matches(['\r', '\n']);
         if let Some((name, lines)) = &mut self.section {
-            // A failure section ends at the next section header or at the
-            // `failures:` list that follows the last one.
-            if !(line.starts_with("---- ") || line == "failures:") {
+            // A section ends at the next section header or at the `failures:`
+            // or `successes:` list that follows the last one. `successes:`
+            // comes with `--show-output`; without it the `test result:` line
+            // would be read into the last section.
+            if !(line.starts_with("---- ") || line == "failures:" || line == "successes:") {
+                if line.starts_with(MEASUREMENT) {
+                    self.measurements
+                        .push((Some(name.clone()), line.to_owned()));
+                }
                 lines.push(line.to_owned());
                 if lines.len() > SECTION_LINES * 2 {
                     lines.drain(..SECTION_LINES);
@@ -80,6 +94,10 @@ impl Parser {
                 .or_else(|| rest.strip_suffix(" stderr ----"))
         {
             self.section = Some((name.to_owned(), Vec::new()));
+            return Event::Other;
+        }
+        if line.starts_with(MEASUREMENT) {
+            self.measurements.push((self.open.clone(), line.to_owned()));
             return Event::Other;
         }
         if let Some(rest) = line.strip_prefix("running ")
@@ -262,6 +280,81 @@ test result: FAILED. 2 passed; 1 failed; 1 ignored; 0 measured; 7 filtered out; 
     fn a_hang_leaves_the_running_test_open() {
         let p = parse("running 2 tests\ntest a::one ... ok\ntest a::slow ... ");
         assert_eq!(p.open.as_deref(), Some("a::slow"));
+        assert_eq!(p.count(Outcome::Passed), 1);
+    }
+
+    /// `--show-output` prints the captured output of passing tests in a
+    /// `successes:` part before the summary. Each measurement line keeps its
+    /// test's name, and the summary is still read.
+    #[test]
+    fn measurement_lines_keep_their_test_and_the_summary_is_read() {
+        let out = "running 3 tests\n\
+test a::one ... ok\n\
+test a::two ... FAILED\n\
+test a::three ... ok\n\
+\n\
+successes:\n\
+\n\
+---- a::one stdout ----\n\
+measurement: one, first\n\
+not a measurement\n\
+measurement: one, second\n\
+\n\
+---- a::three stdout ----\n\
+note: measurement: not at the start\n\
+\n\
+successes:\n\
+    a::one\n\
+    a::three\n\
+\n\
+failures:\n\
+\n\
+---- a::two stdout ----\n\
+measurement: two, before the panic\n\
+thread 'a::two' panicked\n\
+\n\
+failures:\n\
+    a::two\n\
+\n\
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n";
+        let p = parse(out);
+        let got: Vec<(Option<&str>, &str)> = p
+            .measurements
+            .iter()
+            .map(|(t, l)| (t.as_deref(), l.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some("a::one"), "measurement: one, first"),
+                (Some("a::one"), "measurement: one, second"),
+                (Some("a::two"), "measurement: two, before the panic"),
+            ]
+        );
+        assert_eq!(p.summary.as_ref().map(|s| s.passed), Some(2));
+        assert_eq!(p.count(Outcome::Passed), 2);
+        let two = p.failure_text.iter().find(|(n, _)| n == "a::two").unwrap();
+        assert!(two.1.contains("panicked"), "{}", two.1);
+        // With no failure, nothing but `successes:` ends the last section
+        // before the summary.
+        let passing = parse(
+            "running 1 test\ntest a::one ... ok\n\nsuccesses:\n\n---- a::one stdout ----\n\
+             measurement: m\n\nsuccesses:\n    a::one\n\n\
+             test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.01s\n",
+        );
+        assert_eq!(passing.summary.as_ref().map(|s| s.passed), Some(1));
+        assert_eq!(passing.measurements.len(), 1);
+    }
+
+    /// With `--nocapture` a line can arrive while a test is open.
+    #[test]
+    fn a_measurement_outside_a_section_belongs_to_the_open_test() {
+        let p = parse("running 1 test\ntest a::x ... \nmeasurement: live\nok\n");
+        assert_eq!(
+            p.measurements,
+            vec![(Some("a::x".to_owned()), "measurement: live".to_owned())]
+        );
         assert_eq!(p.count(Outcome::Passed), 1);
     }
 

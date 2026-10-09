@@ -6,7 +6,9 @@
 //! `kgraf sandbox setup` (or with `KGRAF_SANDBOX_TAG` naming a tagged setup):
 //! `cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1`.
 //! Without the sandbox user backend every test prints why it skipped and
-//! passes, because there is no runner to test.
+//! passes, because there is no runner to test. Set
+//! `KGRAF_REQUIRE_SANDBOX_USER=1` where the run is about the sandbox user,
+//! and a machine without it fails these tests instead of skipping them.
 //!
 //! The runner and the command run as one sandbox user, and the runner holds
 //! the owner's logon SID, which the command must not get. So the command must
@@ -30,7 +32,7 @@ use std::process::Output;
 
 use common::fixture;
 use kgraf_sandbox::{
-    Backend, Network, Redirect, SandboxPolicy, Workspace, WorkspaceManager, WorkspaceSpec,
+    Network, Redirect, SandboxPolicy, Workspace, WorkspaceManager, WorkspaceSpec,
     platform_isolation, sandboxed_command,
 };
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE};
@@ -337,11 +339,12 @@ fn env() -> Env {
 }
 
 /// Whether commands run as the sandbox user here; prints why a test skips
-/// when they do not.
+/// when they do not. With `KGRAF_REQUIRE_SANDBOX_USER=1` a machine that does
+/// not run them that way fails instead (`common::sandbox_user_mode`).
 fn sandbox_user_mode(test: &str) -> bool {
-    let backend = platform_isolation().expect("a backend").backend;
-    let on = backend == Backend::WindowsSandboxUser;
+    let on = common::sandbox_user_mode();
     if !on {
+        let backend = platform_isolation().expect("a backend").backend;
         println!("{test}: skipped, the backend is {backend:?}, not the sandbox user");
     }
     on

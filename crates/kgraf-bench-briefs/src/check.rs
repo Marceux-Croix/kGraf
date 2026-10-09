@@ -1210,8 +1210,18 @@ mod tests {
     use super::*;
     use crate::brief::suite;
 
+    /// Whether `v` is satisfied. An unsatisfied reason is printed, so a test
+    /// that wanted a pass shows why the check refused it (a sandbox that
+    /// could not start `sh` or `cargo` reads differently from a leak).
+    fn shown(v: Verdict) -> bool {
+        if let Some(why) = v.reason() {
+            eprintln!("check unsatisfied: {why}");
+        }
+        v.is_satisfied()
+    }
+
     fn docs(dir: &Path, file: &str, required: &[DocFact], max_words: usize) -> Result<bool> {
-        super::docs(dir, file, required, max_words).map(|v| v.is_satisfied())
+        super::docs(dir, file, required, max_words).map(shown)
     }
 
     fn script_cases(
@@ -1220,7 +1230,11 @@ mod tests {
         cases: &[ScriptCase],
         env: &CheckEnv<'_>,
     ) -> Result<bool> {
-        super::script_cases(dir, script, cases, env).map(|v| v.is_satisfied())
+        super::script_cases(dir, script, cases, env).map(shown)
+    }
+
+    fn run(check: &Check, dir: &Path, env: &CheckEnv<'_>) -> Result<bool> {
+        super::run_verdict(check, dir, env).map(shown)
     }
 
     /// Where the network is open (the Windows decision, stood in for here),
@@ -1248,11 +1262,11 @@ mod tests {
     }
 
     fn run_guarded(check: &Check, dir: &Path, env: &CheckEnv<'_>, guard: &Guard) -> Result<bool> {
-        super::run_guarded(check, dir, env, guard).map(|v| v.is_satisfied())
+        super::run_guarded(check, dir, env, guard).map(shown)
     }
 
     fn verify(brief: &Brief, attempt: &Attempt<'_>, env: &CheckEnv<'_>) -> Result<bool> {
-        super::verify(brief, attempt, env).map(|v| v.is_satisfied())
+        super::verify(brief, attempt, env).map(shown)
     }
 
     fn env_in(scratch: &Path, secs: u64) -> CheckEnv<'_> {

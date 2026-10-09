@@ -904,7 +904,7 @@ impl WorkspaceManager {
 
     /// Create a locked worktree for one worker.
     pub fn create(&self, spec: &WorkspaceSpec<'_>) -> Result<Workspace, WorkspaceError> {
-        validate_name(spec.name)?;
+        validate_new_name(spec.name)?;
         if let Some(branch) = spec.branch {
             // `check-ref-format --branch` rejects names git would refuse later,
             // before any state is created.
@@ -1722,6 +1722,37 @@ fn validate_name(name: &str) -> Result<(), WorkspaceError> {
     } else {
         Err(WorkspaceError::InvalidName(name.to_string()))
     }
+}
+
+/// Device names Windows reserves in every folder, with or without an
+/// extension (`nul`, `con.x`).
+const WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+    "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// [`validate_name`], plus the rules for a name every supported platform can
+/// use as a folder. Windows drops a trailing dot from a folder name, so git
+/// cannot make `.git/worktrees/<name>` for it ("Invalid argument"), and a
+/// device name opens the device instead of a folder. Checked only when a
+/// workspace is made: a workspace an earlier version already made under such
+/// a name on another platform can still be reopened, cleaned and swept.
+fn validate_new_name(name: &str) -> Result<(), WorkspaceError> {
+    validate_name(name)?;
+    let refuse = |reason: &str| {
+        Err(WorkspaceError::UnportableName {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        })
+    };
+    if name.ends_with('.') {
+        return refuse("Windows drops a trailing '.' from a folder name");
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    if WINDOWS_DEVICE_NAMES.contains(&stem.as_str()) {
+        return refuse("Windows reserves it as a device name");
+    }
+    Ok(())
 }
 
 /// `kgraf:v1:pid=<pid>:start=<t>:machine=<m>:boot=<b>:ns=<n>:name=<name>`
@@ -2666,6 +2697,30 @@ mod tests {
         for good in ["w1", "worker-2", "a_b.c"] {
             assert!(validate_name(good).is_ok(), "{good:?} rejected");
         }
+    }
+
+    /// A new name must be a folder name on every platform; the check runs on
+    /// every platform, so a name refused on Windows is refused everywhere.
+    #[test]
+    fn new_names_refuse_what_windows_cannot_make_a_folder() {
+        for bad in ["trail.", "a..", "nul", "CON", "con.x", "Lpt1", "com9.log"] {
+            let err = validate_new_name(bad).expect_err(bad);
+            assert!(
+                matches!(err, WorkspaceError::UnportableName { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+        // The plain rules still come first.
+        assert!(matches!(
+            validate_new_name(".x"),
+            Err(WorkspaceError::InvalidName(_))
+        ));
+        for good in ["w1", "a_b.c", "console", "nul1", "x.con", "com10", "a..b"] {
+            assert!(validate_new_name(good).is_ok(), "{good:?} rejected");
+        }
+        // Reopen, clean and sweep keep the plain rules, so a workspace an
+        // older version made as "trail." can still be reached.
+        assert!(validate_name("trail.").is_ok());
     }
 
     /// Run `f` on its own thread: a lock wait that never ends fails the

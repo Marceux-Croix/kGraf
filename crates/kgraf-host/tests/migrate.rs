@@ -222,9 +222,16 @@ fn a_haustoria_project_moves_to_kgraf_with_worktrees_records_and_ledger_intact()
     }
     let listing = git(&root, &["worktree", "list", "--porcelain"]);
     assert!(!listing.contains(".haustoria"), "{listing}");
+    // Compared as paths: git writes `/` between components on Windows too.
+    let listed: Vec<PathBuf> = listing
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect();
     assert!(
-        listing.contains(&new_live.display().to_string()),
-        "{listing}"
+        listed.contains(&new_live),
+        "{} not in {listing}",
+        new_live.display()
     );
     let status = git(&new_live, &["status", "--porcelain"]);
     assert!(status.contains("work.txt"), "{status}");

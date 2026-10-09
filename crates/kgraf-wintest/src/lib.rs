@@ -23,6 +23,7 @@ pub mod progress;
 pub mod redact;
 pub mod report;
 pub mod runner;
+pub mod sandbox_access;
 pub mod sandbox_phase;
 pub mod sandbox_run;
 pub mod stub;

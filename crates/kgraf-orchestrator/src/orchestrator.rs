@@ -2351,7 +2351,11 @@ struct RunLoop {
     stop_token: kgraf_tools::CancellationToken,
     route_cursor: usize,
     /// Deferrals already traced, so a long wait is one record, not one per tick.
-    deferred_logged: BTreeSet<(String, DeferReason)>,
+    /// Keyed by contract, reason and whether the deferral is a cluster-cap
+    /// hold ([`cluster_cap::is_hold_detail`]): both causes are traced as
+    /// `Capacity`, and a contract refused at the ceiling first and held at its
+    /// cluster cap later must get a record of each.
+    deferred_logged: BTreeSet<(String, DeferReason, bool)>,
     /// Transient readiness deferrals so far, per waiting contract: a wait with
     /// no end is reported periodically, not once.
     readiness_waits: BTreeMap<String, u32>,
@@ -5113,7 +5117,12 @@ impl RunLoop {
         detail: String,
     ) -> Result<bool, OrchestratorError> {
         self.note_wait(id, Self::wait_of_defer(reason, &detail));
-        if !id.is_empty() && !self.deferred_logged.insert((id.to_owned(), reason)) {
+        let cluster_hold = cluster_cap::is_hold_detail(&detail);
+        if !id.is_empty()
+            && !self
+                .deferred_logged
+                .insert((id.to_owned(), reason, cluster_hold))
+        {
             return Ok(false);
         }
         let at = self.now();
@@ -5498,7 +5507,8 @@ impl RunLoop {
             // 0017's; the "cluster" prefix is what a trace or test greps on
             // to tell the two apart.
             let detail = format!(
-                "cluster cap: cluster {}: {} already in flight ({}), cap {}",
+                "{} cluster {}: {} already in flight ({}), cap {}",
+                cluster_cap::DETAIL_PREFIX,
                 hold.cluster,
                 hold.in_flight.len(),
                 hold.in_flight.join(", "),
@@ -5699,7 +5709,7 @@ impl RunLoop {
             self.record.counters.budget_admitted += 1;
             flight.reservations.insert(w.clone(), r);
         }
-        self.deferred_logged.retain(|(c, _)| c != id);
+        self.deferred_logged.retain(|(c, _, _)| c != id);
         self.readiness_waits.remove(id);
         self.readiness_since.remove(id);
         self.not_ready_routes.remove(id);

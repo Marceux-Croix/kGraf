@@ -3558,10 +3558,21 @@ async fn the_order_pricing_workspace_gets_compile_only_interfaces_and_no_interfa
     let prompts = rig.parts.planner.prompts();
     assert_eq!(prompts.len(), 1, "the contracts ask only: {prompts:?}");
     let c = &report.contracts;
+    // A derived check that fails at the base is not registered; its reason
+    // (with the compile output) is in the unchecked edges' reasons.
+    let unchecked: Vec<String> = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         (c.interfaces_registered, c.compile_only_registered),
         (5, 5),
-        "one compile-only interface per producer (c1 to c5): {report:?}"
+        "one compile-only interface per producer (c1 to c5): {report:?}\nunchecked: {unchecked:#?}"
     );
     assert_eq!(
         (c.interface_asks, c.interface_ask_output_tokens),
@@ -3753,11 +3764,13 @@ async fn a_shell_producer_is_recorded_unchecked_with_its_reason_and_never_blocke
 
 /// Runs a two-contract plan over `files` (`c1` edits `producer`, `c2` edits
 /// `consumer`) to the end, and returns the report and the reason of each edge
-/// recorded unchecked.
+/// recorded unchecked. `delivered`, when set, is what every worker writes;
+/// unset, a worker writes its vendor name.
 async fn run_producer_consumer(
     files: &[(&str, &str)],
     producer: &str,
     consumer: &str,
+    delivered: Option<&str>,
 ) -> (RunReport, Vec<String>) {
     let dir = tempfile::tempdir().expect("dir");
     let plan = plan_json(&[
@@ -3779,6 +3792,10 @@ async fn run_producer_consumer(
         Duration::from_millis(20),
     );
     rig.index(files);
+    if let Some(content) = delivered {
+        rig.parts.alpha.set_content(content);
+        rig.parts.beta.set_content(content);
+    }
     let report = rig
         .orchestrator(vec![])
         .start(RunId::new("r1"), "change".into())
@@ -3870,7 +3887,7 @@ async fn a_correct_project_in_any_language_is_never_blocked_by_a_derived_check()
         ),
     ];
     for (what, files, producer, consumer, why) in cases {
-        let (report, reasons) = run_producer_consumer(&files, producer, consumer).await;
+        let (report, reasons) = run_producer_consumer(&files, producer, consumer, None).await;
         assert_eq!(report.status, RunStatus::Completed, "{what}: {report:?}");
         assert_eq!(
             report.contracts.compile_only_registered, 0,
@@ -3894,7 +3911,13 @@ async fn a_correct_project_in_any_language_is_never_blocked_by_a_derived_check()
             "package cart\n\nimport \"example.com/shop/price\"\n\nfunc CartTotal() int { return price.LookupPrice() }\n",
         ),
     ];
-    let (report, reasons) = run_producer_consumer(&go, "price/price.go", "cart/cart.go").await;
+    // Where `go` is installed, the derived `go vet` check judges what the
+    // producer delivers, so the delivery must be correct Go: a changed
+    // `LookupPrice` that keeps its shape. The consumer's worker writes the
+    // same text, which is a valid Go file in its own folder too.
+    let delivered = "package price\n\n// LookupPrice is the price of one item.\nfunc LookupPrice() int { return 2 }\n";
+    let (report, reasons) =
+        run_producer_consumer(&go, "price/price.go", "cart/cart.go", Some(delivered)).await;
     assert_eq!(report.status, RunStatus::Completed, "Go: {report:?}");
     if report.contracts.compile_only_registered == 0 {
         assert!(
@@ -4144,6 +4167,217 @@ async fn a_producer_a_repository_test_exercises_alone_is_not_asked_about() {
         reason.contains("behavior check not run: the repository's test tests/test_flat.py already exercises c1 alone"),
         "{reason}"
     );
+}
+
+/// A producer that only builds binary package files (a wheel, a source
+/// archive) is not asked about: a text reference of a wheel cannot be written,
+/// so every ask would be refused. The edge's behavior check is recorded as not
+/// run with that reason, and no interface call is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_of_binary_build_outputs_is_not_asked_about() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c(
+            "build",
+            "build the wheel",
+            "dist/app-0.1.0-py3-none-any.whl",
+            &[],
+        ),
+        c("serve", "serve the wheel", "serve.py", &["build"]),
+    ]);
+    let rig = Rig::new(
+        dir.path(),
+        plan,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 1, "no interface call");
+    assert_eq!(report.contracts.interface_asks, 0, "{report:?}");
+    let reason = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the edge is recorded");
+    assert!(
+        reason.contains(
+            "behavior check not run: build writes only binary build outputs \
+             (dist/app-0.1.0-py3-none-any.whl)"
+        ),
+        "{reason}"
+    );
+}
+
+/// `py_ic` with its test as a script of pytest-style functions that the file
+/// never calls, run as `python test_script.py`: the shape a local planner
+/// wrote on every ask of the interface call.
+fn script_test_ic(test_body: &str) -> InterfaceContract {
+    let mut ic = py_ic();
+    ic.tests = vec![FileOverlay::new("test_script.py", test_body)];
+    ic.compile = s(&[py(), "-c", "import consumer, test_script"]);
+    ic.test = s(&[py(), "test_script.py"]);
+    ic
+}
+
+const SCRIPT_TEST: &str = "from config import parse_config\n\n\
+def test_port():\n    assert parse_config('port=8080').port == 8080\n";
+
+/// A test file run as a script that defines its test and never calls it runs
+/// no assertion, so the vacuity check refused it for passing against the stub
+/// on every ask. kGraf adds the call, says so, and the interface is accepted
+/// on the first ask; the registered test file is the one with the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_script_test_that_never_calls_its_test_gets_the_call_added() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&script_test_ic(SCRIPT_TEST)),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "the contracts ask and one interface ask, no re-ask"
+    );
+    assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains(
+            "runs `test_script.py` as a script, which defined test_port without calling them; \
+             kGraf added the calls"
+        )),
+        "{:?}",
+        report.notices
+    );
+    let registered = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface, .. } => Some(interface),
+            _ => None,
+        })
+        .expect("registered");
+    assert!(
+        registered.tests[0]
+            .content
+            .ends_with("if __name__ == \"__main__\":\n    test_port()\n"),
+        "{}",
+        registered.tests[0].content
+    );
+}
+
+/// A script test kGraf cannot call itself (a pytest fixture argument) is
+/// refused with the cause, not with "passes against the stub".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_script_test_kgraf_cannot_call_is_refused_with_the_cause() {
+    let dir = tempfile::tempdir().expect("dir");
+    let fixture = "from config import parse_config\n\n\
+def test_port(tmp_path):\n    assert parse_config('port=8080').port == 8080\n";
+    let rig = Rig::with_planner(
+        dir.path(),
+        first_then(plan_with(&script_test_ic(fixture)), plan_with(&py_ic())),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "the contracts ask, an interface ask, one re-ask"
+    );
+    assert!(
+        prompts[2].contains("defines test_port without calling them")
+            && prompts[2].contains("`test_port` takes arguments")
+            && !prompts[2].contains("constrains nothing"),
+        "{}",
+        prompts[2]
+    );
+    assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+}
+
+/// The planner answers of a live Terminal-Bench `pypi-server` run, served in
+/// the order the run asked them: the contracts, then the interface asks.
+/// Recorded, that run spent three interface asks (310 s) and accepted
+/// nothing: every test file defined `def test_...` and was run as a script,
+/// and the build contract's wheel had no text reference. Now the build
+/// contract is not asked about, the volunteered interface for it does not
+/// buy a re-ask, the test gets its call, and the second ask is the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recorded_pypi_server_answers_are_accepted_on_the_second_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let planner = {
+        let asks = asks.clone();
+        move |prompt: &str| {
+            if !prompt.contains("Write one interface contract per producer") {
+                return recorded("tb-pypi-contracts.txt");
+            }
+            let n = asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            // The run's container had `python`; this host's interpreter may be
+            // `python3` only, and a check whose program is missing does not
+            // run, which would accept every interface unchecked.
+            recorded(&format!("tb-pypi-ask{}.txt", n.min(3)))
+                .replace("[\"python\",", &format!("[\"{}\",", py()))
+        }
+    };
+    let rig = Rig::with_planner(
+        dir.path(),
+        planner,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "the contracts ask and two interface asks: {:?}",
+        report.notices
+    );
+    // Recorded, the request read "c_pkg_build <- c_pkg_create; c_test_serve <-
+    // c_pkg_build".
+    assert!(
+        prompts[1].contains("Consumer <- producers: c_pkg_build <- c_pkg_create\n"),
+        "only the source contract is asked about: {}",
+        prompts[1]
+    );
+    let registered: Vec<String> = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ContractEvent::Registered { interface } => Some(interface.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        registered.iter().any(|id| id == "i_pkg_create"),
+        "{registered:?} {:?}",
+        report.notices
+    );
+    for notice in [
+        "runs `test_vectorops_stubs.py` as a script, which defined test_dotproduct without \
+         calling them; kGraf added the calls",
+        "binds c_pkg_build, whose behavior check kGraf does not ask for (c_pkg_build writes \
+         only binary build outputs",
+    ] {
+        assert!(
+            report.notices.iter().any(|n| n.contains(notice)),
+            "{notice}: {:?}",
+            report.notices
+        );
+    }
 }
 
 /// A re-ask covers only the interface still refused: the previous answer

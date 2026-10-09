@@ -713,8 +713,10 @@ hold. Then `behavior_plan` decides per producer
 whether the planner is asked for a behavior check: not when a repository test already exercises the
 producer alone, and not when every test that reaches it (by crate, module or item name, and through
 the contracts it depends on) also reaches other contracts whose code does not exist yet, so that no
-reference of the producer alone can pass it. Those edges are recorded as unchecked with a one-line
-reason; when no producer needs a check the interface call makes no planner call. Where one is asked
+reference of the producer alone can pass it, and not when every file the producer declares is a
+binary build output (a wheel, an archive, a compiled library: `binary_outputs_only`), which a text
+reference cannot hold. Those edges are recorded as unchecked with a one-line
+reason; a refused interface whose producer is one of them does not buy a re-ask; when no producer needs a check the interface call makes no planner call. Where one is asked
 (its own budget of three asks), the request names what kGraf supplies per producer and asks for
 `reference`, `tests` and `test` only, within 4,096 output tokens; kGraf fills the stub (declared in
 `replaces`), the consumer files, the names and the compile command.
@@ -724,7 +726,9 @@ path in both stub and consumer, every stub path a declared write of a party), th
 files named by path alone read from the dispatch base, a stub file the repository already has listed
 in `replaces` (0081), then its mechanical checks run (stub-compile with canaries, vacuity); a compile
 command the sandbox cannot run, or that fails the stub-compile stage, is replaced by the derived one
-and the checks run again, with no re-ask. An accepted interface is kept across asks; a re-ask covers
+and the checks run again, with no re-ask. A Python test file the test command runs as a script that
+only defines its tests gets their calls appended under `if __name__ == "__main__":` before the
+checks (`script_tests`), or, when a test takes arguments, is refused with that cause. An accepted interface is kept across asks; a re-ask covers
 only the interfaces still refused or unbound, quoting those interfaces' previous entries and their
 refusals (cut at 12,000 characters, the cut said). An omitted interface and a malformed one are
 retried the same way. A compile or test command that names a script or source file the interface

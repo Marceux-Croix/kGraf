@@ -15,14 +15,18 @@
 //!                 --a refusal, or an edge left unbound--> re-ask the refused
 //!                   interfaces only, with their previous answer and refusal;
 //!                   accepted interfaces are kept; a compile command that does
-//!                   not build the files is replaced, not asked about
+//!                   not build the files is replaced, and a script test that
+//!                   never calls its tests gets the calls, not asked about; a
+//!                   refused interface of a producer not asked about is a
+//!                   notice, not a re-ask
 //!                 --asks spent, or the answer cut off--> every edge no behavior
 //!                   interface binds is recorded as unchecked, with the reason
 //! ```
 //!
 //! A behavior check is asked of the planner for a producer only when no
 //! repository test already exercises it alone and one can exist
-//! ([`derive_interface::behavior_plan`]); the answer holds a reference and a
+//! ([`derive_interface::behavior_plan`]), and not when it writes only binary
+//! build outputs ([`derive_interface::binary_outputs_only`]); the answer holds a reference and a
 //! small test, and kGraf fills the stub, consumer files and compile command.
 //! An omitted interface and a malformed one end the same way: both are asked
 //! for again within the interface budget, then fall back. Neither holds the
@@ -701,6 +705,12 @@ impl RunLoop {
                         .map(|p| crate::plan::sanitize_id(p))
                         .collect();
                     taken.implied.extend(declared_edges(&raw, &writes_of, &ids));
+                    if let Some(note) =
+                        unasked_refusal(&raw, &[e.to_string()], &writes_of, &ids, derived)
+                    {
+                        self.intake_notice(note);
+                        continue;
+                    }
                     taken.refusals.push(e.to_string());
                     taken.failed.push(index);
                     continue;
@@ -751,6 +761,9 @@ impl RunLoop {
                 problems.extend(self.fill_from_repository(&mut ic, &from_repository).await);
             }
             if problems.is_empty() {
+                problems.extend(self.call_script_tests(&mut ic, &from_repository));
+            }
+            if problems.is_empty() {
                 problems.extend(self.undeclared_replacements(&ic).await);
             }
             if problems.is_empty() {
@@ -774,6 +787,10 @@ impl RunLoop {
                 accepted.push(ic);
             } else {
                 taken.implied.extend(declared_edges(&ic, &writes_of, &ids));
+                if let Some(note) = unasked_refusal(&ic, &problems, &writes_of, &ids, derived) {
+                    self.intake_notice(note);
+                    continue;
+                }
                 taken.refusals.extend(problems);
                 taken.failed.push(index);
             }
@@ -970,6 +987,40 @@ impl RunLoop {
         problems
     }
 
+    /// A Python test file of the answer's own that the test command runs as a
+    /// script and that never calls its tests ([`crate::script_tests`]): the
+    /// calls are appended when every test can be called without arguments,
+    /// with a notice, as a compile command that does not build the files is
+    /// replaced; otherwise the refusal names the cause. Without this the
+    /// vacuity check refuses the file for passing against the stub, which
+    /// does not say why, and the planner repeats it on every ask.
+    fn call_script_tests(
+        &mut self,
+        ic: &mut InterfaceContract,
+        from_repository: &[(&'static str, usize)],
+    ) -> Option<String> {
+        let written = |i: usize| !from_repository.contains(&("tests", i));
+        match crate::script_tests::check(ic, written)? {
+            crate::script_tests::ScriptTests::Refused(why) => Some(why),
+            crate::script_tests::ScriptTests::Repaired {
+                index,
+                content,
+                called,
+            } => {
+                let path = ic.tests[index].path.clone();
+                ic.tests[index].content = content;
+                self.intake_notice(format!(
+                    "interface `{}`: `{}` runs `{path}` as a script, which defined {} without \
+                     calling them; kGraf added the calls at the end of the file",
+                    ic.id,
+                    ic.test.join(" "),
+                    called.join(", ")
+                ));
+                None
+            }
+        }
+    }
+
     /// A stub file that already exists in the repository and is not listed in
     /// `replaces`: the stub land refuses it before any party dispatches
     /// (decision 0081), so it is asked for again here, where the planner can
@@ -1078,7 +1129,11 @@ impl RunLoop {
                 .producer_facts(&runner, spec, &consumers, specs)
                 .await?;
             let (interface, base, compile_note) = derive_one(&runner, &facts).await;
-            let behavior = derive_interface::behavior_plan(&producer, &tests, &contract_facts);
+            let writes: Vec<String> = spec.writes.iter().map(|w| w.path.clone()).collect();
+            let behavior = match derive_interface::binary_outputs_only(&producer, &writes) {
+                Some(why) => BehaviorPlan::Skip(why),
+                None => derive_interface::behavior_plan(&producer, &tests, &contract_facts),
+            };
             out.push(Derived {
                 producer,
                 consumers,
@@ -1253,20 +1308,54 @@ impl RunLoop {
     }
 }
 
+/// The producer an interface declares among the contracts `ids`: the party
+/// whose writes hold a stub file, failing that the first party named.
+fn declared_producer<'a>(
+    ic: &'a InterfaceContract,
+    writes_of: &impl Fn(&str) -> Option<Vec<String>>,
+    ids: &BTreeSet<&str>,
+) -> Option<&'a String> {
+    ic.parties
+        .iter()
+        .find(|p| writes_of(p).is_some_and(|w| ic.stub.iter().any(|f| w.contains(&f.path))))
+        .or_else(|| ic.parties.first())
+        .filter(|p| ids.contains(p.as_str()))
+}
+
+/// The notice for a refused interface whose producer kGraf decided needs no
+/// behavior check ([`BehaviorPlan::Skip`]), `None` for any other. The planner
+/// was not asked for it, so its refusal does not buy another ask of the
+/// interface call (each one minutes on a local model); its edges keep the
+/// skip reason as their unchecked reason.
+fn unasked_refusal(
+    ic: &InterfaceContract,
+    problems: &[String],
+    writes_of: &impl Fn(&str) -> Option<Vec<String>>,
+    ids: &BTreeSet<&str>,
+    derived: &[Derived],
+) -> Option<String> {
+    let producer = declared_producer(ic, writes_of, ids)?;
+    let BehaviorPlan::Skip(why) = &derived.iter().find(|d| &d.producer == producer)?.behavior
+    else {
+        return None;
+    };
+    Some(kgraf_secrets::scrub_persist_owned(format!(
+        "interface `{}` binds {producer}, whose behavior check kGraf does not ask for ({why}); \
+         it was refused and is not asked for again: {}",
+        ic.id,
+        one_line(&problems.join("; "), 600)
+    )))
+}
+
 /// The `(consumer, producer)` edges an interface declares among the
-/// contracts `ids`: the producer is the party whose writes hold a stub file,
-/// failing that the first party named; every other party consumes it.
+/// contracts `ids`: the producer is [`declared_producer`]; every other party
+/// consumes it.
 fn declared_edges(
     ic: &InterfaceContract,
     writes_of: &impl Fn(&str) -> Option<Vec<String>>,
     ids: &BTreeSet<&str>,
 ) -> Vec<(String, String)> {
-    let producer = ic
-        .parties
-        .iter()
-        .find(|p| writes_of(p).is_some_and(|w| ic.stub.iter().any(|f| w.contains(&f.path))))
-        .or_else(|| ic.parties.first());
-    let Some(producer) = producer.filter(|p| ids.contains(p.as_str())) else {
+    let Some(producer) = declared_producer(ic, writes_of, ids) else {
         return Vec::new();
     };
     ic.parties

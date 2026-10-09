@@ -1326,7 +1326,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   is asked for a behavior check (a reference and a small test of the one producer) only when
   no test in the repository already exercises that producer alone and one could: when the only
   tests need several producers, whose code does not exist yet, no reference of one producer
-  can pass them, so none is asked for. When no producer needs a behavior check, no second
+  can pass them, so none is asked for; nor for a producer whose files are all binary build
+  outputs (a wheel, an archive, a compiled library), since a text reference cannot hold
+  one. When no producer needs a behavior check, no second
   call is made. Each dependency whose behavior check did not run is counted under `not run`
   in the report's `contracts` line, with a notice and a trace record that name the contracts
   and the reason; its compile-only interface still checks it. Where a
@@ -1335,7 +1337,9 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   checked as it arrives, in the sandbox: the consumer and the test compile against the stub,
   the test fails against the stub and passes against the reference. A compile command that
   cannot run or does not build the files is replaced by the derived one, without asking
-  again. An interface that fails any other check, an answer that is not JSON, and a
+  again. A Python test file that the test command runs as a script and that defines its
+  tests without calling them gets the calls added at its end, with a notice; when a test
+  takes arguments (pytest fixtures), the reason is sent back instead. An interface that fails any other check, an answer that is not JSON, and a
   dependency no interface binds are sent back, up to three asks in all, with the reason,
   which quotes the answer where it went wrong and says what each entry needs; a re-ask covers
   only the interfaces still refused, with the planner's previous entries for them (the

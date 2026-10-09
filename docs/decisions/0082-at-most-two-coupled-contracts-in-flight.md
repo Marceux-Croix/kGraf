@@ -47,3 +47,13 @@ A value of one is a legitimate, deliberate choice to serialize a coupling group 
 - **Refuse a configured value of zero at startup.** Rejected for the same value specifically:
   a silent, permanent stall for every coupled contract is worse than flooring the value to the
   smallest meaningful one.
+
+## Amendment (2026-10-08): one trace record per cause
+
+A cluster-cap deferral and a work-item or agent ceiling refusal share one trace reason and
+are told apart by the detail's prefix. The orchestrator's once-per-wait records were keyed
+by the reason alone, so a contract refused at the ceiling first and held at its cluster cap
+later kept the ceiling record for the whole wait: one run held a contract about 800 s at its
+cluster cap while its trace said only that three agents were live. A deferral is now
+recorded once per contract, reason and cause, and a wait record is due when its kind or, for
+a capacity wait, its cause changes. The cap, its default and its trace reason are unchanged.

@@ -913,6 +913,35 @@ pub enum BehaviorPlan {
     Skip(String),
 }
 
+/// File name endings of binary build outputs: package archives, compiled
+/// objects and libraries. Matched without regard to case.
+const BINARY_OUTPUTS: &[&str] = &[
+    ".whl", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar", ".zip", ".egg", ".jar", ".war",
+    ".gem", ".nupkg", ".crate", ".deb", ".rpm", ".so", ".dylib", ".dll", ".exe", ".a", ".lib",
+    ".o", ".obj", ".pyc", ".class", ".wasm",
+];
+
+/// The skip reason when every file `producer` declares is a binary build
+/// output ([`BINARY_OUTPUTS`]), `None` otherwise. An interface's stub and
+/// reference are text the planner writes, and a text file is not a wheel or
+/// an archive, so no reference of such a producer can be written and a
+/// behavior check asked for can only be refused (or pass on a file's size
+/// alone, which checks no behavior). Its consumers' own checks run against
+/// the real build.
+pub fn binary_outputs_only(producer: &str, writes: &[String]) -> Option<String> {
+    let binary = |p: &str| {
+        let p = p.to_ascii_lowercase();
+        BINARY_OUTPUTS.iter().any(|end| p.ends_with(end))
+    };
+    (!writes.is_empty() && writes.iter().all(|w| binary(w))).then(|| {
+        format!(
+            "{producer} writes only binary build outputs ({}), which a text reference cannot \
+             hold, so no reference of it can be written",
+            writes.join(", ")
+        )
+    })
+}
+
 /// Decide whether a behavior check of `producer` needs the planner.
 ///
 /// A test reaches a contract when it uses one of the contract's tokens, and
@@ -1433,6 +1462,32 @@ mod tests {
         assert!(
             why.contains("also need c2, c3, c4, c5, c6 unimplemented"),
             "the others it needs are named, the producer is not: {why}"
+        );
+    }
+
+    /// The plan of a Terminal-Bench task: a contract that only builds the
+    /// wheel and the source archive of a package.
+    #[test]
+    fn a_producer_of_binary_build_outputs_only_is_not_asked_about() {
+        let built = [
+            "dist/packages/vectorops/0.1.0/vectorops-0.1.0-py3-none-any.whl".to_owned(),
+            "dist/packages/vectorops/0.1.0/vectorops-0.1.0.tar.gz".to_owned(),
+        ];
+        let why = binary_outputs_only("c_pkg_build", &built).expect("skipped");
+        assert!(
+            why.starts_with("c_pkg_build writes only binary build outputs (dist/")
+                && why.contains("no reference of it can be written"),
+            "{why}"
+        );
+        assert!(binary_outputs_only("c", &["target/APP.JAR".to_owned()]).is_some());
+        // A source file among them: the planner can still write a reference.
+        let mixed = [built[0].clone(), "src/vectorops/__init__.py".to_owned()];
+        assert_eq!(binary_outputs_only("c", &mixed), None);
+        assert_eq!(binary_outputs_only("c", &["setup.py".to_owned()]), None);
+        assert_eq!(
+            binary_outputs_only("c", &[]),
+            None,
+            "no writes says nothing"
         );
     }
 

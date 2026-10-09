@@ -26,6 +26,11 @@ pub enum WorkspaceError {
     /// A workspace name contains characters that are unsafe in a path or ref.
     #[error("invalid workspace name {0:?}: use ASCII letters, digits, '-', '_' or '.'")]
     InvalidName(String),
+    /// A new workspace name that some supported platform cannot use as a
+    /// folder name. Refused on every platform, so a project named on one
+    /// machine works the same on another.
+    #[error("workspace name {name:?} cannot be a folder name on every platform: {reason}")]
+    UnportableName { name: String, reason: String },
     /// The base directory could hold user data that orphan cleanup would delete.
     #[error("unsafe workspace base directory {path}: {reason}")]
     UnsafeBaseDir { path: PathBuf, reason: String },

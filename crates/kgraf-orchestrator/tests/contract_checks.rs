@@ -229,7 +229,7 @@ async fn a_test_that_asserts_nothing_fails_vacuity_against_the_stub() {
         .await
         .expect("ran")
         .expect_err("fails");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(
         f.detail.contains("passes against the stub producer"),
         "{}",
@@ -253,7 +253,7 @@ async fn a_test_nothing_can_satisfy_fails_against_the_reference() {
         .await
         .expect("ran")
         .expect_err("fails");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(
         f.detail.contains("fails against the reference"),
         "{}",
@@ -276,7 +276,7 @@ async fn the_wrong_stub_catches_a_test_that_only_catches_a_placeholder() {
         .await
         .expect("ran")
         .expect_err("fails");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(
         f.detail.contains("passes against the wrong producer"),
         "{}",
@@ -394,7 +394,7 @@ async fn a_revision_failing_its_own_checks_is_refused_and_a_straddle_re_decompos
         .await
         .expect("ran")
         .expect_err("refused");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(f.artifact.contains("config@v2"), "{}", f.artifact);
 
     let mut straddle = writes();
@@ -534,7 +534,8 @@ async fn check_runs_beyond_the_process_bound_queue() {
         }));
     }
     for run in runs {
-        assert!(run.await.expect("join").success);
+        let out = run.await.expect("join");
+        assert!(out.success, "{out:?}");
     }
     assert!(
         started.elapsed() >= Duration::from_secs(2),
@@ -736,7 +737,7 @@ async fn python_a_hang_against_the_stub_is_a_failure_not_a_pass() {
         .await
         .expect("ran")
         .expect_err("fails");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(f.detail.contains("timed out"), "{}", f.detail);
     // Compiles (up to 60 s, retried once each) plus one 10 s test timeout: bounded,
     // not hung.
@@ -1195,7 +1196,9 @@ async fn p2_a_compile_command_that_builds_nothing_fails_the_canary() {
         reference: vec![FileOverlay::new("src/api.sh", "provide() { :; }\n")],
         consumer: vec![],
         tests: vec![FileOverlay::new("t.sh", ". ./src/api.sh; provide\n")],
-        compile: s(&["/usr/bin/true"]),
+        // A program on every platform kGraf runs on (git is required) that
+        // succeeds and builds nothing.
+        compile: s(&["git", "--version"]),
         test: sh(". ./t.sh"),
         consulted: vec![],
         replaces: vec![],
@@ -1220,7 +1223,7 @@ async fn a_test_that_does_not_build_against_the_wrong_stub_fails_vacuity() {
         .await
         .expect("ran")
         .expect_err("fails");
-    assert_eq!(f.stage, CheckStage::Vacuity);
+    assert_eq!(f.stage, CheckStage::Vacuity, "{}", f.detail);
     assert!(
         f.detail
             .contains("does not build against the wrong producer"),

@@ -105,6 +105,7 @@ mod route_health;
 pub mod routing;
 mod run_state;
 pub mod scheduler_loop;
+mod script_tests;
 mod session_tools;
 mod shortfall;
 mod sizing;

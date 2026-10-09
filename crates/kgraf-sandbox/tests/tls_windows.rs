@@ -28,6 +28,8 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -192,7 +194,13 @@ fn curl_starts_a_tls_handshake_outside_the_sandbox() {
 /// builds selects the backend.
 #[test]
 fn git_for_windows_curl_starts_a_tls_handshake_inside_the_sandbox() {
-    let Some(curl) = git_curl() else {
+    let found = git_curl();
+    assert!(
+        found.is_some() || !common::require_sandbox_user(),
+        "Git for Windows and its OpenSSL curl are not here, so this test measures nothing. \
+         A run that must measure the sandbox user needs them: install Git for Windows"
+    );
+    let Some(curl) = found else {
         return;
     };
     let (bytes, out) = curl_in_the_sandbox(&curl);
@@ -218,12 +226,13 @@ fn git_for_windows_curl_starts_a_tls_handshake_inside_the_sandbox() {
 /// the two failures decision 0097 exists to fix.
 #[test]
 fn system32_curl_starts_tls_only_where_the_backend_allows_it() {
-    let backend = kgraf_sandbox::platform_isolation()
-        .expect("a backend")
-        .backend;
+    // `KGRAF_REQUIRE_SANDBOX_USER=1` fails here when the machine runs the
+    // token sandbox, so a run about the sandbox user cannot pass on the
+    // other backend's branch.
+    let as_user = common::sandbox_user_mode();
     let (bytes, out) = curl_in_the_sandbox(&system_curl());
     let sent = bytes.as_deref().map(is_tls_handshake).unwrap_or(false);
-    if backend == kgraf_sandbox::Backend::WindowsSandboxUser {
+    if as_user {
         assert!(
             sent,
             "the Windows TLS stack did not start a handshake as the sandbox user, where no \

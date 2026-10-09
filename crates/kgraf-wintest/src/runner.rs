@@ -26,7 +26,7 @@ use crate::manifest::{MANIFEST_NAME, Manifest, Set, TestRun};
 use crate::platform::{self, CANCEL, FINISHED};
 use crate::progress::Progress;
 use crate::redact::Redactor;
-use crate::report::{self, BinaryResult, Failure, Report, StepTime};
+use crate::report::{self, BinaryResult, Failure, Measurement, Report, StepTime};
 use crate::sandbox_phase::{self, Exec, StepRun};
 use crate::workdir::{self, Layout, Made, Traces};
 
@@ -373,6 +373,53 @@ const SOLO_RERUN_BUDGET_SECS: u64 = 600;
 struct Env {
     /// Variables every child gets.
     vars: Vec<(String, String)>,
+    /// Add `--show-output` to the full run of a test binary, so libtest
+    /// prints what passing tests printed and their `measurement:` lines
+    /// reach the report. Off for the baseline, which stays as earlier runs
+    /// ran it.
+    show_output: bool,
+}
+
+/// The variable that makes the sandbox user mandatory in the sandbox test
+/// binaries (`tests/common/mod.rs` of kgraf-sandbox): a test that would take
+/// the token sandbox's branch fails instead of passing.
+pub const REQUIRE_SANDBOX_USER_VAR: &str = "KGRAF_REQUIRE_SANDBOX_USER";
+
+/// The environment of the re-run (e) of the sandbox user phase: the
+/// baseline's, plus [`REQUIRE_SANDBOX_USER_VAR`]` = 1` and `--show-output`.
+/// The variable is set here and nowhere else: `e2e::child_env` keeps every
+/// `KGRAF_` variable of the host from the children, so neither a value the
+/// host has nor this one reaches the baseline.
+fn phase_rerun_env(base: &Env) -> Env {
+    let mut vars = base.vars.clone();
+    vars.push((REQUIRE_SANDBOX_USER_VAR.to_owned(), "1".to_owned()));
+    Env {
+        vars,
+        show_output: true,
+    }
+}
+
+/// The test binaries that run with a console of their own
+/// (`CREATE_NEW_CONSOLE`). The runner reads every child through pipes, so a
+/// child has no console unless it gets one. `escape_windows` measures that a
+/// sandboxed command cannot attach to its host's console, and with no
+/// console there is nothing to attach to: that test then fails under
+/// [`REQUIRE_SANDBOX_USER_VAR`] rather than pass without measuring. A new
+/// console keeps the pipes (the standard handles are passed explicitly),
+/// and on a desktop it shows an empty window while the binary runs.
+pub const NEEDS_CONSOLE: &[&str] = &["kgraf-sandbox/test/escape_windows"];
+
+/// `CREATE_NEW_CONSOLE`.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+/// The process creation flags for a run of the test binary `id`.
+pub fn creation_flags_for(id: &str) -> u32 {
+    let base = id.split('#').next().unwrap_or(id);
+    if NEEDS_CONSOLE.contains(&base) {
+        CREATE_NEW_CONSOLE
+    } else {
+        0
+    }
 }
 
 fn base_env(layout: &Layout) -> Env {
@@ -408,7 +455,10 @@ fn base_env(layout: &Layout) -> Env {
         ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
         ("NO_PROXY".to_owned(), "127.0.0.1,localhost".to_owned()),
     ];
-    Env { vars }
+    Env {
+        vars,
+        show_output: false,
+    }
 }
 
 /// Run one test binary and read its results.
@@ -439,7 +489,21 @@ fn binary_command(run: &TestRun, bundle: &Path, cwd: &Path, env: &Env, args: &[S
         .current_dir(cwd)
         .env_clear()
         .envs(e2e::child_env(std::env::vars(), &vars));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(creation_flags_for(&run.id));
+    }
     cmd
+}
+
+/// The arguments of the full run of a binary in `env`.
+fn full_run_args(run: &TestRun, env: &Env) -> Vec<String> {
+    let mut args = test_args(run);
+    if env.show_output {
+        args.push("--show-output".to_owned());
+    }
+    args
 }
 
 /// libtest prints a failed test's panic and captured output only in the
@@ -521,11 +585,29 @@ fn run_binary_limits(
     limit: Duration,
     solo_limit: Duration,
 ) -> BinaryResult {
-    let cmd = binary_command(run, bundle, cwd, env, &test_args(run));
+    let cmd = binary_command(run, bundle, cwd, env, &full_run_args(run, env));
     let mut parser = Parser::default();
     let total = listed.unwrap_or(0);
+    // Each test's time: libtest on stable prints no times of its own. With
+    // one test thread a test starts when the one before it ends, and its
+    // `test name ... ` line usually reaches the pipe only with its result
+    // word, so the time runs from the previous result (or the binary's
+    // start) to this one; a `test name ... ` line of its own, when one
+    // arrives, restarts it.
+    let mut mark = Instant::now();
+    let mut test_secs: Vec<(String, f64)> = Vec::new();
     let f = crate::proc::run(cmd, limit, &CANCEL, |line| {
         let ev = parser.feed(line);
+        match &ev {
+            Event::Started(_) => mark = Instant::now(),
+            Event::Finished(_) => {
+                if let Some(t) = parser.tests.last() {
+                    test_secs.push((t.name.clone(), mark.elapsed().as_secs_f64()));
+                }
+                mark = Instant::now();
+            }
+            Event::Other => {}
+        }
         console.with(|p, _| match ev {
             Event::Started(_) => {
                 p.detail = format!(
@@ -610,7 +692,23 @@ fn run_binary_limits(
             .iter()
             .map(|s| format!("{}: {}", s.pattern, s.reason))
             .collect(),
+        measurements: measurements(&parser.measurements, &test_secs),
     }
+}
+
+/// The measurement lines of one run, each with its test's time when the
+/// runner timed that test.
+fn measurements(lines: &[(Option<String>, String)], secs: &[(String, f64)]) -> Vec<Measurement> {
+    lines
+        .iter()
+        .map(|(test, line)| Measurement {
+            test: test.clone(),
+            secs: test
+                .as_ref()
+                .and_then(|t| secs.iter().find(|(n, _)| n == t).map(|(_, s)| *s)),
+            line: line.clone(),
+        })
+        .collect()
 }
 
 /// `--list` count for a binary, with the same filters and skips.
@@ -941,6 +1039,7 @@ pub fn run(o: RunOptions) -> i32 {
             bundle: &bundle,
             layout: &layout,
             env: &env,
+            rerun_env: phase_rerun_env(&env),
             machine: &machine,
             runs: &all,
             by_id,
@@ -1142,6 +1241,8 @@ struct PhaseExec<'a> {
     bundle: &'a Path,
     layout: &'a Layout,
     env: &'a Env,
+    /// The environment of the re-run (e): [`phase_rerun_env`].
+    rerun_env: Env,
     machine: &'a MachineFacts,
     runs: &'a [&'a TestRun],
     /// Expected seconds and listed test count by run id.
@@ -1188,7 +1289,18 @@ impl Exec for PhaseExec<'_> {
                 .map_err(|e| format!("cannot place {runner} beside the test binaries: {e}"))?;
             self.placed = Some(copy);
         }
-        Ok(())
+        // The re-run starts these binaries as the sandbox user. A folder the
+        // sandbox group cannot read makes every probe fail before it checks
+        // anything, so the phase does not start. The runner copy is checked
+        // with the rest, and removed again here: a phase that does not start
+        // never reaches its teardown.
+        let readable = platform::sandbox_group_can_run(&self.bundle.join("tests"));
+        if readable.is_err()
+            && let Some(copy) = self.placed.take()
+        {
+            let _ = std::fs::remove_file(copy);
+        }
+        readable
     }
 
     fn cli(&mut self, label: &str, args: &[&str], limit: Duration, honor_cancel: bool) -> StepRun {
@@ -1237,6 +1349,7 @@ impl Exec for PhaseExec<'_> {
                 rerun_skipped: Vec::new(),
                 tail: None,
                 skipped: Vec::new(),
+                measurements: Vec::new(),
             };
         };
         let (expected, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
@@ -1245,7 +1358,7 @@ impl Exec for PhaseExec<'_> {
             run,
             self.bundle,
             &package_cwd(self.cwd_root, run),
-            self.env,
+            &self.rerun_env,
             expected,
             listed,
         )
@@ -1352,7 +1465,10 @@ exec sleep 30
             secs_per_test: 1.0,
         };
         let console = Console::new(Progress::default());
-        let env = Env { vars: vec![] };
+        let env = Env {
+            vars: vec![],
+            show_output: false,
+        };
         let b = run_binary_limits(
             &console,
             &run,
@@ -1376,6 +1492,189 @@ exec sleep 30
         let open = b.open_test_solo.as_ref().unwrap();
         assert_eq!(open.solo.as_deref(), Some("hung"));
         assert!(b.rerun_skipped.is_empty());
+    }
+
+    fn run_of(exe: &str, id: &str) -> TestRun {
+        TestRun {
+            id: id.into(),
+            package: "kgraf-sandbox".into(),
+            kind: "test".into(),
+            name: "x".into(),
+            exe: exe.into(),
+            package_dir: ".".into(),
+            set: Set::Core,
+            filters: vec![],
+            skips: vec![],
+            secs_per_test: 1.0,
+        }
+    }
+
+    fn env_of(cmd: &Command, name: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    /// The switch reaches the command of a re-run binary and not the
+    /// command of the baseline. The commands checked are the ones the runner
+    /// starts, after `e2e::child_env` filtered the host's variables: a
+    /// filtered variable once skipped a test without a word.
+    #[test]
+    fn the_sandbox_user_switch_reaches_the_rerun_and_not_the_baseline() {
+        let base = Env {
+            vars: vec![("TEMP".into(), "t".into())],
+            show_output: false,
+        };
+        let rerun = phase_rerun_env(&base);
+        let run = run_of("x", "kgraf-sandbox/test/escape_windows");
+        let p = Path::new("b");
+        let baseline_cmd = binary_command(&run, p, p, &base, &full_run_args(&run, &base));
+        let rerun_cmd = binary_command(&run, p, p, &rerun, &full_run_args(&run, &rerun));
+        assert_eq!(env_of(&baseline_cmd, REQUIRE_SANDBOX_USER_VAR), None);
+        assert_eq!(
+            env_of(&rerun_cmd, REQUIRE_SANDBOX_USER_VAR).as_deref(),
+            Some("1")
+        );
+        // The re-run asks libtest for passing tests' output; the baseline
+        // does not.
+        let args = |c: &Command| -> Vec<String> {
+            c.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(args(&rerun_cmd).contains(&"--show-output".to_owned()));
+        assert!(!args(&baseline_cmd).contains(&"--show-output".to_owned()));
+        // A value on the host never reaches a child: the filter drops it, so
+        // the baseline cannot inherit one from the shell that ran the runner.
+        let host = vec![(REQUIRE_SANDBOX_USER_VAR.to_owned(), "1".to_owned())];
+        assert!(
+            e2e::child_env(host.clone(), &base.vars)
+                .iter()
+                .all(|(k, _)| k != REQUIRE_SANDBOX_USER_VAR)
+        );
+        assert!(
+            e2e::child_env(host, &rerun.vars)
+                .iter()
+                .any(|(k, v)| k == REQUIRE_SANDBOX_USER_VAR && v == "1")
+        );
+        // The name is the one the sandbox tests read (tests/common/mod.rs).
+        assert_eq!(REQUIRE_SANDBOX_USER_VAR, "KGRAF_REQUIRE_SANDBOX_USER");
+    }
+
+    /// The same, through a real process: a fake test binary prints the
+    /// switch and its arguments as a measurement line of a passing test, the
+    /// way `--show-output` prints it, and the runner reads the line back
+    /// with the test's name and time.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_binary_gets_the_switch_and_its_measurements_are_collected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-tests");
+        let script = r#"#!/bin/sh
+echo 'running 2 tests'
+sleep 1.5
+echo 'test e::quick ... ok'
+sleep 0.3
+echo 'test e::probe ... ok'
+echo
+echo 'successes:'
+echo
+echo '---- e::probe stdout ----'
+echo "measurement: switch=${KGRAF_REQUIRE_SANDBOX_USER:-unset} args=$*"
+echo
+echo 'successes:'
+echo '    e::probe'
+echo
+echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s'
+"#;
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = run_of("fake-tests", "p/test/fake");
+        let console = Console::new(Progress::default());
+        let base = Env {
+            vars: vec![],
+            show_output: false,
+        };
+        let go = |env: &Env| {
+            run_binary_limits(
+                &console,
+                &run,
+                dir.path(),
+                dir.path(),
+                env,
+                1.0,
+                Some(1),
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+            )
+        };
+        let b = go(&base);
+        assert!(b.clean(), "{b:?}");
+        assert_eq!(b.measurements.len(), 1, "{:?}", b.measurements);
+        assert!(
+            b.measurements[0].line.contains("switch=unset"),
+            "{:?}",
+            b.measurements
+        );
+        assert!(!b.measurements[0].line.contains("--show-output"));
+        let r = go(&phase_rerun_env(&base));
+        assert!(r.clean(), "{r:?}");
+        let m = &r.measurements[0];
+        assert!(m.line.contains("switch=1"), "{m:?}");
+        assert!(m.line.contains("--show-output"), "{m:?}");
+        assert_eq!(m.test.as_deref(), Some("e::probe"));
+        // libtest prints `test name ... ok` in one piece when the test
+        // ends; the time runs from the result of the test before it.
+        let secs = m.secs.expect("the test was timed");
+        // Not the 1.5 s of the test before it: the time restarts at each
+        // result.
+        assert!((0.25..1.2).contains(&secs), "{secs}");
+        // The phase's own re-run path, as the runner builds it from the
+        // baseline's environment.
+        let layout = workdir::layout(dir.path(), "phase");
+        let machine = MachineFacts::default();
+        let runs = [&run];
+        let mut ex = PhaseExec {
+            console: &console,
+            bundle: dir.path(),
+            layout: &layout,
+            env: &base,
+            rerun_env: phase_rerun_env(&base),
+            machine: &machine,
+            runs: &runs,
+            by_id: std::collections::HashMap::new(),
+            cwd_root: dir.path(),
+            placed: None,
+        };
+        let r = ex.rerun("p/test/fake");
+        assert!(
+            r.measurements[0].line.contains("switch=1"),
+            "{:?}",
+            r.measurements
+        );
+    }
+
+    /// The escape tests get a console of their own (they measure an attach
+    /// to it); no other binary does.
+    #[test]
+    fn only_the_escape_tests_get_a_console_of_their_own() {
+        assert_eq!(
+            creation_flags_for("kgraf-sandbox/test/escape_windows"),
+            CREATE_NEW_CONSOLE
+        );
+        assert_eq!(
+            creation_flags_for("kgraf-sandbox/test/escape_windows#core"),
+            CREATE_NEW_CONSOLE
+        );
+        for id in [
+            "kgraf-sandbox/test/runner_windows",
+            "kgraf-sandbox/lib/kgraf_sandbox",
+            "kgraf-cli/test/worker",
+        ] {
+            assert_eq!(creation_flags_for(id), 0, "{id}");
+        }
+        assert_eq!(CREATE_NEW_CONSOLE, 0x10);
     }
 
     #[test]

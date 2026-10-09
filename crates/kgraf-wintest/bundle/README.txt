@@ -8,7 +8,8 @@ Steps
 -----
 1. Before you unzip: right-click the zip, Properties, tick "Unblock" if it is
    there, OK. (This stops Windows asking about each file.)
-2. Unzip the whole zip to a folder (for example your Downloads folder).
+2. Unzip the whole zip to a folder (for example your Downloads folder; for
+   the sandbox user phase below, a folder outside your profile).
 3. Open the unzipped folder and double-click kgraf-wintest.exe.
    If Windows shows "Windows protected your PC", click "More info", then
    "Run anyway". The program is not signed.
@@ -63,6 +64,16 @@ runs the suite as usual, then sets kGraf's Windows sandbox user up, re-runs
 the parts it changes, and removes it again. Start it from an elevated prompt,
 or accept the UAC prompt. It does not start if this Windows user already has
 a sandbox user set up. The report shows both results side by side.
+
+For this phase, unzip to a folder outside your user profile, for example
+C:\kgraf-wintest, not Downloads or the Desktop. The sandbox users cannot read
+your profile, so they cannot run the test programs from there. The phase
+checks this first and, if they cannot read the tests\ folder, says so and does
+not start. Also start the OpenSSH agent service first, from an elevated
+PowerShell: Set-Service ssh-agent -StartupType Manual; Start-Service ssh-agent.
+In every run, with or without this phase, the sandbox escape tests run in a
+console window of their own: an empty window opens while they run and closes
+after them.
 
 Other options: kgraf-wintest.exe --help
 
