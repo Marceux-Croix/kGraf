@@ -5039,12 +5039,17 @@ impl kgraf_orchestrator::Decomposer for CutsOffInterfaces {
             PlanError::Truncated {
                 kind: "interfaces".into(),
                 max_output_tokens: 4_096,
+                answer_cap: true,
             },
         ))
     }
 
     fn cost_basis(&self) -> CostBasis {
         self.0.cost_basis()
+    }
+
+    fn output_limit(&self, kind: &str, cap: Option<u32>) -> u32 {
+        self.0.output_limit(kind, cap)
     }
 }
 

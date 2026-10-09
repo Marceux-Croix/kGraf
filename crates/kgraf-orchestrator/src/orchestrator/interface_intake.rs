@@ -612,9 +612,10 @@ impl RunLoop {
             })
             + 2_000;
         let mut basis = self.s.decomposer.cost_basis();
-        if let Some(cap) = request.output_cap {
-            basis.max_output_tokens = basis.max_output_tokens.min(cap);
-        }
+        basis.max_output_tokens = self
+            .s
+            .decomposer
+            .output_limit("interfaces", request.output_cap);
         let reservation = self.reserve_rounds(&basis, input, 0);
         let stop = self.stop_token.clone();
         let out = tokio::select! {

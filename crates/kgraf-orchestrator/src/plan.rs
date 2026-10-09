@@ -366,15 +366,14 @@ pub enum PlanError {
     Invalid(String),
     /// The model stopped at the output ceiling: its answer is cut off, and a
     /// cut-off plan (interface contracts carry whole files) is never guessed
-    /// at or partly used.
-    #[error(
-        "the {kind} answer was cut off at the output limit of {max_output_tokens} tokens; \
-         raise the orchestrator's output limit (`--planner-max-tokens`), or turn contract \
-         checks off, since interface contracts carry whole files"
-    )]
+    /// at or partly used. `answer_cap`: the limit was a cap kGraf set for this
+    /// answer below the orchestrator's own limit
+    /// ([`ModelCaller::output_limit`]), which no setting raises.
+    #[error("{}", truncated_text(kind, *max_output_tokens, *answer_cap))]
     Truncated {
         kind: String,
         max_output_tokens: u32,
+        answer_cap: bool,
     },
     /// A JSON-asked call whose every answer was malformed
     /// ([`PlanError::is_malformed_answer`]): made once and again
@@ -390,6 +389,24 @@ pub enum PlanError {
         calls: Vec<CallId>,
         error: Box<PlanError>,
     },
+}
+
+/// What [`PlanError::Truncated`] says: the limit, and what can be done about
+/// it, which differs for the orchestrator's own limit and an answer cap.
+fn truncated_text(kind: &str, max_output_tokens: u32, answer_cap: bool) -> String {
+    if answer_cap {
+        format!(
+            "the {kind} answer was cut off at the output limit of {max_output_tokens} tokens \
+             kGraf sets for this answer when the model is asked not to reason; the answer \
+             itself was longer than that, so it is not asked again"
+        )
+    } else {
+        format!(
+            "the {kind} answer was cut off at the output limit of {max_output_tokens} tokens; \
+             raise the orchestrator's output limit (`--planner-max-tokens`), or turn contract \
+             checks off, since interface contracts carry whole files"
+        )
+    }
 }
 
 /// `; answer begins "..."`, or nothing for an empty excerpt.
@@ -488,6 +505,15 @@ pub trait Decomposer: Send + Sync {
     ) -> Result<crate::interface_plan::InterfaceReply, PlanError>;
     /// What one call costs at most, so the orchestrator can reserve it first.
     fn cost_basis(&self) -> CostBasis;
+    /// The output limit sent on a call of kind `kind` whose answer should
+    /// take at most `cap` tokens, so its reservation matches the call. By
+    /// default the cap under [`Self::cost_basis`]'s limit; a model caller
+    /// enforces the cap only where the model does not reason
+    /// ([`ModelCaller::output_limit`]).
+    fn output_limit(&self, _kind: &str, cap: Option<u32>) -> u32 {
+        let limit = self.cost_basis().max_output_tokens;
+        cap.map_or(limit, |c| c.min(limit))
+    }
 }
 
 /// The model an orchestrator call bills, and its output ceiling.
@@ -1195,6 +1221,28 @@ impl ModelCaller {
         }
     }
 
+    /// The output limit a call of kind `kind` is sent with when its answer
+    /// should take at most `cap` tokens. The cap is enforced only when the
+    /// kind's reasoning level is off: the protocols kGraf speaks count a
+    /// model's reasoning against the same limit (`max_tokens` on Chat
+    /// Completions, which Ollama passes on as `num_predict`;
+    /// `max_output_tokens` on Responses; `max_tokens` with thinking on
+    /// Messages), and the length of the reasoning is not known before the
+    /// call. A reasoning model held to an answer-sized limit spends it on
+    /// reasoning and is cut off before it answers, on every ask. With
+    /// reasoning on, the call gets the caller's own limit and the cap stays
+    /// a size the request states. Never above the caller's own limit.
+    pub(crate) fn output_limit(&self, kind: &str, cap: Option<u32>) -> u32 {
+        let reasoning_off = matches!(
+            self.reasoning.effort_for_call_kind(kind),
+            Some(kgraf_provider::ReasoningEffort::Off)
+        );
+        match cap {
+            Some(c) if reasoning_off => c.min(self.max_output_tokens),
+            _ => self.max_output_tokens,
+        }
+    }
+
     pub(crate) async fn ask(
         &self,
         kind: &str,
@@ -1324,7 +1372,7 @@ impl ModelCaller {
     }
 
     /// [`Self::ask_keeping_call`] with the answer limited to `cap` output
-    /// tokens, when that is under the caller's own limit.
+    /// tokens where [`Self::output_limit`] enforces it.
     pub(crate) async fn ask_keeping_call_capped(
         &self,
         kind: &str,
@@ -1332,7 +1380,7 @@ impl ModelCaller {
         user: String,
         cap: Option<u32>,
     ) -> (Result<String, PlanError>, Option<CallId>) {
-        let limit = cap.map_or(self.max_output_tokens, |c| c.min(self.max_output_tokens));
+        let limit = self.output_limit(kind, cap);
         let mut request = self.request(kind, user, limit);
         request.system = vec![kgraf_provider::Content::text(system)];
         let (result, call) = self.complete_once(kind, &request).await;
@@ -1481,6 +1529,7 @@ impl ModelCaller {
                     PlanError::Truncated {
                         kind: kind.to_owned(),
                         max_output_tokens: request.max_output_tokens,
+                        answer_cap: request.max_output_tokens < self.max_output_tokens,
                     },
                 )),
                 Some(call),
@@ -1590,6 +1639,10 @@ pub struct ModelDecomposer(pub ModelCaller);
 impl Decomposer for ModelDecomposer {
     fn cost_basis(&self) -> CostBasis {
         self.0.cost_basis()
+    }
+
+    fn output_limit(&self, kind: &str, cap: Option<u32>) -> u32 {
+        self.0.output_limit(kind, cap)
     }
 
     async fn decompose(&self, request: &PlanRequest) -> Result<PlanOutput, PlanError> {
@@ -2472,6 +2525,7 @@ mod tests {
         let cut = PlanError::Truncated {
             kind: "plan".into(),
             max_output_tokens: 1,
+            answer_cap: false,
         };
         assert!(!cut.reaskable());
         assert!(!PlanError::attributed(vec![], cut).reaskable());
@@ -3092,22 +3146,55 @@ mod tests {
         assert_eq!(provider.prompts().len(), 3);
     }
 
-    /// An interface ask that states an output cap is limited to it, under the
-    /// caller's own limit: the answer cut off names the cap, not the limit of
-    /// the planner's other calls.
+    /// An interface ask that states an output cap is held to it only when
+    /// the interfaces call's reasoning is off. Reasoning counts against the
+    /// same output limit (a `qwen3.6:35b` decompose call on Ollama with
+    /// `max_tokens` 8,192 spent all 8,192 tokens reasoning and answered
+    /// nothing, `finish_reason: "length"`), and its interface answers took a
+    /// median of 9,118 completion tokens with reasoning on, so a 4,096 cap
+    /// would cut every such answer. With reasoning unset or on, the call gets
+    /// the planner's own limit and so does its reservation; with it off, the
+    /// cut-off answer names the cap and no setting that cannot raise it.
     #[tokio::test]
-    async fn an_interface_ask_is_limited_to_its_stated_output_cap() {
+    async fn an_interface_ask_is_held_to_its_output_cap_only_with_reasoning_off() {
+        use kgraf_provider::{
+            ReasoningEffort, ReasoningLevel, ReasoningLevels, ReasoningProcess, ReasoningScope,
+        };
         let dir = tempfile::tempdir().expect("dir");
         let ledger = Arc::new(Ledger::open(&dir.path().join("l.db")).expect("ledger"));
-        let d = ModelDecomposer(ModelCaller {
-            reasoning: Default::default(),
-            provider: Arc::new(CutOff),
-            ledger,
-            model: "m".into(),
-            max_output_tokens: 32_768,
-            agent: "orchestrator:r".into(),
-            task: "r".into(),
-        });
+        let caller = |reasoning: ReasoningLevels| {
+            ModelDecomposer(ModelCaller {
+                reasoning,
+                provider: Arc::new(CutOff),
+                ledger: ledger.clone(),
+                model: "m".into(),
+                max_output_tokens: 32_768,
+                agent: "orchestrator:r".into(),
+                task: "r".into(),
+            })
+        };
+        let interfaces_at = |effort: ReasoningEffort| {
+            ReasoningLevels::new().with(
+                ReasoningScope::Process(ReasoningProcess::Interfaces),
+                ReasoningLevel::Effort(effort),
+            )
+        };
+        let unset = caller(ReasoningLevels::new());
+        let low = caller(interfaces_at(ReasoningEffort::Low));
+        let off = caller(interfaces_at(ReasoningEffort::Off));
+        // Off for every other planner call but not this one: still the
+        // planner's own limit.
+        let off_elsewhere = caller(
+            ReasoningLevels::new()
+                .with(
+                    ReasoningScope::Group(kgraf_provider::ReasoningGroup::Planner),
+                    ReasoningLevel::Effort(ReasoningEffort::Off),
+                )
+                .with(
+                    ReasoningScope::Process(ReasoningProcess::Interfaces),
+                    ReasoningLevel::Unset,
+                ),
+        );
         let request = |cap: Option<u32>| crate::interface_plan::InterfaceRequest {
             context: PlanRequest {
                 instruction: "do it".into(),
@@ -3130,24 +3217,52 @@ mod tests {
             output_cap: cap,
             previous: None,
         };
-        let capped = d
-            .interfaces(&request(Some(4_096)))
-            .await
-            .expect_err("cut off")
-            .to_string();
-        assert!(
-            capped.contains("cut off at the output limit of 4096 tokens"),
-            "{capped}"
-        );
-        let uncapped = d
-            .interfaces(&request(None))
-            .await
-            .expect_err("cut off")
-            .to_string();
-        assert!(
-            uncapped.contains("cut off at the output limit of 32768 tokens"),
-            "{uncapped}"
-        );
+        let off_by_group = caller(ReasoningLevels::new().with(
+            ReasoningScope::Group(kgraf_provider::ReasoningGroup::Planner),
+            ReasoningLevel::Effort(ReasoningEffort::Off),
+        ));
+        async fn cut(
+            d: &ModelDecomposer,
+            request: crate::interface_plan::InterfaceRequest,
+        ) -> String {
+            d.interfaces(&request)
+                .await
+                .expect_err("cut off")
+                .to_string()
+        }
+        for (name, d) in [
+            ("unset", &unset),
+            ("low", &low),
+            ("off for other kinds", &off_elsewhere),
+        ] {
+            let text = cut(d, request(Some(4_096))).await;
+            assert!(
+                text.contains("cut off at the output limit of 32768 tokens")
+                    && text.contains("--planner-max-tokens"),
+                "{name}: {text}"
+            );
+            assert_eq!(d.output_limit("interfaces", Some(4_096)), 32_768, "{name}");
+        }
+        for (name, d) in [("off", &off), ("off by group", &off_by_group)] {
+            let text = cut(d, request(Some(4_096))).await;
+            assert!(
+                text.contains("cut off at the output limit of 4096 tokens")
+                    && text.contains("asked not to reason")
+                    && !text.contains("--planner-max-tokens"),
+                "{name}: {text}"
+            );
+            assert_eq!(d.output_limit("interfaces", Some(4_096)), 4_096, "{name}");
+            // Never above the planner's own limit.
+            assert_eq!(d.output_limit("interfaces", Some(99_999)), 32_768, "{name}");
+        }
+        for d in [&unset, &off] {
+            let text = cut(d, request(None)).await;
+            assert!(
+                text.contains("cut off at the output limit of 32768 tokens")
+                    && text.contains("--planner-max-tokens"),
+                "{text}"
+            );
+        }
     }
 
     /// A planner that answers with the example JSON from the system prompt it

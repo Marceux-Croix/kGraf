@@ -1352,7 +1352,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   in the report's `contracts` line, with a notice and a trace record that name the contracts
   and the reason; its compile-only interface still checks it. Where a
   behavior check is asked for, the request lists what kGraf already supplies and the answer
-  holds only the reference and the test, within 4,096 output tokens. Each interface is
+  holds only the reference and the test, within 4,096 output tokens. That size is held on the
+  call only when the planner's reasoning is off for the `interfaces` kind (`--planner-reasoning
+  off` or a narrower setting): a model's reasoning counts against the same output limit, so a
+  reasoning planner gets `planner_max_tokens` for this call, as for its others. An answer cut
+  off at the 4,096 limit says so and is not asked again. Each interface is
   checked as it arrives, in the sandbox: the consumer and the test compile against the stub,
   the test fails against the stub and passes against the reference. A compile command that
   cannot run or does not build the files is replaced by the derived one, without asking

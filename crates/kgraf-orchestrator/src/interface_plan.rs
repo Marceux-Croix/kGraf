@@ -44,15 +44,18 @@ pub struct InterfaceRequest {
     /// What kGraf supplies for each producer it asks a behavior check of, so
     /// the answer holds only the reference and the test.
     pub supplied: Vec<Supplied>,
-    /// The most output tokens the answer may take: stated in the prompt and
-    /// enforced on the call. `None`: the planner's own limit.
+    /// The most output tokens the answer may take: stated in the prompt, and
+    /// enforced on the call only where the call's reasoning is off
+    /// (`ModelCaller::output_limit`), since reasoning counts against the same
+    /// limit. `None`: the planner's own limit.
     pub output_cap: Option<u32>,
     /// The previous ask's answer and why it was refused, on a re-ask.
     pub previous: Option<PreviousAsk>,
 }
 
 /// The most output tokens an interface answer may take when kGraf supplies the
-/// stub, the consumer files and the compile command.
+/// stub, the consumer files and the compile command. The answer alone: a
+/// model that reasons first gets the planner's own limit on the call.
 pub const SUPPLIED_OUTPUT_TOKENS: u32 = 4_096;
 
 /// What kGraf already holds for one producer (derived from the repository
@@ -271,8 +274,8 @@ fn supplied_note(supplied: &[Supplied], cap: Option<u32>) -> String {
     }
     if let Some(cap) = cap {
         out.push_str(&format!(
-            "The whole answer must take at most {cap} output tokens; a longer one is cut off and \
-             discarded.\n"
+            "The answer must take at most {cap} output tokens, not counting any reasoning \
+             before it; a longer answer can be cut off and discarded.\n"
         ));
     }
     out
@@ -865,7 +868,7 @@ mod tests {
             "producer c1 (consumers c5): stub supplied: a/src/lib.rs; consumer files supplied: \
              b/src/lib.rs; its items: Flat",
             "producer c2 (consumers c5): no stub is supplied",
-            "at most 4096 output tokens",
+            "at most 4096 output tokens, not counting any reasoning",
         ] {
             assert!(note.contains(needle), "{needle}: {note}");
         }

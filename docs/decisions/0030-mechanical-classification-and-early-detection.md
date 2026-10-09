@@ -993,3 +993,35 @@ rule, taken on the first ask now) and
 `contracts_that_declare_no_writes_are_refused_and_asked_again` (still refused once without its
 writes; with the rule disabled, accepted on the first ask); `kgraf-runtime` `worker_loop.rs`
 `a_write_by_a_contract_that_declares_no_writes_names_the_plan_shape`.
+
+## Amendment (2026-10-09, third): the interface answer cap holds only where the model does not reason
+
+The 4,096-token cap on an interface answer for which kGraf supplies the stub ("What the ask
+holds", above) was sent as the call's output limit. Every protocol kGraf speaks counts a model's
+reasoning against that limit: `max_tokens` on Chat Completions, which Ollama passes on as
+`num_predict`; `max_output_tokens` on Responses; `max_tokens` with thinking on Messages. A
+reasoning planner held to 4,096 tokens spends them reasoning and is cut off before it answers, on
+every ask, and the cut-off answer is not asked again. The refusal also told the user to raise
+`--planner-max-tokens`, which cannot raise the cap.
+
+- **The cap is enforced only when the `interfaces` kind's reasoning level resolves to off**
+  (decision 0098; `ModelCaller::output_limit`). Off is the one level whose absence of reasoning
+  is checked on the answer. With the level unset, low, medium or high, the call gets the
+  planner's own limit, and its reservation matches (`Decomposer::output_limit`). The request
+  still states the size: "at most 4096 output tokens, not counting any reasoning before it".
+- **A cut at the cap says what it is.** `PlanError::Truncated` carries `answer_cap`: an answer
+  cut at a cap below the planner's limit names the cap and that the answer itself was longer,
+  and names no setting; a cut at the planner's limit still names `--planner-max-tokens`.
+- **Nothing else changes.** A cut at either limit is still never guessed at, parsed or asked
+  again. The decomposition and re-grounding calls had no cap and keep the planner's limit.
+
+Tests: `kgraf-orchestrator` `plan.rs`
+`an_interface_ask_is_held_to_its_output_cap_only_with_reasoning_off`; `interface_plan.rs`
+`the_request_says_what_is_supplied_and_states_the_output_cap`.
+
+Measured on `qwen3.6:35b` served by Ollama: at a limit of 8,192, decomposition calls ended with
+`finish_reason: "length"` at 8,192 completion tokens, one with no answer at all, only reasoning.
+Interface calls with reasoning on took 1,433 to 27,614 completion tokens (median 9,118). Answers
+refused because they end before the JSON object closes came back with `finish_reason: "stop"`
+far below the limit: the model ended them itself, and this amendment does not change how they
+are handled.

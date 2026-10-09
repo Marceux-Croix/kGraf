@@ -726,7 +726,9 @@ binary build output (a wheel, an archive, a compiled library: `binary_outputs_on
 reference cannot hold. Those edges are recorded as unchecked with a one-line
 reason; a refused interface whose producer is one of them does not buy a re-ask; when no producer needs a check the interface call makes no planner call. Where one is asked
 (its own budget of three asks), the request names what kGraf supplies per producer and asks for
-`reference`, `tests` and `test` only, within 4,096 output tokens; kGraf fills the stub (declared in
+`reference`, `tests` and `test` only, within 4,096 output tokens of answer (enforced on the call
+only when the interfaces call's reasoning is off, since reasoning counts against the same output
+limit; with reasoning on the call gets the planner's own limit); kGraf fills the stub (declared in
 `replaces`), the consumer files, the names and the compile command.
 Each interface of an answer is taken on its own: parsed, its parties and shape
 checked (symbols, stub, a reference covering every stub path, at least one test, both commands, no
