@@ -64,11 +64,11 @@ pub(crate) fn run_with<F: Future<Output = ()>>(
         loop {
             match watched.recv_timeout(after) {
                 Err(RecvTimeoutError::Timeout) => {
-                    eprintln!(
+                    say(&format!(
                         "[watchdog] {label} still running after {:?}; in flight:\n{}",
                         started.elapsed(),
                         in_flight()
-                    );
+                    ));
                     after = WATCHDOG_REPEAT;
                 }
                 _ => return,
@@ -83,11 +83,11 @@ pub(crate) fn run_with<F: Future<Output = ()>>(
     let _ = watchdog.join();
     let stuck = took >= shutdown;
     if stuck {
-        eprintln!(
+        say(&format!(
             "[watchdog] {name}: a blocking task was still running {shutdown:?} after the test \
              ended; in flight:\n{}",
             in_flight()
-        );
+        ));
     }
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -96,6 +96,21 @@ pub(crate) fn run_with<F: Future<Output = ()>>(
         !stuck,
         "{name}: a blocking task was still running {shutdown:?} after the test ended"
     );
+}
+
+/// Write a watchdog line to the process's standard error itself.
+///
+/// Not `eprintln!`: libtest captures what the print macros write in a test,
+/// on the test's thread and on every thread it spawns (the watchdog's
+/// included), and shows it only once the test has ended. A test that never
+/// ends is killed with its binary, and its captured lines go with it, so the
+/// watchdog said nothing in exactly the case it exists for. A write to the
+/// standard error handle is not captured and reaches the log at once.
+fn say(text: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{text}");
+    let _ = err.flush();
 }
 
 fn in_flight() -> String {
@@ -139,6 +154,55 @@ mod tests {
         let _ = release.send(());
         assert_eq!(failed, Ok(true), "the wrapper returned and failed the test");
         assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    const PROBE_VAR: &str = "KGRAF_E2E_WATCHDOG_PROBE";
+
+    /// The child half of the test below. A no-op unless [`PROBE_VAR`] is set:
+    /// then a test that outlives its watchdog bound and passes.
+    #[test]
+    fn watchdog_probe() {
+        if std::env::var_os(PROBE_VAR).is_none() {
+            return;
+        }
+        run_with(
+            "probe-long",
+            Flavor::CurrentThread,
+            async { tokio::time::sleep(Duration::from_millis(600)).await },
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+        );
+    }
+
+    /// The watchdog's line reaches the binary's output while libtest captures
+    /// the test's output, as it does in a normal run. A captured line is shown
+    /// only when its test ends, and is lost when a hung test is killed with
+    /// its binary. The probe passes, so libtest prints nothing it captured:
+    /// the line is in the output only if it bypassed the capture.
+    #[test]
+    fn the_watchdog_line_is_not_held_by_the_test_output_capture() {
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "e2e_rt::tests::watchdog_probe",
+                "--test-threads=1",
+            ])
+            .env(PROBE_VAR, "1")
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the probe runs");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "the probe did not run: {text}");
+        assert!(
+            text.contains("[watchdog] probe-long still running"),
+            "the watchdog's line was captured with the test's output: {text}"
+        );
     }
 
     #[test]

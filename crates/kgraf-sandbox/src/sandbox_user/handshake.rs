@@ -16,6 +16,14 @@
 //! to this one setup run, beside the process checks on both ends (decision
 //! 0097). A failed step's message is cut to one line. A password is checked
 //! against its alphabet on arrival ([`Password::from_received`]).
+//!
+//! A key is one word on the line. A removal key carries a folder path
+//! (`remove-closed:C:\Users\Public`), which can hold a backslash, a space or
+//! any other character, so a key is written with every byte outside
+//! [`is_plain_key_byte`] as `%XX` ([`escape_key`]) and read back to the same
+//! text ([`unescape_key`]). A raw path in a key would make the owner's side
+//! refuse the line, and a removal that stopped there would leave everything
+//! after it on the machine.
 
 use std::fmt;
 use std::io::Read;
@@ -132,13 +140,90 @@ pub fn pipe_name(nonce: &str) -> String {
     format!(r"\\.\pipe\kgraf-sandbox-setup-{nonce}")
 }
 
+/// A byte a key may carry as it is. Every other byte, `%` among them, is
+/// written as `%XX`.
+pub fn is_plain_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.')
+}
+
+/// The longest key on the wire, escapes counted. A longer key is cut at a
+/// character and ends in `...`, so the line stays under [`MAX_LINE`] with its
+/// message: a key is for the owner's terminal, and the undo record, not the
+/// key, says what is left.
+pub const MAX_KEY: usize = 1024;
+
+/// `key` as one word of [`is_plain_key_byte`] bytes and `%XX` escapes, at
+/// most [`MAX_KEY`] bytes long.
+pub fn escape_key(key: &str) -> String {
+    const CUT: &str = "...";
+    let piece = |c: char| -> String {
+        let mut buf = [0u8; 4];
+        c.encode_utf8(&mut buf)
+            .bytes()
+            .map(|b| {
+                if is_plain_key_byte(b) {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    let whole: String = key.chars().map(piece).collect();
+    if whole.len() <= MAX_KEY {
+        return whole;
+    }
+    // Cut at a character, so no escape and no UTF-8 sequence is split.
+    let mut out = String::with_capacity(MAX_KEY);
+    for c in key.chars() {
+        let p = piece(c);
+        if out.len() + p.len() > MAX_KEY - CUT.len() {
+            break;
+        }
+        out.push_str(&p);
+    }
+    out.push_str(CUT);
+    out
+}
+
+/// The key [`escape_key`] wrote, or `None` for a word it cannot have written:
+/// empty, a byte outside the plain set, a `%` not followed by two hex digits,
+/// or bytes that are not UTF-8.
+pub fn unescape_key(word: &str) -> Option<String> {
+    if word.is_empty() {
+        return None;
+    }
+    let bytes = word.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = word.get(i + 1..i + 3)?;
+                if !hex.bytes().all(|h| h.is_ascii_hexdigit()) {
+                    return None;
+                }
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b if is_plain_key_byte(b) => {
+                out.push(b);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Cuts a message to one line of printable text.
 fn one_line(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let cap = MAX_LINE - 512;
+    // Room for the kind, the longest key and the newline.
+    let cap = MAX_LINE - MAX_KEY - 64;
     if out.len() > cap {
         let mut end = cap;
         while !out.is_char_boundary(end) {
@@ -155,9 +240,13 @@ impl Message {
     pub fn encode(&self) -> Zeroizing<String> {
         Zeroizing::new(match self {
             Message::Hello { nonce } => format!("{PIPE_PROTOCOL} {PIPE_VERSION} {nonce}\n"),
-            Message::Step { key, outcome } => format!("step {key} {outcome}\n"),
-            Message::Note { key, message } => format!("note {key} {}\n", one_line(message)),
-            Message::Fail { key, message } => format!("fail {key} {}\n", one_line(message)),
+            Message::Step { key, outcome } => format!("step {} {outcome}\n", escape_key(key)),
+            Message::Note { key, message } => {
+                format!("note {} {}\n", escape_key(key), one_line(message))
+            }
+            Message::Fail { key, message } => {
+                format!("fail {} {}\n", escape_key(key), one_line(message))
+            }
             Message::Password { role, password } => {
                 return password_line(*role, password);
             }
@@ -175,11 +264,6 @@ impl Message {
         let first = words.next().unwrap_or_default();
         let second = words.next();
         let rest = words.next();
-        let key_ok = |k: &str| {
-            !k.is_empty()
-                && k.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
-        };
         match (first, second, rest) {
             (PIPE_PROTOCOL, Some(v), Some(nonce)) => {
                 if v != PIPE_VERSION.to_string() {
@@ -193,16 +277,16 @@ impl Message {
                 })
             }
             (PIPE_PROTOCOL, _, _) => Err(HandshakeError::Version),
-            ("step", Some(key), Some(word)) if key_ok(key) => Ok(Message::Step {
-                key: key.to_owned(),
+            ("step", Some(key), Some(word)) => Ok(Message::Step {
+                key: unescape_key(key).ok_or(HandshakeError::Malformed)?,
                 outcome: StepOutcome::from_word(word).ok_or(HandshakeError::Malformed)?,
             }),
-            ("note", Some(key), message) if key_ok(key) => Ok(Message::Note {
-                key: key.to_owned(),
+            ("note", Some(key), message) => Ok(Message::Note {
+                key: unescape_key(key).ok_or(HandshakeError::Malformed)?,
                 message: message.unwrap_or_default().to_owned(),
             }),
-            ("fail", Some(key), message) if key_ok(key) => Ok(Message::Fail {
-                key: key.to_owned(),
+            ("fail", Some(key), message) => Ok(Message::Fail {
+                key: unescape_key(key).ok_or(HandshakeError::Malformed)?,
                 message: message.unwrap_or_default().to_owned(),
             }),
             ("password", Some(role), Some(pw)) => Ok(Message::Password {
@@ -329,6 +413,9 @@ impl<R: Read> Iterator for SecretLines<R> {
 pub struct Receiver {
     state: ReceiverState,
     passwords: Vec<(Role, Password)>,
+    /// The name of each line after the greeting that did not parse
+    /// ([`unparsed_name`]), in order.
+    unparsed: Vec<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -359,7 +446,36 @@ pub enum Event {
         message: String,
     },
     PasswordReceived(Role),
+    /// A line after the greeting that did not parse, by name
+    /// ([`unparsed_name`]). The run goes on: the elevated step is still
+    /// removing or setting up, and it stops at its next message if this side
+    /// stops reading. The owner's process fails at the end
+    /// ([`Receiver::unparsed`]).
+    Unparsed(String),
     Finished,
+}
+
+/// What a line that did not parse was, without what it carried: its kind
+/// when that is one this protocol knows, and for a step, note or failure the
+/// key as it arrived, cut to [`MAX_KEY`] bytes of printable text. A password
+/// line is named by its kind alone, so no part of a password reaches a
+/// terminal or a log.
+pub fn unparsed_name(line: &str) -> String {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let mut words = line.splitn(3, ' ');
+    let kind = words.next().unwrap_or_default();
+    match kind {
+        "step" | "note" | "fail" => {
+            let key = one_line(words.next().unwrap_or_default());
+            let mut end = key.len().min(MAX_KEY);
+            while !key.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{kind} {}", &key[..end])
+        }
+        "password" | "end" | PIPE_PROTOCOL => kind.to_owned(),
+        _ => "a line of no known kind".to_owned(),
+    }
 }
 
 impl Receiver {
@@ -370,7 +486,20 @@ impl Receiver {
     /// Takes one line. `nonce` is the one this run passed on the command line.
     pub fn take(&mut self, line: &str, nonce: &str) -> Result<Event, HandshakeError> {
         use ReceiverState as S;
-        let msg = Message::parse(line)?;
+        let msg = match Message::parse(line) {
+            Ok(msg) => msg,
+            // After the greeting the pipe is known to be this run's, so a
+            // line this side cannot read is named and passed over, and the
+            // rest of the run is still read: a removal that stopped here
+            // would leave everything after the line on the machine.
+            // Before it, nothing on the pipe is trusted yet.
+            Err(HandshakeError::Malformed) if matches!(self.state, S::Steps | S::Passwords) => {
+                let name = unparsed_name(line);
+                self.unparsed.push(name.clone());
+                return Ok(Event::Unparsed(name));
+            }
+            Err(e) => return Err(e),
+        };
         match (&self.state, msg) {
             (S::AwaitHello, Message::Hello { nonce: got }) => {
                 if got != nonce {
@@ -409,10 +538,19 @@ impl Receiver {
         self.state == ReceiverState::Failed
     }
 
+    /// The names of the lines that did not parse ([`Event::Unparsed`]). A
+    /// run with any is a failed run, whatever else it reported.
+    pub fn unparsed(&self) -> &[String] {
+        &self.unparsed
+    }
+
     /// The passwords, once the run finished.
     pub fn into_passwords(self) -> Result<Vec<(Role, Password)>, HandshakeError> {
         if self.state != ReceiverState::Done {
             return Err(HandshakeError::Closed);
+        }
+        if !self.unparsed.is_empty() {
+            return Err(HandshakeError::Malformed);
         }
         Ok(self.passwords)
     }
@@ -646,6 +784,272 @@ mod tests {
         let mut bad = SecretLines::new(&b"step \xff created\n"[..]);
         assert!(bad.next().unwrap().is_err());
         assert!(SecretLines::new(&b""[..]).next().is_none());
+    }
+
+    /// Keys as a removal writes them, with what a folder path can hold.
+    const AWKWARD_KEYS: [&str; 8] = [
+        r"remove-closed:C:\",
+        r"remove-closed:C:\Users\Public",
+        r"remove-closed:C:\Users\Public\Account Pictures",
+        r"remove-closed:D:\données partagées",
+        r"remove-closed:C:\100% done\%41",
+        "remove-closed:C:\\tab\there\r\nend",
+        "remove-closed:C:\\\u{1F600}",
+        "plain-key_1.2:x",
+    ];
+
+    #[test]
+    fn a_key_round_trips_whatever_it_holds() {
+        for key in AWKWARD_KEYS {
+            let word = escape_key(key);
+            assert!(
+                word.bytes().all(|b| is_plain_key_byte(b) || b == b'%'),
+                "{word}"
+            );
+            assert_eq!(unescape_key(&word).as_deref(), Some(key), "{word}");
+        }
+        // A plain key is written as it is, so a key an older elevated step
+        // sent still reads the same.
+        assert_eq!(
+            escape_key("remove-rule:kgraf-sandbox-1a2b"),
+            "remove-rule:kgraf-sandbox-1a2b"
+        );
+        for bad in ["", "a b", r"C:\", "%", "%4", "%zz", "%FF", "a%2"] {
+            assert_eq!(unescape_key(bad), None, "{bad:?}");
+        }
+        // A key too long for a line is cut at a character, and still reads.
+        let long = format!("remove-closed:C:\\{}", "\u{e9}".repeat(MAX_KEY));
+        let word = escape_key(&long);
+        assert!(
+            word.len() <= MAX_KEY && word.ends_with("..."),
+            "{}",
+            word.len()
+        );
+        let back = unescape_key(&word).expect("a cut key still reads");
+        assert!(long.starts_with(back.trim_end_matches('.')));
+        let line = Message::Fail {
+            key: long,
+            message: "y".repeat(MAX_LINE * 2),
+        }
+        .encode();
+        assert!(line.len() <= MAX_LINE, "{}", line.len());
+        assert!(Message::parse(&line).is_ok());
+    }
+
+    /// Every message the elevated step sends, for a setup and for a
+    /// removal, read by a single receiver on the owner's side: each key comes
+    /// out as it went in. A removal sends a key per undo record entry, and a folder's
+    /// key carries its path, which the owner's side once refused.
+    #[test]
+    fn every_message_the_elevated_step_sends_reaches_the_owner_intact() {
+        use super::super::acl::{CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS};
+        use super::super::names::{MAX_SLOTS, OwnerNames};
+        use super::super::plan::{
+            Observed, StepId, failure_leaves, plan_remove, plan_setup, undo_key,
+        };
+        use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
+        use super::super::wfp::WfpKeys;
+
+        let n = OwnerNames::derive("S-1-5-21-1-2-3-1001", Some("t1"))
+            .unwrap()
+            .with_slots(MAX_SLOTS);
+        let mut observed = Observed::default();
+        observed.firewall.enabled_all_profiles = Some(true);
+        observed.firewall.local_policy_effective = Some(true);
+        let setup = plan_setup(&n, &observed).unwrap();
+        let mut keys: Vec<String> = setup.iter().map(|s| s.id.key()).collect();
+        assert!(keys.contains(&StepId::CloseFolders.key()));
+
+        // A record with an entry of every kind, the deny entries on folders
+        // whose paths hold what a path can.
+        let mut record = Record::new(n.owner_sid(), n.tag());
+        for role in n.roles() {
+            let user = n.user(role);
+            record.add(UndoEntry::User(user.clone()));
+            record.add(UndoEntry::Hidden(user.clone()));
+            record.add(UndoEntry::Rights {
+                user,
+                rights: DENIED_LOGON_RIGHTS
+                    .iter()
+                    .map(|r| (*r).to_owned())
+                    .collect(),
+            });
+        }
+        record.add(UndoEntry::Group(n.group()));
+        for rule in n.rules() {
+            record.add(UndoEntry::Rule(rule));
+        }
+        for (object, key) in WfpKeys::derive(&n).all() {
+            record.add(UndoEntry::Wfp { object, key });
+        }
+        let group_sid = "S-1-5-21-1-2-3-1100";
+        observed.group_sid = Some(group_sid.into());
+        for key in AWKWARD_KEYS {
+            let Some(path) = key.strip_prefix("remove-closed:") else {
+                continue;
+            };
+            observed.closable.insert(path.to_owned());
+            record.add(UndoEntry::Closed {
+                sid: group_sid.into(),
+                path: path.to_owned(),
+                mask: CLOSED_FOLDER_DENY,
+                flags: CLOSED_FOLDER_FLAGS,
+            });
+        }
+        let remove = plan_remove(&n, &record, &observed, &|_| Some(false)).unwrap();
+        assert_eq!(remove.len(), record.entries.len());
+        for step in &remove {
+            assert_eq!(step.key(), undo_key(&step.entry));
+            keys.push(step.key());
+        }
+        // The keys of the elevated step's own failures.
+        for key in [
+            "names", "plan", "record", "password", "pipe", "observe", "remove",
+        ] {
+            keys.push(key.to_owned());
+        }
+
+        let nonce = nonce();
+        let mut r = Receiver::new();
+        assert_eq!(
+            r.take(
+                &Message::Hello {
+                    nonce: nonce.clone()
+                }
+                .encode(),
+                &nonce
+            )
+            .unwrap(),
+            Event::Started
+        );
+        let outcomes = [
+            StepOutcome::Created,
+            StepOutcome::Updated,
+            StepOutcome::Verified,
+            StepOutcome::Removed,
+            StepOutcome::AlreadyGone,
+        ];
+        for key in &keys {
+            for outcome in outcomes {
+                let line = Message::Step {
+                    key: key.clone(),
+                    outcome,
+                }
+                .encode();
+                assert_eq!(
+                    r.take(&line, &nonce).unwrap(),
+                    Event::Step {
+                        key: key.clone(),
+                        outcome
+                    },
+                    "{line:?}"
+                );
+            }
+            let line = Message::Note {
+                key: key.clone(),
+                message: format!("not removed: Access is denied.\r\n{key}"),
+            }
+            .encode();
+            assert!(
+                matches!(r.take(&line, &nonce).unwrap(), Event::Note { key: k, .. } if k == *key),
+                "{line:?}"
+            );
+        }
+        for role in n.roles() {
+            let line = Message::Password {
+                role,
+                password: Password::generate(&n.password_forbidden_parts(role)).unwrap(),
+            }
+            .encode();
+            assert_eq!(
+                r.take(&line, &nonce).unwrap(),
+                Event::PasswordReceived(role)
+            );
+        }
+        assert_eq!(
+            r.take(&Message::End.encode(), &nonce).unwrap(),
+            Event::Finished
+        );
+        assert!(r.unparsed().is_empty());
+        assert_eq!(r.into_passwords().unwrap().len(), n.roles().len());
+
+        // A failure, with each key and with what a setup step's failure
+        // carries, ends a run on the owner's side.
+        for key in &keys {
+            let mut r = Receiver::new();
+            r.take(
+                &Message::Hello {
+                    nonce: nonce.clone(),
+                }
+                .encode(),
+                &nonce,
+            )
+            .unwrap();
+            let leaves = StepId::from_key(key)
+                .map(failure_leaves)
+                .unwrap_or_default();
+            let line = Message::Fail {
+                key: key.clone(),
+                message: format!("I/O error at C:\\: in use (os error 32); {leaves}"),
+            }
+            .encode();
+            assert!(
+                matches!(r.take(&line, &nonce).unwrap(), Event::Failed { key: k, .. } if k == *key),
+                "{line:?}"
+            );
+            assert!(r.failed());
+        }
+    }
+
+    /// A line the owner's side cannot read, once the run is known to be this
+    /// one's, is named and read past, so the elevated step goes on removing;
+    /// the run still fails. Before the greeting nothing is read past.
+    #[test]
+    fn an_unreadable_line_is_named_read_past_and_fails_the_run() {
+        let n = nonce();
+        let raw = "step remove-closed:C:\\Users\\Public removed\n";
+        let mut r = Receiver::new();
+        assert_eq!(
+            r.take(raw, &n).unwrap_err(),
+            HandshakeError::Malformed,
+            "nothing is read past before the greeting"
+        );
+        let mut r = Receiver::new();
+        r.take(&Message::Hello { nonce: n.clone() }.encode(), &n)
+            .unwrap();
+        // The line an elevated step that wrote raw paths sent.
+        assert_eq!(
+            r.take(raw, &n).unwrap(),
+            Event::Unparsed(r"step remove-closed:C:\Users\Public".into())
+        );
+        assert!(matches!(
+            r.take("step remove-hidden:kgraf-on-1a2b3c4d removed\n", &n)
+                .unwrap(),
+            Event::Step { .. }
+        ));
+        // A password line is named by its kind alone.
+        let secret = "password offline not-a-valid-password-at-all";
+        let Event::Unparsed(name) = r.take(secret, &n).unwrap() else {
+            panic!("a bad password line is read past");
+        };
+        assert_eq!(name, "password");
+        assert_eq!(
+            r.take("bogus words here\n", &n).unwrap(),
+            Event::Unparsed("a line of no known kind".into())
+        );
+        assert_eq!(r.take("end\n", &n).unwrap(), Event::Finished);
+        assert!(r.finished());
+        assert_eq!(r.unparsed().len(), 3);
+        assert_eq!(r.into_passwords().unwrap_err(), HandshakeError::Malformed);
+        // A wrong order still ends the run at once.
+        let mut r = Receiver::new();
+        r.take(&Message::Hello { nonce: n.clone() }.encode(), &n)
+            .unwrap();
+        assert_eq!(
+            r.take(&Message::Hello { nonce: n.clone() }.encode(), &n)
+                .unwrap_err(),
+            HandshakeError::Order
+        );
     }
 
     #[test]

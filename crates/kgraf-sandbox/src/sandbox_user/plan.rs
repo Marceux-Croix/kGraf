@@ -246,6 +246,11 @@ pub enum PlanError {
         "the undo record lists {0}, which is not one of kGraf's names for this account; nothing was removed"
     )]
     ForeignEntry(String),
+    #[error(
+        "the undo record lists {0}, which this removal did not read from the machine; nothing \
+         was removed"
+    )]
+    NotRead(String),
     #[error("the administrator step sent no password for {0}; nothing was stored. Run setup again")]
     PasswordMissing(String),
     #[error("the administrator step sent a password for {0}, which this setup did not ask for")]
@@ -556,20 +561,51 @@ pub struct RemoveStep {
 }
 
 impl RemoveStep {
-    /// A single word for the pipe messages.
+    /// The key of this step's pipe messages ([`undo_key`]).
     pub fn key(&self) -> String {
-        match &self.entry {
-            UndoEntry::User(n) => format!("remove-user:{n}"),
-            UndoEntry::Group(n) => format!("remove-group:{n}"),
-            UndoEntry::Rights { user, .. } => format!("remove-rights:{user}"),
-            UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
-            UndoEntry::Rule(n) => format!("remove-rule:{n}"),
-            UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
-            UndoEntry::Wfp { object, key } => {
-                format!("remove-{}:{}", object.key(), guid_text(*key))
-            }
-        }
+        undo_key(&self.entry)
     }
+}
+
+/// The key of a removal step's pipe messages. It carries a user, group or
+/// rule name, a GUID or a folder path as they are; the pipe escapes what one
+/// word cannot hold ([`super::handshake::escape_key`]).
+pub fn undo_key(e: &UndoEntry) -> String {
+    match e {
+        UndoEntry::User(n) => format!("remove-user:{n}"),
+        UndoEntry::Group(n) => format!("remove-group:{n}"),
+        UndoEntry::Rights { user, .. } => format!("remove-rights:{user}"),
+        UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
+        UndoEntry::Rule(n) => format!("remove-rule:{n}"),
+        UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
+        UndoEntry::Wfp { object, key } => format!("remove-{}:{}", object.key(), guid_text(*key)),
+    }
+}
+
+/// How `kgraf sandbox remove` ends on the owner's side. `left` names each
+/// place the removal could not clear before the users went (a folder whose
+/// sandbox grant could not be revoked, with the reason; a slot table that
+/// could not be read), and `elevated` is the elevated step's error, if it
+/// failed. Neither stops the removal: every folder is tried and the elevated
+/// step runs whatever the folders did. The removal fails at the end, naming
+/// all of them, so a folder that kept its grant is never reported as a
+/// finished removal.
+pub fn removal_outcome(left: &[String], elevated: Option<&str>) -> Result<(), String> {
+    if left.is_empty() && elevated.is_none() {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if let Some(e) = elevated {
+        parts.push(e.to_owned());
+    }
+    if !left.is_empty() {
+        parts.push(format!(
+            "{} place(s) kept an access-list entry for a sandbox user: {}",
+            left.len(),
+            left.join("; ")
+        ));
+    }
+    Err(parts.join("; "))
 }
 
 fn entry_text(e: &UndoEntry) -> String {
@@ -631,11 +667,28 @@ pub fn plan_remove(
         if !ours {
             return Err(PlanError::ForeignEntry(entry_text(e)));
         }
+        // A user the caller did not read is absent from `observed`, and an
+        // absent user is planned as already gone, which drops its record
+        // line with the user still on the machine. The caller must read
+        // every role the record names.
+        let user = match e {
+            UndoEntry::User(n) | UndoEntry::Hidden(n) => Some(n),
+            UndoEntry::Rights { user, .. } => Some(user),
+            _ => None,
+        };
+        if user
+            .and_then(|n| names.role_of(n))
+            .is_some_and(|role| !names.roles().contains(&role))
+        {
+            return Err(PlanError::NotRead(entry_text(e)));
+        }
     }
     // A deny entry goes before the group, while its SID still names it.
     //
-    // The WFP objects go last, after the accounts. Removal stops at the first
-    // step that fails, and a block filter that will not go is fail-safe: it
+    // The WFP objects go last, after the accounts. Removal used to stop at
+    // the first step that failed, and now goes on past it (the elevated
+    // step's `run_remove`); the order still puts what matters most first. A
+    // block filter that will not go is fail-safe: it
     // blocks name lookups for users that no longer exist, which is nothing.
     // An account that will not go is not fail-safe. A stopped Base Filtering
     // Engine, a firewall service that is off, or a sublayer another object
@@ -954,6 +1007,7 @@ pub fn status_report(
 
 #[cfg(test)]
 mod tests {
+    use super::super::names::MAX_SLOTS;
     use super::*;
 
     /// A SID lookup for a host test: no SID resolves, which is the state of
@@ -973,6 +1027,31 @@ mod tests {
             enabled_all_profiles: Some(true),
             local_policy_effective: Some(true),
         }
+    }
+
+    #[test]
+    fn a_removal_that_left_a_folder_fails_at_the_end_naming_it() {
+        assert_eq!(removal_outcome(&[], None), Ok(()));
+        let left = [
+            r"C:\work\a keeps its entries for the sandbox users: os error 5".to_owned(),
+            r"C:\work\b keeps its entries for the sandbox users: os error 21".to_owned(),
+        ];
+        let err = removal_outcome(&left, None).unwrap_err();
+        assert!(err.starts_with("2 place(s) kept"), "{err}");
+        assert!(
+            err.contains(r"C:\work\a keeps") && err.contains(r"C:\work\b keeps"),
+            "{err}"
+        );
+        // A failed elevated step is named first, and the folders still are.
+        let err = removal_outcome(&left, Some("step remove-user:x failed")).unwrap_err();
+        assert!(
+            err.starts_with("step remove-user:x failed; 2 place(s)"),
+            "{err}"
+        );
+        assert_eq!(
+            removal_outcome(&[], Some("step remove-user:x failed")),
+            Err("step remove-user:x failed".to_owned())
+        );
     }
 
     /// The machine after a complete setup.
@@ -1487,9 +1566,9 @@ mod tests {
         let mut short = o.clone();
         short.group_members.remove(&n.user(Role::OnlineSlot(2)));
         assert!(!status_report(&n, &short, Ok(Some(&r)), &all_stored(&n)).ready);
-        // Remove deletes every pool user the record lists, with names that
-        // cover no slots: a removal does not know the slot count.
-        let steps = plan_remove(&names(), &r, &o, &all_gone).unwrap();
+        // Remove deletes every pool user the record lists. A removal does not
+        // know the slot count, so it reads every slot user there can be.
+        let steps = plan_remove(&names().with_slots(MAX_SLOTS), &r, &o, &all_gone).unwrap();
         for role in &pool {
             let user = n.user(*role);
             assert!(
@@ -1511,6 +1590,48 @@ mod tests {
                     .any(|s| s.entry == UndoEntry::Hidden(user.clone())),
                 "remove keeps the sign-in screen entry of {user}"
             );
+        }
+    }
+
+    /// A removal whose names cover fewer slots than the record lists read
+    /// none of the other users, so each looks absent. It must refuse, not
+    /// plan them as already gone: that drops their record lines, and the
+    /// users, their sign-in screen entries and their rights stay on the
+    /// machine with nothing left that lists them.
+    #[test]
+    fn a_removal_that_did_not_read_a_slot_user_refuses_instead_of_dropping_it() {
+        let n = names().with_slots(3);
+        let full = full_with_slots(&n);
+        let r = record_from(&plan_setup(&n, &full).unwrap(), &n);
+        // What the machine looks like through names that cover no slots.
+        let fixed = names();
+        let mut seen = full.clone();
+        for role in n.roles() {
+            if !fixed.roles().contains(&role) {
+                let user = n.user(role);
+                seen.users.remove(&user);
+                seen.hidden.remove(&user);
+                seen.rights.remove(&user);
+            }
+        }
+        let err = plan_remove(&fixed, &r, &seen, &all_gone).unwrap_err();
+        assert!(matches!(err, PlanError::NotRead(_)), "{err}");
+        // Names that cover every slot read them all, and remove them all.
+        let all = names().with_slots(MAX_SLOTS);
+        let steps = plan_remove(&all, &r, &full, &all_gone).unwrap();
+        for role in n.roles() {
+            let user = n.user(role);
+            for entry in [
+                UndoEntry::User(user.clone()),
+                UndoEntry::Hidden(user.clone()),
+            ] {
+                assert!(
+                    steps
+                        .iter()
+                        .any(|s| s.entry == entry && s.action == RemoveAction::Remove),
+                    "{entry:?} is not removed"
+                );
+            }
         }
     }
 

@@ -1037,7 +1037,8 @@ The changes below harden the folder the undo record lives in and the deny entrie
 closed folders. Each bullet is one behavior change. None of it has run on Windows.
 
 - **The deny entries are written with `SetSecurityInfo`, on a handle opened with
-  `MAXIMUM_ALLOWED`.** They were written with `SetKernelObjectSecurity`, which Microsoft
+  `MAXIMUM_ALLOWED`.** (Superseded: system folders refuse that handle; see the amendment
+  of 2026-10-09.) They were written with `SetKernelObjectSecurity`, which Microsoft
   documents must not be used on a file system object: "This function should not be used
   when setting a security descriptor on file system objects. Instead, use the
   SetSecurityInfo or SetNamedSecurityInfo functions." The reason the call was picked is
@@ -1314,3 +1315,162 @@ The resolution:
   folder the same grant admits no longer carries a write entry onto that folder, because
   the pass does not enter a reparse point and the kernel propagates nothing. What the
   command reaches through such a link is what the grant on that folder gives it.
+
+## Amendment (2026-10-09): what the first Windows run of setup and remove found
+
+A hosted Windows Server 2025 run of `kgraf sandbox setup --slots 4` and
+`kgraf sandbox remove` ran both for the first time. Setup
+stopped at the deny entries, and the removal stopped part-way. Each bullet is one behavior
+change. Host tests prove the protocol and plan changes; the Windows tests named below run
+on the next Windows run.
+
+- **The deny entries are written through a handle no other open can refuse.** Setup
+  failed on `C:\`, `C:\ProgramData` and `C:\Windows\Tasks` with `ERROR_SHARING_VIOLATION`
+  (os error 32). The share mode was already full. The cause was the access: a handle opened
+  with `MAXIMUM_ALLOWED` on a folder that administrators control fully is given every
+  right, `DELETE` and the data rights among them, and those rights take part in sharing
+  checks. Windows and its services hold those three folders open without
+  `FILE_SHARE_DELETE` (a current folder, a change notification), and the elevated step held
+  ProgramData itself the same way while it ran. The handle now asks for
+  `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES`, none of which takes part in a sharing
+  check, with full sharing; the link check runs on the same handle as before. That handle is
+  not `MAXIMUM_ALLOWED`, so `SetSecurityInfo` on it would propagate, which on `C:\` is a
+  walk of the whole drive. The write is therefore `SetKernelObjectSecurity` again, with a
+  descriptor that carries the folder's own `SE_DACL_PROTECTED` and `SE_DACL_AUTO_INHERITED`
+  bits and the whole list as it was read, inherited entries included, without
+  `SE_DACL_AUTO_INHERIT_REQ`. The risk recorded above for this call (a dropped
+  protected bit opening ProgramData to inheritance from `C:\`) is now checked, not assumed:
+  the list and the two bits are read back after every write, and on any difference the old
+  list and bits are written back, read back again, and the step fails with what it found.
+  The write needs none of the inheritance work the documentation warns about, because the
+  one entry it adds or takes off carries no inheritance flag. Windows tests:
+  `a_folder_held_open_without_delete_sharing_is_closed_and_opened_again` (a folder held as
+  a current folder is, and as the elevated step holds the record's folders),
+  `a_protected_folder_keeps_its_protection_and_its_list`, and the existing
+  `closing_a_folder_changes_no_child_and_keeps_the_protection`.
+- **ProgramData is checked, not held.** The record's base folder is opened for its check
+  with full sharing and only access that takes no part in sharing checks. Only an
+  administrator may rename ProgramData, so holding it bought nothing, and it took part in
+  the sharing check of every later open of ProgramData. The `kGraf` and `sandbox` folders
+  below it, which setup made, are still held from the check to the last write.
+- **A removal key carries any path.** The removal stopped with "a setup pipe message is
+  not understood" at its first deny entry: the key `remove-closed:C:\Users\Public` holds a
+  backslash, which the owner's parser refused, and a path with a space would have split the
+  line. Keys are now written with every byte outside letters, digits and `-_:.` as `%XX`
+  and read back to the same text, so a key from an older elevated step, which never held
+  such a byte, reads the same. A key longer than 1,024 bytes is cut at a character. The
+  host test `every_message_the_elevated_step_sends_reaches_the_owner_intact` sends every
+  setup step key, every removal key of a record with an entry of every kind (deny entries
+  on paths with backslashes, spaces, non-ASCII text, `%` and control characters), every
+  outcome, notes, a failure per key and a password per role through the owner's receiver.
+- **The owner reads past a line it cannot parse.** After the greeting, a line the owner's
+  side cannot parse is named (its kind, and the key for a step, note or failure; a password
+  line by its kind alone) and read past, so the elevated step goes on removing; the command
+  fails at the end and lists every such line. Before the greeting nothing is read past.
+- **A failed removal step no longer ends the removal.** Its entry stays in the record, the
+  owner is told why, every later step runs, and the removal fails at the end naming the
+  steps. No later step needs an earlier one: a deny entry left behind a deleted group names
+  a SID that resolves to nothing, which the next removal may take off.
+- **A removal reads every slot user.** The owner's process asked for the removal with
+  every slot, but `--slots` was passed to the elevated step for a setup alone, so the
+  elevated removal read the two fixed users only. Each slot user then looked absent, and
+  the plan marked its record lines as already gone and dropped them: the run reported every
+  slot user's sign-in screen entry as already gone while it was still there, and the users
+  themselves would have followed. The elevated removal now reads all 99 slots whatever it is
+  told, and the plan refuses a record that names a user it was not asked to read
+  (`PlanError::NotRead`) instead of dropping the line. Host test:
+  `a_removal_that_did_not_read_a_slot_user_refuses_instead_of_dropping_it`.
+- **A planted junction at the record's temporary name is deleted, not a stop.** Writing the
+  record deleted the `.tmp` name only when the create reported that it exists. A create over
+  a folder, a junction among them, is refused with `ERROR_ACCESS_DENIED` instead, so every
+  record write failed. The name is now deleted without being followed before every create,
+  and the create stays `CREATE_NEW`. Windows test:
+  `a_planted_temporary_name_is_replaced_and_its_target_kept`.
+- **Measured: a file written by the grant pass also takes in its parent's entry.** After
+  the pass wrote the grant on a folder and then on a file in it, the file held two entries
+  for the sandbox user, not one: the pass's explicit entry and one inherited from the
+  folder. `SetSecurityInfo` on a list that is not protected takes in the parent's
+  inheritable entries. Both allow, and a deny written later still stands before both; the
+  test `a_deny_on_a_child_stands_before_the_grant_pass_entry` asserted exactly one entry and
+  now asserts one explicit entry and the deny before every allow. Open, to measure: a file
+  that holds only an inherited entry is not rewritten by a revoke (`names_sid` counts
+  explicit entries), so whether its inherited entry goes when the folder's does is not
+  known.
+- **The setup test checks that nothing is left.** `setup_status_again_remove_leave_nothing_behind`
+  accepted any failing status after the removal, so it passed with every slot user still on
+  the machine. It now fails on any `present` line other than the machine's firewall facts.
+
+
+## Amendment (2026-10-09): a current folder in a granted tree no longer stops a grant or a revoke
+
+The worktree grant, deny and removal passes opened every folder and file with
+`MAXIMUM_ALLOWED`, because a handle opened that way is the one documented switch that keeps
+`SetSecurityInfo` from propagating (the amendment on kGraf's own propagation pass above). The
+same open is given `DELETE` on an object kGraf controls, and Windows holds every process's
+current folder open without `FILE_SHARE_DELETE`, so the open failed with
+`ERROR_SHARING_VIOLATION` (os error 32) whenever a worker, a build or a test had its current
+folder in the tree. A revoke during `kgraf sandbox remove`, or when a slot moved to another
+folder, then failed for the whole folder. The first Windows run of setup found the same
+cause in setup's shared folders (the amendment above); this is the worktree side of it. Each bullet is one behavior
+change.
+
+- **The `MAXIMUM_ALLOWED` open stays first; a sharing violation opens the object again.**
+  The second handle holds `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES` with full
+  sharing, none of which takes part in a sharing check, and is opened by the shared folders'
+  own opener (`secure::open_for_lone_write`, no link followed). Only error 32 takes the
+  second open; every other error stands as before. The common case keeps the open whose
+  behavior Windows runs have measured. The alternative, the minimal handle for every write,
+  was rejected: `SetSecurityInfo` on a child also takes the parent's inheritable entries into
+  the child's own list (measured on Windows), and a removal written through
+  `SetSecurityInfo` relies on that to drop a child's inherited copies of a revoked entry.
+  Giving that up for every child would change every grant and removal to fix the rare held
+  object.
+- **Through the second handle the list is written alone, with the shared folders' helper.**
+  `SetSecurityInfo` through a handle that is not `MAXIMUM_ALLOWED` propagates (Microsoft,
+  `SetSecurityInfo`: "the system automatically propagates any inheritable access control
+  entries (ACEs) to existing child objects"). The write is therefore `SetKernelObjectSecurity`,
+  with the object's own protected and auto-inherited bits, then a read-back and a roll-back on
+  any difference, by the same function setup uses (`secure::write_dacl_alone`, which wraps the
+  existing `set_folder_dacl`; no second copy). Documentation evidence on propagation:
+  Microsoft's "Automatic Propagation of Inheritable ACEs" names `SetNamedSecurityInfo` and
+  `SetSecurityInfo` as the functions that propagate, and the `SetKernelObjectSecurity` page says
+  it "should not be used when setting a security descriptor on file system objects" and points
+  to those two. Neither page says in so many words that `SetKernelObjectSecurity` propagates
+  nothing; that is measured by a Windows test, not assumed. kGraf's own pass stays the only
+  writer of the children.
+- **A removal written alone drops the inherited copies itself.** The lone write takes
+  nothing in from the parent, so a held child would keep an inherited copy of the entry its
+  parent just lost, and the slot user its access there. Through the second handle a removal
+  also writes a child that holds only an inherited allow entry for a removed SID, and drops
+  every such inherited allow entry. The pass writes a folder before it enters it, so the
+  copy's source is gone by then; a copy whose source lies above the removed tree is dropped
+  too, which only narrows the removed user's access, as the removal already does for that
+  user's explicit entries. Through `MAXIMUM_ALLOWED` nothing changes: a child that holds only
+  inherited entries is still skipped (the open measurement of the amendment above, now in
+  `removal_writes`, which replaces `names_sid`). Host tests: `list_write_tests` (the open
+  decision, which children a removal writes, which entries it keeps).
+- **The Low label is not written alone.** The second handle holds no `WRITE_OWNER`, which a
+  label write needs, and the helper writes access lists only. A held object fails the label
+  write with os error 32, as it did before, and the pass records it.
+- **`kgraf sandbox remove` fails at the end when a folder kept its grant.** Every folder was
+  already tried and each failure named; the command then printed the list and succeeded. It
+  now fails at the end with the list (`plan::removal_outcome`), and a failed elevated step
+  names those folders too. Host test:
+  `a_removal_that_left_a_folder_fails_at_the_end_naming_it`.
+
+What the next Windows run must show, in `1-sandbox-lib.txt`:
+
+- `a_lone_write_on_a_held_folder_changes_no_child` passes: the second open is taken, and an
+  inheritable entry written on the held folder reaches neither the file nor the folder below
+  it. A failure here means `SetKernelObjectSecurity` propagated, and the second handle must
+  not be used.
+- `a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree` passes: a grant and a
+  revoke with `ping.exe` holding the root and a folder below it as current folders, no child
+  blocked, the held folder holding the pass's one entry and no inherited copy, and no object
+  naming the user after the revoke.
+- `a_revoke_through_a_lone_write_drops_the_inherited_copy` passes.
+- Each of the three first checks that the `MAXIMUM_ALLOWED` open is refused with os error 32
+  at the held folder; a panic that says "the condition under test is absent" voids its
+  result.
+- `MEASURE maximum-allowed-suppresses-propagation: suppressed true` still holds, and the
+  existing propagation tests still pass.

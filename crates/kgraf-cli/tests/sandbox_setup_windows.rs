@@ -83,9 +83,28 @@ fn setup_status_again_remove_leave_nothing_behind() {
     assert!(remove.status.success(), "{}", text(&remove));
 
     let after = kgraf(&[&["sandbox", "status"][..], &t].concat());
-    assert!(
-        !after.status.success(),
-        "everything removed: {}",
-        text(&after)
-    );
+    let af = text(&after);
+    assert!(!after.status.success(), "everything removed: {af}");
+    // A failing status says only that something is missing. Nothing setup
+    // made may still be present: a removal that dropped record lines for
+    // users it did not read once left every slot user behind while this
+    // check passed.
+    let left = left_behind(&af);
+    assert!(left.is_empty(), "left behind after remove: {left:?}\n{af}");
+}
+
+/// The `present` lines of a status report that name something setup makes,
+/// not a fact of the machine's firewall.
+fn left_behind(status: &str) -> Vec<&str> {
+    const MACHINE_FACTS: [&str; 2] = [
+        "Windows Firewall on for every profile",
+        "local firewall rules take effect",
+    ];
+    status
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("present"))
+        .map(str::trim)
+        .filter(|item| !MACHINE_FACTS.contains(item))
+        .collect()
 }

@@ -444,6 +444,8 @@ fn print_event(
         Event::Note { key, message } => println!("  kept         {key}: {message}"),
         Event::Failed { key, message } => eprintln!("  failed       {key}: {message}"),
         Event::PasswordReceived(role) => println!("  received     the {role} user's password"),
+        // Read past, and the run fails at the end with every name listed.
+        Event::Unparsed(name) => eprintln!("  not understood {name}"),
         Event::Finished => println!("The administrator step finished."),
     }
 }
@@ -527,7 +529,8 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
         if !left.is_empty() {
             // The users are gone, so these entries name a SID no account
             // has and grant nothing; they are reported so the owner can
-            // clear them where the folder stays.
+            // clear them where the folder stays, and the command fails so a
+            // removal that left one is never read as finished.
             println!(
                 "{} place(s) kept an access-list entry for a sandbox user:",
                 left.len()
@@ -536,7 +539,8 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
                 println!("  {line}");
             }
         }
-        Ok(())
+        kgraf_sandbox::sandbox_user::plan::removal_outcome(&left, None)
+            .map_err(|why| anyhow::anyhow!("the removal did not finish: {why}"))
     }
     #[cfg(not(windows))]
     {

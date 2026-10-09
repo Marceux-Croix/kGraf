@@ -1079,7 +1079,6 @@ fn the_strength_indicator_matches_the_backend_in_use() {
                 "{}",
                 s.gaps
             );
-            assert!(s.gaps.contains("PROCESS_VM_READ"), "{}", s.gaps);
         }
         other => panic!("{other:?} is not a Windows backend"),
     }
@@ -1359,11 +1358,18 @@ fn a_junction_inside_the_root_cannot_escape() {
 
 /// A planted `scratch\.git` junction must be refused at prepare, so the
 /// host never rewrites DACLs across the junction target (the user profile).
+///
+/// Two guards can refuse it, and either holds the claim: the walk of a tree
+/// for links before an inheritable entry is written on it (it meets the
+/// junction inside the scratch folder first), and the reparse-point check on
+/// the path itself. The refusal must name the planted junction, and the
+/// target's access list must be unchanged afterwards.
 #[test]
 fn a_planted_git_junction_is_refused_at_prepare() {
     let e = env();
     let victim = e.outside.path().join("victim-profile");
     std::fs::create_dir_all(&victim).unwrap();
+    let acl_before = icacls_listing(&victim);
     let gitlink = e.ws.scratch().join(".git");
     let status = std::process::Command::new("cmd.exe")
         .args([
@@ -1381,14 +1387,46 @@ fn a_planted_git_junction_is_refused_at_prepare() {
     // The step, not only its kind: a refused slot user, a runner that cannot
     // start and every other platform failure is also `PlatformSetup`, and
     // none of those refused the junction.
+    let SandboxError::PlatformSetup { step, source } = &err else {
+        panic!("not a setup refusal: {err}");
+    };
     assert!(
-        matches!(err, SandboxError::PlatformSetup { .. })
-            && err.to_string().contains("is a reparse point"),
-        "{err}"
+        PRE_WRITE_LINK_REFUSALS.contains(step),
+        "refused at {step:?}, not by a guard that runs before the write: {err}"
     );
-    // The victim's DACL is untouched: it still holds no capability deny ACE we
-    // would have added. A coarse check: the directory is still readable/usable.
+    // Paths compare without a verbatim prefix and without case, as Windows
+    // compares them.
+    let plain = |s: String| s.replace(r"\\?\", "").to_lowercase();
+    assert!(
+        plain(source.to_string()).contains(&plain(gitlink.display().to_string())),
+        "the refusal does not name the planted junction {}: {err}",
+        gitlink.display()
+    );
+    // The victim's access list is exactly what it was: nothing was written
+    // through the junction.
     assert!(victim.is_dir());
+    assert_eq!(
+        icacls_listing(&victim),
+        acl_before,
+        "the access list of the junction's target changed"
+    );
+}
+
+/// The steps that refuse a planted link before any entry is written. The
+/// step that finds a link only after granting is not one of them.
+const PRE_WRITE_LINK_REFUSALS: [&str; 2] = [
+    "check a tree for links before granting on it",
+    "reject a reparse point before changing its security",
+];
+
+/// The access list of `path` as `icacls` prints it.
+fn icacls_listing(path: &Path) -> String {
+    let out = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .output()
+        .expect("icacls runs");
+    assert!(out.status.success(), "icacls {}: {out:?}", path.display());
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Opening the OpenSSH agent pipe for read and write, against what the
@@ -1603,17 +1641,20 @@ fn reads_outside_the_workspace_are_not_confined() {
 /// Whether a command can open the harness process for `PROCESS_VM_READ`,
 /// against what the backend in use claims.
 ///
-/// Under the token sandbox this is a documented gap: the command runs as the
-/// same Windows user, so the harness process's own access list admits it,
-/// Low integrity blocks writes up and not reads, and the harness holds
-/// provider keys while egress is open. Under the sandbox user the command
-/// runs as another user, which that list does not admit, so the open must
-/// fail; that is one of the reasons for decision 0097.
+/// Under the token sandbox the command runs as the same Windows user, so the
+/// harness process's own access list admits it, but a process object carries
+/// a mandatory label with the no-read-up policy as well as no-write-up, so a
+/// Low command is refused `PROCESS_VM_READ` on the Medium harness. Measured
+/// on Windows Server 2025 24H2: access denied (os error 5). The strength text
+/// claims no such gap. The test holds the text and the
+/// measurement together in both directions: an open that works while the
+/// text is silent fails, and so does a refusal while the text claims the gap.
+/// Under the sandbox user the command runs as another user, which that list
+/// does not admit, so the open must fail; that is one of the reasons for
+/// decision 0097.
 ///
-/// A refusal under the token sandbox and a probe that failed for some other
-/// reason are different findings, and this says which it was: the first means
-/// the strength text must drop the claim, the second means the run proved
-/// nothing. Run 7 reported this test failing without saying which.
+/// A refusal and a probe that failed for some other reason are different
+/// findings, and this says which it was.
 ///
 /// This is the harness process. The runner, which starts the command and
 /// holds the owner's logon SID, is covered by
@@ -1645,10 +1686,12 @@ fn the_harness_process_vm_read_matches_what_the_backend_claims() {
         ),
         (_, 0) => assert!(
             claims_gap,
-            "VM_READ of the harness works, and the strength text no longer claims that \
-             gap: put it back, or fix the backend: {line}"
+            "VM_READ of the harness works, and the strength text does not claim that \
+             gap: the no-read-up label on the harness process did not hold. Claim the gap \
+             in STRENGTH.gaps in sandbox/windows.rs, or fix the backend: {line}"
         ),
-        (_, DENIED) => panic!(
+        (_, DENIED) => assert!(
+            !claims_gap,
             "VM_READ of the harness is refused on this machine, and the strength text \
              still claims it as a gap. Measure it by hand, then drop the claim from \
              STRENGTH.gaps in sandbox/windows.rs: {line}"

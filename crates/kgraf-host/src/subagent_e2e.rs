@@ -320,6 +320,8 @@ fn child_id(script: &Script) -> Option<String> {
 struct Fixture {
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
+    /// The run's state folder: its trace is `runs/r1/trace.jsonl` here.
+    state: std::path::PathBuf,
     branch: String,
     worker: Arc<Script>,
     workspaces: Arc<GitWorkspaces>,
@@ -491,6 +493,7 @@ impl Fixture {
             Fixture {
                 _dir: dir,
                 root,
+                state: state.clone(),
                 branch,
                 worker,
                 workspaces,
@@ -498,6 +501,41 @@ impl Fixture {
                 admission,
             },
         )
+    }
+
+    /// The run completed. When it did not, the failure carries the verdict,
+    /// notice and worker-finished lines of its trace: the report names only
+    /// how many attempts failed, and the trace says why (a check that could
+    /// not start, a refused merge, a worker out of rounds), so a run on a
+    /// machine nobody can attach to still names its cause.
+    #[track_caller]
+    fn assert_completed(&self, report: &kgraf_orchestrator::RunReport) {
+        if report.status == RunStatus::Completed {
+            return;
+        }
+        panic!(
+            "the run did not complete: {:?}\n{}\n{report:?}",
+            report.status,
+            self.trace_evidence()
+        );
+    }
+
+    /// The verdict, notice and worker-finished lines of the run's trace.
+    fn trace_evidence(&self) -> String {
+        let path = self.state.join("runs").join("r1").join("trace.jsonl");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => return format!("(no trace at {}: {e})", path.display()),
+        };
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                ["verdict", "notice", "worker_finished"]
+                    .iter()
+                    .any(|kind| l.contains(&format!("\"event\":\"{kind}\"")))
+            })
+            .collect();
+        format!("verdicts and notices from the trace:\n{}", lines.join("\n"))
     }
 
     fn seen(&self) -> Vec<String> {
@@ -585,7 +623,7 @@ fn a_writer_subagent_over_git_worktrees_is_merged_verified_integrated_and_swept(
                 &["src/a.rs", "src/c.rs"],
             );
             let report = run_to_end(o).await;
-            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            fx.assert_completed(&report);
 
             let seen = fx.seen();
             assert!(
@@ -655,7 +693,7 @@ fn two_concurrent_writer_subagents_with_disjoint_writes_both_merge() {
                 &["src/a.rs", "src/c.rs", "src/d.rs"],
             );
             let report = run_to_end(o).await;
-            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            fx.assert_completed(&report);
 
             let seen = fx.seen();
             assert!(
@@ -753,7 +791,7 @@ fn a_subagent_stopped_mid_run_releases_its_slot_and_resumes_to_a_merge() {
                 .await
                 .expect("the child resumes");
             let report = run.await.expect("the run task");
-            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            fx.assert_completed(&report);
             let reports = fx.reports();
             assert_eq!(reports.len(), 1, "{reports:?}");
             assert!(
@@ -827,7 +865,7 @@ fn a_subagent_merge_the_parent_conflicts_with_is_refused_and_reported() {
                 &["src/a.rs", "src/c.rs"],
             );
             let report = run_to_end(o).await;
-            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            fx.assert_completed(&report);
 
             let reports = fx.reports();
             assert_eq!(reports.len(), 1, "{reports:?}");
@@ -876,7 +914,7 @@ fn a_subagent_whose_task_panics_is_settled_and_its_slot_and_fence_released() {
                 &["src/c.rs"],
             );
             let report = run_to_end(o).await;
-            assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+            fx.assert_completed(&report);
 
             let reports = fx.reports();
             assert_eq!(reports.len(), 1, "{reports:?}");

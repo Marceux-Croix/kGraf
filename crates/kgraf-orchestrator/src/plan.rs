@@ -4097,27 +4097,9 @@ mod tests {
         let mut asked = std::collections::BTreeSet::new();
         for file in files {
             let text = std::fs::read_to_string(&file).expect("read");
-            // The code, not its tests: a test asks with any kind it likes.
-            let code = text
-                .split("\n#[cfg(test)]\nmod ")
-                .next()
-                .unwrap_or_default();
-            for method in [
-                ".ask(",
-                ".ask_json(",
-                ".ask_keeping_call(",
-                ".ask_keeping_call_capped(",
-                ".ask_with_model_tools(",
-            ] {
-                for (at, _) in code.match_indices(method) {
-                    let rest = code[at + method.len()..].trim_start();
-                    if let Some(quoted) = rest.strip_prefix('"') {
-                        let kind = quoted.split('"').next().unwrap_or_default();
-                        asked.insert(kind.to_owned());
-                    }
-                }
-            }
+            asked.extend(call_kinds_asked_in(&text));
         }
+        assert!(!asked.is_empty(), "the scan found no orchestrator call");
         for kind in &asked {
             assert!(
                 ReasoningProcess::from_call_kind(kind).is_some(),
@@ -4130,5 +4112,46 @@ mod tests {
             .map(|p| p.call_kind().to_owned())
             .collect();
         assert_eq!(asked, listed);
+    }
+
+    /// The call kinds the non-test code of one source file asks a model with.
+    /// Line endings are normalized first: a Windows checkout with
+    /// `core.autocrlf` holds CRLF, where the module split below would never
+    /// match and the scan would read the test module as code.
+    fn call_kinds_asked_in(text: &str) -> std::collections::BTreeSet<String> {
+        let text = text.replace("\r\n", "\n");
+        // The code, not its tests: a test asks with any kind it likes.
+        let code = text
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or_default();
+        let mut asked = std::collections::BTreeSet::new();
+        for method in [
+            ".ask(",
+            ".ask_json(",
+            ".ask_keeping_call(",
+            ".ask_keeping_call_capped(",
+            ".ask_with_model_tools(",
+        ] {
+            for (at, _) in code.match_indices(method) {
+                let rest = code[at + method.len()..].trim_start();
+                if let Some(quoted) = rest.strip_prefix('"') {
+                    let kind = quoted.split('"').next().unwrap_or_default();
+                    asked.insert(kind.to_owned());
+                }
+            }
+        }
+        asked
+    }
+
+    /// The scan reads a CRLF file as it reads the same file with LF: the code
+    /// part's kinds are found, and the test module's kinds are not.
+    #[test]
+    fn the_call_kind_scan_reads_crlf_source_as_it_reads_lf_source() {
+        let lf = "fn run() {\n    caller.ask(\"plan\", s, u);\n}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        caller.ask(\"not-a-kind\", s, u);\n    }\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let want: std::collections::BTreeSet<String> = ["plan".to_owned()].into();
+        assert_eq!(call_kinds_asked_in(lf), want);
+        assert_eq!(call_kinds_asked_in(&crlf), want);
     }
 }

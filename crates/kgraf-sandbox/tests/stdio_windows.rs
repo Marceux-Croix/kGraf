@@ -93,7 +93,7 @@ fn check_console_stdin_refused() -> std::io::Result<(bool, String)> {
     }
     let dir = PathBuf::from(std::env::var_os("KGRAF_STDIO_PROBE_ROOT").unwrap_or_default());
     let ws_root = dir.clone();
-    let policy = SandboxPolicy::new(vec![ws_root], Network::Deny).accept_partial_isolation(true);
+    let policy = SandboxPolicy::new(vec![ws_root], network()).accept_partial_isolation(true);
     let result = sandboxed_command(&policy, "cmd.exe", &dir)
         .map_err(std::io::Error::other)?
         .args(["/d", "/c", "exit", "0"])
@@ -155,7 +155,31 @@ fn env() -> Env {
 }
 
 fn policy(ws: &Workspace) -> SandboxPolicy {
-    SandboxPolicy::for_workspace(ws, Network::Deny).accept_partial_isolation(true)
+    SandboxPolicy::for_workspace(ws, network()).accept_partial_isolation(true)
+}
+
+/// The strictest network setting the active backend enforces: `Deny` where it
+/// can deny the network (the sandbox user), `Allow` where it cannot (the
+/// token sandbox, decision 0011, refuses `Deny` even with partial isolation
+/// accepted), as kGraf's own commands run on each. These tests are about the
+/// command's standard handles, not its network, so each backend runs them.
+/// `KGRAF_REQUIRE_SANDBOX_USER=1` still fails a run on the token sandbox.
+fn network() -> Network {
+    let sandbox_user = common::sandbox_user_mode();
+    let deniable = kgraf_sandbox::platform_isolation()
+        .expect("a backend")
+        .network_deniable;
+    if sandbox_user {
+        assert!(
+            deniable,
+            "the sandbox user backend claims it cannot deny the network"
+        );
+    }
+    if deniable {
+        Network::Deny
+    } else {
+        Network::Allow
+    }
 }
 
 fn self_exe() -> PathBuf {
@@ -357,7 +381,10 @@ fn a_commands_standard_input_is_never_a_console() {
 #[test]
 fn an_inherited_console_as_standard_input_is_refused() {
     // In a process of its own, which gives itself a console: this test
-    // process's standard input may or may not be one.
+    // process's standard input may or may not be one. The backend is checked
+    // here first, so a run that requires the sandbox user fails in this
+    // process with the reason, not in the probe.
+    let _ = network();
     let e = env();
     let out = Command::new(self_exe())
         .args(probe_args())

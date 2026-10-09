@@ -16,13 +16,13 @@ use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
     Action, CredentialCheck, Credentials, Observed, RemoveAction, StatusReport, StepId,
-    check_passwords, elevated_params, failure_leaves, plan_remove, plan_setup,
-    stale_closed_entries, status_report,
+    check_passwords, elevated_params, failure_leaves, plan_remove, plan_setup, removal_outcome,
+    stale_closed_entries, status_report, undo_key,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
 use super::super::slots::roots_in_text;
 use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
-use super::super::wfp::{WfpKeys, filter_users, guid_text};
+use super::super::wfp::{WfpKeys, filter_users};
 use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure, wfp};
 use crate::error::SandboxError;
 
@@ -241,7 +241,13 @@ pub fn elevated_main(args: &ElevatedArgs) -> i32 {
                 "names".to_owned(),
                 format!("--slots must be {MAX_SLOTS} or fewer"),
             )),
-            (_, slots) => Ok(names.with_slots(slots.unwrap_or(0))),
+            (ElevatedAction::Setup, Some(n)) => Ok(names.with_slots(n)),
+            // A removal reads every slot user there can be, whatever it was
+            // told: a user it did not read looks absent, and the plan refuses
+            // a record that names one (`PlanError::NotRead`). Reading only the
+            // two fixed users once reported every slot user's sign-in screen
+            // entry as already gone while it was still there.
+            (ElevatedAction::Remove, _) => Ok(names.with_slots(MAX_SLOTS)),
         })
         .and_then(|names| match args.action {
             ElevatedAction::Setup => run_setup(&names, &mut send),
@@ -397,6 +403,13 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
     let observed = observe(names, true).map_err(|e| fail("observe", &e))?;
     let steps = plan_remove(names, &record, &observed, &accounts::sid_resolves)
         .map_err(|e| fail("plan", &e))?;
+    // Keys of the steps that failed. A failed step no longer ends the
+    // removal: its entry stays in the record, the owner is told why, every
+    // later step still runs, and the removal fails at the end. No later step
+    // needs an earlier one to have worked: a deny entry left behind a deleted
+    // group names a SID that resolves to nothing, which the next removal may
+    // take off ([`super::super::plan::stale_closed_entries`]).
+    let mut failed: Vec<String> = Vec::new();
     for step in steps {
         let key = undo_key(&step.entry);
         // Kept: this removal may not undo the entry (the plan says why). The
@@ -435,7 +448,17 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
                 } => secure::reopen_folder(Path::new(path), sid, *mask, *flags),
                 UndoEntry::Wfp { object, key } => wfp::remove(*object, *key).map(drop),
             };
-            done.map_err(|e| fail(&key, &e))?;
+            if let Err(e) = done {
+                let message = format!(
+                    "not removed: {e}; the undo record keeps it, so `kgraf sandbox remove` \
+                     tries it again"
+                );
+                failed.push(key.clone());
+                if !send(Message::Note { key, message }) {
+                    return Err(fail("pipe", &"the user's process stopped listening"));
+                }
+                continue;
+            }
             StepOutcome::Removed
         };
         record.remove(&step.entry);
@@ -447,20 +470,17 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
     if record.is_empty() {
         secure::delete_no_follow(&path).map_err(|e| fail("record", &e))?;
     }
-    Ok(())
-}
-
-/// A one-word key for a removal step's pipe message.
-fn undo_key(e: &UndoEntry) -> String {
-    match e {
-        UndoEntry::User(n) => format!("remove-user:{n}"),
-        UndoEntry::Group(n) => format!("remove-group:{n}"),
-        UndoEntry::Rights { user, .. } => format!("remove-rights:{user}"),
-        UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
-        UndoEntry::Rule(n) => format!("remove-rule:{n}"),
-        UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
-        UndoEntry::Wfp { object, key } => format!("remove-{}:{}", object.key(), guid_text(*key)),
+    if !failed.is_empty() {
+        return Err(fail(
+            "remove",
+            &format!(
+                "{} step(s) could not be undone and stay in the undo record: {}",
+                failed.len(),
+                failed.join(", ")
+            ),
+        ));
     }
+    Ok(())
 }
 
 // ---- the user's own process -------------------------------------------------
@@ -500,14 +520,42 @@ fn drive(
         if let Event::Failed { key, message } = &event {
             return Err(setup_error(
                 "the elevated setup step",
-                format!("step {key} failed: {message}"),
+                format!(
+                    "step {key} failed: {message}{}",
+                    unparsed_clause(receiver.unparsed())
+                ),
             ));
         }
         if receiver.finished() {
             break;
         }
     }
+    // Every line was read to the end, so the elevated step did all it could;
+    // a line this side could not read still fails the run, by name.
+    if !receiver.unparsed().is_empty() {
+        return Err(setup_error(
+            "read the setup pipe",
+            format!(
+                "the elevated step finished{}",
+                unparsed_clause(receiver.unparsed())
+            ),
+        ));
+    }
     Ok(receiver)
+}
+
+/// `; N message(s) ... not understood: a, b` for the error of a run that
+/// had lines this side could not read, or nothing.
+fn unparsed_clause(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {} setup pipe message(s) were not understood, so what they reported is not \
+         known: {}",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 /// The SIDs of `users`, each of which setup has made by now. The firewall
@@ -572,7 +620,10 @@ pub fn setup(
 /// The users, the firewall rules and the DNS filter are removed whatever is
 /// left, so a folder kGraf cannot reach now (an unready drive, a junction, a
 /// list this user cannot write) never keeps a machine set up for good. An
-/// entry for a deleted user's SID grants nothing to anyone.
+/// entry for a deleted user's SID grants nothing to anyone. The caller fails
+/// the command at the end when anything is left
+/// ([`super::super::plan::removal_outcome`]); a failed elevated step fails
+/// it here, naming the folders as well.
 pub fn remove(
     names: &OwnerNames,
     launch: &Launch<'_>,
@@ -581,7 +632,14 @@ pub fn remove(
 ) -> Result<Vec<String>, SandboxError> {
     let mut left = revoke_grants(store);
     left.extend(revoke_slot_grants(store));
-    drive(names, launch, ElevatedAction::Remove, on_event)?;
+    // A failed elevated step still names the folders that kept a grant:
+    // they were tried first, and the owner clears them by hand.
+    if let Err(e) = drive(names, launch, ElevatedAction::Remove, on_event) {
+        return Err(match removal_outcome(&left, Some(&e.to_string())) {
+            Err(all) if !left.is_empty() => setup_error("remove the sandbox users", all),
+            _ => e,
+        });
+    }
     match std::fs::remove_file(store) {
         Ok(()) => Ok(left),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(left),

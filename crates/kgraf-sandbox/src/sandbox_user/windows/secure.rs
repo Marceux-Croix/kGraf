@@ -9,10 +9,13 @@
 //! that is then renamed over the old one: a rename replaces a link's name,
 //! never its target, and a planted hard link is only unlinked.
 //!
-//! The deny entries are written with `SetSecurityInfo` on a handle opened
-//! with `MAXIMUM_ALLOWED`, which keeps the write on the one folder: the
-//! entries are for that folder alone, and a call that propagates would walk
-//! a whole drive. [`set_folder_dacl`] quotes the pages it rests on.
+//! The deny entries are written on a handle opened with
+//! `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES` and full sharing, which
+//! no other open of a system folder can refuse, and with a call that
+//! propagates nothing, so the write stays on the one folder: the entries are
+//! for that folder alone, and a call that propagates would walk a whole
+//! drive. The list and its protection are read back and put back on any
+//! difference. [`set_folder_dacl`] says why each choice was made.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io::{self, Read, Write};
@@ -23,19 +26,20 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-    ERROR_SUCCESS, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GetLastError,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    SE_FILE_OBJECT, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, AddAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    InitializeAcl, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES,
+    GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, NO_INHERITANCE,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERITED,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
@@ -44,11 +48,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle, GetLogicalDrives,
     GetVolumeInformationW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle,
+    OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemServices::{
-    ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS, MAXIMUM_ALLOWED,
+    ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS, SECURITY_DESCRIPTOR_REVISION,
 };
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, FOLDERID_Public, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
@@ -175,6 +179,22 @@ fn open_held(path: &Path) -> io::Result<OwnedHandle> {
     )
 }
 
+/// A handle on the base folder the record's folders are made under
+/// (`%ProgramData%`), for its check alone: full sharing, and only access that
+/// takes no part in sharing checks.
+///
+/// [`open_held`] leaves `FILE_SHARE_DELETE` out so no one can rename a folder
+/// away between its check and the writes. That is refused whenever another
+/// process already holds the folder open with delete access, and it took
+/// part in the sharing check of every later open of ProgramData with delete
+/// access, the elevated step's own among them. Only an administrator may
+/// rename ProgramData, and an administrator is already past every boundary
+/// here, so holding it bought nothing. The folders below it, which kGraf
+/// made, are still held.
+fn open_base(path: &Path) -> io::Result<OwnedHandle> {
+    open_no_follow(path, FOLDER_CHECK_ACCESS)
+}
+
 fn attributes(h: &OwnedHandle) -> io::Result<u32> {
     // SAFETY: zeroed is a valid value of this plain struct.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -213,14 +233,13 @@ fn sid_text(sid: PSID) -> Result<String, SandboxError> {
     }))
 }
 
-/// The owner and the access list of the object behind `h`.
-///
-/// The control bits are not read: the write in [`set_folder_dacl`] leaves
-/// the folder's protection exactly as Windows found it, so this code never
-/// has to carry those bits from the read to the write.
+/// The owner, the access list and the list's control bits of the object
+/// behind `h`. [`set_folder_dacl`] carries `control`'s protected and
+/// auto-inherited bits to the write and checks them after it.
 struct Security {
     owner: PSID,
     dacl: *mut ACL,
+    control: u16,
     _sd: Local,
 }
 
@@ -248,10 +267,21 @@ fn security_of(h: &OwnedHandle, path: &Path) -> Result<Security, SandboxError> {
             source: io::Error::from_raw_os_error(code as i32),
         });
     }
+    let sd = Local(sd);
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: a valid descriptor the call above allocated.
+    if unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) } == 0 {
+        return Err(os_fail(
+            "read an access list's control bits",
+            io::Error::last_os_error(),
+        ));
+    }
     Ok(Security {
         owner,
         dacl,
-        _sd: Local(sd),
+        control,
+        _sd: sd,
     })
 }
 
@@ -403,7 +433,7 @@ pub struct TrustedFolder {
 /// Open and judge the folder the record's folders are made under.
 fn held_base(base: &Path, elevated_user: &str) -> Result<OwnedHandle, SandboxError> {
     check_record_base(base)?;
-    let h = open_held(base).map_err(|source| SandboxError::Io {
+    let h = open_base(base).map_err(|source| SandboxError::Io {
         path: base.to_path_buf(),
         source,
     })?;
@@ -566,23 +596,19 @@ fn create_new(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Replace the file `path` with `bytes`: written to a new `.tmp` file beside
-/// it, then renamed over it. A `.tmp` name that exists already (a run cut
-/// short) is deleted without being followed first.
+/// it, then renamed over it. Whatever holds the `.tmp` name already (a run
+/// cut short, a planted hard link or junction) is deleted without being
+/// followed first, and the new file is then made with `CREATE_NEW`, which
+/// fails rather than open anything that took the name since.
+///
+/// The name is deleted first whatever is there, not on a "file exists"
+/// error from the create: a create over a folder, a junction among them, is
+/// refused with `ERROR_ACCESS_DENIED`, not with `ERROR_FILE_EXISTS`, so a
+/// junction planted at the name stopped every write of the record.
 pub fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut file = match create_new(&tmp) {
-        Ok(f) => f,
-        Err(e)
-            if matches!(
-                e.raw_os_error().map(|c| c as u32),
-                Some(ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS)
-            ) =>
-        {
-            delete_no_follow(&tmp)?;
-            create_new(&tmp)?
-        }
-        Err(e) => return Err(e),
-    };
+    delete_no_follow(&tmp)?;
+    let mut file = create_new(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
@@ -793,15 +819,6 @@ fn entries(acl: *const ACL) -> Vec<*mut c_void> {
         .collect()
 }
 
-/// A handle on the folder `path` for a read and a write of its access list.
-///
-/// The access asked for is `MAXIMUM_ALLOWED`, not `READ_CONTROL | WRITE_DAC`,
-/// because that is what keeps the write off the folder's children
-/// ([`set_folder_dacl`]). The two rights it stands in for are not asked for
-/// by name, so a folder whose list an administrator may not write (one
-/// TrustedInstaller owns, say) opens here and fails at the write with
-/// `ERROR_ACCESS_DENIED`, which [`super::setup`] reports with the folder's
-/// owner.
 /// Refuse a link in any component of `path` above the last one. The last one
 /// is judged from the handle by [`open_folder_for_dacl`], whose open does not
 /// follow it; without this, a link higher up would still be followed and the
@@ -842,9 +859,30 @@ fn refuse_links_above(path: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// A handle on the folder `path` for a read and a write of its access list,
+/// with no link followed (the open does not follow the last component, and
+/// [`refuse_links_above`] refuses one above it) and the link check made on
+/// this same handle.
+///
+/// **The access is `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES`, and the
+/// share mode is full.** None of these rights takes part in a sharing check:
+/// only `FILE_READ_DATA`, `FILE_EXECUTE`, `FILE_WRITE_DATA`,
+/// `FILE_APPEND_DATA` and `DELETE` do. So this open succeeds whatever other
+/// processes hold the folder open with. The open this replaced asked for
+/// `MAXIMUM_ALLOWED`, which on a folder an administrator controls fully is
+/// resolved to every right, `DELETE` and the data rights among them. Windows
+/// and its services always hold `C:\`, `C:\ProgramData` and
+/// `C:\Windows\Tasks` open without `FILE_SHARE_DELETE` (a current folder, a
+/// change notification; and the elevated step's own hold on ProgramData), so
+/// that open failed there with `ERROR_SHARING_VIOLATION` and no setup could
+/// finish.
+///
+/// A folder whose list an administrator may not write (one TrustedInstaller
+/// owns, say) is refused here with `ERROR_ACCESS_DENIED`, which
+/// [`super::setup`] reports with the folder's owner.
 fn open_folder_for_dacl(path: &Path) -> Result<OwnedHandle, SandboxError> {
     refuse_links_above(path)?;
-    let h = open_no_follow(path, MAXIMUM_ALLOWED).map_err(|source| SandboxError::Io {
+    let h = open_no_follow(path, FOLDER_DACL_ACCESS).map_err(|source| SandboxError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -864,58 +902,161 @@ fn open_folder_for_dacl(path: &Path) -> Result<OwnedHandle, SandboxError> {
     Ok(h)
 }
 
-/// Write `acl` as the list of the folder behind `h`, that folder alone.
-///
-/// **Not `SetKernelObjectSecurity`.** Its page says: "This function should
-/// not be used when setting a security descriptor on file system objects.
-/// Instead, use the SetSecurityInfo or SetNamedSecurityInfo functions."
-///
-/// **How the write stays off the children.** `SetSecurityInfo` normally
-/// walks them: "If you are setting the discretionary access control list
-/// (DACL) or any elements in the system access control list (SACL) of an
-/// object, the system automatically propagates any inheritable access
-/// control entries (ACEs) to existing child objects". On a drive root that
-/// is a walk of the whole drive. The same page gives the switch, and `h` is
-/// opened with it ([`open_folder_for_dacl`]): "Warning: If the supplied
-/// handle was opened with an ACCESS_MASK value of MAXIMUM_ALLOWED, then the
-/// SetSecurityInfo function will not propagate ACEs to children." The entry
-/// this code writes is `NO_INHERITANCE` as well, so there is nothing a child
-/// could inherit from it either.
-///
-/// **How the folder keeps its protection.** Neither
-/// `PROTECTED_DACL_SECURITY_INFORMATION` ("The DACL cannot inherit access
-/// control entries (ACEs)") nor `UNPROTECTED_DACL_SECURITY_INFORMATION`
-/// ("The DACL inherits ACEs from the parent object") is passed, and those
-/// two flags are the only channel that sets the state, so ProgramData stays
-/// protected and a folder that is not protected stays open to inheritance.
-/// On a folder that is not protected the kernel also keeps the inherited
-/// entries itself, so this list does not have to carry them:
-/// `SeSetSecurityDescriptorInfoEx`, which is what the file system calls,
-/// says that with `SE_DACL_PROTECTED` absent it "constructs the output
-/// security descriptor from the inherited ACEs of the current security
-/// descriptor and noninherited ACEs of SecurityDescriptor. That is, it is
-/// impossible to change an inherited ACE by changing the ACL on an object."
-fn set_folder_dacl(h: &OwnedHandle, acl: *const ACL, path: &Path) -> Result<(), SandboxError> {
-    // SAFETY: a valid handle on a file system object and a valid list; no
-    // owner, group or SACL is written.
-    let code = unsafe {
-        SetSecurityInfo(
-            h.as_raw_handle() as HANDLE,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            acl,
-            ptr::null(),
-        )
+/// The access [`open_folder_for_dacl`] asks for: none of it takes part in a
+/// sharing check.
+const FOLDER_DACL_ACCESS: u32 = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES;
+
+/// The control bits of a list that say how it inherits: protected (it takes
+/// nothing from its parent) and auto-inherited.
+const DACL_INHERIT_BITS: u16 = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED;
+
+/// Each entry of `acl` as its bytes, in list order, for comparing a list
+/// read back with the one written.
+fn ace_bytes(acl: *const ACL) -> Vec<Vec<u8>> {
+    entries(acl)
+        .into_iter()
+        .map(|ace| {
+            // SAFETY: every entry starts with a header that gives its size,
+            // and the entry lies wholly inside the list.
+            let len = usize::from(unsafe { (*(ace as *const ACE_HEADER)).AceSize });
+            // SAFETY: as above; `len` bytes from `ace` are the entry.
+            unsafe { std::slice::from_raw_parts(ace as *const u8, len) }.to_vec()
+        })
+        .collect()
+}
+
+/// Write `acl` as the list of the folder behind `h`, with the protected and
+/// auto-inherited bits of `control`, by one call on the handle.
+fn write_dacl(h: &OwnedHandle, acl: *const ACL, control: u16) -> io::Result<()> {
+    // SAFETY: zeroed is a valid value of this plain struct, initialized next.
+    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let psd: PSECURITY_DESCRIPTOR = ptr::addr_of_mut!(sd).cast();
+    // SAFETY: `psd` points to a descriptor this frame owns, and `acl` is
+    // valid for the call; no owner, group or SACL is written.
+    let ok = unsafe {
+        InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) != 0
+            && SetSecurityDescriptorDacl(psd, 1, acl, 0) != 0
+            && SetSecurityDescriptorControl(psd, DACL_INHERIT_BITS, control & DACL_INHERIT_BITS)
+                != 0
+            && SetKernelObjectSecurity(h.as_raw_handle() as HANDLE, DACL_SECURITY_INFORMATION, psd)
+                != 0
     };
-    if code != ERROR_SUCCESS {
-        return Err(SandboxError::Io {
-            path: path.to_path_buf(),
-            source: io::Error::from_raw_os_error(code as i32),
-        });
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
-    Ok(())
+}
+
+/// Write `acl` as the list of the folder behind `h`, that folder alone, and
+/// read it back: the folder must then hold exactly `acl`'s entries and the
+/// protected and auto-inherited bits it had before (`before`). On any
+/// difference the old list and bits are written back and the write fails.
+///
+/// **Why not `SetSecurityInfo`.** It propagates: "If you are setting the
+/// discretionary access control list (DACL) or any elements in the system
+/// access control list (SACL) of an object, the system automatically
+/// propagates any inheritable access control entries (ACEs) to existing child
+/// objects". On a drive root that is a walk of the whole drive. Its one
+/// documented switch is a handle opened with `MAXIMUM_ALLOWED`, and that open
+/// is refused on the system folders this step closes
+/// ([`open_folder_for_dacl`]).
+///
+/// **What is written instead.** `SetKernelObjectSecurity` sets the object's
+/// own descriptor and walks nothing. Its page says it "should not be used
+/// when setting a security descriptor on file system objects", because it
+/// does none of the inheritance work `SetSecurityInfo` does. This write needs
+/// none: it adds or takes off one entry that carries no inheritance flag, so
+/// no child's inherited entries change, and it carries the rest of the list,
+/// inherited entries included, as it was read. The descriptor is built here
+/// with the folder's own protected and auto-inherited bits, without
+/// `SE_DACL_AUTO_INHERIT_REQ`, so Windows takes the list as given and merges
+/// nothing in from the parent.
+///
+/// **What would go wrong, and how it is caught.** Had Windows dropped the
+/// protected bit, `C:\ProgramData` would be open to inheritance from `C:\`,
+/// and the drive root's inheritable entries would reach it at the next write
+/// that propagates from `C:\`. The read-back sees that, writes the old list
+/// and bits back, and fails the step, so no folder is left changed in a way
+/// this code did not mean.
+fn set_folder_dacl(
+    h: &OwnedHandle,
+    acl: *const ACL,
+    before: &Security,
+    path: &Path,
+) -> Result<(), SandboxError> {
+    let io_err = |source: io::Error| SandboxError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    write_dacl(h, acl, before.control).map_err(io_err)?;
+    let after = security_of(h, path)?;
+    let bits_kept = after.control & DACL_INHERIT_BITS == before.control & DACL_INHERIT_BITS;
+    let list_kept = ace_bytes(after.dacl) == ace_bytes(acl);
+    if bits_kept && list_kept {
+        return Ok(());
+    }
+    // Written back, then read back again: a write that dropped the bits once
+    // may drop them again, and only the read says what the folder holds.
+    let restored = write_dacl(h, before.dacl, before.control)
+        .map_err(|e| e.to_string())
+        .and_then(|()| security_of(h, path).map_err(|e| e.to_string()))
+        .and_then(|now| {
+            let same = now.control & DACL_INHERIT_BITS == before.control & DACL_INHERIT_BITS
+                && ace_bytes(now.dacl) == ace_bytes(before.dacl);
+            if same {
+                Ok(())
+            } else {
+                Err("it still differs".to_owned())
+            }
+        });
+    Err(fail(
+        "write a folder's access list",
+        format!(
+            "{} did not keep the list as written (protection bits {:#06x} before, {:#06x} \
+             after; entries {}); the old list was {}",
+            path.display(),
+            before.control & DACL_INHERIT_BITS,
+            after.control & DACL_INHERIT_BITS,
+            if list_kept { "as written" } else { "changed" },
+            match restored {
+                Ok(()) => "written back".to_owned(),
+                Err(e) => format!("not written back ({e}); check it with `icacls`"),
+            }
+        ),
+    ))
+}
+
+/// A handle on `path` for [`write_dacl_alone`], with no link followed: the
+/// open does not follow the last component, so a junction or symbolic link
+/// is opened as itself. The access is [`FOLDER_DACL_ACCESS`] and the share
+/// mode is full, so no other open can refuse it ([`open_folder_for_dacl`]
+/// says why). The caller checks what it reached.
+///
+/// For the worktree grant pass in `sandbox::windows`, where an open with
+/// `MAXIMUM_ALLOWED` met a sharing violation: a process with its current
+/// folder in the worktree holds that folder open without
+/// `FILE_SHARE_DELETE`, and `MAXIMUM_ALLOWED` is given `DELETE` there.
+pub(crate) fn open_for_lone_write(path: &Path) -> io::Result<OwnedHandle> {
+    open_no_follow(path, FOLDER_DACL_ACCESS)
+}
+
+/// Write `acl` as the access list of the object behind `h`, that object
+/// alone, with its own protected and auto-inherited bits, then read it back
+/// and roll back on any difference ([`set_folder_dacl`], which says why each
+/// choice was made). `h` needs `READ_CONTROL` and `WRITE_DAC`
+/// ([`open_for_lone_write`]).
+///
+/// The one place this write is made, for the shared folders setup closes
+/// and for the worktree grant pass alike, so the read-back and the roll-back
+/// are written once.
+pub(crate) fn write_dacl_alone(
+    h: &OwnedHandle,
+    acl: *const ACL,
+    path: &Path,
+) -> Result<(), SandboxError> {
+    let before = security_of(h, path)?;
+    set_folder_dacl(h, acl, &before, path)
 }
 
 /// Whether the folder `path` holds the deny entry `sid`, `mask` and `flags`
@@ -974,7 +1115,7 @@ pub fn close_folder(path: &Path, group_sid: &str) -> Result<(), SandboxError> {
         });
     }
     let _free = Local(new_acl.cast());
-    set_folder_dacl(&h, new_acl, path)?;
+    set_folder_dacl(&h, new_acl, &sec, path)?;
     if !closed_now(path, group_sid)? {
         return Err(fail(
             "close a folder to the sandbox users",
@@ -1030,7 +1171,7 @@ pub fn reopen_folder(
             return Err(os_fail("build an access list", io::Error::last_os_error()));
         }
     }
-    set_folder_dacl(&h, acl, path)?;
+    set_folder_dacl(&h, acl, &sec, path)?;
     if is_closed(path, group_sid, mask, flags)? {
         return Err(fail(
             "open a folder to the sandbox users again",
@@ -1232,9 +1373,9 @@ mod tests {
     }
 
     /// The write must leave the folder's protection as Windows had it and
-    /// must change no child. `SetSecurityInfo` on a handle opened with
-    /// `MAXIMUM_ALLOWED` propagates nothing ([`set_folder_dacl`]); a write
-    /// that propagated would rebuild each child's list.
+    /// must change no child. `SetKernelObjectSecurity` propagates nothing
+    /// ([`set_folder_dacl`]); a write that propagated would rebuild each
+    /// child's list.
     #[test]
     fn closing_a_folder_changes_no_child_and_keeps_the_protection() {
         const GROUP: &str = "S-1-5-21-1-2-3-5";
@@ -1263,6 +1404,62 @@ mod tests {
         assert_eq!(dacl_control(dir.path()), control, "protection still kept");
         assert_eq!(dacl_of(&child).unwrap(), child_before);
         assert_eq!(dacl_of(&grandchild).unwrap(), leaf_before);
+    }
+
+    /// A folder another process holds open without `FILE_SHARE_DELETE`, as
+    /// Windows holds `C:\`, `C:\ProgramData` and `C:\Windows\Tasks` (a
+    /// current folder, a change notification) and as the elevated step holds
+    /// the record's folders ([`open_held`]), is still closed and opened again.
+    /// The open that asked for `MAXIMUM_ALLOWED` was given `DELETE` here and
+    /// failed with `ERROR_SHARING_VIOLATION` (os error 32).
+    #[test]
+    fn a_folder_held_open_without_delete_sharing_is_closed_and_opened_again() {
+        const GROUP: &str = "S-1-5-21-1-2-3-6";
+        let dir = tempfile::tempdir().unwrap();
+        // What a process's current folder holds: list and traverse, sharing
+        // read and write but not delete.
+        let cwd_like = open_no_follow_shared(
+            dir.path(),
+            0x0000_0001 | 0x0000_0020,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
+        .unwrap();
+        let held = open_held(dir.path()).unwrap();
+        close_folder(dir.path(), GROUP).unwrap();
+        assert!(closed_now(dir.path(), GROUP).unwrap());
+        reopen_folder(dir.path(), GROUP, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS).unwrap();
+        assert!(!closed_now(dir.path(), GROUP).unwrap());
+        drop((cwd_like, held));
+    }
+
+    /// A protected folder (as ProgramData is) stays protected through a close
+    /// and a reopen, and its list is exactly what it was after the reopen.
+    #[test]
+    fn a_protected_folder_keeps_its_protection_and_its_list() {
+        const GROUP: &str = "S-1-5-21-1-2-3-7";
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("icacls.exe")
+            .arg(dir.path())
+            .args(["/inheritance:d"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls failed");
+        let control = dacl_control(dir.path());
+        assert_ne!(
+            control & DACL_INHERIT_BITS & SE_DACL_PROTECTED,
+            0,
+            "the folder is protected before the test starts"
+        );
+        let before = dacl_of(dir.path()).unwrap();
+        close_folder(dir.path(), GROUP).unwrap();
+        assert_eq!(dacl_control(dir.path()), control, "protection kept");
+        reopen_folder(dir.path(), GROUP, CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS).unwrap();
+        assert_eq!(dacl_control(dir.path()), control, "protection still kept");
+        assert_eq!(
+            dacl_of(dir.path()).unwrap(),
+            before,
+            "the list is as it was"
+        );
     }
 
     #[test]

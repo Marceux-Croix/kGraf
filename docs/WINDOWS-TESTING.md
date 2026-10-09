@@ -372,6 +372,19 @@ process environment.
      second whether a removal takes kGraf's entry off every child. Send both results, and
      any note that names a file a grant left alone: a build that writes such a file in
      place fails with an access error.
+   - The tests `a_lone_write_on_a_held_folder_changes_no_child`,
+     `a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree` and
+     `a_revoke_through_a_lone_write_drops_the_inherited_copy` start `ping.exe` with its
+     current folder inside the tree, which Windows holds open without delete sharing. Each
+     first checks that an open with `MAXIMUM_ALLOWED` is refused there with os error 32;
+     a panic that says "the condition under test is absent" means this build does not
+     refuse it, and the other results say nothing. Otherwise the first says whether the
+     write that replaces the refused open changes no child, the second whether a grant
+     and a revoke succeed with a current folder at the root and one below it, and the
+     third whether a revoke on such a folder also drops the entry it had inherited. A
+     failed precondition in the third ("the folder holds an inherited copy") means a
+     folder written by the grant pass took in no inherited entry on this build; send
+     the line.
 
 2. `sh` and `bash` through Git Bash inside the sandbox:
 
@@ -863,8 +876,8 @@ How to read the three files:
   on the folder may have changed: the entry order, every other entry, the owner, and
   `AreAccessRulesProtected` must read the same as before, folder by folder.
 - **No child of ProgramData or Public** may have changed its rule count or its protected
-  state between the runs. A change there means the write propagated, which is what the
-  `MAXIMUM_ALLOWED` handle is there to prevent.
+  state between the runs. A change there means the write propagated, which writing the
+  list with `SetKernelObjectSecurity`, on that folder alone, is there to prevent.
 - **After remove**, every folder must read exactly as it did before setup, byte for byte in
   the `icacls` output.
 - **A folder setup could not close** is named in the failure, with the principal that owns

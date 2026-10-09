@@ -104,8 +104,9 @@
 //! **Partial isolation.** `WRITE_RESTRICTED` makes Windows consult the
 //! restricting SIDs for writes only, and Low integrity blocks writes up, not
 //! reads. Reads are therefore not confined: credential stores, browser
-//! profiles and the Credential Manager API stay readable, and a Low process
-//! can open the Medium harness process for `PROCESS_VM_READ`. Network egress
+//! profiles and the Credential Manager API stay readable. Process objects
+//! carry a no-read-up label, so a Low process cannot open the Medium harness
+//! process for `PROCESS_VM_READ` (measured: "Access is denied"). Network egress
 //! is not blocked (only AppContainer or administrator-installed filtering
 //! rules can do that), so [`Network::Deny`] is refused here. Checks, gates and
 //! the worker's shell ask through [`super::CheckNetwork`] instead, which runs
@@ -187,9 +188,7 @@ pub(super) const STRENGTH: IsolationStrength = IsolationStrength {
     git_config_freezable: false,
     gaps: "reads are not confined: the Low integrity level blocks writes up, not reads, so \
            %USERPROFILE%\\.ssh, browser profiles, the Credential Manager API and every file \
-           the user can read stay readable; a Low process can also open the (Medium) harness \
-           process for PROCESS_VM_READ, and the harness holds provider API keys while egress \
-           is open, so a read there is exfiltratable; network egress is not blocked; a DACL \
+           the user can read stay readable; network egress is not blocked; a DACL \
            that grants write to Everyone still needs a Low label to be writable, but a Low, \
            Everyone-writable location (some temp and shared paths) is writable; named pipes \
            and sockets are confined only by their own ACLs and integrity labels; HTTPS \
@@ -665,7 +664,7 @@ pub(super) fn outside_link_refusal(
     );
     format!(
         "{} holds the link {} to {target}, which this command is not granted. Writing the \
-         sandbox user's entry on {} could carry it through the link onto {target}, so nothing \
+         sandbox's access entry on {} could carry it through the link onto {target}, so nothing \
          was written. The dependency trees kGraf links into a tree are granted, and a link \
          inside the tree is allowed, so this link leads somewhere else: it has to lead inside \
          the tree, or into a folder the command is granted, before a command can run here.",
@@ -1012,6 +1011,197 @@ fn reasons(paths: &[(std::path::PathBuf, String)], total: usize) -> String {
         out.push_str(&format!("; and {} more", total - paths.len()));
     }
     out
+}
+
+/// How one write of an object's access list in a granted tree is kept off
+/// the objects below it. Chosen by how the object's handle could be opened
+/// ([`lone_write_after`]); every grant, deny and removal pass writes through
+/// one of the two, and kGraf's own pass ([`propagation_plan`]) stays the only
+/// writer of the children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ListWrite {
+    /// The handle was opened with `MAXIMUM_ALLOWED`, and `SetSecurityInfo`
+    /// writes the list. Microsoft's `SetSecurityInfo` page: "If the supplied
+    /// handle was opened with an ACCESS_MASK value of MAXIMUM_ALLOWED, then
+    /// the SetSecurityInfo function will not propagate ACEs to children."
+    /// The same call still takes the parent's inheritable entries into this
+    /// object's own list when that list is not protected (measured on
+    /// Windows, decision 0097), so a removal that writes a child this way
+    /// also drops the inherited copies of an entry its parent lost.
+    SetSecurityInfo,
+    /// The `MAXIMUM_ALLOWED` open met `ERROR_SHARING_VIOLATION`: another
+    /// process holds the object open without `FILE_SHARE_DELETE`, as Windows
+    /// does for every process's current folder, and `MAXIMUM_ALLOWED` on an
+    /// object kGraf controls is given `DELETE`, which takes part in sharing
+    /// checks. The second handle holds only
+    /// `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES`, none of which does.
+    /// `SetSecurityInfo` would propagate through such a handle (the same
+    /// page: "the system automatically propagates any inheritable access
+    /// control entries (ACEs) to existing child objects"), so the list is
+    /// written with `SetKernelObjectSecurity`, read back and rolled back on
+    /// any difference (`secure::write_dacl_alone`). Microsoft's page on
+    /// automatic propagation names `SetNamedSecurityInfo` and
+    /// `SetSecurityInfo` as the functions that propagate, and the
+    /// `SetKernelObjectSecurity` page says it "should not be used when
+    /// setting a security descriptor on file system objects" for that
+    /// reason; nothing propagating is what this write needs. That this call
+    /// changes no child is measured on Windows, not documented in so many
+    /// words. It also takes nothing in from the parent, so a removal does
+    /// that part itself ([`removal_keeps`]).
+    KernelObjectAlone,
+}
+
+/// `ERROR_SHARING_VIOLATION`.
+const ERROR_SHARING_VIOLATION: u32 = 32;
+
+/// Whether a `MAXIMUM_ALLOWED` open that failed with the Win32 error `code`
+/// is opened a second time for a lone write ([`ListWrite::KernelObjectAlone`]).
+/// Only a sharing violation is: a smaller mask answers exactly that refusal.
+/// Every other error stands, as it did before this second open existed: a
+/// missing object, a refused one (a `MAXIMUM_ALLOWED` open is refused only
+/// when the caller has no right at all) and a bad path would fail the second
+/// open the same way.
+pub(super) fn lone_write_after(code: u32) -> bool {
+    code == ERROR_SHARING_VIOLATION
+}
+
+/// One entry of a child's access list, as a removal judges it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EntryFacts {
+    /// An allow entry (a deny only narrows, and stays).
+    pub allow: bool,
+    /// Marked `INHERITED_ACE`: a copy of an entry of a folder above.
+    pub inherited: bool,
+    /// It names one of the SIDs being removed.
+    pub names_removed: bool,
+}
+
+/// Whether a removal writes a child whose list holds `entries`, through a
+/// handle that writes as `write` does.
+///
+/// A child with an explicit entry for a removed SID is written either way;
+/// that is what the pass is for. Through [`ListWrite::KernelObjectAlone`] a
+/// child is also written for an inherited allow entry for a removed SID:
+/// `SetSecurityInfo` would have dropped that copy as it took in the parent's
+/// list again, and the lone write takes nothing in, so it must drop the copy
+/// itself ([`removal_keeps`]), or the slot user would keep its write access
+/// to a folder that a process had as its current folder.
+///
+/// Through [`ListWrite::SetSecurityInfo`] a child that holds only inherited
+/// entries is still skipped, as before: whether its inherited copy goes when
+/// the folder's entry goes is an open measurement (decision 0097), and
+/// writing every such child would rewrite every file a build made.
+pub(super) fn removal_writes(write: ListWrite, entries: &[EntryFacts]) -> bool {
+    entries.iter().any(|e| {
+        e.names_removed && (!e.inherited || (write == ListWrite::KernelObjectAlone && e.allow))
+    })
+}
+
+/// Whether an entry stays on a child after a removal's merge, when the list
+/// is written as `write` does. The merge (`SetEntriesInAclW` with
+/// `REVOKE_ACCESS`) has taken the explicit entries off already; this decides
+/// the inherited ones.
+///
+/// Through [`ListWrite::KernelObjectAlone`] an inherited allow entry for a
+/// removed SID is dropped. The pass writes a folder before it enters it, so
+/// when a child is written its parent no longer holds the entry this copy
+/// came from, and Windows' own rule is that a copy goes with its source:
+/// "If you remove an inheritable ACE from a parent object, automatic
+/// inheritance removes any copies of the ACE that were inherited by child
+/// objects" (Microsoft, Automatic Propagation of Inheritable ACEs). A copy
+/// whose source lies above the removed tree is dropped too; that only
+/// narrows the removed user's access, as the merge already does for that
+/// user's explicit entries from such a source. Every other entry stays.
+pub(super) fn removal_keeps(write: ListWrite, entry: EntryFacts) -> bool {
+    !(write == ListWrite::KernelObjectAlone
+        && entry.inherited
+        && entry.allow
+        && entry.names_removed)
+}
+
+/// The two ways a list write stays on one object, and what a removal does
+/// on a child through each. These run on every host.
+#[cfg(test)]
+mod list_write_tests {
+    use super::*;
+
+    const fn e(allow: bool, inherited: bool, names_removed: bool) -> EntryFacts {
+        EntryFacts {
+            allow,
+            inherited,
+            names_removed,
+        }
+    }
+
+    #[test]
+    fn only_a_sharing_violation_opens_the_object_again_for_a_lone_write() {
+        assert!(lone_write_after(32));
+        // Access denied, file and path not found, a bad name, a lock.
+        for code in [5, 2, 3, 123, 33, 0] {
+            assert!(!lone_write_after(code), "error {code}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_entry_for_a_removed_user_is_written_whatever_the_handle() {
+        for write in [ListWrite::SetSecurityInfo, ListWrite::KernelObjectAlone] {
+            assert!(removal_writes(write, &[e(true, false, true)]), "{write:?}");
+            assert!(removal_writes(write, &[e(false, false, true)]), "{write:?}");
+            // Nothing naming a removed user: never written, so a pass over a
+            // built tree does not rewrite what has nothing to do with it.
+            assert!(
+                !removal_writes(write, &[e(true, false, false), e(true, true, false)]),
+                "{write:?}"
+            );
+            assert!(!removal_writes(write, &[]), "{write:?}");
+        }
+    }
+
+    #[test]
+    fn an_inherited_allow_for_a_removed_user_is_written_only_by_a_lone_write() {
+        let only_inherited = [e(true, true, true), e(true, false, false)];
+        assert!(removal_writes(
+            ListWrite::KernelObjectAlone,
+            &only_inherited
+        ));
+        assert!(!removal_writes(ListWrite::SetSecurityInfo, &only_inherited));
+        // An inherited deny only narrows: no write for it alone.
+        assert!(!removal_writes(
+            ListWrite::KernelObjectAlone,
+            &[e(false, true, true)]
+        ));
+    }
+
+    #[test]
+    fn a_lone_write_drops_the_inherited_allow_copy_and_keeps_every_other_entry() {
+        let alone = ListWrite::KernelObjectAlone;
+        assert!(!removal_keeps(alone, e(true, true, true)));
+        for kept in [
+            e(false, true, true),
+            e(true, true, false),
+            e(true, false, false),
+            e(false, false, false),
+            // An explicit entry is the merge's to take off, not this rule's.
+            e(true, false, true),
+        ] {
+            assert!(removal_keeps(alone, kept), "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_through_set_security_info_keeps_what_the_merge_left() {
+        for allow in [false, true] {
+            for inherited in [false, true] {
+                for names_removed in [false, true] {
+                    let entry = e(allow, inherited, names_removed);
+                    assert!(
+                        removal_keeps(ListWrite::SetSecurityInfo, entry),
+                        "{entry:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The per-child decision of the propagation pass, and the note it leaves.
@@ -1897,7 +2087,7 @@ mod imp {
         SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AccessCheck, AddMandatoryAce,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AccessCheck, AddAce, AddMandatoryAce,
         AdjustTokenPrivileges, CONTAINER_INHERIT_ACE, CopySid, CreateRestrictedToken,
         DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, EqualSid,
         GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetTokenInformation,
@@ -2258,35 +2448,79 @@ mod imp {
         })
     }
 
-    /// A handle on `path` through which [`SetSecurityInfo`] writes the
-    /// object's own list and propagates nothing to what already exists below
-    /// it.
+    /// A handle on `path` for a write of its own access list that propagates
+    /// nothing to what already exists below it, and how that write is made
+    /// through it ([`super::ListWrite`]).
     ///
-    /// Microsoft's `SetSecurityInfo` page states the rule this rests on:
-    /// "If the supplied handle was opened with an ACCESS_MASK value of
-    /// MAXIMUM_ALLOWED, then the SetSecurityInfo function will not propagate
-    /// ACEs to children." (Windows API, aclapi.h, SetSecurityInfo, Warning;
-    /// read 2026-10-08). Upstream openai/codex
-    /// `codex-rs/windows-sandbox-rs` opens its handles the same way for the
-    /// same reason. kGraf then walks the tree itself
+    /// **First, `MAXIMUM_ALLOWED`.** Microsoft's `SetSecurityInfo` page
+    /// states the rule this rests on: "If the supplied handle was opened with
+    /// an ACCESS_MASK value of MAXIMUM_ALLOWED, then the SetSecurityInfo
+    /// function will not propagate ACEs to children." (Windows API, aclapi.h,
+    /// SetSecurityInfo, Warning; read 2026-10-08 and again 2026-10-09).
+    /// Upstream openai/codex `codex-rs/windows-sandbox-rs` opens its handles
+    /// the same way for the same reason. kGraf then walks the tree itself
     /// ([`propagate`]), because the kernel's own walk follows what it finds:
     /// a junction it may enter, and a hard link whose file is also named
     /// outside the tree (decision 0083).
     ///
+    /// **Then, on a sharing violation, a handle no other open refuses.**
+    /// `MAXIMUM_ALLOWED` on an object kGraf controls is given every right,
+    /// `DELETE` and the data rights among them, and those take part in
+    /// sharing checks. Windows holds every process's current folder open
+    /// without `FILE_SHARE_DELETE`, so a worker, a build or a test with its
+    /// current folder in the worktree made this open fail with
+    /// `ERROR_SHARING_VIOLATION` (os error 32), and a grant, or a revoke
+    /// during `kgraf sandbox remove` or a slot move, failed with it. The
+    /// object is then opened again with
+    /// `READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES` and full sharing
+    /// ([`secure::open_for_lone_write`]), and its list is written with
+    /// `SetKernelObjectSecurity`, read back and rolled back on a difference
+    /// ([`secure::write_dacl_alone`]), because `SetSecurityInfo` through a
+    /// handle that is not `MAXIMUM_ALLOWED` would propagate. The common case
+    /// keeps the first open, whose behavior Windows runs have measured; the
+    /// second is taken only where the first is refused
+    /// ([`super::lone_write_after`]).
+    ///
     /// `FILE_FLAG_BACKUP_SEMANTICS` is what opens a folder at all, and
     /// `FILE_FLAG_OPEN_REPARSE_POINT` opens the name itself, so a junction
-    /// is never followed. Neither protection flag
+    /// is never followed; both opens use both. Neither protection flag
     /// (`PROTECTED_DACL_SECURITY_INFORMATION`,
-    /// `UNPROTECTED_DACL_SECURITY_INFORMATION`) is passed to the write, so
-    /// the object keeps the inheritance protection Windows set on it.
+    /// `UNPROTECTED_DACL_SECURITY_INFORMATION`) is passed to the write, and
+    /// the lone write carries the object's own protected and auto-inherited
+    /// bits, so the object keeps the inheritance protection Windows set on
+    /// it.
     ///
     /// The share mode lets other programs keep the file open while kGraf
-    /// writes its list; a file another program opened without sharing
-    /// cannot be opened here, which [`propagate`] records.
-    fn open_for_security(path: &Path) -> Result<OwnedHandle, SandboxError> {
+    /// writes its list.
+    fn open_for_security(path: &Path) -> Result<ListHandle, SandboxError> {
+        let code = match open_maximum_allowed(path) {
+            Ok(handle) => {
+                return Ok(ListHandle {
+                    handle,
+                    write: super::ListWrite::SetSecurityInfo,
+                });
+            }
+            Err(code) => code,
+        };
+        if !super::lone_write_after(code) {
+            return Err(acl_error(path, code));
+        }
+        let handle = secure::open_for_lone_write(path).map_err(|source| SandboxError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(ListHandle {
+            handle,
+            write: super::ListWrite::KernelObjectAlone,
+        })
+    }
+
+    /// `path` opened with `MAXIMUM_ALLOWED`, full sharing and no link
+    /// followed, or the Win32 error of the open.
+    fn open_maximum_allowed(path: &Path) -> Result<OwnedHandle, u32> {
         let name = wide(path.as_os_str());
         // SAFETY: `name` is NUL-terminated; the call returns a handle or an
-        // invalid-handle value, which `owned` turns into this crate's error.
+        // invalid-handle value.
         let h = unsafe {
             CreateFileW(
                 name.as_ptr(),
@@ -2300,11 +2534,17 @@ mod imp {
         };
         if h.is_null() || h == INVALID_HANDLE_VALUE {
             // SAFETY: plain call, made right after the failing one.
-            let code = unsafe { GetLastError() };
-            return Err(acl_error(path, code));
+            return Err(unsafe { GetLastError() });
         }
         // SAFETY: a valid handle this process now owns alone.
         Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+    }
+
+    /// A handle for a write of one object's access list, and how the write
+    /// through it stays on that object ([`open_for_security`]).
+    struct ListHandle {
+        handle: OwnedHandle,
+        write: super::ListWrite,
     }
 
     /// `dwFileAttributes` and `nNumberOfLinks` of whatever `handle` reached,
@@ -2389,10 +2629,22 @@ mod imp {
     /// it was read, so a list read before another writer's write would put
     /// that writer's entries back as they were.
     fn apply_handle(
-        handle: &OwnedHandle,
+        handle: &ListHandle,
         path: &Path,
         dacl: &Dacl,
         entries: &[EXPLICIT_ACCESS_W],
+    ) -> Result<(), SandboxError> {
+        apply_handle_keeping(handle, path, dacl, entries, &|_| true)
+    }
+
+    /// [`apply_handle`], keeping of the merged list only the entries `keep`
+    /// accepts (a removal's lone write on a child, [`remove_child_entries`]).
+    fn apply_handle_keeping(
+        handle: &ListHandle,
+        path: &Path,
+        dacl: &Dacl,
+        entries: &[EXPLICIT_ACCESS_W],
+        keep: &dyn Fn(*mut c_void) -> bool,
     ) -> Result<(), SandboxError> {
         let mut new_acl: *mut ACL = ptr::null_mut();
         // SAFETY: `entries` is a valid slice; the old ACL is valid or null;
@@ -2409,22 +2661,83 @@ mod imp {
             return Err(acl_error(path, code));
         }
         let _guard = Local(new_acl.cast());
-        // SAFETY: a valid handle and a valid ACL.
-        let code = unsafe {
-            SetSecurityInfo(
-                handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                new_acl,
-                ptr::null(),
+        let kept = kept_entries(new_acl, keep)?;
+        let acl: *const ACL = match &kept {
+            Some(buf) => buf.as_ptr().cast(),
+            None => new_acl,
+        };
+        match handle.write {
+            super::ListWrite::SetSecurityInfo => {
+                // SAFETY: a valid handle and a valid ACL.
+                let code = unsafe {
+                    SetSecurityInfo(
+                        handle.handle.as_raw_handle(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        acl,
+                        ptr::null(),
+                    )
+                };
+                if code != ERROR_SUCCESS {
+                    return Err(acl_error(path, code));
+                }
+                Ok(())
+            }
+            super::ListWrite::KernelObjectAlone => {
+                secure::write_dacl_alone(&handle.handle, acl, path)
+            }
+        }
+    }
+
+    /// A copy of `acl` holding only the entries `keep` accepts, in their
+    /// order, or `None` when it accepts every one (or there is no list), so
+    /// the common write uses the merged list as it is.
+    fn kept_entries(
+        acl: *mut ACL,
+        keep: &dyn Fn(*mut c_void) -> bool,
+    ) -> Result<Option<Vec<u32>>, SandboxError> {
+        if acl.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a valid list the caller owns.
+        let (size, revision, count) = unsafe {
+            (
+                usize::from((*acl).AclSize),
+                (*acl).AclRevision,
+                (*acl).AceCount,
             )
         };
-        if code != ERROR_SUCCESS {
-            return Err(acl_error(path, code));
+        let mut all = Vec::with_capacity(usize::from(count));
+        for i in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `i` is below the entry count of a valid list.
+            if unsafe { GetAce(acl, i, &mut ace) } == 0 {
+                return Err(last_error("read an access list entry"));
+            }
+            all.push(ace);
         }
-        Ok(())
+        if all.iter().all(|ace| keep(*ace)) {
+            return Ok(None);
+        }
+        // The copy is no larger than the list it is made from.
+        let mut buf = vec![0u32; size.div_ceil(4)];
+        let out: *mut ACL = buf.as_mut_ptr().cast();
+        // SAFETY: `buf` holds `size` bytes, aligned for an ACL.
+        if unsafe { InitializeAcl(out, size as u32, u32::from(revision)) } == 0 {
+            return Err(last_error("build an access list"));
+        }
+        for ace in all.into_iter().filter(|ace| keep(*ace)) {
+            // SAFETY: every entry starts with a header that gives its size.
+            let len = u32::from(unsafe { (*(ace as *const ACE_HEADER)).AceSize });
+            // SAFETY: appends one valid entry of `len` bytes to a list with
+            // room for it, at the end, so the order is kept.
+            if unsafe { AddAce(out, u32::from(revision), u32::MAX, ace, len) } == 0 {
+                return Err(last_error("build an access list"));
+            }
+        }
+        Ok(Some(buf))
     }
 
     /// Merge `entries` into the DACL of `path` and write it back, without
@@ -2466,7 +2779,7 @@ mod imp {
     /// Already-present entries are not written again, so a second pass over
     /// the same tree costs one list read per child.
     fn write_child_entry(
-        handle: &OwnedHandle,
+        handle: &ListHandle,
         path: &Path,
         is_dir: bool,
         sid: &Sid,
@@ -2505,17 +2818,91 @@ mod imp {
     /// inside a pass that already holds it costs a counter, because it is
     /// reentrant within a thread.
     fn write_child_entries(
-        handle: &OwnedHandle,
+        handle: &ListHandle,
         path: &Path,
         entries: &[EXPLICIT_ACCESS_W],
         done: &dyn Fn(&Dacl) -> bool,
     ) -> Result<(), SandboxError> {
         let _acl = lock_acls()?;
-        let dacl = read_dacl_handle(handle, path)?;
+        let dacl = read_dacl_handle(&handle.handle, path)?;
         if done(&dacl) {
             return Ok(());
         }
         apply_handle(handle, path, &dacl, entries)
+    }
+
+    /// Take every entry for `sids` off an existing child of a tree whose
+    /// grant is being removed ([`revoke`]). A removal only narrows access,
+    /// so it needs no entry of its own and cannot carry anything out of the
+    /// tree.
+    ///
+    /// A child is written only when [`super::removal_writes`] says so: a
+    /// removal walks the whole tree, and a worktree with a built `target`
+    /// folder holds hundreds of thousands of files whose lists have nothing
+    /// to do with this user. Through a lone write (a child a process holds
+    /// as its current folder) the inherited copies of the removed entries go
+    /// too ([`super::removal_keeps`]), because that write, unlike
+    /// `SetSecurityInfo`, takes nothing in from the parent.
+    fn remove_child_entries(
+        handle: &ListHandle,
+        path: &Path,
+        sids: &[Sid],
+    ) -> Result<(), SandboxError> {
+        let dacl = read_dacl_handle(&handle.handle, path)?;
+        let facts: Vec<super::EntryFacts> = dacl_entries(dacl.acl)
+            .into_iter()
+            .map(|ace| entry_facts(ace, sids))
+            .collect();
+        if !super::removal_writes(handle.write, &facts) {
+            return Ok(());
+        }
+        let entries: Vec<EXPLICIT_ACCESS_W> = sids
+            .iter()
+            .map(|sid| explicit(sid, 0, REVOKE_ACCESS, NO_INHERITANCE))
+            .collect();
+        apply_handle_keeping(handle, path, &dacl, &entries, &|ace| {
+            super::removal_keeps(handle.write, entry_facts(ace, sids))
+        })
+    }
+
+    /// The entries of `acl`, in list order; none for a missing list.
+    fn dacl_entries(acl: *mut ACL) -> Vec<*mut c_void> {
+        if acl.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: `acl` points into a descriptor the caller holds.
+        let count = unsafe { (*acl).AceCount };
+        (0..u32::from(count))
+            .filter_map(|i| {
+                let mut ace: *mut c_void = ptr::null_mut();
+                // SAFETY: `i` is below the entry count of a valid list.
+                (unsafe { GetAce(acl, i, &mut ace) } != 0).then_some(ace)
+            })
+            .collect()
+    }
+
+    /// One entry as a removal judges it ([`super::EntryFacts`]). Only allow
+    /// and deny entries are read for a SID: they share the layout read here,
+    /// and a file system list holds no other kind kGraf writes.
+    fn entry_facts(ace: *mut c_void, sids: &[Sid]) -> super::EntryFacts {
+        const INHERITED_ACE: u32 = 0x10;
+        // SAFETY: every entry starts with an ACE_HEADER.
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        let kind = u32::from(header.AceType);
+        let plain = kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_DENIED_ACE_TYPE;
+        let names_removed = plain && {
+            // SAFETY: allow and deny entries share this layout.
+            let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+            let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
+            // SAFETY: both are valid SIDs.
+            sids.iter()
+                .any(|sid| unsafe { EqualSid(ace_sid, sid.as_psid()) } != 0)
+        };
+        super::EntryFacts {
+            allow: kind == ACCESS_ALLOWED_ACE_TYPE,
+            inherited: u32::from(header.AceFlags) & INHERITED_ACE != 0,
+            names_removed,
+        }
     }
 
     /// kGraf's own propagation pass over the existing children of `root`:
@@ -2531,71 +2918,20 @@ mod imp {
     /// hard-linked file shares with every other name of it, which can lie
     /// outside the tree (decision 0083).
     ///
-    /// A child it cannot open or write is recorded and the pass goes on, as
-    /// Windows' own propagation does with a child whose share access is not
-    /// available (`super::Skipped::blocked`); the note reaches the command's
-    /// output, so a file that keeps its old list is never silent. A folder
-    /// that cannot be listed is recorded the same way and not entered.
+    /// A child another process holds open without delete sharing (a current
+    /// folder, a file open in a build) is written through a second handle
+    /// that no open refuses ([`open_for_security`]). A child it still cannot
+    /// open or write is recorded and the pass goes on, as Windows' own
+    /// propagation does with a child whose share access is not available
+    /// (`super::Skipped::blocked`); the note reaches the command's output, so
+    /// a file that keeps its old list is never silent. A folder that cannot
+    /// be listed is recorded the same way and not entered.
     ///
     /// No time or entry bound: the walk in front of the write is bounded and
     /// refuses a tree larger than that bound, and this pass must finish once
     /// the folder's own list is written. It enters no reparse point, so no
     /// unreachable network path can hold it.
-    /// Take every entry for `sids` off an existing child of a tree whose
-    /// grant is being removed ([`revoke`]). A removal only narrows access,
-    /// so it needs no entry of its own and cannot carry anything out of the
-    /// tree.
     ///
-    /// A child that names none of the SIDs is not written at all: a removal
-    /// walks the whole tree, and a worktree with a built `target` folder
-    /// holds hundreds of thousands of files whose lists have nothing to do
-    /// with this user.
-    fn remove_child_entries(
-        handle: &OwnedHandle,
-        path: &Path,
-        sids: &[Sid],
-    ) -> Result<(), SandboxError> {
-        let dacl = read_dacl_handle(handle, path)?;
-        if !sids.iter().any(|sid| names_sid(&dacl, sid)) {
-            return Ok(());
-        }
-        let entries: Vec<EXPLICIT_ACCESS_W> = sids
-            .iter()
-            .map(|sid| explicit(sid, 0, REVOKE_ACCESS, NO_INHERITANCE))
-            .collect();
-        apply_handle(handle, path, &dacl, &entries)
-    }
-
-    /// Whether any entry of `dacl` that kGraf itself wrote names `sid`. An
-    /// inherited entry is not counted: it belongs to a folder above and a
-    /// removal on this object could not take it off anyway.
-    fn names_sid(dacl: &Dacl, sid: &Sid) -> bool {
-        if dacl.acl.is_null() {
-            return false;
-        }
-        const INHERITED_ACE: u32 = 0x10;
-        // SAFETY: `acl` points into the descriptor `dacl` owns.
-        let count = unsafe { (*dacl.acl).AceCount };
-        (0..u32::from(count)).any(|i| {
-            let mut ace: *mut c_void = ptr::null_mut();
-            // SAFETY: `i` is below the entry count of a valid list.
-            if unsafe { GetAce(dacl.acl, i, &mut ace) } == 0 {
-                return false;
-            }
-            // SAFETY: every entry starts with an ACE_HEADER.
-            let header = unsafe { &*(ace as *const ACE_HEADER) };
-            if u32::from(header.AceFlags) & INHERITED_ACE != 0 {
-                return false;
-            }
-            // SAFETY: allow and deny entries share this layout, and a file
-            // list holds no other kind.
-            let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-            let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
-            // SAFETY: both are valid SIDs.
-            unsafe { EqualSid(ace_sid, sid.as_psid()) != 0 }
-        })
-    }
-
     /// The walk itself is [`super::propagation_plan`], which runs on any
     /// host; this adds the three Windows operations: list a folder, open one
     /// child and read its attributes and link count in that same open, and
@@ -2603,7 +2939,7 @@ mod imp {
     fn propagate(
         root: &Path,
         denied: &[PathBuf],
-        write: &dyn Fn(&OwnedHandle, &Path, bool) -> Result<(), SandboxError>,
+        write: &dyn Fn(&ListHandle, &Path, bool) -> Result<(), SandboxError>,
     ) -> Result<super::Skipped, SandboxError> {
         let mut list = |dir: &Path| -> Result<Vec<PathBuf>, String> {
             let mut children = Vec::new();
@@ -2612,9 +2948,10 @@ mod imp {
             }
             Ok(children)
         };
-        let mut probe = |path: &Path| -> Result<super::ChildFacts<OwnedHandle>, String> {
+        let mut probe = |path: &Path| -> Result<super::ChildFacts<ListHandle>, String> {
             let handle = open_for_security(path).map_err(|e| e.to_string())?;
-            let (attributes, links) = handle_info(&handle, path).map_err(|e| e.to_string())?;
+            let (attributes, links) =
+                handle_info(&handle.handle, path).map_err(|e| e.to_string())?;
             Ok(super::ChildFacts {
                 is_reparse: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 is_dir: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
@@ -2622,7 +2959,7 @@ mod imp {
                 handle,
             })
         };
-        let mut write_one = |handle: &OwnedHandle, path: &Path, is_dir: bool| {
+        let mut write_one = |handle: &ListHandle, path: &Path, is_dir: bool| {
             write(handle, path, is_dir).map_err(|e| e.to_string())
         };
         super::propagation_plan(root, denied, &mut list, &mut probe, &mut write_one).map_err(
@@ -2682,7 +3019,7 @@ mod imp {
         done: &dyn Fn(&Dacl) -> bool,
         allowed: &[PathBuf],
         denied: &[PathBuf],
-        write_child: &dyn Fn(&OwnedHandle, &Path, bool) -> Result<(), SandboxError>,
+        write_child: &dyn Fn(&ListHandle, &Path, bool) -> Result<(), SandboxError>,
     ) -> Result<super::Skipped, super::GuardedWrite<SandboxError>> {
         super::guarded_inheritable_write(
             || link_walk_refusal(dir, allowed),
@@ -3131,18 +3468,48 @@ mod imp {
             // that case on purpose, so the order is checked where both
             // entries meet.
             grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
-            assert_eq!(entries_for(&inside, &sid).len(), 1, "the grant entry");
+            // The file holds the pass's own entry and, once the pass has
+            // written the folder above it, an entry inherited from there:
+            // writing the file's list with `SetSecurityInfo` takes in the
+            // parent's inheritable entries, as Windows documents for a list
+            // that is not protected. Both allow; the pass's is the explicit
+            // one, and there is exactly one of it.
+            const INHERITED_ACE: u32 = 0x10;
+            let granted = entries_for(&inside, &sid);
+            assert_eq!(
+                granted
+                    .iter()
+                    .filter(|(kind, flags)| *kind == ACCESS_ALLOWED_ACE_TYPE
+                        && flags & INHERITED_ACE == 0)
+                    .count(),
+                1,
+                "the grant pass entry: {granted:?}"
+            );
+            assert!(
+                granted
+                    .iter()
+                    .all(|(kind, _)| *kind == ACCESS_ALLOWED_ACE_TYPE),
+                "{granted:?}"
+            );
             deny_all(&hidden, &sid, &[]).unwrap();
             let entries = entries_for(&inside, &sid);
             let deny = entries
                 .iter()
                 .position(|(kind, _)| *kind == ACCESS_DENIED_ACE_TYPE)
                 .expect("a deny entry");
-            let allow = entries
+            // Every allow, the explicit one and any inherited one, stands
+            // after the deny, or the first allow would decide the check.
+            let allows: Vec<usize> = entries
                 .iter()
-                .position(|(kind, _)| *kind == ACCESS_ALLOWED_ACE_TYPE)
-                .expect("an allow entry");
-            assert!(deny < allow, "the deny must come first: {entries:?}");
+                .enumerate()
+                .filter(|(_, (kind, _))| *kind == ACCESS_ALLOWED_ACE_TYPE)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!allows.is_empty(), "an allow entry: {entries:?}");
+            assert!(
+                allows.iter().all(|a| deny < *a),
+                "the deny must come first: {entries:?}"
+            );
         }
 
         /// The gap this pass closes: a file in the tree with a second hard
@@ -3407,6 +3774,159 @@ mod imp {
             let dacl = read_dacl(root.path()).unwrap();
             apply(root.path(), &dacl, &[]).expect("kGraf can write the tree's list");
         }
+
+        /// A process whose current folder is `dir`, killed when dropped.
+        /// Windows holds a current folder open without `FILE_SHARE_DELETE`,
+        /// which is what made the `MAXIMUM_ALLOWED` open of a worktree fail
+        /// with os error 32.
+        struct CwdHolder(std::process::Child);
+
+        impl CwdHolder {
+            /// Start the process and wait until the condition holds: an
+            /// open of `dir` with `MAXIMUM_ALLOWED` fails with a sharing
+            /// violation. Without that the tests below would prove nothing.
+            fn start(dir: &Path) -> Self {
+                let child = std::process::Command::new("ping.exe")
+                    .args(["-n", "120", "127.0.0.1"])
+                    .current_dir(dir)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start a process in the folder");
+                let holder = Self(child);
+                let started = std::time::Instant::now();
+                loop {
+                    match open_maximum_allowed(dir) {
+                        Err(32) => return holder,
+                        _ if started.elapsed() > std::time::Duration::from_secs(10) => {
+                            panic!(
+                                "{} held as a current folder still opens with \
+                                 MAXIMUM_ALLOWED; the condition under test is absent",
+                                dir.display()
+                            )
+                        }
+                        _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    }
+                }
+            }
+        }
+
+        impl Drop for CwdHolder {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        const INHERITED_ACE: u32 = 0x10;
+
+        /// The lone write that replaces a refused `MAXIMUM_ALLOWED` open
+        /// writes the folder's own list and nothing below it: an inheritable
+        /// entry written on a held folder reaches no existing child. This
+        /// is the property the `MAXIMUM_ALLOWED` handle gave, measured for
+        /// the call that replaces it (`SetKernelObjectSecurity`, whose page
+        /// does not say in so many words that it propagates nothing).
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_lone_write_on_a_held_folder_changes_no_child() {
+            let sid = Sid::from_string(SID).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let child = dir.path().join("child.txt");
+            std::fs::write(&child, "x").unwrap();
+            let sub = dir.path().join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            let _held = CwdHolder::start(dir.path());
+            assert_eq!(
+                open_for_security(dir.path()).unwrap().write,
+                super::super::ListWrite::KernelObjectAlone
+            );
+            let dacl = read_dacl(dir.path()).unwrap();
+            apply(
+                dir.path(),
+                &dacl,
+                &[explicit(&sid, TREE_MASK, GRANT_ACCESS, TREE_INHERIT)],
+            )
+            .expect("a held folder's list is written");
+            assert!(mentions(dir.path(), &sid), "the folder's own entry");
+            assert!(!mentions(&child, &sid), "the file below took the entry");
+            assert!(!mentions(&sub, &sid), "the folder below took the entry");
+        }
+
+        /// A grant and a revoke on a worktree while processes have their
+        /// current folders at its root and in a folder of it: both succeed,
+        /// every object holds the entries the pass wrote, the held child
+        /// folder holds exactly the pass's own entry (its lone write took no
+        /// inherited copy in, and the root's write carried nothing down),
+        /// and after the revoke no object names the user.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_grant_and_a_revoke_succeed_with_current_folders_in_the_tree() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let src = root.path().join("src");
+            let deep = src.join("deep");
+            std::fs::create_dir_all(&deep).unwrap();
+            let main = src.join("main.rs");
+            std::fs::write(&main, "fn main() {}").unwrap();
+            let leaf = deep.join("leaf.txt");
+            std::fs::write(&leaf, "x").unwrap();
+            let _at_root = CwdHolder::start(root.path());
+            let _at_src = CwdHolder::start(&src);
+            let skipped = grant_writable_root(root.path(), &sid, &[], &[], false)
+                .expect("a grant with current folders in the tree");
+            assert_eq!(skipped.blocked, 0, "{:?}", skipped.first_blocked);
+            for path in [root.path(), &src, &deep, &main, &leaf] {
+                let own = entries_for(path, &sid)
+                    .into_iter()
+                    .filter(|(_, flags)| flags & INHERITED_ACE == 0)
+                    .count();
+                assert!(own > 0, "{} lacks the pass's entry", path.display());
+            }
+            assert_eq!(
+                entries_for(&src, &sid),
+                vec![(ACCESS_ALLOWED_ACE_TYPE, CHILD_INHERIT)],
+                "the held folder holds the pass's entry alone"
+            );
+            let notes = revoke(root.path(), &[SID]).expect("a revoke with current folders");
+            assert!(notes.is_empty(), "{notes:?}");
+            for path in [root.path(), &src, &deep, &main, &leaf] {
+                assert!(
+                    !mentions(path, &sid),
+                    "{} keeps an entry: {:?}",
+                    path.display(),
+                    entries_for(path, &sid)
+                );
+            }
+        }
+
+        /// A folder the grant wrote through `SetSecurityInfo` holds the
+        /// pass's entry and an inherited copy of its parent's. When a process
+        /// holds that folder at the revoke, its list is written alone, which
+        /// takes nothing in from the parent, so the copy must be dropped by
+        /// kGraf, or the user keeps its access there.
+        /// Windows only; compile-checked on the development host.
+        #[test]
+        fn a_revoke_through_a_lone_write_drops_the_inherited_copy() {
+            let sid = Sid::from_string(SID).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let src = root.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            grant_writable_root(root.path(), &sid, &[], &[], false).unwrap();
+            let before = entries_for(&src, &sid);
+            assert!(
+                before.iter().any(|(_, flags)| flags & INHERITED_ACE != 0),
+                "precondition: the folder holds an inherited copy: {before:?}"
+            );
+            let _held = CwdHolder::start(&src);
+            revoke(root.path(), &[SID]).expect("a revoke with a current folder");
+            assert!(
+                !mentions(&src, &sid),
+                "the held folder keeps {:?}",
+                entries_for(&src, &sid)
+            );
+            assert!(!mentions(root.path(), &sid));
+        }
     }
 
     /// Deny `sid` every read and write beneath the hidden folder `dir`. A
@@ -3473,6 +3993,15 @@ mod imp {
     /// The pass has to run: a child carries kGraf's entry as an explicit
     /// entry of its own ([`write_child_entry`]), not as an inherited copy
     /// that would disappear when the folder's list is rewritten.
+    ///
+    /// **A current folder in the tree does not stop it.** A worker, a build
+    /// or a test whose current folder is the folder or one below it used to
+    /// make the folder's open fail with `ERROR_SHARING_VIOLATION`, and the
+    /// whole removal with it. Such a folder is now written through a handle
+    /// no open refuses, with a write that propagates nothing
+    /// ([`open_for_security`]). A folder that still cannot be opened fails
+    /// this call with its path, and `kgraf sandbox remove` names it, goes on
+    /// with the other folders, and fails at the end.
     ///
     /// **What a removal leaves.** A hard-linked file is skipped, as it is
     /// during a grant, and recorded. After the grant pass of this version
@@ -3756,7 +4285,7 @@ mod imp {
                     (&effective, NO_INHERITANCE)
                 };
                 if has_ace(
-                    &read_label_handle(handle, path)?,
+                    &read_label_handle(&handle.handle, path)?,
                     SYSTEM_MANDATORY_LABEL_ACE_TYPE,
                     &low,
                     SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
@@ -3803,11 +4332,21 @@ mod imp {
 
     /// Write `acl` as the mandatory label of whatever `handle` reached, with
     /// no propagation to existing children ([`open_for_security`]).
-    fn write_label(handle: &OwnedHandle, path: &Path, acl: &[u32]) -> Result<(), SandboxError> {
+    ///
+    /// Only through a `MAXIMUM_ALLOWED` handle. The lone write
+    /// ([`super::ListWrite::KernelObjectAlone`]) is for access lists alone:
+    /// its handle holds no `WRITE_OWNER`, which a label write needs, and
+    /// `SetSecurityInfo` through it would propagate. Such an object fails
+    /// with the sharing violation its first open met, as it did before the
+    /// second open existed; the pass records it.
+    fn write_label(handle: &ListHandle, path: &Path, acl: &[u32]) -> Result<(), SandboxError> {
+        if handle.write != super::ListWrite::SetSecurityInfo {
+            return Err(acl_error(path, super::ERROR_SHARING_VIOLATION));
+        }
         // SAFETY: a valid handle and a valid label ACL.
         let code = unsafe {
             SetSecurityInfo(
-                handle.as_raw_handle(),
+                handle.handle.as_raw_handle(),
                 SE_FILE_OBJECT,
                 LABEL_SECURITY_INFORMATION,
                 ptr::null_mut(),
