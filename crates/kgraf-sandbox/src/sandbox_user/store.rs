@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use super::blob::{BlobError, Protector, StoredUser, decode_users};
-use super::names::Role;
+use super::names::{MAX_SLOTS, Role};
 use super::password::Password;
 
 /// The file name for `tag` (a test run's own users) or the owner's default.
@@ -88,6 +88,11 @@ pub enum LoadError {
     NoUser(String),
     #[error("the stored passwords file holds the {0} sandbox user twice")]
     Duplicate(String),
+    #[error(
+        "the stored passwords file names {0} but not every slot below it; run `kgraf sandbox \
+         setup` again"
+    )]
+    SlotGap(String),
 }
 
 /// The user of `role` and its opened password. Only that user's password is
@@ -108,6 +113,31 @@ pub fn load_user(
     let text = String::from_utf8(plain.to_vec()).map_err(|_| BlobError::Entry)?;
     let password = Password::from_received(text).map_err(|_| BlobError::Entry)?;
     Ok((user, password))
+}
+
+/// The stored users of `role(0)`, `role(1)`, and on, up to the first slot
+/// the file does not hold, each with its opened password. The end of the
+/// list is where setup stopped making slots, so a slot the file does not
+/// hold ends it and is not an error. A file that holds a later slot past
+/// that gap is refused: setup never writes one, and acting on part of it
+/// would run two folders as one user without saying so.
+pub fn load_slot_users(
+    bytes: &[u8],
+    role: fn(u8) -> Role,
+    protector: &dyn Protector,
+) -> Result<Vec<(StoredUser, Password)>, LoadError> {
+    let users = decode_users(bytes)?;
+    let holds = |r: Role| users.iter().any(|(user, _)| user.role == r);
+    let mut found = Vec::new();
+    let mut next = 0;
+    while next < MAX_SLOTS && holds(role(next)) {
+        found.push(load_user(bytes, role(next), protector)?);
+        next += 1;
+    }
+    if let Some(later) = (next..MAX_SLOTS).map(role).find(|r| holds(*r)) {
+        return Err(LoadError::SlotGap(later.key()));
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -214,6 +244,51 @@ mod tests {
             assert_eq!(pw.expose(), want.expose());
             assert_eq!(p.opened.get(), before + 1, "one password opened per load");
         }
+    }
+
+    /// Setup with four slots stores slot users 0 to 3 of each pool. Loading
+    /// stops at the first slot the file does not hold; before, that slot was
+    /// an error, so no stored setup ever loaded and every command was
+    /// refused.
+    #[test]
+    fn slot_users_load_up_to_the_first_slot_the_file_does_not_hold() {
+        let pw = Password::generate(&[]).unwrap();
+        let p = CountingProtector::new(7);
+        let mut entries = vec![
+            (user(Role::Offline, 1010), &pw),
+            (user(Role::Online, 1011), &pw),
+        ];
+        for i in 0..4u8 {
+            entries.push((user(Role::Slot(i), 1100 + u32::from(i)), &pw));
+            entries.push((user(Role::OnlineSlot(i), 1200 + u32::from(i)), &pw));
+        }
+        let bytes = encode_credentials(&entries, &p).unwrap();
+        for role in [Role::Slot as fn(u8) -> Role, Role::OnlineSlot] {
+            let found = load_slot_users(&bytes, role, &p).unwrap();
+            let roles: Vec<Role> = found.iter().map(|(u, _)| u.role).collect();
+            assert_eq!(roles, (0..4u8).map(role).collect::<Vec<_>>());
+        }
+        let none = encode_credentials(&entries[..2], &p).unwrap();
+        assert!(load_slot_users(&none, Role::Slot, &p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_slot_past_a_gap_is_refused() {
+        let pw = Password::generate(&[]).unwrap();
+        let p = CountingProtector::new(9);
+        let gap = encode_credentials(
+            &[
+                (user(Role::Offline, 1010), &pw),
+                (user(Role::Slot(0), 1100), &pw),
+                (user(Role::Slot(2), 1102), &pw),
+            ],
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            load_slot_users(&gap, Role::Slot, &p).unwrap_err(),
+            LoadError::SlotGap(Role::Slot(2).key())
+        );
     }
 
     #[test]

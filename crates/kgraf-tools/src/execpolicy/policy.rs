@@ -79,6 +79,11 @@ pub struct ExecPolicy {
     /// Decision 0094: the user's live permission mode, read on every
     /// evaluation, so a mode change reaches a running worker's next command.
     live: Option<LivePermissions>,
+    /// Decision 0087, amended 2026-10-09: the commands run in a disposable
+    /// remote environment, so a package download is the task's own and is
+    /// decided like any command. Off, a download is refused
+    /// ([`super::package_fetch`]).
+    package_downloads: bool,
     /// Decision 0094, amended 2026-10-06: where the files a command's
     /// programs run (a recipe, a script) are read from. None by default, so
     /// every such command is granted by nothing.
@@ -116,6 +121,7 @@ impl ExecPolicy {
             granted: std::collections::BTreeSet::new(),
             unrestricted: false,
             live: None,
+            package_downloads: false,
             reading: crate::permissions::ReadContext::default(),
             reviewed: std::sync::Arc::default(),
         }
@@ -286,6 +292,18 @@ impl ExecPolicy {
         self
     }
 
+    /// Let a command that downloads packages (`pip install`, `npm ci`,
+    /// `cargo fetch`) be decided like any other (decision 0087, amended
+    /// 2026-10-09). Only for a run whose commands execute in a disposable
+    /// remote environment, never on the user's machine: there, the host
+    /// fetches dependencies with the project's consent, and a worker's
+    /// download is refused in every mode. An unrestricted shell
+    /// ([`Self::with_unrestricted_shell`]) allows downloads too.
+    pub fn with_package_downloads(mut self, on: bool) -> Self {
+        self.package_downloads = on;
+        self
+    }
+
     /// Whether [`Self::with_unrestricted_shell`] is on.
     pub fn is_unrestricted(&self) -> bool {
         self.unrestricted
@@ -394,6 +412,15 @@ impl ExecPolicy {
                 script_checked: false,
             },
             AllowlistMatch::NotListed => {
+                // Decision 0087, amended 2026-10-09: a package download is
+                // refused before any grant is read, so no mode, allow set or
+                // contract grant turns it into a confined command. An
+                // allowlisted build (the user's own configured commands
+                // included) is not read for one: it runs with the network
+                // off and is the user's choice.
+                if let Some(v) = self.package_download(argv) {
+                    return v;
+                }
                 let from_rule = ruled.is_some();
                 let verdict = ruled.unwrap_or(PolicyVerdict {
                     decision: self.default,
@@ -518,6 +545,35 @@ impl ExecPolicy {
                     })
                 })
             })
+    }
+
+    /// The refusal of a call that downloads packages, outside a disposable
+    /// remote environment: the call itself, every command a script or a
+    /// wrapper starts, and what a recipe or script file it runs holds, each
+    /// from every place its program may stand (the same reading the
+    /// `forbid` rules get, so `env pip install` or `sh -c 'npm ci'` is
+    /// found).
+    fn package_download(&self, argv: &[String]) -> Option<PolicyVerdict> {
+        if self.package_downloads || self.unrestricted {
+            return None;
+        }
+        let fetch = crate::permissions::simple_commands_in(argv, &self.reading)
+            .into_iter()
+            .find_map(|words| {
+                crate::permissions::command_starts(&words)
+                    .into_iter()
+                    .find_map(|at| super::package_fetch::package_fetch(&words[at..]))
+            })?;
+        Some(PolicyVerdict {
+            decision: Decision::Forbidden,
+            read_only: false,
+            matched_prefix: None,
+            reason: Some(super::package_fetch::refusal(&fetch)),
+            build: false,
+            granted: false,
+            script_note: None,
+            script_checked: false,
+        })
     }
 
     /// The script constructs the user turned on (decision 0094, amended
@@ -1101,6 +1157,82 @@ mod tests {
 
     fn sh(script: &str) -> Vec<String> {
         argv(&["sh", "-c", script])
+    }
+
+    /// Decision 0087, amended 2026-10-09: a command that downloads packages
+    /// is refused in every mode, under every grant (Bypass, Auto's allow set,
+    /// a contract's grant of the program), as the call itself, behind a
+    /// wrapper and inside a script, and the refusal says why and what allows
+    /// it. A check-only contract that runs `pip install` met the grant path:
+    /// the download ran confined, and failed at the network with no reason
+    /// (or, where the network is open, reached PyPI unasked). The same
+    /// program's other commands keep their grant, and a run whose commands
+    /// execute in a disposable remote environment decides it like any
+    /// command.
+    #[test]
+    fn a_package_download_is_refused_under_every_grant_outside_a_disposable_environment() {
+        use crate::permissions::PermissionMode;
+        let downloads = [
+            argv(&["pip", "install", "vectorops"]),
+            argv(&["python3", "-m", "pip", "install", "x"]),
+            argv(&["env", "pip", "install", "x"]),
+            sh("cd web && npm ci"),
+            sh("pip install --index-url http://localhost:8080/simple vectorops==0.1.0"),
+            argv(&["cargo", "fetch"]),
+        ];
+        for mode in PermissionMode::ALL {
+            let policy = ExecPolicy::default_kgraf_policy()
+                .with_build_allowlist(BuildAllowlist::standard())
+                .with_granted_programs(["pip".to_owned(), "npm".to_owned(), "env".to_owned()])
+                .with_permissions(control_in(mode, &["pip", "python3", "cargo", "npm"]));
+            for call in &downloads {
+                let v = policy.evaluate(call);
+                assert_eq!(v.decision, Decision::Forbidden, "{mode}: {call:?}: {v:?}");
+                assert!(!v.granted, "{mode}: {call:?}");
+                let why = v.reason.unwrap_or_default();
+                assert!(
+                    super::super::is_package_fetch_refusal(&why),
+                    "{mode}: {call:?}: {why}"
+                );
+                assert!(why.contains("decision 0087"), "{why}");
+            }
+            // The program's other commands keep their grant.
+            let show = policy.evaluate(&argv(&["pip", "show", "vectorops"]));
+            assert_ne!(show.decision, Decision::Forbidden, "{mode}: {show:?}");
+        }
+        let bypass = || {
+            ExecPolicy::default_kgraf_policy()
+                .with_permissions(control_in(PermissionMode::Bypass, &[]))
+        };
+        let pip = argv(&["pip", "install", "vectorops"]);
+        let remote = bypass().with_package_downloads(true).evaluate(&pip);
+        assert_eq!(remote.decision, Decision::Allow, "{remote:?}");
+        let container = bypass().with_unrestricted_shell(true).evaluate(&pip);
+        assert_eq!(container.decision, Decision::Allow, "{container:?}");
+        // A recipe a granted command runs is read for a download too; an
+        // allowlisted build the user configured is not (it runs with the
+        // network off, and is the user's choice).
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "deps:\n\tpip install -r requirements.txt\ntest:\n\tpip install -e . && pytest\n",
+        )
+        .expect("write");
+        let ctx = crate::permissions::ReadContext::in_worktree(dir.path(), None);
+        let policy = bypass()
+            .with_build_allowlist(BuildAllowlist::cargo_default().with_configured("make test"))
+            .with_read_context(ctx);
+        let deps = policy.evaluate(&argv(&["make", "deps"]));
+        assert_eq!(deps.decision, Decision::Forbidden, "{deps:?}");
+        let test = policy.evaluate(&argv(&["make", "test"]));
+        assert!(test.build && test.decision == Decision::Allow, "{test:?}");
+        // The policy for a routed run allows it; a `forbid` rule still wins.
+        let routed = crate::external::remote_policy();
+        assert_eq!(routed.evaluate(&pip).decision, Decision::Allow);
+        assert_eq!(
+            routed.evaluate(&argv(&["rm", "-rf", "/"])).decision,
+            Decision::Forbidden
+        );
     }
 
     /// A worktree holding the scripts these tests run, each starting no

@@ -3443,7 +3443,14 @@ async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_g
         .verify_among(&c, &ws, &result(), &[])
         .await
         .expect("ran");
-    assert!(!verdict.passed(), "nothing left to merge: {verdict:?}");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("nothing left to merge: {verdict:?}");
+    };
+    // The base run is still made, and no merge of the run precedes it.
+    assert!(
+        reason.contains("where no contract of this run had merged yet"),
+        "{reason}"
+    );
 
     let ungated = verifier(&r, BOTH_FILES);
     let (c, ws) = greeting_attempt(&r, "w-ungated").await;
@@ -3451,7 +3458,107 @@ async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_g
         .verify_among(&c, &ws, &result(), &["c2".to_owned()])
         .await
         .expect("ran");
-    assert!(!verdict.passed(), "no root gate would run it: {verdict:?}");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("no root gate would run it: {verdict:?}");
+    };
+    assert!(
+        reason.contains("also fails at the dispatch base"),
+        "{reason}"
+    );
+}
+
+/// A run whose first contract `c1` merged a `src/lib.rs` that says `broken`;
+/// at the run's start it said `ok`.
+async fn repo_where_c1_merged_a_break() -> Repo {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(dir, root, &base, &[("src/lib.rs", "ok\n")]);
+    let c1 = named("src/lib.rs", "c1");
+    let ws = prepared(&r, &c1, "w-c1").await;
+    std::fs::write(ws.join("src/lib.rs"), "broken\n").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c1, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let merged = r.workspaces.integrate(&c1, &ws).await.expect("integrate");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+    r.workspaces.release(&ws, true).await;
+    r
+}
+
+/// The plan's last contract gets the dispatch-base run too. Its whole check
+/// fails on the attempt and at its dispatch base, which holds `c1`'s merge,
+/// and passes where the run started: the failure is an earlier delivery's
+/// break, and the reason names it. Still a failure (the last contract is
+/// checked whole), never a deferral.
+#[tokio::test]
+async fn the_last_contract_s_failure_is_attributed_to_an_earlier_merge_that_broke_its_check() {
+    let r = repo_where_c1_merged_a_break().await;
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, "! grep -q broken src/lib.rs")
+    };
+    let c2 = named("src/other.rs", "c2");
+    let ws = prepared(&r, &c2, "w-c2").await;
+    std::fs::write(ws.join("src/other.rs"), "fine\n").expect("write");
+    let verdict = v.verify_among(&c2, &ws, &result(), &[]).await.expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("the last contract is checked whole: {verdict:?}");
+    };
+    assert!(
+        reason.contains("also fails at the dispatch base"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("passes at the run's original base"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("an earlier merge of this run broke it"),
+        "{reason}"
+    );
+    assert!(reason.contains("merges of contracts c1"), "{reason}");
+    assert!(!reason.contains("deferred"), "{reason}");
+}
+
+/// The same last contract with a check that also failed where the run
+/// started: the failure predates the run's work, and the reason says so.
+/// One its own change broke (it passes at the dispatch base) is still its
+/// own failure.
+#[tokio::test]
+async fn the_last_contract_s_failure_is_told_apart_from_a_check_that_failed_before_the_run() {
+    let r = repo_where_c1_merged_a_break().await;
+    let gated = |command: &str| CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, command)
+    };
+    let c2 = named("src/other.rs", "c2");
+    let ws = prepared(&r, &c2, "w-c2-before").await;
+    std::fs::write(ws.join("src/other.rs"), "fine\n").expect("write");
+    let verdict = gated("test -f src/never.rs")
+        .verify_among(&c2, &ws, &result(), &[])
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(
+        reason.contains("at the run's original base") && reason.contains("before this run's work"),
+        "{reason}"
+    );
+
+    let ws = prepared(&r, &c2, "w-c2-own").await;
+    std::fs::write(ws.join("src/other.rs"), "fine\n").expect("write");
+    let verdict = gated("test ! -f src/other.rs")
+        .verify_among(&c2, &ws, &result(), &[])
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("{verdict:?}");
+    };
+    assert!(reason.contains("passes at the dispatch base"), "{reason}");
 }
 
 /// A whole check that passes at the dispatch base and fails on the attempt

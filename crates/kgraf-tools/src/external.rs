@@ -141,7 +141,10 @@ impl<T: Tool> Tool for SyncedWrites<T> {
 /// No rule here marks a command read-only: read-only confinement checks host
 /// paths, and a routed command does not run on the host.
 pub fn remote_policy() -> ExecPolicy {
+    // Decision 0087, amended 2026-10-09: a package download runs in the
+    // disposable environment, never on this host, so it is not refused.
     ExecPolicy::new(Decision::Allow)
+        .with_package_downloads(true)
         .forbid(&["rm", "-rf", "/"], "refuses to remove the filesystem root")
         .forbid(
             &["git", "push", "--force"],

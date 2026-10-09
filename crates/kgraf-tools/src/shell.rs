@@ -4296,7 +4296,6 @@ mod tests {
             for off in [
                 vec!["touch", "x"],
                 vec!["cargo", "run"],
-                vec!["cargo", "install", "ripgrep"],
                 vec!["./cargo", "build"],
                 vec!["sh", "-c", "cargo build && touch x"],
                 vec!["sh", "-c", "cargo build $(echo --release)"],
@@ -4308,6 +4307,15 @@ mod tests {
                     "{off:?} must still need approval"
                 );
             }
+            // Decision 0087, amended 2026-10-09: a package download is not
+            // asked about; it is refused, with what allows it.
+            let Err(e) = tool.access(&call_input(&["cargo", "install", "ripgrep"])) else {
+                panic!("a package download is refused");
+            };
+            assert!(
+                crate::execpolicy::is_package_fetch_refusal(&e.to_string()),
+                "{e}"
+            );
             // Decision 0094, amended again 2026-10-02: a `sh -c` script of
             // allowlisted cargo commands alone is a build, as each command is.
             let script = ["sh", "-c", "cargo build"];

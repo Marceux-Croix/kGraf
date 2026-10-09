@@ -451,3 +451,43 @@ Tests: `kgraf-host` `gates.rs`
 error lines, the kept text names only `iface/src/lib.rs`) and
 `located_lines_keep_headers_and_their_spans_within_the_budget`; `kgraf-orchestrator`
 `outside_error` `a_notes_span_is_never_read_as_an_error_outside`.
+
+## Amendment (2026-10-09, second): every contract's failing whole check runs at its dispatch base
+
+The whole check ran again at the dispatch base only when other contracts of the plan were
+still open (the deferral of 2026-10-02). The plan's last contract, and every contract of a run
+without a root gate, got no base run: when its check failed, nothing said whether the failure
+was its own change or a break an earlier merge of the run had delivered, and the verdict, the
+retry brief and the hold reason all read as the attempt's own failure.
+
+- **The base run is made for every committed attempt whose whole check fails** (not narrowed,
+  not a gate remediation), open contracts or not (`CommandVerifier::verify_among`).
+- **Deferral is unchanged.** It still needs open contracts and the root gate. The last contract
+  is still checked whole: a failure stays a failure.
+- **What the verdict says.** Passing at the base: "(it passes at the dispatch base, so this
+  attempt's change makes it fail)", as before. Failing at the base with nothing to defer to:
+  the merges of the run before the base are read from the integration branch
+  (`earlier_delivery::merged_before`, every `Merge attempt ... into <branch>` commit on its
+  first-parent line, oldest first), and the command runs once more at the run's original base.
+  Passing there: "(it also fails at the dispatch base and passes at the run's original base
+  <sha>, so an earlier merge of this run broke it before this attempt started: the dispatch
+  base holds the merges of contracts <ids>)". Failing there too: "it failed before this run's
+  work, not because of this attempt's change". With no merge before the base: "(it also fails
+  at the dispatch base, where no contract of this run had merged yet: ...)". A run that cannot
+  be made, or a history that cannot be read, is said with its error, never read as either
+  answer.
+- **Cost.** One more run of the command per such failure, and a second one only when an
+  earlier merge exists and the base fails too. A narrowed check gets no base run: it runs the
+  tests of the contract's own files, which hold their stubs at the base, so it fails there
+  almost always and would separate nothing.
+
+Rejected: deferring the last contract's check to the root gate when the base fails. The last
+contract is checked whole so that a run completes only on a passing tree, and the root gate's
+remediation already owns a break on the merged result; the attribution tells the worker, the
+retry and the user where the break came from without moving the judgment.
+
+Tests: `kgraf-host` `tests.rs`
+`the_last_contract_s_failure_is_attributed_to_an_earlier_merge_that_broke_its_check`,
+`the_last_contract_s_failure_is_told_apart_from_a_check_that_failed_before_the_run`,
+`a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_gate`. With the base run
+gated on open contracts again, all three fail.

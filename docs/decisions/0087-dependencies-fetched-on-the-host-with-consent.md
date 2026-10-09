@@ -521,3 +521,68 @@ with the watch disabled (the install passed and the file was written).
 `a_holder_still_running_after_a_kill_is_reported_with_the_kill`,
 `a_failed_watch_fails_the_install`. `kgraf-sandbox` `lifecycle.rs`:
 `holders_started_since_names_new_holders_with_their_group`.
+
+## Amendment (2026-10-09): a worker's package download is refused in every mode, with what allows it
+
+A plan can hold a contract that only installs and checks: a Terminal-Bench `pypi-server` plan's
+`c3-install-verify` runs `pip install --index-url http://localhost:8080/simple
+vectorops==0.1.0`, then an import check, and declares no writes (decision 0030 accepts such a
+contract since 2026-10-09). On the user's machine its download met three outcomes, none of
+them a stated reason. Under a write scope the shell refused it as a command that may write
+anywhere, and the worker's shortfall report could be granted `pip` (Bypass, Orchestrator
+decides, Auto's allow set, or a person's yes). Granted, the download ran confined: with the
+network off (macOS, Linux) it failed with pip's own network error; with the network open
+(Windows) it reached the registry with no consent asked, which this decision forbids. In
+Bypass it ran the same way with no report at all.
+
+- **The rule.** Outside a disposable remote environment, a command that downloads packages is
+  refused by the command policy in every permission mode, whatever is granted
+  (`kgraf_tools::execpolicy` `package_fetch`; `ExecPolicy::evaluate` checks a command the
+  build allowlist does not list, before any grant is read). An allowlisted build, the user's
+  configured commands included, is not read for one: it runs with the network off and is the
+  user's choice. The install and fetch forms of pip
+  (and `python -m pip`), uv, pipx, poetry, conda, npm, pnpm, yarn, bun, cargo (`install`,
+  `fetch`), gem, bundler, go (`get`, `mod download`), composer and the .NET CLI (`restore`,
+  `add package`, `tool install`) count, as the call itself, behind a wrapper (`env pip
+  install`), inside a script (`sh -c 'cd web && npm ci'`), and in a recipe or script file a
+  call runs. A form that says it stays offline (`pip install --no-index`, `--offline`,
+  cargo's `--frozen`) is left to the policy.
+- **The refusal says why and what allows it.** It names the command and its registry, says
+  the network is off in a worker's shell, that kGraf fetches or installs a project's
+  dependencies itself, on the host, with the project's consent, and that no mode or grant
+  lifts it. Then the setting: for `cargo fetch`, `kgraf deps allow` or `--fetch-deps`; for a
+  package manager kGraf installs for, declare the package in the project's dependency files
+  and run `kgraf deps allow <name>` (`python`, `npm`, `go`, `bundler`, `composer`, `dotnet`)
+  or pass `--fetch-deps`, or install it before the run; for a program installed for the user
+  (`cargo install`, `pipx install`, `uv tool install`, `gem install`, `dotnet tool install`)
+  and for conda, install it before the run.
+- **A report of it is held, not granted.** A permission shortfall grounded in such a refusal
+  holds the contract at once with the refusal's words ("a worker of this contract needs `pip`
+  to download packages, which no grant allows: ..."): a grant would start an attempt the
+  policy refuses again. No attempt is spent on it.
+- **Where downloads still run.** A run whose commands execute in a disposable remote
+  environment (`kgraf_tools::remote_policy`, the Terminal-Bench bridge) and an unrestricted
+  shell (a disposable container) decide a download like any command
+  (`ExecPolicy::with_package_downloads`).
+
+Alternatives. Widening the allowlist for a check-only contract was rejected: a contract's
+shape does not make a download safe, and this decision gives the fetch to the host, not a
+worker. A refusal at plan intake was rejected: whether a contract needs a download is in its
+instruction's prose, and reading prose for commands refused correct plans before (decision
+0030, amended 2026-10-09). A setup step that runs a contract's install on the host was
+rejected: the run-start install already covers what the project's dependency files declare,
+with consent, and an undeclared package (a local index's `vectorops`) is the task's own
+environment, which belongs in a disposable environment, not on the user's machine.
+
+Known limits: a global option with a value before the subcommand (`npm --prefix web install`)
+hides the subcommand from the reading; the sandbox's network denial still stands behind it on
+macOS and Linux. A package runner that downloads to run (`npx`, `uvx`, `pipx run`) is not
+counted; it stays with the command policy's other rules.
+
+Tests: `kgraf-tools` `execpolicy::policy`
+`a_package_download_is_refused_under_every_grant_outside_a_disposable_environment`;
+`execpolicy::package_fetch`; `shell` `build_allowlist`
+`an_allowlisted_command_is_a_sandboxed_build_and_nothing_else_is`; `kgraf-host`
+`shortfall_tests.rs` `a_package_download_is_refused_and_held_with_what_allows_it_never_granted`.
+With the policy check disabled, the policy and shell tests fail; with the shortfall hold
+disabled, the hosted test fails.

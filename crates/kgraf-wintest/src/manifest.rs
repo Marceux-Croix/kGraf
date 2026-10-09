@@ -246,6 +246,14 @@ pub const CORE: &[(&str, &[&str], f64)] = &[
 /// estimate corrects itself from the observed rate).
 pub const EXTENDED_SECS_PER_TEST: f64 = 0.15;
 
+/// Extended binaries whose tests are slow on Windows, with the seconds per
+/// test measured there. The time limit of a binary follows its expected
+/// time ([`crate::runner::limit_for`]), so a binary left at the default rate
+/// is cut off before it ends and its later tests are never reported.
+/// `kgraf_host#rest`: each test starts git and worker runs; 428 of its tests
+/// took the whole 600 s limit and it was still running.
+pub const MEASURED_SECS_PER_TEST: &[(&str, f64)] = &[("kgraf-host/lib/kgraf_host#rest", 1.4)];
+
 /// One test binary or program from cargo's `--message-format=json` output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Artifact {
@@ -398,6 +406,11 @@ pub fn plan_from_messages(
             }
         }
     }
+    for r in &mut runs {
+        if let Some((_, secs)) = MEASURED_SECS_PER_TEST.iter().find(|(id, _)| *id == r.id) {
+            r.secs_per_test = *secs;
+        }
+    }
     // Core first, in the order of the CORE table; then the rest by id.
     let order = |r: &TestRun| {
         let core_pos = CORE
@@ -501,6 +514,8 @@ mod tests {
         assert!(host_core.filters.contains(&"network_notice".to_owned()));
         let host_rest = &runs[3];
         assert_eq!(host_rest.set, Set::Extended);
+        assert_eq!(host_rest.secs_per_test, 1.4, "the measured Windows rate");
+        assert_eq!(runs[2].secs_per_test, EXTENDED_SECS_PER_TEST);
         assert!(host_rest.filters.is_empty());
         // The rest skips what the core set runs, and the cargo-built tests.
         assert!(

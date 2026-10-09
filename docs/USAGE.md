@@ -78,6 +78,16 @@ kgraf deps refuse npm      # never run it; runs go on without it and say so
 kgraf deps reset npm       # forget the answer; the next run that needs it asks
 ```
 
+A worker never downloads packages itself. Its shell has the network off, and a command that
+downloads (`pip install`, `npm ci`, `go get`, `cargo fetch`, `cargo install`, and the install
+forms of uv, pipx, poetry, conda, pnpm, yarn, bun, gem, bundler, composer and `dotnet`) is
+refused in every permission mode, Bypass included, whatever is granted (decision 0087, amended
+2026-10-09). The refusal names the setting that allows the work: `kgraf deps allow` for
+crates.io, or a package declared in the project's dependency files with `kgraf deps allow
+<name>` (or `--fetch-deps` for one run), or an install you make before the run. A worker that
+reports it short holds its contract with that reason; nothing is granted. Only a run whose
+commands execute in a disposable remote environment lets a worker download.
+
 The package managers are `npm` (also pnpm, Yarn and Bun), `python`, `go`, `maven`, `gradle`,
 `dotnet`, `composer` and `bundler`.
 
@@ -712,7 +722,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   placeholder checks, its verdict reads `<command> (deferred to the root gate)`, and a notice
   names the contract and the contracts not merged. The last contract is checked whole, and the
   run completes only when the root gate passes. A command that passes at the dispatch base and
-  fails on the attempt was broken by the attempt: that is a failure, never deferred.
+  fails on the attempt was broken by the attempt: that is a failure, never deferred. A command
+  that fails on the attempt and at its dispatch base with nothing to defer to (the last
+  contract, or no root gate) is still a failure, and its reason says why: an earlier merge of
+  the run broke it (it passes at the run's original base, and the contracts merged since are
+  named), or it failed before the run's work.
 - A worker's round budget (`worker --budget`, default 12; orchestrated workers 30) is a
   checkpoint, not a wall (decision 0096). Near the end of each block of that many rounds,
   kGraf measures what the worker did since the last checkpoint: files changed on net, its
@@ -929,8 +943,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
     contract and never asks you. It refuses after two re-dispatches, when a grant did not help,
     for a tool, and for a path outside the repository or one no worker may write.
   - **Bypass**: everything is granted without asking: workers' shell commands run under a write
-    scope, except the few the policy forbids. It offers no protection against prompt injection
-    or unintended actions. Workers may also write the repository's git directory (a patch to
+    scope, except the few the policy forbids and package downloads (see "Set up a project").
+    It offers no protection against prompt injection or unintended actions. Workers may also write the repository's git directory (a patch to
     `.git/info/exclude`, `.git/config` or a ref, or, on macOS, any shell command) and kGraf's settings files `.kgraf/run.json` and `.kgraf/worker.json`. Before the first such write,
     kGraf copies the refs, config and index (at most 32 MiB) or the settings file; after each
     write it checks that the repository still reads (every ref resolves, the config parses,

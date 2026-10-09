@@ -1147,7 +1147,7 @@ whole-suite runner kGraf recognizes (`unittest discover`, `pytest`, `node
 workspace), each attempt runs only the tests that belong to its declared
 files by the runner's naming convention, and the brief names that command.
 The whole command is added as a root gate when it is not one already, so it
-judges the merged result. The acceptance command is a root gate in every case, narrowable or not (decision 0018). A whole command that fails on an attempt while other contracts of the plan are open, and also fails at the attempt's dispatch base, is deferred to that root gate for that contract: the attempt merges after its scope and placeholder checks, with a verdict and a notice that say so, and the run completes only when the root gate passes. A command the attempt broke (it passes at the dispatch base) is a failure; the last open contract is checked whole. Anything else runs whole, as do gate remediations; the brief then still names the whole
+judges the merged result. The acceptance command is a root gate in every case, narrowable or not (decision 0018). A whole command that fails on an attempt while other contracts of the plan are open, and also fails at the attempt's dispatch base, is deferred to that root gate for that contract: the attempt merges after its scope and placeholder checks, with a verdict and a notice that say so, and the run completes only when the root gate passes. A command the attempt broke (it passes at the dispatch base) is a failure; the last open contract is checked whole. A failing whole check of every committed attempt runs at the dispatch base, open contracts or not, so the verdict of the last contract, or of a run with no root gate, says whether an earlier merge of the run broke the check (it passes at the run's original base) or the check failed before the run's work (decision 0018). Anything else runs whole, as do gate remediations; the brief then still names the whole
 command as what the attempt is judged by, calls the contract's Acceptance line advisory,
 and says `todo!()` panics and failing tests in other contracts' unfinished code are not the
 worker's to fix, while a compile error anywhere that the worker's change caused is its own.
@@ -1460,7 +1460,7 @@ one live setting that only the user sets, from the box's dropdown, the
 user-level `permissions.toml` or the command line: Manual asks the user,
 Accept edits grants file edits, Auto grants the user's allow set, Orchestrator
 decides lets the orchestrator grant or refuse each request without asking, and
-Bypass grants everything. Where a mode or a contract's grant covers named
+Bypass grants everything. A command that downloads packages (`pip install`, `npm ci`, `cargo fetch`) is the exception: outside a disposable remote environment it is refused in every mode and under every grant, with a reason that names the setting that allows the work, and a shortfall report of it holds the contract instead of granting the program (decision 0087, amended 2026-10-09). Where a mode or a contract's grant covers named
 programs, an `sh -c` script of simple commands is granted when a grant covers
 every command's program, as Claude Code allows a compound command; a script
 with substitution, a subshell, backgrounding or a redirection outside the

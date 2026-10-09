@@ -1142,6 +1142,20 @@ pub fn ground_report(
     }
 }
 
+/// The held reason for a permission report grounded in a refused package
+/// download (decision 0087, amended 2026-10-09): the command policy refuses
+/// it whatever is granted, so the contract is held with the refusal, which
+/// says what allows the work, instead of being granted `program`.
+pub fn package_fetch_hold(program: &str, refusal: &str) -> String {
+    let why = refusal
+        .split_once("forbidden by command policy: ")
+        .map_or(refusal, |(_, why)| why);
+    format!(
+        "a worker of this contract needs `{program}` to download packages, which no grant \
+         allows: {why}"
+    )
+}
+
 /// The held reason for a permission report a skill refuses.
 pub fn skill_hold_reason(refusal: &str) -> String {
     format!(

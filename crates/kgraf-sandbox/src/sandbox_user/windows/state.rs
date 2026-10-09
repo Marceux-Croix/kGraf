@@ -15,12 +15,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use super::super::names::{MAX_SLOTS, OwnerNames, Role};
+use super::super::names::{OwnerNames, Role};
 use super::super::password::Password;
 use super::super::runner::RUNNER_NAME;
 use super::super::slots::{Lease, Leases, Pool};
-use super::super::store::{credentials_path, grants_path, missing_store, slots_dir};
-use super::{accounts, setup::stored_user};
+use super::super::store::{
+    credentials_path, grants_path, load_slot_users, missing_store, slots_dir,
+};
+use super::{accounts, dpapi::Dpapi, setup::stored_user};
 use crate::error::SandboxError;
 
 /// Names the sandbox users of a test run (`kgraf sandbox setup --tag`), so
@@ -264,29 +266,17 @@ fn load() -> Result<Option<Users>, SandboxError> {
     }))
 }
 
-/// The stored users of `role(0)`, `role(1)`, and on, up to the first one
-/// missing. A store that names a later one past that gap is refused.
+/// The stored slot users of `role(0)`, `role(1)`, and on
+/// ([`load_slot_users`]). Read only after the offline user was found, so the
+/// store exists.
 fn stored_slots(
     store: &Path,
     role: fn(u8) -> Role,
 ) -> Result<Vec<(super::super::blob::StoredUser, Password)>, SandboxError> {
-    let mut found = Vec::new();
-    for i in 0..MAX_SLOTS {
-        match stored_user(store, role(i))? {
-            Some(user) => found.push(user),
-            None => break,
-        }
-    }
-    for i in u8::try_from(found.len()).unwrap_or(u8::MAX)..MAX_SLOTS {
-        if stored_user(store, role(i))?.is_some() {
-            return Err(error(format!(
-                "the stored passwords file names {} but not every slot below it; run `kgraf \
-                 sandbox setup` again",
-                role(i)
-            )));
-        }
-    }
-    Ok(found)
+    let bytes = std::fs::read(store)
+        .map_err(|e| error(format!("read the stored sandbox passwords: {e}")))?;
+    load_slot_users(&bytes, role, &Dpapi)
+        .map_err(|e| error(format!("open the stored sandbox passwords: {e}")))
 }
 
 /// The runner beside `exe`; for a test binary in Cargo's `deps` folder, the

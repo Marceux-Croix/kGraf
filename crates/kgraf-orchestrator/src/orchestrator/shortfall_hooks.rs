@@ -27,7 +27,8 @@ use super::*;
 use crate::challenge::ContractReply;
 use crate::shortfall::{
     Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind,
-    decide_in_plan, instructions_answer, path_answer, skill_hold_reason, stored,
+    decide_in_plan, instructions_answer, package_fetch_hold, path_answer, skill_hold_reason,
+    stored,
 };
 
 /// The longest part of a failed check quoted in a shortfall's hold, in
@@ -162,6 +163,13 @@ impl RunLoop {
                 with = others;
                 if scope == RequestScope::File {
                     plan_shape_hold = self.member_hold(&contract_id, &subject);
+                }
+                // Decision 0087, amended 2026-10-09: a package download is
+                // refused whatever is granted, so a grant would only start an
+                // attempt the policy refuses again. Held with the refusal,
+                // which says what allows the work.
+                if kgraf_tools::execpolicy::is_package_fetch_refusal(&reason) {
+                    plan_shape_hold = Some(package_fetch_hold(&subject, &reason));
                 }
                 let answer = (scope == RequestScope::File && plan_shape_hold.is_none())
                     .then(|| path_answer(&subject, &contract, &self.record.open_contracts, &reason))

@@ -69,6 +69,10 @@ pub(super) enum Worker {
     /// `cli/Cargo.toml` (see [`Script::root`]), tries to write
     /// `cli/Cargo.toml`, is refused, and reports a file shortfall for it.
     NeedsLaterMember,
+    /// Runs `pip install vectorops` (a package download), is refused, and
+    /// reports a permission shortfall naming `pip`; with a grant, runs it
+    /// again.
+    Downloads,
 }
 
 pub(super) struct Script {
@@ -309,6 +313,17 @@ impl Provider for Script {
                     )),
                     _ => None,
                 },
+                (Worker::Downloads, _, 0) => Some(tool(
+                    "shell",
+                    serde_json::json!({"command": ["pip", "install", "vectorops"]}),
+                    round,
+                )),
+                (Worker::Downloads, _, 1) => {
+                    let mut input = report();
+                    input["need"] = "pip".into();
+                    input["why"] = "the contract installs vectorops and checks the import".into();
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, input, round))
+                }
                 (Worker::RunsScript, _, 0) => Some(tool("shell", script(), round)),
                 (Worker::RunsScript, _, 1) if !seen.contains("exit status: 0") => {
                     let mut input = report();
@@ -841,6 +856,47 @@ async fn baseless_reports_are_answered_twice_then_the_attempt_is_stuck() {
         trace.contains(r#""kind":"stuck""#) || trace.contains("ends as stuck"),
         "{trace}"
     );
+}
+
+/// Decision 0087, amended 2026-10-09: a package download is refused in
+/// every mode, Bypass included, and a worker that reports it short is not
+/// granted `pip` (the next attempt would be refused again): the contract is
+/// held at once with the refusal, which says why and what allows the work.
+/// Before, Bypass ran the download as a confined command, and a grant in
+/// another mode re-dispatched an attempt that ran it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_package_download_is_refused_and_held_with_what_allows_it_never_granted() {
+    for (mode, id) in [
+        (kgraf_tools::PermissionMode::Bypass, "sf-pip-bypass"),
+        (
+            kgraf_tools::PermissionMode::OrchestratorDecides,
+            "sf-pip-od",
+        ),
+    ] {
+        let (report, trace, script) = run(Worker::Downloads, control(mode), "true", id).await;
+        assert!(
+            matches!(report.status, kgraf_orchestrator::RunStatus::Blocked { .. }),
+            "{mode}: {report:?}\n{trace}"
+        );
+        let lines = shortfall_lines(&trace);
+        assert_eq!(lines.len(), 1, "{mode}: {trace}");
+        assert!(
+            lines[0].contains("needs `pip` to download packages, which no grant allows"),
+            "{mode}: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("decision 0087"), "{}", lines[0]);
+        assert!(lines[0].contains("kgraf deps allow python"), "{}", lines[0]);
+        assert!(
+            !script.saw_grant.load(Ordering::SeqCst),
+            "{mode}: never granted"
+        );
+        assert_eq!(
+            script.attempts.load(Ordering::SeqCst),
+            1,
+            "{mode}: no attempt re-dispatched for a grant that cannot help"
+        );
+    }
 }
 
 /// Disjoint writes hold in Bypass: contract `a`'s worker is refused

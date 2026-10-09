@@ -195,6 +195,60 @@ fn passes_at(
     Ok(passed)
 }
 
+/// What the verdict of an attempt says when its whole check also fails at
+/// its dispatch base and nothing is deferred (the plan's last contract, or
+/// no root gate): which merges of this run the base holds, and whether the
+/// check passed where the run started. Passing there means one of those
+/// earlier deliveries broke it; failing there too means it failed before the
+/// run's work. Either way the failure is not this attempt's change alone,
+/// and the worker, the retry brief and the hold reason are told so. One more
+/// run of the command, at the run's original base, and only when an earlier
+/// merge exists.
+fn base_attribution(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    branch: &str,
+    dispatch_base: &str,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+) -> String {
+    let earlier =
+        match crate::earlier_delivery::merged_before(manager.repo(), branch, dispatch_base) {
+            Ok(earlier) => earlier,
+            Err(e) => {
+                return format!(
+                    "\n(it also fails at the dispatch base, so the failure is not this attempt's \
+                 change alone; which earlier merge of this run it comes from could not be read: \
+                 {e})"
+                );
+            }
+        };
+    if earlier.contracts.is_empty() {
+        return "\n(it also fails at the dispatch base, where no contract of this run had merged \
+                yet: it failed before this run's work, not because of this attempt's change)"
+            .into();
+    }
+    let short: String = earlier.original_base.chars().take(12).collect();
+    let contracts = clean(&earlier.contracts.join(", "));
+    match passes_at(manager, &earlier.original_base, denies, command, timeout) {
+        Ok(true) => format!(
+            "\n(it also fails at the dispatch base and passes at the run's original base \
+             {short}, so an earlier merge of this run broke it before this attempt started: the \
+             dispatch base holds the merges of contracts {contracts})"
+        ),
+        Ok(false) => format!(
+            "\n(it also fails at the dispatch base and at the run's original base {short}: it \
+             failed before this run's work, not because of this attempt's change; the merges of \
+             contracts {contracts} did not make it pass)"
+        ),
+        Err(e) => format!(
+            "\n(it also fails at the dispatch base, which holds the merges of contracts \
+             {contracts}, so the failure is not this attempt's change alone; it could not be run \
+             at the run's original base {short} to tell whether one of them broke it: {e})"
+        ),
+    }
+}
+
 /// What a worker checked by the whole command is told about deferral.
 pub(crate) const DEFERRED_BRIEF: &str = "If that command can only pass once other contracts \
      of the plan have merged (it also fails on the tree you were given), it is checked on the \
@@ -854,27 +908,45 @@ impl Verifier for CommandVerifier {
             // the same command on the merged result before the run can
             // complete. Only a committed (non-empty) attempt, whose scope and
             // placeholder checks above passed, is deferred.
+            //
+            // The run at the dispatch base is made for every such failure,
+            // not only when contracts are open: for the plan's last contract
+            // (or without a root gate) nothing is deferred, but whether the
+            // base already fails is what tells an earlier delivery's break
+            // from this attempt's own. The verdict stays a failure; its
+            // reason says which (`base_attribution`).
             let mut deferred: Option<String> = None;
-            let defers = !passed
+            let at_base = !passed
                 && failing == command
                 && commit.is_some()
                 && contract.gate_commands.is_empty()
-                && matches!(scope, crate::scoped_check::Scope::Whole { .. })
-                && !unmerged.is_empty();
-            if defers {
+                && matches!(scope, crate::scoped_check::Scope::Whole { .. });
+            if at_base {
                 match passes_at(&manager, ws.head(), &denies, &command, timeout) {
-                    Ok(false) => {
+                    Ok(false) if !unmerged.is_empty() => {
                         deferred = Some(clean_lines(&output));
                         passed = true;
                     }
+                    Ok(false) => output.push_str(&base_attribution(
+                        &manager,
+                        merge_back.integration_branch(),
+                        ws.head(),
+                        &denies,
+                        &command,
+                        timeout,
+                    )),
                     Ok(true) => output.push_str(
                         "\n(it passes at the dispatch base, so this attempt's change makes it \
                          fail)",
                     ),
-                    Err(e) => output.push_str(&format!(
+                    Err(e) if !unmerged.is_empty() => output.push_str(&format!(
                         "\n(it could not be run at the dispatch base to tell whether the \
                          contracts not merged yet ({}) cause the failure: {e})",
                         unmerged.join(", ")
+                    )),
+                    Err(e) => output.push_str(&format!(
+                        "\n(it could not be run at the dispatch base to tell whether an \
+                         earlier merge of this run causes the failure: {e})"
                     )),
                 }
             }

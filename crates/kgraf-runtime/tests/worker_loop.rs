@@ -2964,9 +2964,11 @@ async fn a_write_by_a_contract_that_declares_no_writes_names_the_plan_shape() {
         })
         .collect();
     assert_eq!(refusals.len(), 2, "{refusals:?}");
+    // The refusal names the path in the platform's own form.
+    let named = std::path::Path::new("dist").join("index.html");
     let write = refusals
         .iter()
-        .find(|o| o.contains("dist/index.html"))
+        .find(|o| o.contains(&*named.to_string_lossy()))
         .unwrap_or_else(|| panic!("{refusals:?}"));
     // The phrase other readers key on stays.
     assert!(
