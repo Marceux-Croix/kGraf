@@ -39,6 +39,7 @@
 
 pub mod acl;
 pub mod blob;
+pub mod dns_check;
 pub mod firewall;
 pub mod handshake;
 pub mod names;
@@ -48,6 +49,7 @@ pub mod record;
 pub mod runner;
 pub mod slots;
 pub mod store;
+pub mod wfp;
 #[cfg(windows)]
 pub mod windows;
 
@@ -67,6 +69,7 @@ pub use store::{
     LoadError, credentials_file_name, credentials_path, grants_path, load_user, parse_grants,
     slots_dir,
 };
+pub use wfp::{DNS_RESOLVER_INTERFACE, WfpKeys, WfpObject};
 
 /// What `kgraf sandbox setup` prints on a platform that needs no setup.
 pub fn no_setup_needed_notice() -> String {

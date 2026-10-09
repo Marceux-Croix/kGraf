@@ -18,9 +18,17 @@
 //! token sandbox the network cannot be confined (decision 0011): the check
 //! runs with the network open, prints a `network: not confined` line that is
 //! not a pass, and still exits 0 when the other steps pass.
+//!
+//! With the sandbox user the check also proves DNS confinement: a name lookup
+//! by the sandbox user goes through the DNS Client service, which the firewall
+//! rules do not see. The `dns:` line passes only when the lookup reached no
+//! server and the service did not look the name up
+//! (`kgraf_sandbox::sandbox_user::dns_check`); anything else is a failed line
+//! and the check exits with an error.
 
 use anyhow::{Result, bail};
 use kgraf_sandbox::Backend;
+use kgraf_sandbox::sandbox_user::dns_check::DnsVerdict;
 
 /// The marker the local origin answers with.
 const ORIGIN_BODY: &str = "selfcheck-ok";
@@ -97,12 +105,48 @@ fn verdict(backend: Backend, code: Option<i32>) -> Result<NetworkResult, String>
     }
 }
 
-/// The lines printed for a pass. The first is `sandbox selfcheck: ok` only
-/// when every step was proved.
-fn report_lines(backend: Backend, network: NetworkResult) -> Vec<String> {
-    let first = match network {
-        NetworkResult::Confined => "sandbox selfcheck: ok",
-        NetworkResult::NotConfined => "sandbox selfcheck: passed with a gap",
+/// What the check learned about name lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DnsResult {
+    /// No DNS step for this backend: on macOS and Linux a proxy-only command
+    /// reaches no resolver by construction (no resolver socket, no route out
+    /// of the network namespace), and this check does not probe it. No line.
+    NotChecked,
+    /// The token sandbox leaves the network, and so DNS, open.
+    OpenUnderTokenSandbox,
+    /// The sandbox user: judged from a real lookup. Built only on Windows;
+    /// the tests build it on every host.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Judged(DnsVerdict),
+}
+
+impl DnsResult {
+    /// Whether this result fails the whole check.
+    fn failed(&self) -> bool {
+        matches!(self, DnsResult::Judged(v) if !v.passed())
+    }
+
+    fn line(&self) -> Option<String> {
+        match self {
+            DnsResult::NotChecked => None,
+            DnsResult::OpenUnderTokenSandbox => {
+                Some("  dns: not confined (token sandbox; run `kgraf sandbox setup`)".to_owned())
+            }
+            DnsResult::Judged(v) => Some(format!("  {v}")),
+        }
+    }
+}
+
+/// The lines printed once the probe passed. The first is
+/// `sandbox selfcheck: ok` only when every step was proved, and
+/// `sandbox selfcheck: failed` when the DNS step failed or proved nothing.
+fn report_lines(backend: Backend, network: NetworkResult, dns: &DnsResult) -> Vec<String> {
+    let first = if dns.failed() {
+        "sandbox selfcheck: failed"
+    } else if network == NetworkResult::Confined && *dns != DnsResult::OpenUnderTokenSandbox {
+        "sandbox selfcheck: ok"
+    } else {
+        "sandbox selfcheck: passed with a gap"
     };
     let net = match network {
         NetworkResult::Confined => "  network: only the egress proxy was reachable",
@@ -110,13 +154,68 @@ fn report_lines(backend: Backend, network: NetworkResult) -> Vec<String> {
             "  network: not confined (token sandbox; run `kgraf sandbox setup`)"
         }
     };
-    vec![
+    let mut lines = vec![
         first.to_owned(),
         format!("  backend: {}", backend_name(backend)),
         net.to_owned(),
-        "  hidden folder: not writable".to_owned(),
-        "  tree: writable".to_owned(),
-    ]
+    ];
+    lines.extend(dns.line());
+    lines.push("  hidden folder: not writable".to_owned());
+    lines.push("  tree: writable".to_owned());
+    lines
+}
+
+/// The DNS step under the sandbox user: the owner looks up a control name,
+/// the sandbox user looks up a probe name under `policy`, and the owner asks
+/// the DNS Client cache about both and about a third, new name. The verdict
+/// is `kgraf_sandbox::sandbox_user::dns_check::judge`.
+#[cfg(windows)]
+fn dns_check(
+    proxy: &kgraf_sandbox::egress::EgressProxy,
+    policy: &kgraf_sandbox::SandboxPolicy,
+    tree: &std::path::Path,
+) -> Result<DnsVerdict> {
+    use anyhow::Context;
+    use kgraf_sandbox::sandbox_user::dns_check::{
+        DnsEvidence, judge, parse_probe, probe_name, probe_script,
+    };
+    use kgraf_sandbox::sandbox_user::windows::dns::query;
+    use kgraf_sandbox::{Redirect, sandboxed_command};
+
+    let fresh = || probe_name().context("make a probe name");
+    let (control, probe, unseen) = (fresh()?, fresh()?, fresh()?);
+    let control_status = query(&control, false);
+    let script = probe_script(&probe).context("the probe name")?;
+    // Windows PowerShell 5.1 ships with every supported Windows at a fixed
+    // path, so no PATH lookup decides which program runs.
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let powershell =
+        std::path::Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut cmd = sandboxed_command(policy, &powershell, tree)
+        .context("the sandbox refused the DNS probe")?;
+    for (k, v) in proxy.env() {
+        cmd.env(k, v);
+    }
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Redirect::Piped)
+        .stderr(Redirect::Piped);
+    let out = run_command(proxy, &mut cmd)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let probe_result = parse_probe(&stdout).ok_or_else(|| {
+        format!(
+            "status {:?}; {} {}",
+            out.status.code(),
+            stdout.trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    });
+    Ok(judge(&DnsEvidence {
+        control: control_status,
+        probe: probe_result,
+        cache_known: query(&control, true),
+        cache_fresh: query(&unseen, true),
+        cache_probe: query(&probe, true),
+    }))
 }
 
 /// A listener for the local origin on a port the command must not reach
@@ -228,8 +327,23 @@ pub fn selfcheck() -> Result<()> {
     let out = run_command(&proxy, &mut cmd)?;
     match verdict(backend, out.status.code()) {
         Ok(network) => {
-            for line in report_lines(backend, network) {
+            let dns = match backend {
+                Backend::WindowsRestrictedToken => DnsResult::OpenUnderTokenSandbox,
+                #[cfg(windows)]
+                Backend::WindowsSandboxUser => {
+                    DnsResult::Judged(dns_check(&proxy, &policy, &tree)?)
+                }
+                _ => DnsResult::NotChecked,
+            };
+            for line in report_lines(backend, network, &dns) {
                 println!("{line}");
+            }
+            if dns.failed() {
+                bail!(
+                    "sandbox selfcheck failed (backend: {}): {}",
+                    backend_name(backend),
+                    dns.line().unwrap_or_default().trim()
+                );
             }
             Ok(())
         }
@@ -295,7 +409,7 @@ pub fn setup(tag: Option<&str>, slots: u8) -> Result<()> {
         let store = credentials_path(tag)?;
         let exe = launch_exe()?;
         println!(
-            "kGraf asks Windows for administrator rights once, to create its sandbox users and firewall rules."
+            "kGraf asks Windows for administrator rights once, to create its sandbox users, firewall rules and DNS filter."
         );
         setup(
             &names,
@@ -352,7 +466,7 @@ pub fn remove(tag: Option<&str>) -> Result<()> {
             &store,
             &mut |e| print_event(&names, e),
         )?;
-        println!("The Windows sandbox user and its firewall rules are removed.");
+        println!("The Windows sandbox user, its firewall rules and its DNS filter are removed.");
         Ok(())
     }
     #[cfg(not(windows))]
@@ -496,11 +610,16 @@ mod tests {
     #[test]
     fn a_pass_prints_the_backend_and_only_a_full_pass_says_ok() {
         for backend in ALL {
-            let lines = report_lines(backend, NetworkResult::Confined);
+            let lines = report_lines(backend, NetworkResult::Confined, &DnsResult::NotChecked);
             assert_eq!(lines[0], "sandbox selfcheck: ok");
             assert!(lines.contains(&format!("  backend: {}", backend_name(backend))));
+            assert!(!lines.iter().any(|l| l.contains("dns:")), "{lines:?}");
         }
-        let gap = report_lines(Backend::WindowsRestrictedToken, NetworkResult::NotConfined);
+        let gap = report_lines(
+            Backend::WindowsRestrictedToken,
+            NetworkResult::NotConfined,
+            &DnsResult::OpenUnderTokenSandbox,
+        );
         assert_ne!(gap[0], "sandbox selfcheck: ok");
         assert!(
             gap.contains(
@@ -508,7 +627,53 @@ mod tests {
             ),
             "{gap:?}"
         );
+        assert!(
+            gap.contains(
+                &"  dns: not confined (token sandbox; run `kgraf sandbox setup`)".to_owned()
+            ),
+            "{gap:?}"
+        );
         assert!(!gap.iter().any(|l| l.contains("only the egress proxy")));
+    }
+
+    /// Under the sandbox user the `dns:` line passes only when the lookup was
+    /// proved confined. A leak, or a run that proved nothing, prints a failed
+    /// line and fails the whole check, never `ok`.
+    #[test]
+    fn the_sandbox_user_says_ok_only_when_dns_was_proved_confined() {
+        let b = Backend::WindowsSandboxUser;
+        let ok = report_lines(
+            b,
+            NetworkResult::Confined,
+            &DnsResult::Judged(DnsVerdict::Confined),
+        );
+        assert_eq!(ok[0], "sandbox selfcheck: ok");
+        assert!(
+            ok.iter().any(|l| l.starts_with("  dns: confined")),
+            "{ok:?}"
+        );
+        for v in [
+            DnsVerdict::Leaked("the sandbox user's lookup got a DNS server's answer".into()),
+            DnsVerdict::NotProved("the cache cannot tell".into()),
+        ] {
+            let dns = DnsResult::Judged(v);
+            assert!(dns.failed());
+            let lines = report_lines(b, NetworkResult::Confined, &dns);
+            assert_eq!(lines[0], "sandbox selfcheck: failed", "{lines:?}");
+            assert!(!lines.iter().any(|l| l.contains("dns: confined")));
+        }
+        let leak = report_lines(
+            b,
+            NetworkResult::Confined,
+            &DnsResult::Judged(DnsVerdict::Leaked("x".into())),
+        );
+        assert!(
+            leak.iter()
+                .any(|l| l.starts_with("  dns: not confined (lookups leave the machine)")),
+            "{leak:?}"
+        );
+        assert!(!DnsResult::NotChecked.failed());
+        assert!(!DnsResult::OpenUnderTokenSandbox.failed());
     }
 
     /// Where the system allows the policy the check passes; where a Linux

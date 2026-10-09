@@ -1709,11 +1709,18 @@ What `setup` creates, for the Windows user who runs it:
 - four Windows Firewall block rules for the offline user: everything off this
   machine, inbound from off this machine, local TCP except kGraf's proxy ports
   47100 to 47131, and local UDP;
+- a DNS filter for the users the firewall rules block (the offline user and each worker
+  slot's user without the network, below): a Windows Filtering Platform (WFP) filter
+  that makes the DNS Client service refuse their name lookups. A lookup goes through
+  that service, which sends it as its own account, so the firewall rules
+  do not see it. The filter, its provider and its sublayer are named "kGraf sandbox"
+  and stay after a restart. The online users and your own account are not filtered;
 - an undo record under `%ProgramData%\kGraf\sandbox\`.
 
 The users' passwords are random, 40 characters long, and stored only for your
 Windows user, sealed with Windows' data protection (DPAPI), in kGraf's configuration
-folder. Running `setup` again resets the passwords and refreshes the rules. Setup
+folder. Running `setup` again resets the passwords and refreshes the rules and the DNS
+filter. Setup
 stops with a message if Windows Firewall is off or a group policy makes local rules
 ineffective, and it never takes over an account it did not create.
 
@@ -1734,7 +1741,21 @@ proxy. A command can write only where kGraf allows. It cannot read your Windows 
 from the toolchain and program folders kGraf grants it inside that profile.
 Without `setup`, the token sandbox described below stays in use. If the users exist but
 the runner is missing, every sandboxed command stops with an error. `kgraf sandbox remove`
-also revokes the folder permissions that kGraf added for the users.
+also revokes the folder permissions that kGraf added for the users, and deletes the DNS
+filter, its sublayer and its provider by the keys the undo record lists. It does not touch
+other WFP filters.
+
+`kgraf sandbox status` shows the DNS filter on one line, with its key:
+
+```
+  present  DNS filter <key> (WFP; the DNS Client service refuses the offline users; `kgraf sandbox selfcheck` proves the effect)
+```
+
+`MISSING` there means setup has not added it; run `kgraf sandbox setup` again. `unknown`
+means Windows did not let your account read WFP filters; run `status` as an administrator
+to see it. `present` says only that the filter exists. Only `kgraf sandbox selfcheck`
+shows that it works (below). Until a selfcheck on your machine prints `dns: confined`,
+treat name lookups by the offline user as able to leave the machine.
 
 On macOS and Linux these commands say that no setup is needed.
 
@@ -1761,9 +1782,30 @@ rules block it:
 sandbox selfcheck: ok
   backend: Windows sandbox user
   network: only the egress proxy was reachable
+  dns: confined (the sandbox user's lookup reached no DNS server, and the DNS Client service did not look the name up)
   hidden folder: not writable
   tree: writable
 ```
+
+With the sandbox user the check also proves the DNS filter by its effect. It makes three
+new names of the form `kgraf-probe-<32 hex digits>.invalid`, and then:
+
+1. Your own process looks up the first name. A DNS server's answer (the name does not
+   exist) shows that this machine reaches a DNS server.
+2. The sandbox user looks up the second name with `Resolve-DnsName` in Windows PowerShell.
+3. Your process asks the DNS Client service's cache, without sending anything, about all
+   three names. The service keeps "does not exist" for a name it looked up, so the second
+   name must look like the third (never looked up), not like the first.
+
+The `dns:` line passes only when step 2 got no DNS server's answer and step 3 shows that
+the service did not look the name up. Every other result fails the line and the whole
+check, which then starts with `sandbox selfcheck: failed` and exits non-zero:
+
+- `dns: not confined (lookups leave the machine): ...` when the sandbox user's lookup got a
+  server's answer, or the service cached its name;
+- `dns: not proved: ...` when nothing could be shown either way: this machine reached no DNS
+  server, the cache cannot tell a looked-up name from a new one, or the probe printed no
+  status. A run without a working network cannot prove DNS confinement.
 
 With the token sandbox (no setup), the Windows sandbox cannot confine the network
 (decision 0011). The check runs the command with the network open. It proves nothing about
@@ -1773,15 +1815,20 @@ the network, and it says so on a line that is not a pass:
 sandbox selfcheck: passed with a gap
   backend: Windows restricted token (token sandbox)
   network: not confined (token sandbox; run `kgraf sandbox setup`)
+  dns: not confined (token sandbox; run `kgraf sandbox setup`)
   hidden folder: not writable
   tree: writable
 ```
 
+On macOS and Linux the check prints no `dns:` line. There a command limited to the proxy
+reaches no resolver by construction, and this check does not probe it.
+
 Exit status: 0 when every step passed. A pass with the network gap above also exits 0. The
 gap is a known property of the token sandbox, and the output states it. The check exits
 non-zero, with the failing step and the backend, when any step fails. That includes a
-direct connection that works under the sandbox user, or a missing Git Bash. A script that
-must have a confined network checks that the first line is `sandbox selfcheck: ok`.
+direct connection that works under the sandbox user, a `dns:` line that is not
+`dns: confined` under the sandbox user, or a missing Git Bash. A script that must have a
+confined network checks that the first line is `sandbox selfcheck: ok`.
 
 ## Windows sandbox: checks and the worker shell run with the network open
 

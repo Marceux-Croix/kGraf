@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::super::blob::{StoredUser, decode_credentials, decode_users, encode_credentials};
-use super::super::firewall::offline_rules;
+use super::super::firewall::{offline_rules, rule_users};
 use super::super::handshake::{Event, Message, Receiver, StepOutcome, new_nonce, pipe_name};
 use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
@@ -20,7 +20,8 @@ use super::super::plan::{
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
 use super::super::slots::read_table;
 use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
-use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure};
+use super::super::wfp::{WfpKeys, filter_users, guid_text};
+use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure, wfp};
 use crate::error::SandboxError;
 
 fn setup_error(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
@@ -95,6 +96,10 @@ pub fn observe(names: &OwnerNames, with_rights: bool) -> Result<Observed, Sandbo
             Some(sid) => secure::is_closed(Path::new(&folder), sid).ok(),
         };
         o.closed.insert(folder, closed);
+    }
+    match wfp::existing(&WfpKeys::derive(names)) {
+        Ok(found) => o.wfp = found,
+        Err(why) => o.wfp_unreadable = Some(why),
     }
     Ok(o)
 }
@@ -271,7 +276,7 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                 .and_then(|s| s.ok_or_else(|| setup_error("find a sandbox user", "missing")))
                 .and_then(|sid| accounts::add_rights(&sid, &DENIED_LOGON_RIGHTS)),
             StepId::Hide(role) => accounts::hide(&names.user(role)),
-            StepId::Rule(purpose) => blocked_sids(names).and_then(|sids| {
+            StepId::Rule(purpose) => sids_of(&rule_users(names)).and_then(|sids| {
                 let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
                 offline_rules(names, &refs)
                     .into_iter()
@@ -280,6 +285,10 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                     .and_then(|spec| firewall::put(&spec))
             }),
             StepId::CloseFolders => close_folders(names, &mut record, &path),
+            StepId::DnsFilter => sids_of(&filter_users(names)).and_then(|sids| {
+                let refs: Vec<&str> = sids.iter().map(String::as_str).collect();
+                wfp::put(names, &refs)
+            }),
             StepId::Record => Ok(()),
         };
         done.map_err(|e| fail(&key, &e))?;
@@ -333,6 +342,7 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
                 UndoEntry::Group(n) => accounts::delete_group(n).map(drop),
                 UndoEntry::User(n) => accounts::delete_user(n).map(drop),
                 UndoEntry::Closed { sid, path } => secure::reopen_folder(Path::new(path), sid),
+                UndoEntry::Wfp { object, key } => wfp::remove(*object, *key).map(drop),
             };
             done.map_err(|e| fail(&key, &e))?;
             StepOutcome::Removed
@@ -358,6 +368,7 @@ fn undo_key(e: &UndoEntry) -> String {
         UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
         UndoEntry::Rule(n) => format!("remove-rule:{n}"),
         UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
+        UndoEntry::Wfp { object, key } => format!("remove-{}:{}", object.key(), guid_text(*key)),
     }
 }
 
@@ -408,17 +419,15 @@ fn drive(
     Ok(receiver)
 }
 
-/// The SIDs of every user whose network the firewall rules block: the
-/// offline user and each worker slot's user. One rule names them all, so the
-/// rule names stay the same whatever the slot count is.
-fn blocked_sids(names: &OwnerNames) -> Result<Vec<String>, SandboxError> {
-    names
-        .roles()
-        .into_iter()
-        .filter(|r| r.blocked())
-        .map(|role| {
-            let user = names.user(role);
-            accounts::sid_of(&user)?
+/// The SIDs of `users`, each of which setup has made by now. The firewall
+/// rules name [`rule_users`] and the DNS filter [`filter_users`]: the offline
+/// user and each worker slot's user without the network. One rule names them
+/// all, so the rule names stay the same whatever the slot count is.
+fn sids_of(users: &[String]) -> Result<Vec<String>, SandboxError> {
+    users
+        .iter()
+        .map(|user| {
+            accounts::sid_of(user)?
                 .ok_or_else(|| setup_error("find a sandbox user", format!("{user} is missing")))
         })
         .collect()

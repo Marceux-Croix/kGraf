@@ -82,12 +82,18 @@ junction = { version = "2.1.0", default-features = false }
 # the sandbox user's runner starts in the system folder (`GetSystemDirectoryW`).
 # `Win32_System_Diagnostics_ToolHelp`: the runner lists its own threads to
 # protect each one (`CreateToolhelp32Snapshot`).
+# `Win32_NetworkManagement_WindowsFilteringPlatform` and `Win32_System_Rpc`: the
+# setup's DNS filter (`sandbox_user/windows/wfp.rs`; `FwpmEngineOpen0` takes an
+# RPC identity type). `Win32_NetworkManagement_Dns`: the DNS check of
+# `kgraf sandbox selfcheck` (`DnsQuery_W`).
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_Dns",
     "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Security",
     "Win32_Security_Authentication_Identity",
     "Win32_Security_Authorization",
@@ -100,6 +106,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_Rpc",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",

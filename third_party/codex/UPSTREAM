@@ -279,3 +279,18 @@ handshake has one deadline and ends the job when it passes.
 Followed in design, not copied: the alternate window station for an untrusted
 process, as Chromium's sandbox uses one (chromium sandbox/win/src/window.cc,
 BSD-3-Clause). No code was taken, and nothing was read from that file.
+
+Ported (2026-10-08), the DNS filter of the Windows sandbox user (decision 0097), into
+crates/kgraf-sandbox/src/sandbox_user/windows/wfp.rs: from codex-rs/windows-sandbox-rs/
+src/wfp.rs, read at commit 665e5f45ab91d43ec3a49487fb9be90109dd2875 (Apache-2.0). Taken:
+the engine handle and transaction guards (abort unless committed), the persistent
+provider and sublayer added with "already exists" accepted, the sublayer weight, the
+filter's field layout, and delete-then-add to refresh a filter.
+Deliberately different: the filter is on the user-mode RPC layer (FWPM_LAYER_RPC_UM) and
+matches the DNS Client's RPC interface and the caller's token, where upstream matches
+connects at the connect layers by user ID and remote port; the provider, sublayer and
+filter keys derive from the installing user's SID and tag, where upstream's are fixed;
+the block clears the action right; the user match descriptor comes from SDDL with one
+entry per blocked user, where upstream builds it from one account name.
+Checked first and not taken: the wfp crate (mullvad/wfp-rs 0.2.0, MIT OR Apache-2.0),
+which builds no RPC-layer filter and no security-descriptor condition.

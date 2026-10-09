@@ -120,10 +120,10 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 
 | Step | Command | What it checks |
 |---|---|---|
-| (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line that is not a pass. |
-| (b) | `kgraf sandbox setup` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group and the firewall rules, with no tag. The output lists a received password for every one of these users. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot. Every stored password logs on. |
-| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If the gate fails, step (e) does not run. |
+| (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
+| (b) | `kgraf sandbox setup` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and the DNS filter, with no tag. The output lists a received password for every one of these users. |
+| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the DNS filter line included. Every stored password logs on. |
+| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`. Any other failure stops the phase: step (e) does not run. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
 
@@ -155,6 +155,23 @@ What the report part "Sandbox user phase" shows:
 - The confirmation after (f). If anything is left, the runner exits with a non-zero code.
 
 The totals and the verdict at the top of the report count the baseline only.
+
+What the phase collects about the DNS filter, and what to read in the report:
+
+- The `dns:` line of selfcheck before setup (b0) and after it (d). Before: `dns: not
+  confined (token sandbox; ...)`. After: `dns: confined (...)`. Any other line after setup
+  means the filter is not proved on that machine; the summary then says `DNS FAILED`.
+- The DNS filter line of status (c) and of status after removal (f): `present`, then
+  `MISSING`.
+- The test binary `dns_windows`, in the baseline (each test returns at once, because no
+  sandbox user is set up) and in the re-run (e). In the re-run it checks the filter's
+  `netsh wfp show filters` entry (name, layer `FWPM_LAYER_RPC_UM`, block), and the cache
+  check: after `Clear-DnsClientCache`, a lookup by the offline user fails and
+  `Get-DnsClientCache` does not list its name, while the online user and the owner still
+  resolve. A failure message carries the netsh entry or the lookup status.
+- Read the failed tests of `dns_windows` in the re-run table before the selfcheck verdict:
+  they say which part did not hold (the filter's listing, the offline lookup, or the
+  online one).
 
 ## 1. Find out which machine you have
 
@@ -516,23 +533,27 @@ is 0:
 sandbox selfcheck: passed with a gap
   backend: Windows restricted token (token sandbox)
   network: not confined (token sandbox; run `kgraf sandbox setup`)
+  dns: not confined (token sandbox; run `kgraf sandbox setup`)
   hidden folder: not writable
   tree: writable
 ```
 
 Expected after `setup` (sandbox user). The direct connection to the local origin is blocked,
-and the exit code is 0:
+the DNS filter refuses the sandbox user's lookup, and the exit code is 0:
 
 ```
 sandbox selfcheck: ok
   backend: Windows sandbox user
   network: only the egress proxy was reachable
+  dns: confined (the sandbox user's lookup reached no DNS server, and the DNS Client service did not look the name up)
   hidden folder: not writable
   tree: writable
 ```
 
 Any other output is a failure. A failure starts with `sandbox selfcheck failed (backend: ...)`
-and names the step. Send back the full output of both runs.
+and names the step. If only the `dns:` line failed, the first line is
+`sandbox selfcheck: failed` and the `dns:` line says why: `not confined (lookups leave the
+machine)` or `not proved`. Send back the full output of both runs.
 
 Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users plus two per
 worker slot (ten with the default four slots: `kgraf-off-`, `kgraf-on-`, `kgraf-s00-` to
@@ -540,6 +561,49 @@ worker slot (ten with the default four slots: `kgraf-off-`, `kgraf-on-`, `kgraf-
 `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"` lists four block rules. The rules name
 `kgraf-off-` and every `kgraf-sNN-` user, and no `kgraf-oNN-` user. Send back the output of
 every command.
+
+### The DNS filter
+
+`kgraf sandbox setup` adds a Windows Filtering Platform (WFP) filter that makes the DNS
+Client service refuse name lookups from the users the firewall rules block: `kgraf-off-` and
+every slot user without the network (`kgraf-sNN-`). It never names `kgraf-on-`, a
+`kgraf-oNN-` user or the owner. No Windows run has proved it yet. These checks need an administrator PowerShell and a working
+network. Run them after `setup`:
+
+```powershell
+# 1. The filter, its sublayer and its provider: every item whose name starts with "kGraf sandbox".
+netsh wfp show filters file="$r\wfp-filters.xml"
+Select-String -Path "$r\wfp-filters.xml" -Pattern "kGraf sandbox" -Context 3,40 | Out-File "$r\wfp-kgraf.txt"
+
+# 2. The status line of the filter.
+kgraf sandbox status | Out-File "$r\status-dns.txt"
+
+# 3. The cache check: clear the cache, run selfcheck, and list the probe names in the cache.
+Clear-DnsClientCache
+kgraf sandbox selfcheck 2>&1 | Out-File "$r\selfcheck-dns.txt"
+Get-DnsClientCache | Where-Object Entry -like "kgraf-probe-*" | Format-List | Out-File "$r\dns-cache.txt"
+
+# 4. The DNS test: offline user, online user and owner.
+cargo test -p kgraf-sandbox --test dns_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\dns-windows.txt"
+```
+
+What to expect:
+
+1. `wfp-kgraf.txt` shows one filter on the layer `FWPM_LAYER_RPC_UM` with two conditions:
+   the RPC interface `45776b01-5956-4485-9f80-f428f7d60129` and the caller's token. The
+   action is block. It also shows the sublayer and the provider.
+2. The status line starts with `present  DNS filter`.
+3. `dns-cache.txt` lists one `kgraf-probe-...` name: the one your own process looked up.
+   A second name means the DNS Client service looked the sandbox user's name up: the
+   filter does not work. No name at all means the cache does not keep "does not exist"
+   answers on this machine, and the check proves nothing there.
+4. The three tests of `dns_windows` pass. One prints the status the offline user's
+   lookups got (`offline user: DnsQuery status ..., getaddrinfo ...`). That status is how
+   the filter's refusal looks to a program; send it back. Another prints the filter's
+   entry from `netsh wfp show filters` and checks its name, layer and action.
+
+After `kgraf sandbox remove`, step 1 shows no item named `kGraf sandbox`, and the status
+line of the filter is `MISSING`.
 
 After `setup` (run it again if you removed the users), check that commands now run as
 the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must sit beside
@@ -557,7 +621,8 @@ the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must s
    network allowed): `C:\Windows\System32\curl.exe -sS -o NUL -w "%{http_code}" https://example.com`
    prints `200`. This uses Windows' own TLS (Schannel), which failed under the token sandbox.
 5. Network with the offline user (an ordinary shell command): the same `curl.exe` line
-   fails to connect. A lookup of a name may still leave the machine (a known gap).
+   fails to connect. A lookup of a name must fail too (the DNS filter); the checks under
+   "The DNS filter" above prove whether it left the machine.
 6. In a project's worktree, a sandboxed command can write a file inside the worktree and
    cannot write in a sibling folder, in a top-level `.git` entry, or in a hidden folder.
 7. `kgraf sandbox remove` revokes the folder grants it listed, then removes the users. The

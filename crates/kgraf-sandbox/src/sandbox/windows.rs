@@ -228,6 +228,8 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
     gitlink_protected: false,
     git_config_freezable: false,
     // Each clause is one gap; `user_gaps_name_each_known_gap` pins them.
+    // The DNS clause stays until a Windows run proves the DNS filter: the
+    // proof is the `dns:` line of `kgraf sandbox selfcheck`.
     gaps: "the sandbox user can read whatever every local user can read (other drives, \
            Program Files, world-readable folders), though not the owner's profile; it can \
            still write where every local user may write below the folders setup closes to \
@@ -237,9 +239,12 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            own profile, which keeps files from one command to the next; registry keys and \
            named objects every user may write are not closed; DNS lookups go through the \
            system's DNS client service, which the firewall rules do not scope to the \
-           sandbox user, so a name lookup can leave the machine; traffic Windows sends on \
-           the user's behalf is not proved blocked: a UNC path (\\\\host\\share) makes the \
-           kernel's SMB client connect, the WebClient service carries WebDAV, and ICMP \
+           sandbox user: `kgraf sandbox setup` adds a WFP filter meant to refuse that \
+           service to the slot users without the network, but no Windows run has proved \
+           it, so until `kgraf sandbox selfcheck` prints `dns: confined` on this machine \
+           a name lookup can leave the machine; traffic Windows sends on the user's behalf \
+           is not proved blocked: a UNC path (\\\\host\\share) makes the kernel's SMB \
+           client connect, the WebClient service carries WebDAV, and ICMP \
            (ping) is sent by the system's own network stack, none of which runs as the \
            sandbox user; two commands that run as the same sandbox user (always two in one \
            folder) can write each other's writable folders and open each other's \
@@ -264,6 +269,7 @@ mod user_gaps_tests {
             "in its own profile",
             "registry keys",
             "DNS",
+            "`dns: confined`",
             "UNC path",
             "WebDAV",
             "ICMP",

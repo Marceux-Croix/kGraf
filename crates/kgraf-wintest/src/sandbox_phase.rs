@@ -35,6 +35,9 @@ pub const SELFCHECK_LIMIT: Duration = Duration::from_secs(300);
 /// (crates/kgraf-cli/src/sandbox_cmd.rs, `backend_name`).
 const SELFCHECK_OK: &str = "sandbox selfcheck: ok";
 const SELFCHECK_SANDBOX_USER: &str = "  backend: Windows sandbox user";
+/// The first line of a selfcheck that ran every step and failed one, the
+/// `dns:` step.
+const SELFCHECK_FAILED: &str = "sandbox selfcheck: failed";
 
 /// The gate passes only when selfcheck exited 0, proved confinement, and ran
 /// on the sandbox user. Under the token sandbox selfcheck also exits 0, with a
@@ -48,6 +51,29 @@ fn gate_passed(step: &StepRun) -> bool {
             .lines()
             .any(|l| l.trim_end() == SELFCHECK_SANDBOX_USER)
 }
+
+/// The `dns:` line of a selfcheck that failed on DNS alone: it ran on the
+/// sandbox user, proved the network, the hidden folder and the tree, and its
+/// only failed line is `dns:`. `None` for any other output.
+///
+/// The DNS filter is the newest part of the sandbox user and the one most
+/// likely not to work on a given Windows (decision 0097). A DNS failure is
+/// reported in the summary, but the re-run (e) still runs, so one unproved
+/// filter does not throw away the evidence about Git Bash, the cargo
+/// jobserver and Schannel that the phase exists to collect.
+fn dns_only_failure(step: &StepRun) -> Option<String> {
+    let lines: Vec<&str> = step.output.lines().map(str::trim_end).collect();
+    let has = |want: &str| lines.contains(&want);
+    let dns = lines
+        .iter()
+        .find(|l| l.starts_with("  dns: ") && !l.starts_with("  dns: confined"))?;
+    (has(SELFCHECK_FAILED)
+        && has(SELFCHECK_SANDBOX_USER)
+        && has("  network: only the egress proxy was reachable")
+        && has("  hidden folder: not writable")
+        && has("  tree: writable"))
+    .then(|| dns.trim().to_owned())
+}
 pub const REMOVE_LIMIT: Duration = Duration::from_secs(300);
 
 /// Test binaries that always re-run with the sandbox user active (ids without
@@ -58,6 +84,7 @@ pub const ALWAYS: &[&str] = &[
     "kgraf-sandbox/test/tls_windows",
     "kgraf-sandbox/test/shell_windows",
     "kgraf-sandbox/test/startup_windows",
+    "kgraf-sandbox/test/dns_windows",
 ];
 
 /// Output of a failed test that names a limit the sandbox user may lift, as
@@ -302,6 +329,8 @@ pub struct SandboxPhase {
     pub selfcheck: Option<StepRun>,
     /// (d) failed, so (e) did not run.
     pub stopped_at_gate: bool,
+    /// (d) failed on its `dns:` line alone (that line); (e) ran anyway.
+    pub dns_failed: Option<String>,
     pub cancelled: bool,
     pub reruns: Vec<Rerun>,
     pub e2e: Vec<Check>,
@@ -333,7 +362,12 @@ impl SandboxPhase {
             Some(_) => "STILL THERE after removal",
             None => "removal not checked",
         };
-        format!("{gate}; sandbox user {left}")
+        let dns = if self.dns_failed.is_some() {
+            "; DNS FAILED in selfcheck (see the gate)"
+        } else {
+            ""
+        };
+        format!("{gate}; sandbox user {left}{dns}")
     }
 }
 
@@ -381,8 +415,13 @@ pub fn run_phase(
         true,
     );
     let passed = gate_passed(&gate);
+    p.dns_failed = if passed {
+        None
+    } else {
+        dns_only_failure(&gate)
+    };
     p.selfcheck = Some(gate);
-    if !passed {
+    if !passed && p.dns_failed.is_none() {
         p.stopped_at_gate = true;
     } else {
         for s in select(first) {
@@ -537,6 +576,13 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
             "The phase stopped at the gate: selfcheck did not pass, so the re-run (e) did not \
              happen. The full selfcheck output is above.\n\n",
         );
+    }
+    if let Some(line) = &p.dns_failed {
+        md.push_str(&format!(
+            "**DNS FAILED:** `{line}`. Every other selfcheck step passed on the sandbox user, so \
+             the re-run (e) ran. Name lookups by the offline users are not proved confined on \
+             this machine.\n\n"
+        ));
     }
 
     if !p.stopped_at_gate {
@@ -794,6 +840,50 @@ mod tests {
                 .any(|c| c.starts_with("rerun") || c == "e2e")
         );
         assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
+    }
+
+    const SELFCHECK_DNS_ONLY: &str = "sandbox selfcheck: failed\n  backend: Windows sandbox user\n  network: only the egress proxy was reachable\n  dns: not confined (lookups leave the machine): the sandbox user's lookup got a DNS server's answer (status 9003)\n  hidden folder: not writable\n  tree: writable\nError: sandbox selfcheck failed (backend: Windows sandbox user): dns: not confined";
+
+    /// A selfcheck that failed on its DNS line alone does not stop the phase:
+    /// the re-run still runs, and the summary and the report say DNS failed.
+    #[test]
+    fn a_dns_only_failure_reruns_and_says_dns_failed() {
+        let mut ex = Fake {
+            selfcheck_code: 1,
+            selfcheck_out: Some(SELFCHECK_DNS_ONLY),
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(!p.stopped_at_gate);
+        assert!(ex.calls.iter().any(|c| c.starts_with("rerun")));
+        let line = p.dns_failed.clone().expect("the DNS line is kept");
+        assert!(line.starts_with("dns: not confined"), "{line}");
+        assert!(p.summary().contains("DNS FAILED"), "{}", p.summary());
+        let md = render(&baseline(), &[], &p);
+        assert!(md.contains("**DNS FAILED:**"), "{md}");
+    }
+
+    /// Any other failed line still closes the gate, DNS line or not.
+    #[test]
+    fn a_dns_failure_with_another_failure_still_stops_at_the_gate() {
+        for out in [
+            // The network was not proved.
+            "sandbox selfcheck: failed\n  backend: Windows sandbox user\n  dns: not proved: x\n  hidden folder: not writable\n  tree: writable",
+            // The token sandbox, not the sandbox user.
+            "sandbox selfcheck: failed\n  backend: Windows restricted token (token sandbox)\n  network: only the egress proxy was reachable\n  dns: not proved: x\n  hidden folder: not writable\n  tree: writable",
+            // A DNS line that passed is no DNS failure.
+            "sandbox selfcheck: failed\n  backend: Windows sandbox user\n  network: only the egress proxy was reachable\n  dns: confined (x)\n  hidden folder: not writable\n  tree: writable",
+        ] {
+            let mut ex = Fake {
+                selfcheck_code: 1,
+                selfcheck_out: Some(out),
+                ..Fake::default()
+            };
+            let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+            assert!(p.stopped_at_gate, "{out}");
+            assert_eq!(p.dns_failed, None, "{out}");
+            assert!(!p.summary().contains("DNS"), "{}", p.summary());
+        }
     }
 
     #[test]

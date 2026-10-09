@@ -118,6 +118,13 @@ pub struct RuleSpec {
     pub local_users: String,
 }
 
+/// The users the rules below name, by user name: every user whose network is
+/// blocked ([`OwnerNames::blocked_users`]). Setup resolves these to the SIDs
+/// it passes to [`offline_rules`].
+pub fn rule_users(names: &OwnerNames) -> Vec<String> {
+    names.blocked_users()
+}
+
 /// The rules that block the network of every user that must not reach it:
 /// the offline user and each worker slot's user ([`Role::blocked`]). One set
 /// of four rules names them all, so the rule names do not change with the

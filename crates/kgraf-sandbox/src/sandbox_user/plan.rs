@@ -17,6 +17,7 @@ use std::fmt;
 use super::firewall::RulePurpose;
 use super::names::{OwnerNames, Role};
 use super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
+use super::wfp::{WfpKeys, WfpObject, guid_text};
 
 /// One existing local user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +61,12 @@ pub struct Observed {
     /// ([`super::acl::closed_folders`]), each with whether the group's deny
     /// entry is on it; `None` when that could not be read.
     pub closed: BTreeMap<String, Option<bool>>,
+    /// The keys of kGraf's WFP objects (provider, sublayer, DNS filter) that
+    /// exist.
+    pub wfp: BTreeSet<u128>,
+    /// Why the WFP objects could not be read, when they could not (reading
+    /// them can need administrator rights).
+    pub wfp_unreadable: Option<String>,
 }
 
 /// One setup step.
@@ -82,6 +89,9 @@ pub enum StepId {
     /// Deny the sandbox group the right to create or change entries in the
     /// folders every local user may write ([`super::acl::closed_folders`]).
     CloseFolders,
+    /// Add or refresh the WFP filter that keeps the blocked users from the
+    /// DNS Client service ([`super::wfp`]).
+    DnsFilter,
     /// Write the undo record.
     Record,
 }
@@ -98,6 +108,7 @@ impl StepId {
             StepId::Hide(r) => format!("hide-{}", r.key()),
             StepId::Rule(p) => format!("rule-{}", p.key()),
             StepId::CloseFolders => "close-folders".into(),
+            StepId::DnsFilter => "dns-filter".into(),
             StepId::Record => "record".into(),
         }
     }
@@ -109,6 +120,7 @@ impl StepId {
             "group" => StepId::Group,
             "record" => StepId::Record,
             "close-folders" => StepId::CloseFolders,
+            "dns-filter" => StepId::DnsFilter,
             _ => {
                 if let Some(r) = key.strip_prefix("user-") {
                     StepId::User(role(r)?)
@@ -141,6 +153,10 @@ impl StepId {
             StepId::CloseFolders => "sandbox users cannot create files in the drive roots, \
                                      ProgramData, Public and the Windows temporary folders"
                 .into(),
+            StepId::DnsFilter => format!(
+                "WFP filter: the DNS Client service refuses lookups from the offline users ({})",
+                guid_text(WfpKeys::derive(names).filter)
+            ),
             StepId::Record => "undo record".into(),
         }
     }
@@ -341,6 +357,21 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
         },
         undo: Vec::new(),
     });
+    // After the users: the filter names the blocked users' SIDs.
+    let keys = WfpKeys::derive(names);
+    steps.push(Step {
+        id: StepId::DnsFilter,
+        action: if observed.wfp.contains(&keys.filter) {
+            Action::Update
+        } else {
+            Action::Create
+        },
+        undo: keys
+            .all()
+            .into_iter()
+            .map(|(object, key)| UndoEntry::Wfp { object, key })
+            .collect(),
+    });
     Ok(steps)
 }
 
@@ -380,6 +411,9 @@ impl RemoveStep {
             UndoEntry::Hidden(n) => format!("remove-hidden:{n}"),
             UndoEntry::Rule(n) => format!("remove-rule:{n}"),
             UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
+            UndoEntry::Wfp { object, key } => {
+                format!("remove-{}:{}", object.key(), guid_text(*key))
+            }
         }
     }
 }
@@ -392,6 +426,7 @@ fn entry_text(e: &UndoEntry) -> String {
         UndoEntry::Hidden(n) => format!("sign-in screen entry of {n}"),
         UndoEntry::Rule(n) => format!("firewall rule {n}"),
         UndoEntry::Closed { sid, path } => format!("the deny entry for {sid} on {path}"),
+        UndoEntry::Wfp { object, key } => format!("{object} {}", guid_text(*key)),
     }
 }
 
@@ -410,6 +445,7 @@ pub fn plan_remove(
         });
     }
     let rules = names.rules();
+    let keys = WfpKeys::derive(names);
     for e in &record.entries {
         let ours = match e {
             UndoEntry::User(n) | UndoEntry::Hidden(n) => names.role_of(n).is_some(),
@@ -417,6 +453,7 @@ pub fn plan_remove(
             UndoEntry::Group(n) => *n == names.group(),
             UndoEntry::Rule(n) => rules.contains(n),
             UndoEntry::Closed { sid, .. } => is_group_sid(sid, observed),
+            UndoEntry::Wfp { object, key } => keys.get(*object) == *key,
         };
         if !ours {
             return Err(PlanError::ForeignEntry(entry_text(e)));
@@ -424,6 +461,19 @@ pub fn plan_remove(
     }
     // A deny entry goes before the group, while its SID still names it.
     let rank = |e: &UndoEntry| match e {
+        // The filter before the sublayer and provider it names.
+        UndoEntry::Wfp {
+            object: WfpObject::Filter,
+            ..
+        } => -3,
+        UndoEntry::Wfp {
+            object: WfpObject::Sublayer,
+            ..
+        } => -2,
+        UndoEntry::Wfp {
+            object: WfpObject::Provider,
+            ..
+        } => -1,
         UndoEntry::Rule(_) => 0,
         UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
         UndoEntry::Rights { .. } => 2,
@@ -436,6 +486,10 @@ pub fn plan_remove(
     for entry in entries {
         let present = match &entry {
             UndoEntry::Rule(n) => observed.rules.contains(n),
+            // Unreadable: try the removal, which treats "not found" as done.
+            UndoEntry::Wfp { key, .. } => {
+                observed.wfp_unreadable.is_some() || observed.wfp.contains(key)
+            }
             UndoEntry::Hidden(n) => observed.hidden.contains(n),
             UndoEntry::Rights { user, .. } => observed.users.contains_key(user),
             // Whether the entry is still on the folder is read when it is
@@ -659,6 +713,21 @@ pub fn status_report(
             state,
         );
     }
+    let filter = WfpKeys::derive(names).filter;
+    let state = match &observed.wfp_unreadable {
+        Some(why) => ItemState::Unknown(why.clone()),
+        None if observed.wfp.contains(&filter) => ItemState::Present,
+        None => ItemState::Missing,
+    };
+    // Present is not proved: only `kgraf sandbox selfcheck` shows the effect.
+    push(
+        format!(
+            "DNS filter {} (WFP; the DNS Client service refuses the offline users; \
+             `kgraf sandbox selfcheck` proves the effect)",
+            guid_text(filter)
+        ),
+        state,
+    );
     let state = match record {
         Ok(None) => ItemState::Missing,
         Ok(Some(r)) if r.owner_sid != names.owner_sid() || r.tag.as_deref() != names.tag() => {
@@ -745,6 +814,7 @@ mod tests {
         for path in [r"C:\", r"C:\ProgramData"] {
             o.closed.insert(path.into(), Some(true));
         }
+        o.wfp = WfpKeys::derive(n).all().iter().map(|(_, k)| *k).collect();
         o
     }
 
@@ -791,9 +861,10 @@ mod tests {
             }
         }
         // The undo list names every user, the group, both hidden entries,
-        // both rights sets and every rule, and nothing else.
+        // both rights sets, every rule and the three WFP objects, and nothing
+        // else.
         let r = record_from(&steps, &n);
-        assert_eq!(r.entries.len(), 2 + 1 + 2 + 2 + RulePurpose::ALL.len());
+        assert_eq!(r.entries.len(), 2 + 1 + 2 + 2 + RulePurpose::ALL.len() + 3);
         for user in n.users() {
             assert!(r.entries.contains(&UndoEntry::User(user.clone())));
             assert!(r.entries.contains(&UndoEntry::Hidden(user.clone())));
@@ -914,6 +985,18 @@ mod tests {
         assert_eq!(steps.len(), r.entries.len());
         assert!(steps.iter().all(|s| s.action == RemoveAction::Remove));
         let rank = |e: &UndoEntry| match e {
+            UndoEntry::Wfp {
+                object: WfpObject::Filter,
+                ..
+            } => -3,
+            UndoEntry::Wfp {
+                object: WfpObject::Sublayer,
+                ..
+            } => -2,
+            UndoEntry::Wfp {
+                object: WfpObject::Provider,
+                ..
+            } => -1,
             UndoEntry::Rule(_) => 0,
             UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
             UndoEntry::Rights { .. } => 2,
@@ -1236,6 +1319,193 @@ mod tests {
             check_passwords(&n, &extra),
             Err(PlanError::PasswordUnexpected(n.user(Role::Slot(5))))
         );
+    }
+
+    // ---- the DNS filter ----------------------------------------------------
+
+    fn wfp_entries(n: &OwnerNames) -> Vec<UndoEntry> {
+        WfpKeys::derive(n)
+            .all()
+            .into_iter()
+            .map(|(object, key)| UndoEntry::Wfp { object, key })
+            .collect()
+    }
+
+    #[test]
+    fn setup_plans_the_dns_filter_after_the_blocked_users_and_records_its_keys() {
+        let n = names().with_slots(3);
+        let o = Observed {
+            firewall: firewall_ok(),
+            ..Observed::default()
+        };
+        let steps = plan_setup(&n, &o).unwrap();
+        let ids: Vec<StepId> = steps.iter().map(|s| s.id).collect();
+        let at = ids
+            .iter()
+            .position(|id| *id == StepId::DnsFilter)
+            .expect("the DNS filter step is planned");
+        assert_eq!(ids.iter().filter(|id| **id == StepId::DnsFilter).count(), 1);
+        // The filter names the SIDs of the offline and slot users, so they
+        // exist first.
+        for role in n.roles().into_iter().filter(|r| r.blocked()) {
+            let user_at = ids.iter().position(|id| *id == StepId::User(role)).unwrap();
+            assert!(user_at < at, "{role} is made before the filter");
+        }
+        let step = &steps[at];
+        assert_eq!(step.action, Action::Create);
+        assert_eq!(step.undo, wfp_entries(&n), "provider, sublayer, filter");
+        assert_eq!(StepId::from_key("dns-filter"), Some(StepId::DnsFilter));
+        assert!(StepId::DnsFilter.describe(&n).contains("DNS"));
+    }
+
+    #[test]
+    fn a_second_setup_refreshes_the_dns_filter_in_place() {
+        let n = names();
+        let first = plan_setup(
+            &n,
+            &Observed {
+                firewall: firewall_ok(),
+                ..Observed::default()
+            },
+        )
+        .unwrap();
+        let again = plan_setup(&n, &full(&n)).unwrap();
+        let step = again.iter().find(|s| s.id == StepId::DnsFilter).unwrap();
+        assert_eq!(step.action, Action::Update);
+        // The same keys both times: a re-run replaces the filter, it never
+        // adds a second one.
+        let keys_of = |steps: &[Step]| {
+            steps
+                .iter()
+                .find(|s| s.id == StepId::DnsFilter)
+                .unwrap()
+                .undo
+                .clone()
+        };
+        assert_eq!(keys_of(&first), keys_of(&again));
+        let mut r = record_from(&first, &n);
+        let before = r.entries.len();
+        for e in &step.undo {
+            r.add(e.clone());
+        }
+        assert_eq!(r.entries.len(), before, "the record does not grow");
+        // A filter whose provider survived but not the filter itself is made
+        // again.
+        let mut half = full(&n);
+        half.wfp.remove(&WfpKeys::derive(&n).filter);
+        let step = plan_setup(&n, &half)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == StepId::DnsFilter)
+            .unwrap();
+        assert_eq!(step.action, Action::Create);
+    }
+
+    #[test]
+    fn remove_deletes_the_dns_filter_before_its_sublayer_and_provider() {
+        let n = names();
+        let o = full(&n);
+        let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
+        let steps = plan_remove(&n, &r, &o).unwrap();
+        let wfp: Vec<(WfpObject, RemoveAction)> = steps
+            .iter()
+            .filter_map(|s| match s.entry {
+                UndoEntry::Wfp { object, .. } => Some((object, s.action)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wfp,
+            vec![
+                (WfpObject::Filter, RemoveAction::Remove),
+                (WfpObject::Sublayer, RemoveAction::Remove),
+                (WfpObject::Provider, RemoveAction::Remove),
+            ]
+        );
+        // They go before anything else, while the users still exist.
+        assert!(matches!(steps[0].entry, UndoEntry::Wfp { .. }));
+        let key = steps[0].key();
+        assert_eq!(
+            key,
+            format!(
+                "remove-wfp-filter:{}",
+                guid_text(WfpKeys::derive(&n).filter)
+            )
+        );
+        // Gone already: nothing to do.
+        let gone = plan_remove(&n, &r, &Observed::default()).unwrap();
+        assert!(
+            gone.iter()
+                .filter(|s| matches!(s.entry, UndoEntry::Wfp { .. }))
+                .all(|s| s.action == RemoveAction::AlreadyGone)
+        );
+        // Unreadable: the removal is tried.
+        let unknown = Observed {
+            wfp_unreadable: Some("access denied".into()),
+            ..Observed::default()
+        };
+        assert!(
+            plan_remove(&n, &r, &unknown)
+                .unwrap()
+                .iter()
+                .filter(|s| matches!(s.entry, UndoEntry::Wfp { .. }))
+                .all(|s| s.action == RemoveAction::Remove)
+        );
+    }
+
+    #[test]
+    fn remove_refuses_wfp_keys_that_are_not_this_owners() {
+        let n = names();
+        let o = full(&n);
+        let other = OwnerNames::derive("S-1-5-21-9-9-9-1001", None).unwrap();
+        let tagged = OwnerNames::derive(OWNER, Some("wintest")).unwrap();
+        for foreign in [
+            wfp_entries(&other)[2].clone(),
+            wfp_entries(&tagged)[0].clone(),
+            UndoEntry::Wfp {
+                object: WfpObject::Filter,
+                key: WfpKeys::derive(&n).provider,
+            },
+            UndoEntry::Wfp {
+                object: WfpObject::Filter,
+                key: 0x75a89dda_95e4_40f3_adc7_7688a9c847e1,
+            },
+        ] {
+            let mut r = Record::new(OWNER, None);
+            r.add(foreign.clone());
+            assert!(
+                matches!(plan_remove(&n, &r, &o), Err(PlanError::ForeignEntry(_))),
+                "{foreign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_reports_the_dns_filter() {
+        let n = names();
+        let line = |o: &Observed| {
+            status_report(&n, o, Ok(None), &Credentials::Missing)
+                .lines
+                .into_iter()
+                .find(|l| l.item.contains("DNS"))
+                .expect("a DNS filter line")
+        };
+        let o = full(&n);
+        assert_eq!(line(&o).state, ItemState::Present);
+        assert!(
+            line(&o)
+                .item
+                .contains(&guid_text(WfpKeys::derive(&n).filter))
+        );
+        let mut missing = o.clone();
+        missing.wfp.clear();
+        assert_eq!(line(&missing).state, ItemState::Missing);
+        let r = record_from(&plan_setup(&n, &o).unwrap(), &n);
+        assert!(!status_report(&n, &missing, Ok(Some(&r)), &all_stored(&n)).ready);
+        let mut unread = o.clone();
+        unread.wfp.clear();
+        unread.wfp_unreadable = Some("needs administrator rights".into());
+        assert!(matches!(line(&unread).state, ItemState::Unknown(_)));
     }
 }
 

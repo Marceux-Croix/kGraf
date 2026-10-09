@@ -3,6 +3,7 @@
 //! plan returns. Nothing here decides what to do.
 
 pub mod accounts;
+pub mod dns;
 pub mod dpapi;
 pub mod elevate;
 pub mod firewall;
@@ -12,6 +13,7 @@ pub mod runner;
 pub mod secure;
 pub mod setup;
 pub(crate) mod state;
+pub mod wfp;
 
 use std::ffi::OsStr;
 use std::io;

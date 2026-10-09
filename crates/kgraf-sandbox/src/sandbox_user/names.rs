@@ -192,6 +192,19 @@ impl OwnerNames {
         self.roles().iter().map(|r| self.user(*r)).collect()
     }
 
+    /// The users whose network is blocked ([`Role::blocked`]): the fixed
+    /// offline user and each slot's user without the network, in role order.
+    /// The one source of the firewall rules' user list
+    /// ([`super::firewall::rule_users`]) and the DNS filter's
+    /// ([`super::wfp::filter_users`]), so the two cannot drift apart.
+    pub fn blocked_users(&self) -> Vec<String> {
+        self.roles()
+            .into_iter()
+            .filter(|r| r.blocked())
+            .map(|r| self.user(r))
+            .collect()
+    }
+
     /// The role of the user `user`, whether or not these names cover its
     /// slot: a removal must recognize a user an earlier, larger setup made.
     pub fn role_of(&self, user: &str) -> Option<Role> {
@@ -274,7 +287,7 @@ fn is_tag(s: &str) -> bool {
 
 /// FNV-1a, 64-bit. The same function the token sandbox uses for its
 /// capability SIDs; not a security boundary here, only a short stable name.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);

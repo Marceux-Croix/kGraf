@@ -19,6 +19,7 @@
 //! hidden kgraf-off-1a2b3c4d
 //! rule kgraf-sandbox-1a2b3c4d-block-outbound
 //! closed S-1-5-21-...-1003 C:\ProgramData
+//! wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b
 //! ```
 //!
 //! A `closed` line names a folder where setup denied the sandbox group the
@@ -26,6 +27,7 @@
 //! take exactly that entry off again even after the group is gone.
 
 use super::names::is_sid_string;
+use super::wfp::{WfpObject, guid_text, parse_guid};
 
 pub const RECORD_HEADER: &str = "kgraf-sandbox-record 1";
 
@@ -58,6 +60,11 @@ pub enum UndoEntry {
     Closed {
         sid: String,
         path: String,
+    },
+    /// A WFP provider, sublayer or filter, by its key.
+    Wfp {
+        object: WfpObject,
+        key: u128,
     },
 }
 
@@ -129,6 +136,7 @@ impl Record {
                 UndoEntry::Hidden(n) => format!("hidden {n}"),
                 UndoEntry::Rule(n) => format!("rule {n}"),
                 UndoEntry::Closed { sid, path } => format!("closed {sid} {path}"),
+                UndoEntry::Wfp { object, key } => format!("{} {}", object.key(), guid_text(*key)),
             };
             out.push_str(&line);
             out.push('\n');
@@ -190,7 +198,11 @@ impl Record {
                         rights,
                     });
                 }
-                _ => return Err(bad()),
+                k => {
+                    let object = WfpObject::from_key(k).ok_or_else(bad)?;
+                    let key = parse_guid(rest).ok_or_else(bad)?;
+                    entries.push(UndoEntry::Wfp { object, key });
+                }
             }
         }
         Ok(Self {
@@ -221,6 +233,12 @@ mod tests {
             sid: "S-1-5-21-1-2-3-1003".into(),
             path: r"C:\Users\Public\Public Documents".into(),
         });
+        for object in WfpObject::ALL {
+            r.add(UndoEntry::Wfp {
+                object,
+                key: 0x3c0e5a71_2b9d_8f40_a1c3_5d6e7f809a10 + object as u128,
+            });
+        }
         r
     }
 
@@ -232,6 +250,18 @@ mod tests {
         tagged.add(UndoEntry::User("kgraf-on-00000000".into()));
         assert_eq!(Record::parse(&tagged.to_text()).unwrap(), tagged);
         assert!(r.to_text().starts_with(RECORD_HEADER));
+        // The WFP keys are written in the usual GUID text form, one line each.
+        let text = r.to_text();
+        for object in WfpObject::ALL {
+            assert_eq!(
+                text.lines()
+                    .filter(|l| l.starts_with(&format!("{} ", object.key())))
+                    .count(),
+                1,
+                "{text}"
+            );
+        }
+        assert!(text.contains("wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a10\n"));
     }
 
     #[test]
@@ -275,6 +305,9 @@ mod tests {
             "closed S-1-5-21-1-2-3-1003",
             "closed not-a-sid C:\\ProgramData",
             "closed S-1-5-21-1-2-3-1003  ",
+            "wfp-filter not-a-guid",
+            "wfp-filter 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b extra",
+            "wfp-callout 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b",
         ] {
             let text = format!("{RECORD_HEADER}\nowner S-1-5-18\n{bad}\n");
             assert!(

@@ -395,3 +395,92 @@ only when a worktree's command takes a slot other than the one granted before
 the link, which the table makes rare. Two users can still both hold a grant on
 a folder that two of their folders share, such as a project's package stores;
 those writes are shared by design.
+
+**Amendment (2026-10-08): the DNS filter.** This closes the DNS item of the known gaps
+above in code. A Windows run has not proved it, so the gap stays in the backend's gaps
+text until one does.
+
+A program looks a name up through the DNS Client service (Dnscache). The service runs as
+NETWORK SERVICE and sends the query as that account, so the firewall rules, which match
+the sandbox user's SID, do not see it. `kgraf sandbox setup` now adds a step,
+`dns-filter`, after the firewall rules. The step adds three persistent Windows Filtering
+Platform (WFP) objects in one transaction:
+
+- a provider and a sublayer, both named "kGraf sandbox";
+- one filter on the user-mode RPC layer (`FWPM_LAYER_RPC_UM`) with the action block and
+  two conditions: the RPC interface of the DNS Client service (`RPC_IF_UUID`,
+  `45776b01-5956-4485-9f80-f428f7d60129`) and the caller's token
+  (`REMOTE_USER_TOKEN`).
+
+The token condition is a security descriptor with one allow entry for
+`FWP_ACTRL_MATCH_FILTER` per user the firewall rules block: the fixed offline user
+(`kgraf-off-<hash>`) and each slot's user without the network (`kgraf-sNN-<hash>`).
+The list comes from the same function as the firewall rules' user list, so the two
+cannot drift, and a unit test holds them equal for one slot, four and the maximum.
+The sandbox group is not in it, because the group also holds the online users
+(`kgraf-on-<hash>` and each `kgraf-oNN-<hash>`), which need name lookups for
+dependency installs. The installing user is not in it. A lookup by a
+blocked user then fails inside its own process. The firewall rules already block the
+direct path, a query the process sends itself.
+
+Keys and undo. The provider, sublayer and filter keys are derived from the installing
+user's SID and the tag, as the user names are. Two users of one machine, or a tagged test
+setup and a real one, never share an object. The undo record lists the three keys
+(`wfp-provider`, `wfp-sublayer`, `wfp-filter`). `kgraf sandbox remove` deletes the filter,
+then the sublayer, then the provider, by those keys only, before it removes the users. It
+does not use `netsh rpc filter delete`, which deletes every RPC filter on the machine. A
+key that is not this user's derived key is refused, like a user name that is not ours.
+Setup again deletes the filter and adds it from the current list of blocked users, so a
+setup with more slots refreshes it in place.
+
+Choices made here:
+
+- (e) **Keys per installing user**, not fixed keys as in codex. A fixed provider would be
+  shared by two users of one machine, and removing one setup could delete the other's
+  objects.
+- (f) **The block clears the action right** (`FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`), so a
+  permit filter in another sublayer cannot override it.
+- (g) **Status shows presence, never effect.** `kgraf sandbox status` has a `DNS filter`
+  line: present, MISSING, or unknown where the account may not read WFP filters.
+- (h) **The proof is `kgraf sandbox selfcheck`**, which gets a `dns:` line under the
+  sandbox user. It uses three new names under `.invalid`. The installing user's process
+  looks up the first, as a control: a DNS server's answer proves a working network. The
+  sandbox user looks up the second with `Resolve-DnsName` in Windows PowerShell. The
+  installing user's process then asks the DNS Client cache, without sending anything,
+  about all three; the service caches a name error, so the second name must look like
+  the third (never looked up), not like the first. The line passes only when the
+  sandbox user's lookup got no server answer and the cache shows the service did not look
+  its name up. A server answer or a cached name is `dns: not confined (lookups leave the
+  machine)`. A run that cannot decide (no network, a cache that does not tell the names
+  apart, a probe that printed no status) is `dns: not proved`. Both fail the whole check.
+  A blocked RPC call and a server's name error can look alike to a program, so the cache
+  is a second, independent witness.
+- (i) **The Windows self-test lets a DNS-only failure through its gate.** If selfcheck
+  proved everything but DNS on the sandbox user, the re-run of the phase still runs, and
+  the summary says `DNS FAILED`. One unproved filter must not throw away the other
+  evidence the phase collects.
+- (j) **The fallback is the failed line.** If Windows does not honor the filter, the gap
+  stays, and selfcheck reports it as a failed line, never as a pass.
+
+Reuse. The WFP engine, transaction, provider and sublayer code is ported from openai/codex
+`codex-rs/windows-sandbox-rs/src/wfp.rs` (Apache-2.0, commit
+665e5f45ab91d43ec3a49487fb9be90109dd2875). The `wfp` crate (mullvad/wfp-rs 0.2.0, MIT OR
+Apache-2.0) was checked first. It builds no RPC-layer filter and no security-descriptor
+condition. Codex's own filters match connects by the sandbox user's process at the
+connect layers, so they do not stop the DNS Client service either.
+
+Not yet confirmed on Windows:
+
+- the interface UUID, taken from the ReactOS reimplementation (`dnsrslvr.idl`), not from
+  Windows' own `dnsrslvr.dll`. A wrong value blocks nothing, and only the selfcheck shows
+  it;
+- whether WFP evaluates RPC filters for local RPC (`ncalrpc`) calls to this service, and
+  whether the caller-token condition matches the client's token there;
+- the status a program gets from a blocked lookup, and whether the resolver then sends
+  the query from the process itself (the firewall rules block that);
+- whether `localhost` lookups by an offline or slot user go through the service and fail;
+- whether a standard user may read WFP filters (if not, status shows `unknown`);
+- whether the DNS Client cache keeps name errors on every machine; where it does not,
+  selfcheck says `dns: not proved`;
+- the `netsh wfp show filters` text of the filter (name, layer, action), which a Windows
+  test checks.
