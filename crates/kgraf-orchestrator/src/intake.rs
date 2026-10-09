@@ -53,13 +53,31 @@ impl Asker for ModelAsker {
     }
 
     async fn ask(&self, system: &str, user: String) -> Result<AskAnswer, AskFailure> {
-        let (result, call) = self
+        // Read here only to close an answer the model ended before its JSON
+        // closed, or ask for it once more (`ModelCaller::ask_read`); the pass
+        // parses and checks the text it gets back as it does any answer.
+        let parse = |text: &str| {
+            kgraf_interpret::model::parse_answer(text)
+                .map(|_| ())
+                .map_err(|e| crate::plan::PlanError::BadOutput {
+                    reason: e.to_string(),
+                    excerpt: String::new(),
+                })
+        };
+        let (result, calls) = self
             .caller
-            .ask_keeping_call("interpret", system, user)
+            .ask_read("interpret", system, user, None, &parse)
             .await;
-        let call = call.map(|c| c.to_string());
+        // The answering call names the answer. An earlier call of this ask
+        // (an answer asked for once more) is in the ledger, attributed to the
+        // run, and is charged when the run opens, as every call of the run
+        // not settled here is (`seed_spend`).
+        let call = calls.last().map(|c| c.to_string());
         match result {
-            Ok(text) => Ok(AskAnswer { text, call }),
+            Ok(read) => Ok(AskAnswer {
+                text: read.text,
+                call,
+            }),
             Err(e) => Err(AskFailure {
                 message: e.to_string(),
                 call,

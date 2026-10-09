@@ -1,0 +1,107 @@
+{
+  "interfaces": [
+    {
+      "id": "i_tax_us",
+      "parties": ["i_tax_us", "c4", "c5"],
+      "symbols": ["state_tax_rate", "TaxUs"],
+      "stub": [
+        {
+          "path": "tax_us/src/lib.rs",
+          "content": "use iface::{Order, TaxRule};\n\npub fn state_tax_rate(_state: &str) -> f64 {\n    0.0\n}\n\npub struct TaxUs;\n\nimpl TaxRule for TaxUs {\n    fn tax_cents(&self, _order: &Order, _taxable_cents: i64) -> i64 {\n        0\n    }\n}\n"
+        }
+      ],
+      "reference": [
+        {
+          "path": "tax_us/src/lib.rs",
+          "content": "use iface::{Order, TaxRule};\n\npub fn state_tax_rate(state: &str) -> f64 {\n    match state {\n        \"CA\" => 0.08,\n        \"OR\" => 0.0,\n        _ => 0.05,\n    }\n}\n\npub struct TaxUs;\n\nimpl TaxRule for TaxUs {\n    fn tax_cents(&self, order: &Order, taxable_cents: i64) -> i64 {\n        (taxable_cents as f64 * state_tax_rate(&order.state)).round() as i64\n    }\n}\n"
+        }
+      ],
+      "consumer": [
+        {"path": "shipping_standard/src/lib.rs"},
+        {"path": "pricing_engine/src/lib.rs"}
+      ],
+      "tests": [
+        {"path": "checkout/tests/integration.rs"}
+      ],
+      "replaces": ["tax_us/src/lib.rs"],
+      "compile": ["cargo", "test", "--no-run"],
+      "test": ["cargo", "test", "-p", "checkout", "--test", "integration"]
+    },
+    {
+      "id": "i_shipping_standard",
+      "parties": ["i_shipping_standard", "c5"],
+      "symbols": ["StandardShipping", "ShippingRule"],
+      "stub": [
+        {
+          "path": "shipping_standard/src/lib.rs",
+          "content": "use iface::{Order, ShippingRule};\n\npub struct StandardShipping;\n\nimpl ShippingRule for StandardShipping {\n    fn shipping_cents(&self, _order: &Order) -> i64 {\n        0\n    }\n}\n"
+        }
+      ],
+      "reference": [
+        {
+          "path": "shipping_standard/src/lib.rs",
+          "content": "use iface::{Order, ShippingRule};\nuse tax_us::state_tax_rate;\n\npub struct StandardShipping;\n\nimpl ShippingRule for StandardShipping {\n    fn shipping_cents(&self, order: &Order) -> i64 {\n        let rate = state_tax_rate(&order.state);\n        if rate > 0.0 {\n            0\n        } else {\n            500\n        }\n    }\n}\n"
+        }
+      ],
+      "consumer": [
+        {"path": "pricing_engine/src/lib.rs"}
+      ],
+      "tests": [
+        {"path": "checkout/tests/integration.rs"}
+      ],
+      "replaces": ["shipping_standard/src/lib.rs"],
+      "compile": ["cargo", "test", "--no-run"],
+      "test": ["cargo", "test", "-p", "checkout", "--test", "integration"]
+    },
+    {
+      "id": "i_discount_flat",
+      "parties": ["i_discount_flat", "c5"],
+      "symbols": ["FlatDiscount", "Discount"],
+      "stub": [
+        {
+          "path": "discount_flat/src/lib.rs",
+          "content": "use iface::{Order, Discount};\n\npub struct FlatDiscount;\n\nimpl Discount for FlatDiscount {\n    fn discount_cents(&self, _order: &Order, _subtotal_cents: i64) -> i64 {\n        0\n    }\n}\n"
+        }
+      ],
+      "reference": [
+        {
+          "path": "discount_flat/src/lib.rs",
+          "content": "use iface::{Order, Discount};\n\npub struct FlatDiscount;\n\nimpl Discount for FlatDiscount {\n    fn discount_cents(&self, order: &Order, subtotal_cents: i64) -> i64 {\n        if order.state == \"VIP\" {\n            subtotal_cents / 10\n        } else {\n            0\n        }\n    }\n}\n"
+        }
+      ],
+      "consumer": [
+        {"path": "pricing_engine/src/lib.rs"}
+      ],
+      "tests": [
+        {"path": "checkout/tests/integration.rs"}
+      ],
+      "replaces": ["discount_flat/src/lib.rs"],
+      "compile": ["cargo", "test", "--no-run"],
+      "test": ["cargo", "test", "-p", "checkout", "--test", "integration"]
+    },
+    {
+      "id": "i_discount_bulk",
+      "parties": ["i_discount_bulk", "c5"],
+      "symbols": ["BulkDiscount", "Discount"],
+      "stub": [
+        {
+          "path": "discount_bulk/src/lib.rs",
+          "content": "use iface::{Order, Discount};\n\npub struct BulkDiscount;\n\nimpl Discount for BulkU
+</think>
+
+{
+  "interfaces": [
+    {
+      "id": "i_tax_us",
+      "parties": ["i_tax_us", "c4", "c5"],
+      "symbols": ["state_tax_rate", "TaxUs"],
+      "stub": [
+        {
+          "path": "tax_us/src/lib.rs",
+          "content": "use iface::{Order, TaxRule};\n\npub fn state_tax_rate(_state: &str) -> f64 {\n    0.0\n}\n\npub struct TaxUs;\n\nimpl TaxRule for TaxUs {\n    fn tax_cents(&self, _order: &Order, _taxable_cents: i64) -> i64 {\n        0\n    }\n}\n"
+        }
+      ],
+      "reference": [
+        {
+          "path": "tax_us/src/lib.rs",
+          "content": "use iface::{Order, TaxRule};\n\npub fn state_tax_rate(state: &str) -> f64 {\n    match state {\n        \"CA\" => 0.08,\n        \"OR\" => 0.0,\n        _ => 0.05,\n    }\n}\n\npub struct TaxUs;\n\nimpl TaxRule for TaxU

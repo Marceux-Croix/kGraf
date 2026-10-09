@@ -681,6 +681,20 @@ answer cut at the output limit is not asked again. An `error` object a server se
 answered 200 (in the body or mid-stream) is a typed error, never answer text, and one that
 names a parse failure of the model's output is the same malformed-output kind as the 5xx.
 
+**An answer the model stopped before its JSON closed is closed or asked once more (0030,
+amended 2026-10-09, fourth).** Every orchestrator call that parses JSON reads its answer through
+`ModelCaller::ask_read`: decompose (also with model tools), interfaces, reground, answer_question,
+judge_connections, interpret, question_route, challenge_review, handshake, consumer_test and
+interface_review. For an answer the model ended itself (`StopReason::EndTurn`) whose open object
+fails to parse only because the text ended, and that stops right after a complete value, the
+missing closing brackets and braces are appended (`answer_json::closing`) and the closed text
+must pass the same parser; never inside a string or after a key, comma, colon, opening bracket
+or number. Otherwise the same request, with one sentence added at its end, is sent once more
+inside the same ask: not counted against any ask budget, ledgered like any call, at most once
+per ask, and a second incomplete answer is the ask's normal refusal. A cut at the output limit
+is unchanged. Each closing and re-ask is written to the trace (`answer_repaired`,
+`answer_reasked`) and as a run notice.
+
 **Contract checks and challenges (decisions 0029 to 0037)** are available
 on the live path, off by default, opt in per run. When enabled, a second
 planner call writes an interface contract for each place one contract uses

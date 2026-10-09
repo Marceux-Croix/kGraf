@@ -7,6 +7,11 @@
 //! would be gone. A reader of the run's files could not tell a server fault
 //! from a call that was dropped mid-flight.
 //!
+//! The same side channel keeps each answer a caller repaired or asked again
+//! for because the model ended it before its JSON object closed
+//! ([`AnswerRecovery`]): the row records the call, never what was done with
+//! its answer.
+//!
 //! This log is the side channel for that evidence. It lives on the [`Ledger`]
 //! because every orchestrator call of a run already shares one, so no call
 //! signature changes. It is memory only, never part of the chain, and bounded;
@@ -69,20 +74,43 @@ pub struct Drained {
     pub dropped: u64,
 }
 
-/// Memory-only, bounded log of [`CallError`]s.
-#[derive(Default)]
-pub struct CallErrorLog {
-    inner: Mutex<Inner>,
+/// An entry of an [`AgentLog`]: kept for the run whose agent id it names.
+pub trait KeptForAgent {
+    /// The ledger agent the entry belongs to (`orchestrator:<run>...`).
+    fn agent(&self) -> &str;
 }
 
-#[derive(Default)]
-struct Inner {
-    entries: VecDeque<CallError>,
+impl KeptForAgent for CallError {
+    fn agent(&self) -> &str {
+        &self.agent
+    }
+}
+
+/// Memory-only, bounded log of entries kept per agent, drained by the run
+/// that owns them. The oldest entry is evicted when the log is full, and the
+/// eviction is counted.
+pub struct AgentLog<T> {
+    inner: Mutex<Inner<T>>,
+}
+
+struct Inner<T> {
+    entries: VecDeque<T>,
     dropped: u64,
 }
 
-impl CallErrorLog {
-    pub fn push(&self, entry: CallError) {
+impl<T> Default for AgentLog<T> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                entries: VecDeque::new(),
+                dropped: 0,
+            }),
+        }
+    }
+}
+
+impl<T: KeptForAgent> AgentLog<T> {
+    pub fn push(&self, entry: T) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if g.entries.len() >= CAPACITY {
             g.entries.pop_front();
@@ -91,22 +119,74 @@ impl CallErrorLog {
         g.entries.push_back(entry);
     }
 
-    /// Take the entries whose agent starts with `agent_prefix`, in order. The
-    /// others stay for the run they belong to.
-    pub fn drain(&self, agent_prefix: &str) -> Drained {
+    /// Take the entries whose agent starts with `agent_prefix`, in order, and
+    /// the count evicted since the last drain. The others stay for the run
+    /// they belong to.
+    pub fn drain_entries(&self, agent_prefix: &str) -> (Vec<T>, u64) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if g.entries.is_empty() && g.dropped == 0 {
-            return Drained::default();
+            return (Vec::new(), 0);
         }
         let (mine, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut g.entries)
             .into_iter()
-            .partition(|e| e.agent.starts_with(agent_prefix));
+            .partition(|e| e.agent().starts_with(agent_prefix));
         g.entries = rest;
         let dropped = std::mem::take(&mut g.dropped);
-        Drained {
-            errors: mine.into(),
-            dropped,
-        }
+        (mine.into(), dropped)
+    }
+}
+
+/// Memory-only, bounded log of [`CallError`]s.
+#[derive(Default)]
+pub struct CallErrorLog {
+    log: AgentLog<CallError>,
+}
+
+impl CallErrorLog {
+    pub fn push(&self, entry: CallError) {
+        self.log.push(entry);
+    }
+
+    /// Take the entries whose agent starts with `agent_prefix`, in order. The
+    /// others stay for the run they belong to.
+    pub fn drain(&self, agent_prefix: &str) -> Drained {
+        let (errors, dropped) = self.log.drain_entries(agent_prefix);
+        Drained { errors, dropped }
+    }
+}
+
+/// What a caller did with an answer the model ended itself before its JSON
+/// object closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnswerRecoveryAction {
+    /// The answer lacked only closing delimiters: `appended` was added and
+    /// the closed answer passed the same parsing a whole answer passes.
+    Repaired { appended: String },
+    /// The answer could not be closed that way (it stopped inside a string,
+    /// after a key, a comma or a number, or the closed answer did not parse):
+    /// the same request was sent once more, outside the caller's ask budget.
+    /// `reason` says why the answer could not be closed.
+    Reasked { reason: String },
+}
+
+/// One answer a caller repaired or asked again for because the model ended it
+/// before its JSON object closed. The run's trace drains these as records:
+/// the ledger row of the call cannot say that its answer was changed or
+/// replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerRecovery {
+    /// The ledger id of the call whose answer stopped early.
+    pub call: CallId,
+    /// The ledger agent that made it.
+    pub agent: String,
+    /// The call kind (`decompose`, `interfaces`, `reground`, ...).
+    pub what: String,
+    pub action: AnswerRecoveryAction,
+}
+
+impl KeptForAgent for AnswerRecovery {
+    fn agent(&self) -> &str {
+        &self.agent
     }
 }
 
@@ -146,6 +226,30 @@ mod tests {
         let d = log.drain("o");
         assert_eq!((d.errors.len(), d.dropped), (CAPACITY, 3));
         assert_eq!(d.errors[0].call, CallId::new("c3"));
+    }
+
+    #[test]
+    fn answer_recoveries_drain_per_run_in_order() {
+        let log: AgentLog<AnswerRecovery> = AgentLog::default();
+        let rec = |agent: &str, n: u32| AnswerRecovery {
+            call: CallId::new(format!("c{n}")),
+            agent: agent.into(),
+            what: "interfaces".into(),
+            action: AnswerRecoveryAction::Repaired {
+                appended: "}".into(),
+            },
+        };
+        log.push(rec("orchestrator:a", 1));
+        log.push(rec("orchestrator:b", 2));
+        log.push(rec("orchestrator:a", 3));
+        let (a, dropped) = log.drain_entries("orchestrator:a");
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            a.iter().map(|r| r.call.to_string()).collect::<Vec<_>>(),
+            ["c1", "c3"]
+        );
+        assert_eq!(log.drain_entries("orchestrator:b").0.len(), 1);
+        assert!(log.drain_entries("orchestrator:").0.is_empty());
     }
 
     #[test]

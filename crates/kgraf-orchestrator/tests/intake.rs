@@ -319,8 +319,12 @@ async fn a_failed_interpretation_call_is_settled_and_reported_as_charged() {
 }
 
 /// An interpretation answer cut mid-string (a normal stop, the object never
-/// closed) is asked again within the shared bound; each try is its own
-/// charged call, and the answer that parses is the reading.
+/// closed) cannot be closed, so the same request is sent once more inside the
+/// same try (`ModelCaller::ask_read`), outside the shared bound of tries, and
+/// the answer that parses is the reading. The try's hold is settled at the
+/// answering call; the first call is in the ledger, attributed to the run,
+/// and is charged when the run opens, as every call of the run not settled
+/// here is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interpretation_answer_cut_mid_string_is_asked_again() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -355,10 +359,72 @@ async fn an_interpretation_answer_cut_mid_string_is_asked_again() {
         &NoTestRuns,
     )
     .await;
-    let reading = intake.result.expect("read on the retry");
+    let reading = intake.result.expect("read on the second call");
     assert_eq!(reading.answer().work_items.len(), 3);
     assert_eq!(asked.load(Ordering::SeqCst), 2);
-    assert_eq!(intake.charged.len(), 2, "both calls are charged");
+    assert_eq!(intake.charged.len(), 1, "one try, settled at its answer");
+    let rows: Vec<_> = p
+        .ledger
+        .calls()
+        .expect("rows")
+        .into_iter()
+        .filter(|r| r.trace.kind.as_deref() == Some("interpret"))
+        .collect();
+    assert_eq!(rows.len(), 2, "both calls are in the ledger");
+    assert!(
+        rows.iter().all(|r| r.task_id == "r1"),
+        "attributed to the run"
+    );
+    assert_eq!(p.admission.budget().held(), Money::ZERO);
+    let (kept, _) = p.ledger.take_answer_recoveries("orchestrator:r1");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].what, "interpret");
+    assert!(matches!(
+        kept[0].action,
+        kgraf_provider::AnswerRecoveryAction::Reasked { .. }
+    ));
+}
+
+/// An interpretation answer that stops early twice in one try is that try's
+/// refusal: the try counts against the shared bound, and the next try asks
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interpretation_answer_cut_twice_in_one_try_spends_a_try() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().expect("dir");
+    corpus(dir.path());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            if !prompt.contains("# Corpus") {
+                return "{\"contracts\":[]}".into();
+            }
+            let answer = interpretation_answer();
+            if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+                answer[..answer.len() / 2].to_owned()
+            } else {
+                answer
+            }
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let prices = prices();
+    let clock = SystemClock;
+    let intake = interpret_corpus(
+        intake_parts(&p, &prices, &clock),
+        &RunId::new("r1"),
+        request(),
+        &asker(&p),
+        &NoTestRuns,
+    )
+    .await;
+    let reading = intake.result.expect("read on the second try");
+    assert_eq!(reading.answer().work_items.len(), 3);
+    assert_eq!(asked.load(Ordering::SeqCst), 3, "two calls, then one try");
+    assert_eq!(intake.charged.len(), 2, "two tries, each settled");
     assert_eq!(p.admission.budget().held(), Money::ZERO);
 }
 

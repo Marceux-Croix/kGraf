@@ -316,7 +316,7 @@ pub fn quote_safe(text: &str) -> String {
 }
 
 /// `text` on one line, at most `max` characters.
-fn one_line(text: &str, max: usize) -> String {
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max {
         format!("{}...", flat.chars().take(max).collect::<String>())

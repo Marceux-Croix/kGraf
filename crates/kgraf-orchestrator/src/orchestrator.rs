@@ -923,8 +923,49 @@ fn cluster_cap_check(
 
 /// How many times the planner is asked again after a refused contracts answer,
 /// on top of the first ask. The interface call has its own budget
-/// (`interface_intake::MAX_INTERFACE_ASKS`).
+/// (`interface_intake::MAX_INTERFACE_ASKS`). An answer the model ended before
+/// its JSON closed and that was asked for once more
+/// (`ModelCaller::ask_read`) is not one of these.
 const MAX_PLAN_REASKS: u32 = 2;
+
+/// The trace record and the run notice of one answer recovery.
+fn answer_recovery_record(at_ms: i64, r: kgraf_provider::AnswerRecovery) -> (TraceEvent, String) {
+    let kgraf_provider::AnswerRecovery {
+        call,
+        agent,
+        what,
+        action,
+    } = r;
+    match action {
+        kgraf_provider::AnswerRecoveryAction::Repaired { appended } => (
+            TraceEvent::AnswerRepaired {
+                at_ms,
+                call: call.to_string(),
+                agent,
+                what: what.clone(),
+                appended: appended.clone(),
+            },
+            format!(
+                "the {what} answer of call {call} ended before its JSON object closed; kGraf \
+                 appended `{appended}` to close it, and the closed answer was read as any answer"
+            ),
+        ),
+        kgraf_provider::AnswerRecoveryAction::Reasked { reason } => (
+            TraceEvent::AnswerReasked {
+                at_ms,
+                call: call.to_string(),
+                agent,
+                what: what.clone(),
+                reason: reason.clone(),
+            },
+            format!(
+                "the {what} answer of call {call} ended before its JSON object closed and could \
+                 not be closed; the same request was sent once more, not counted as an ask ({})",
+                crate::interface_plan::one_line(&reason, 300)
+            ),
+        ),
+    }
+}
 
 /// How many times the whole plan is sent back to the planner when the
 /// pre-dispatch checks of its interfaces hold it before any work started
@@ -3135,6 +3176,28 @@ impl RunLoop {
                 "{} retried-call record(s) were dropped for lack of room; \
                  the ledger still holds every call",
                 kept.dropped
+            ));
+        }
+        // Then the answers the model ended before their JSON closed that were
+        // closed or asked for once more (`ModelCaller::ask_read`): each is a
+        // record and a notice, never silent.
+        let (recovered, dropped) = self
+            .s
+            .ledger
+            .take_answer_recoveries(&format!("orchestrator:{}", self.run_id()));
+        for r in recovered {
+            let (event, notice) = answer_recovery_record(at_ms, r);
+            self.notices
+                .insert(kgraf_secrets::scrub_persist_owned(notice));
+            self.trace
+                .record(event)
+                .await
+                .map_err(|e| OrchestratorError::Trace(e.to_string()))?;
+        }
+        if dropped > 0 {
+            self.notices.insert(format!(
+                "{dropped} answer-recovery record(s) were dropped for lack of room; \
+                 the ledger still holds every call"
             ));
         }
         self.trace

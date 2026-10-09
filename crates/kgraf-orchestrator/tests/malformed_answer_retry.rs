@@ -71,10 +71,19 @@ async fn a_re_grounding_answer_cut_mid_string_is_asked_again_and_the_step_runs()
         assert_eq!(report.status, RunStatus::Completed, "{cut}");
         assert_eq!(report.verified, vec!["a".to_owned(), "b".to_owned()]);
         let prompts = p.grounder.prompts();
-        assert_eq!(prompts.len(), 2, "one cut answer, one retry: {prompts:?}");
-        // The retry shows the model where its answer broke.
-        assert!(prompts[1].contains("<answer_refused>"), "{}", prompts[1]);
-        assert!(prompts[1].contains("[ERROR HERE]"), "{}", prompts[1]);
+        // The cut answer cannot be closed (it stops inside a string): the
+        // same request is sent once more, inside the same ask. The script
+        // answers it cut again, which is the ask's refusal; the retry then
+        // shows the model where its answer broke.
+        assert_eq!(prompts.len(), 3, "cut, cut again, retry: {prompts:?}");
+        assert!(
+            prompts[1].ends_with(kgraf_orchestrator::INCOMPLETE_ANSWER_NOTE),
+            "{}",
+            prompts[1]
+        );
+        assert!(!prompts[1].contains("<answer_refused>"), "{}", prompts[1]);
+        assert!(prompts[2].contains("<answer_refused>"), "{}", prompts[2]);
+        assert!(prompts[2].contains("[ERROR HERE]"), "{}", prompts[2]);
         let record = record_of(&p);
         let g = &record.groundings[0];
         assert!(g.serves);
@@ -87,7 +96,29 @@ async fn a_re_grounding_answer_cut_mid_string_is_asked_again_and_the_step_runs()
             .into_iter()
             .filter(|r| r.task_id == "r1" && r.trace.kind.as_deref() == Some("reground"))
             .count();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 3);
+        // The free second call is said in the trace and in the run's notices.
+        let events = kgraf_orchestrator::TraceLog::open(&dir.path().join("runs/r1/trace.jsonl"))
+            .await
+            .expect("trace")
+            .load()
+            .await
+            .expect("load");
+        let reasked = events
+            .iter()
+            .filter(|e| {
+                matches!(e, kgraf_orchestrator::TraceEvent::AnswerReasked { what, .. } if what == "reground")
+            })
+            .count();
+        assert_eq!(reasked, 1, "{events:?}");
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|n| n.contains("the same request was sent once more")),
+            "{:?}",
+            report.notices
+        );
     }
 }
 
@@ -98,10 +129,12 @@ async fn a_re_grounding_malformed_every_time_holds_after_the_bound_and_says_so()
     let report = run(&p).await;
     assert!(matches!(report.status, RunStatus::Blocked { .. }));
     assert_eq!(report.verified, vec!["a".to_owned()]);
+    // Each ask's answer stops inside a string, so each ask also sends its
+    // request once more, outside the bound: two calls per ask.
     assert_eq!(
         p.grounder.calls(),
-        1 + kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES as usize,
-        "asked once and again up to the bound, never more"
+        2 * (1 + kgraf_provider::MAX_MALFORMED_OUTPUT_RETRIES as usize),
+        "asked once and again up to the bound, each with one free call, never more"
     );
     let record = record_of(&p);
     let b = record.contract("b").expect("b");
@@ -233,4 +266,102 @@ async fn a_retried_refused_answer_is_not_recorded_as_a_server_fault() {
         })
         .collect();
     assert_eq!(kept, vec![(None, false)], "{events:?}");
+}
+
+async fn trace_of(dir: &std::path::Path) -> Vec<kgraf_orchestrator::TraceEvent> {
+    kgraf_orchestrator::TraceLog::open(&dir.join("runs/r1/trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load")
+}
+
+/// A contracts answer the model ended with only its final brace missing is
+/// closed on the same call: no refusal is recorded, no ask is spent, and the
+/// trace and the run's notices say what was appended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_missing_its_final_brace_is_closed_and_no_ask_is_spent() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("b", "make b", "src/b.rs", &["a"]),
+    ]);
+    let cut = plan
+        .trim_end()
+        .strip_suffix('}')
+        .expect("ends with }")
+        .to_owned();
+    let p = Parts::open(
+        dir.path(),
+        move |_| cut.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let report = run(&p).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(p.planner.calls(), 1, "closed on the same call");
+    let events = trace_of(dir.path()).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, kgraf_orchestrator::TraceEvent::PlanRefused { .. })),
+        "{events:?}"
+    );
+    let repaired: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            kgraf_orchestrator::TraceEvent::AnswerRepaired { what, appended, .. } => {
+                Some((what.as_str(), appended.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repaired, vec![("decompose", "}")], "{events:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains("appended `}`")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// A contracts answer that stops inside a string is sent once more, and that
+/// second call is not a refused ask: no `plan_refused` is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_stopped_mid_string_is_asked_once_more_without_a_refusal() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("b", "make b", "src/b.rs", &["a"]),
+    ]);
+    let cut = plan[..plan.find("make b").expect("b") + 3].to_owned();
+    let p = Parts::open(
+        dir.path(),
+        move |prompt| {
+            if prompt.contains(kgraf_orchestrator::INCOMPLETE_ANSWER_NOTE) {
+                plan.clone()
+            } else {
+                cut.clone()
+            }
+        },
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let report = run(&p).await;
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(p.planner.calls(), 2);
+    let events = trace_of(dir.path()).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, kgraf_orchestrator::TraceEvent::PlanRefused { .. })),
+        "{events:?}"
+    );
+    let reasked = events
+        .iter()
+        .filter(|e| {
+            matches!(e, kgraf_orchestrator::TraceEvent::AnswerReasked { what, .. } if what == "decompose")
+        })
+        .count();
+    assert_eq!(reasked, 1, "{events:?}");
 }

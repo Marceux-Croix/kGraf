@@ -38,7 +38,8 @@ pub use accounting::{
     TaskUsage,
 };
 pub use call_errors::{
-    CallError, CallErrorLog, Drained as DrainedCallErrors, ERROR_KEEP_BYTES, bounded_error_text,
+    AgentLog, AnswerRecovery, AnswerRecoveryAction, CallError, CallErrorLog,
+    Drained as DrainedCallErrors, ERROR_KEEP_BYTES, KeptForAgent, bounded_error_text,
 };
 pub use capability::{CacheControl, Capabilities, Reasoning, StreamEvent, Streaming};
 pub use crosslimit::{CrossLimitError, SharedLimiterStore, default_store_path, key_id};

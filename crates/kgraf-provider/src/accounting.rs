@@ -1240,6 +1240,9 @@ pub struct Ledger {
     /// Failures of calls their callers asked again; memory only, outside the
     /// chain. See [`crate::call_errors`].
     call_errors: crate::call_errors::CallErrorLog,
+    /// Answers their callers repaired or asked again for; memory only,
+    /// outside the chain. See [`crate::call_errors`].
+    answer_recoveries: crate::call_errors::AgentLog<crate::call_errors::AnswerRecovery>,
     /// Test-only: the write connection, which tests tamper through to play an
     /// attacker. Outside tests only the writer thread (and, in memory,
     /// [`Reads::Shared`]) holds it.
@@ -1284,6 +1287,21 @@ impl Ledger {
     /// `agent_prefix`.
     pub fn take_call_errors(&self, agent_prefix: &str) -> crate::call_errors::Drained {
         self.call_errors.drain(agent_prefix)
+    }
+
+    /// Keep an answer its caller repaired or asked again for because the model
+    /// ended it before its JSON object closed (see [`crate::call_errors`]).
+    pub fn note_answer_recovery(&self, entry: crate::call_errors::AnswerRecovery) {
+        self.answer_recoveries.push(entry);
+    }
+
+    /// Take the kept answer recoveries of the agents whose id starts with
+    /// `agent_prefix`, and the count evicted for lack of room.
+    pub fn take_answer_recoveries(
+        &self,
+        agent_prefix: &str,
+    ) -> (Vec<crate::call_errors::AnswerRecovery>, u64) {
+        self.answer_recoveries.drain_entries(agent_prefix)
     }
 
     /// Open a ledger on disk.
@@ -1449,6 +1467,7 @@ impl Ledger {
 
         Ok(Self {
             call_errors: Default::default(),
+            answer_recoveries: Default::default(),
             #[cfg(test)]
             conn,
             submitter: Mutex::new(Submitter { tx, next_ticket: 1 }),

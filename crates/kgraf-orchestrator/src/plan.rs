@@ -1124,6 +1124,109 @@ pub(crate) fn json_object(text: &str) -> Result<serde_json::Value, PlanError> {
     crate::answer_json::json_object_with(text, None)
 }
 
+/// Sent once after an answer the model ended itself before its JSON object
+/// closed and that could not be closed ([`ModelCaller::ask_read`]).
+pub const INCOMPLETE_ANSWER_NOTE: &str = "Your previous answer to this request stopped \
+before its JSON object was complete. Answer again with the whole JSON object and nothing else.";
+
+/// How one answer was read ([`read_answer`]).
+#[derive(Debug)]
+pub(crate) enum Reading<T> {
+    /// The answer parsed: as written, or, with `appended`, once the closing
+    /// brackets it lacked were added. `text` is what parsed.
+    Parsed {
+        value: T,
+        text: String,
+        appended: Option<String>,
+    },
+    /// The model ended its answer before its JSON object closed, and closing
+    /// it did not give an answer that parses: `why` says what stood in the
+    /// way. `error` is the refusal of the answer as written.
+    Incomplete { error: PlanError, why: String },
+    /// Any other answer `parse` refused.
+    Refused(PlanError),
+}
+
+/// Read one answer with `parse`. An answer the model ended itself
+/// (`ended_by_model`: a normal stop, never a cut at the output limit) that
+/// stops inside its open JSON object is closed when only closing brackets
+/// and braces are missing ([`crate::answer_json::closing`]), and the closed
+/// text must pass the same `parse`. Nothing else is changed.
+pub(crate) fn read_answer<T>(
+    text: &str,
+    ended_by_model: bool,
+    parse: &impl Fn(&str) -> Result<T, PlanError>,
+) -> Reading<T> {
+    use crate::answer_json::{Closing, closing};
+    let error = match parse(text) {
+        Ok(value) => {
+            return Reading::Parsed {
+                value,
+                text: text.to_owned(),
+                appended: None,
+            };
+        }
+        Err(e) => e.into_unattributed(),
+    };
+    if !ended_by_model {
+        return Reading::Refused(error);
+    }
+    match closing(text) {
+        Closing::NotStoppedEarly => Reading::Refused(error),
+        Closing::Closable {
+            text: closed,
+            appended,
+        } => match parse(&closed) {
+            Ok(value) => Reading::Parsed {
+                value,
+                text: closed,
+                appended: Some(appended),
+            },
+            Err(e) => Reading::Incomplete {
+                error,
+                why: format!(
+                    "closing it with `{appended}` gives an answer that is still refused ({})",
+                    e.into_unattributed()
+                ),
+            },
+        },
+        Closing::Unclosable(why) => Reading::Incomplete {
+            error,
+            why: why.to_owned(),
+        },
+    }
+}
+
+/// One answer of [`ModelCaller::ask_read`]: the text read, and what `parse`
+/// made of it.
+#[derive(Debug)]
+pub(crate) struct ReadAnswer<T> {
+    /// The answer as parsed: as written, or closed (see [`read_answer`]).
+    pub text: String,
+    pub parsed: Result<T, PlanError>,
+}
+
+/// `note` added to the end of `request`'s last user message: to its last
+/// text block, or as a block of its own after tool results.
+fn add_to_last_user_message(request: &mut Request, note: &str) {
+    use kgraf_provider::{Content, Message, Role};
+    match request
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == Role::User)
+    {
+        Some(message) => match message.content.last_mut() {
+            Some(Content::Text { text, .. }) => {
+                text.push_str("\n\n");
+                text.push_str(note);
+            }
+            _ => message.content.push(Content::text(note)),
+        },
+        None => request.messages.push(Message::user(note)),
+    }
+}
+
 /// Parse a decomposition answer.
 pub fn parse_plan(text: &str) -> Result<Vec<ContractSpec>, PlanError> {
     #[derive(Deserialize)]
@@ -1287,28 +1390,24 @@ impl ModelCaller {
         let mut prompt = user.clone();
         let mut retries = 0u32;
         loop {
-            let (result, call) = self.ask_keeping_call(kind, system, prompt).await;
-            let answered = call.is_some();
-            let this_call = call.clone();
-            calls.extend(call);
+            // One ask: its answer, closed or asked once more when the model
+            // ended it before its JSON closed, all outside this bound.
+            let (result, these) = self.ask_read(kind, system, prompt, None, &parse).await;
+            let this_call = these.last().cloned();
+            let answered = !these.is_empty();
+            calls.extend(these);
             let failure = match result {
-                Ok(text) if answered => match parse(&text) {
-                    Ok(value) => return Ok((value, calls)),
-                    Err(e) => e.into_unattributed(),
-                },
-                // Never asked again: a call with no ledger row is an
-                // accounting fault, not the model's output.
-                Ok(_) => {
-                    return Err(PlanError::attributed(
-                        calls,
-                        PlanError::BadOutput {
-                            reason: "a completed call has no ledger row".into(),
-                            excerpt: String::new(),
-                        },
-                    ));
-                }
+                Ok(ReadAnswer {
+                    parsed: Ok(value), ..
+                }) => return Ok((value, calls)),
+                Ok(ReadAnswer { parsed: Err(e), .. }) => e.into_unattributed(),
                 Err(e) => e.into_unattributed(),
             };
+            // Never asked again: a call with no ledger row is an accounting
+            // fault, not the model's output.
+            if !answered && failure.is_malformed_answer() {
+                return Err(PlanError::attributed(calls, failure));
+            }
             if !failure.is_malformed_answer() {
                 return Err(PlanError::attributed(calls, failure));
             }
@@ -1360,6 +1459,120 @@ impl ModelCaller {
         });
     }
 
+    /// Keep what was done with an answer the model ended before its JSON
+    /// closed, for the run's trace and output
+    /// ([`kgraf_provider::Ledger::take_answer_recoveries`]).
+    fn note_answer_recovery(
+        &self,
+        kind: &str,
+        call: &CallId,
+        action: kgraf_provider::AnswerRecoveryAction,
+    ) {
+        self.ledger
+            .note_answer_recovery(kgraf_provider::AnswerRecovery {
+                call: call.clone(),
+                agent: self.agent.clone(),
+                what: kind.to_owned(),
+                action,
+            });
+    }
+
+    /// One ask of a JSON answer, read by `parse` ([`read_answer`]), with the
+    /// answer limited to `cap` output tokens where [`Self::output_limit`]
+    /// enforces it. An answer the model ended itself before its JSON object
+    /// closed is closed when it lacks only closing brackets and braces; when
+    /// it cannot be closed, the same request, with
+    /// [`INCOMPLETE_ANSWER_NOTE`] added at its end, is sent once more. That
+    /// second call is part of this ask: it never counts against a caller's
+    /// ask budget, and a second incomplete answer is returned as the ask's
+    /// refusal, never asked again here. A cut at the output limit is
+    /// [`PlanError::Truncated`] and is neither closed nor asked again. Each
+    /// closing and each second call is kept for the run's trace
+    /// ([`Self::note_answer_recovery`]); a closed answer costs no call.
+    ///
+    /// Returns every ledger call made, the answering one last. `Err` is a
+    /// failure of a call (a provider error, a cut at the output limit, a
+    /// ledger error), attributed to the calls made.
+    pub(crate) async fn ask_read<T>(
+        &self,
+        kind: &str,
+        system: &str,
+        user: String,
+        cap: Option<u32>,
+        parse: &impl Fn(&str) -> Result<T, PlanError>,
+    ) -> (Result<ReadAnswer<T>, PlanError>, Vec<CallId>) {
+        let limit = self.output_limit(kind, cap);
+        let mut request = self.request(kind, user, limit);
+        request.system = vec![kgraf_provider::Content::text(system)];
+        let mut calls: Vec<CallId> = Vec::new();
+        let mut asked_again = false;
+        loop {
+            let (result, call) = self.complete_once(kind, &request).await;
+            calls.extend(call.clone());
+            let response = match result {
+                Ok(response) => response,
+                Err(e) => {
+                    let e = PlanError::attributed(calls.clone(), e.into_unattributed());
+                    return (Err(e), calls);
+                }
+            };
+            let Some(call) = call else {
+                let e = PlanError::BadOutput {
+                    reason: "a completed call has no ledger row".into(),
+                    excerpt: String::new(),
+                };
+                return (Err(PlanError::attributed(calls.clone(), e)), calls);
+            };
+            let ended = response.stop_reason == kgraf_provider::StopReason::EndTurn;
+            let text = response.text();
+            match read_answer(&text, ended, parse) {
+                Reading::Parsed {
+                    value,
+                    text,
+                    appended,
+                } => {
+                    if let Some(appended) = appended {
+                        self.note_answer_recovery(
+                            kind,
+                            &call,
+                            kgraf_provider::AnswerRecoveryAction::Repaired { appended },
+                        );
+                    }
+                    return (
+                        Ok(ReadAnswer {
+                            text,
+                            parsed: Ok(value),
+                        }),
+                        calls,
+                    );
+                }
+                Reading::Incomplete { error, why } if !asked_again => {
+                    asked_again = true;
+                    self.note_answer_recovery(
+                        kind,
+                        &call,
+                        kgraf_provider::AnswerRecoveryAction::Reasked {
+                            reason: kgraf_provider::bounded_error_text(&format!(
+                                "the model ended its answer before its JSON object closed and \
+                                 {why}; {error}"
+                            )),
+                        },
+                    );
+                    add_to_last_user_message(&mut request, INCOMPLETE_ANSWER_NOTE);
+                }
+                Reading::Incomplete { error, .. } | Reading::Refused(error) => {
+                    return (
+                        Ok(ReadAnswer {
+                            text,
+                            parsed: Err(error),
+                        }),
+                        calls,
+                    );
+                }
+            }
+        }
+    }
+
     /// The call and its ledger row id, which is kept on failure too, so a caller
     /// can settle a failed call at its ledger cost rather than lose track of it.
     pub(crate) async fn ask_keeping_call(
@@ -1401,21 +1614,30 @@ impl ModelCaller {
     /// history holding tool calls needs them listed on some wires); the
     /// instruction and the refusal bound it instead.
     ///
+    /// The answer without tool calls is read by `parse` as
+    /// [`Self::ask_read`] reads one: closed when it lacks only closing
+    /// brackets, or, once, the same round sent again with
+    /// [`INCOMPLETE_ANSWER_NOTE`], which does not count as a round.
+    ///
     /// [`ModelKindCalls::take_calls`]: crate::model_kinds::ModelKindCalls::take_calls
-    pub(crate) async fn ask_with_model_tools(
+    pub(crate) async fn ask_with_model_tools<T>(
         &self,
         kind: &str,
         system: &str,
         user: String,
         tools: &crate::model_kinds::ModelKindCalls,
-    ) -> Result<(String, Vec<CallId>), PlanError> {
+        parse: &impl Fn(&str) -> Result<T, PlanError>,
+    ) -> Result<(ReadAnswer<T>, Vec<CallId>), PlanError> {
         use kgraf_provider::{Content, Message, Role};
         let mut request = self.request(kind, user, self.max_output_tokens);
         request.system = vec![Content::text(system)];
         request.tools = tools.tool_definitions();
         let mut calls = Vec::new();
-        for round in 0..=MAX_MODEL_TOOL_ROUNDS {
+        let mut asked_again = false;
+        let mut round = 0;
+        while round <= MAX_MODEL_TOOL_ROUNDS {
             let (result, call) = self.complete_once(kind, &request).await;
+            let this_call = call.clone();
             calls.extend(call);
             // A failed round carries its own call; the failure is charged with
             // every round's.
@@ -1437,7 +1659,50 @@ impl ModelCaller {
                 })
                 .collect();
             if uses.is_empty() {
-                return Ok((response.text(), calls));
+                let ended = response.stop_reason == kgraf_provider::StopReason::EndTurn;
+                let text = response.text();
+                let read = match read_answer(&text, ended, parse) {
+                    Reading::Parsed {
+                        value,
+                        text,
+                        appended,
+                    } => {
+                        if let (Some(appended), Some(call)) = (appended, &this_call) {
+                            self.note_answer_recovery(
+                                kind,
+                                call,
+                                kgraf_provider::AnswerRecoveryAction::Repaired { appended },
+                            );
+                        }
+                        ReadAnswer {
+                            text,
+                            parsed: Ok(value),
+                        }
+                    }
+                    Reading::Incomplete { error, why } if !asked_again => {
+                        asked_again = true;
+                        if let Some(call) = &this_call {
+                            self.note_answer_recovery(
+                                kind,
+                                call,
+                                kgraf_provider::AnswerRecoveryAction::Reasked {
+                                    reason: kgraf_provider::bounded_error_text(&format!(
+                                        "the model ended its answer before its JSON object \
+                                         closed and {why}; {error}"
+                                    )),
+                                },
+                            );
+                        }
+                        add_to_last_user_message(&mut request, INCOMPLETE_ANSWER_NOTE);
+                        // The same round again: not a round of its own.
+                        continue;
+                    }
+                    Reading::Incomplete { error, .. } | Reading::Refused(error) => ReadAnswer {
+                        text,
+                        parsed: Err(error),
+                    },
+                };
+                return Ok((read, calls));
             }
             if round == MAX_MODEL_TOOL_ROUNDS {
                 return Err(PlanError::attributed(
@@ -1482,6 +1747,7 @@ impl ModelCaller {
                 role: Role::User,
                 content: results,
             });
+            round += 1;
         }
         // The loop returns on its last round.
         Err(PlanError::attributed(
@@ -1702,18 +1968,23 @@ impl Decomposer for ModelDecomposer {
             user.push('\n');
             user.push_str(n);
         }
-        let (text, calls) = match model_calls {
+        let (read, calls) = match model_calls {
             Some(tools) => {
                 self.0
-                    .ask_with_model_tools("decompose", DECOMPOSE_SYSTEM, user, tools)
+                    .ask_with_model_tools("decompose", DECOMPOSE_SYSTEM, user, tools, &parse_plan)
                     .await?
             }
             None => {
-                let (text, call) = self.0.ask("decompose", DECOMPOSE_SYSTEM, user).await?;
-                (text, vec![call])
+                let (result, calls) = self
+                    .0
+                    .ask_read("decompose", DECOMPOSE_SYSTEM, user, None, &parse_plan)
+                    .await;
+                (result?, calls)
             }
         };
-        let contracts = parse_plan(&text).map_err(|e| PlanError::attributed(calls.clone(), e))?;
+        let contracts = read
+            .parsed
+            .map_err(|e| PlanError::attributed(calls.clone(), e))?;
         Ok(PlanOutput { contracts, calls })
     }
 
@@ -1722,28 +1993,23 @@ impl Decomposer for ModelDecomposer {
         request: &crate::interface_plan::InterfaceRequest,
     ) -> Result<crate::interface_plan::InterfaceReply, PlanError> {
         let user = crate::interface_plan::interface_prompt(request);
-        let (text, call) = match self
+        // Read here only to close an answer the model ended before its JSON
+        // closed, or ask for it once more; the caller parses the text it gets
+        // back as it parses any answer, and quotes it when it refuses it.
+        let (result, calls) = self
             .0
-            .ask_keeping_call_capped(
+            .ask_read(
                 "interfaces",
                 crate::interface_plan::INTERFACES_SYSTEM,
                 user,
                 request.output_cap,
+                &|text: &str| crate::interface_plan::parse_interfaces(text).map(|_| ()),
             )
-            .await
-        {
-            (Ok(text), Some(call)) => (text, call),
-            (Ok(_), None) => {
-                return Err(PlanError::BadOutput {
-                    reason: "a completed call has no ledger row".into(),
-                    excerpt: String::new(),
-                });
-            }
-            (Err(e), _) => return Err(e),
-        };
+            .await;
+        let read = result?;
         Ok(crate::interface_plan::InterfaceReply {
-            text,
-            calls: vec![call],
+            text: read.text,
+            calls,
         })
     }
 }
@@ -3111,11 +3377,11 @@ mod tests {
     #[tokio::test]
     async fn an_interface_review_malformed_every_time_is_unparseable_after_the_bound() {
         use crate::interface_review::{InterfaceReviewer, ReviewOutcome, ReviewRequest};
-        let provider = Scripted::new(vec![
-            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
-            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
-            Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"),
-        ]);
+        let provider = Scripted::new(
+            (0..6)
+                .map(|_| Scripted1::Text("{\"approve\":true,\"findings\":[{\"symbol\":\"a"))
+                .collect(),
+        );
         let reviewer = crate::interface_review::RoutedInterfaceReviewer {
             ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
             routes: [(
@@ -3143,7 +3409,10 @@ mod tests {
             matches!(&outcome, ReviewOutcome::Unparseable(why) if why.contains("made 3 times")),
             "{outcome:?}"
         );
-        assert_eq!(provider.prompts().len(), 3);
+        // Three asks; each answer stops inside a string, so each ask also
+        // sent its request once more, outside the bound
+        // (`ModelCaller::ask_read`).
+        assert_eq!(provider.prompts().len(), 6);
     }
 
     /// An interface ask that states an output cap is held to it only when
@@ -3507,7 +3776,7 @@ mod tests {
         }
     }
 
-    fn rerank_calls(ledger: Arc<Ledger>) -> Arc<crate::model_kinds::ModelKindCalls> {
+    pub(super) fn rerank_calls(ledger: Arc<Ledger>) -> Arc<crate::model_kinds::ModelKindCalls> {
         let reranker: Arc<dyn kgraf_provider::Reranker> = Arc::new(FirstIsBest);
         let routes = kgraf_provider::ModelRoutes::new(vec![kgraf_provider::ModelRoute::new(
             "local:r",
@@ -3523,7 +3792,7 @@ mod tests {
         ))
     }
 
-    fn tool_request(calls: Arc<crate::model_kinds::ModelKindCalls>) -> PlanRequest {
+    pub(super) fn tool_request(calls: Arc<crate::model_kinds::ModelKindCalls>) -> PlanRequest {
         PlanRequest {
             instruction: "do it".into(),
             split_reason: None,
@@ -4276,6 +4545,7 @@ mod tests {
             ".ask_json(",
             ".ask_keeping_call(",
             ".ask_keeping_call_capped(",
+            ".ask_read(",
             ".ask_with_model_tools(",
         ] {
             for (at, _) in code.match_indices(method) {
@@ -4300,3 +4570,9 @@ mod tests {
         assert_eq!(call_kinds_asked_in(&crlf), want);
     }
 }
+
+/// Answers the model ended before their JSON object closed, from recorded
+/// answers.
+#[cfg(test)]
+#[path = "incomplete_answer_tests.rs"]
+mod incomplete_answer_tests;

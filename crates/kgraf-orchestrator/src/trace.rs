@@ -487,6 +487,40 @@ pub enum TraceEvent {
         /// The failure, bounded to 2 KiB.
         error: String,
     },
+    /// An orchestrator answer the model ended itself before its JSON object
+    /// closed, closed by appending the closing brackets and braces it lacked
+    /// (`ModelCaller::ask_read`). The closed answer passed the same parsing
+    /// a whole answer passes. No call was added: the answer is the one of
+    /// `call`'s ledger row, which this record says was changed.
+    AnswerRepaired {
+        at_ms: i64,
+        /// The ledger id of the call whose answer was closed.
+        call: String,
+        /// The ledger agent that made it.
+        agent: String,
+        /// The call kind.
+        what: String,
+        /// What was appended, in order.
+        appended: String,
+    },
+    /// An orchestrator answer the model ended itself before its JSON object
+    /// closed and that could not be closed, so the same request was sent once
+    /// more (`ModelCaller::ask_read`). That second call is part of the same
+    /// ask and does not count against the ask budget; it is ledgered and
+    /// accounted like any call. A second incomplete answer is the ask's
+    /// refusal and counts.
+    AnswerReasked {
+        at_ms: i64,
+        /// The ledger id of the call whose answer stopped early.
+        call: String,
+        /// The ledger agent that made it.
+        agent: String,
+        /// The call kind.
+        what: String,
+        /// Why the answer could not be closed, and its refusal, bounded to
+        /// 2 KiB.
+        reason: String,
+    },
 }
 
 /// Persist-scrub every string value of a [`TraceEvent`] (decision 0071), including the ones nested
@@ -626,6 +660,19 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             status,
             server_parse,
             error: s(error),
+        },
+        TraceEvent::AnswerReasked {
+            at_ms,
+            call,
+            agent,
+            what,
+            reason,
+        } => TraceEvent::AnswerReasked {
+            at_ms,
+            call,
+            agent,
+            what,
+            reason: s(reason),
         },
         TraceEvent::InterfacesRefused {
             at_ms,
@@ -914,6 +961,7 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         }
         other @ (TraceEvent::Dispatch { .. }
         | TraceEvent::RouteRecovered { .. }
+        | TraceEvent::AnswerRepaired { .. }
         | TraceEvent::WorkerFinished { .. }
         | TraceEvent::Compaction { .. }
         | TraceEvent::ExtractorChanged { .. }

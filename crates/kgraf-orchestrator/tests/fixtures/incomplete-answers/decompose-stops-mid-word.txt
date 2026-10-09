@@ -1,0 +1,46 @@
+```json
+{
+"contracts": [
+{
+"id": "c1",
+"instruction": "Implement `discount_cents` for the `FlatDiscount` struct in `discount_flat/src/lib.rs`. When `order.state == \"VIP\"`, return `subtotal_cents / 10` (integer division). Return `0` for all other states.",
+"acceptance": "The code compiles and correctly implements the VIP discount logic as specified.",
+"writes": [{"path": "discount_flat/src/lib.rs"}],
+"depends_on": [],
+"slices": ["Order", "Discount", "FlatDiscount"],
+"tools": ["apply_patch", "shell"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c2",
+"instruction": "Implement `discount_cents` for the `BulkDiscount` struct in `discount_bulk/src/lib.rs`. Return `5000` when `order.total_qty() >= 10`, else return `0`.",
+"acceptance": "The code compiles and correctly implements the bulk quantity threshold logic as specified.",
+"writes": [{"path": "discount_bulk/src/lib.rs"}],
+"depends_on": [],
+"slices": ["Order", "Discount", "BulkDiscount", "total_qty"],
+"tools": ["apply_patch", "shell"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c3",
+"instruction": "Implement `state_tax_rate` as a public function in `tax_us/src/lib.rs`: return `0.08` for \"CA\", `0.0` for \"OR\", and `0.05` for any other state (including \"VIP\"). Then implement `tax_cents` for `TaxUs` in the same file by calling `state_tax_rate(&order.state)` on the taxable amount, rounding the result.",
+"acceptance": "The code compiles and `state_tax_rate` returns correct rates for CA, OR, and all other states.",
+"writes": [{"path": "tax_us/src/lib.rs"}],
+"depends_on": [],
+"slices": ["Order", "TaxRule", "state_tax_rate"],
+"tools": ["apply_patch", "shell"],
+"route": null,
+"attempts": 1,
+"task_kind": "implementation"
+},
+{
+"id": "c4",
+"instruction": "Implement `shipping_cents` for the `StandardShipping` struct in `shipping_standard/src/lib.rs`. Import and call `tax_us::state_tax_rate(&order.state)` directly. Return `0` when that rate is strictly greater than `0.0`, otherwise return `500`.",
+"acceptance": "The code compiles, uses the correct dependency on `tax_us::state_tax_rate`, and implements the shipping logic accurately.",
+"writes": [{"path": "shipping_standard/src/lib.rs"}],
+"depends_on": ["c3"],
+"slices": ["Ship

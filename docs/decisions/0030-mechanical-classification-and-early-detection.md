@@ -1025,3 +1025,48 @@ Interface calls with reasoning on took 1,433 to 27,614 completion tokens (median
 refused because they end before the JSON object closes came back with `finish_reason: "stop"`
 far below the limit: the model ended them itself, and this amendment does not change how they
 are handled.
+
+## Amendment (2026-10-09, fourth): an answer the model stopped before its JSON closed is closed or asked once more, not refused
+
+An answer the model ends itself (`finish_reason: "stop"`, `StopReason::EndTurn`) before its JSON
+object closes used to be refused and cost one of the three asks, though its content was not at
+fault. Measured on recorded planner calls: about 3 in 62 interface calls and 1 in 758
+decomposition calls. Two shapes occur: the final `}` missing after a complete value, and a stop
+inside a string, mid-word.
+
+- **Every orchestrator call that parses JSON reads its answer one way**
+  (`ModelCaller::ask_read`, `read_answer`): `decompose` (with or without model tools),
+  `interfaces`, `reground`, `answer_question`, `judge_connections`, `interpret`,
+  `question_route`, `challenge_review`, `handshake`, `consumer_test`, `interface_review`.
+  `question_answer` asks for prose and is not read as JSON.
+- **Closing rule** (`answer_json::closing`). Only for an answer the model ended itself. The
+  answer's open object must fail to parse with an end-of-input error, so the parser read to the
+  end of the text with no other error; and the text, without trailing white space or a closing
+  code fence, must stop right after a complete value (a closed string value, `}`, `]`, `true`,
+  `false`, `null`). Then the closing brackets and braces of every open container are appended
+  in order, and the closed text must pass the same parser a whole answer passes. Never inside a
+  string, never after a key, a colon, a comma, an opening bracket or a number. An error before
+  the end of the text, such as a string left open in the middle of a finished answer, is the
+  answer's own mistake and is refused as before.
+- **One free re-ask.** An answer the model stopped early that cannot be closed, or whose closed
+  form the parser refuses, sends the same request once more with one sentence added at its end
+  (`INCOMPLETE_ANSWER_NOTE`). That call belongs to the same ask: it is not counted against the
+  ask budget, writes no `plan_refused` or `interfaces_refused`, and is ledgered and attributed
+  like any call. At most one per ask: a second incomplete answer is the ask's normal refusal and
+  counts. In the model-tool loop the same round is sent again and is not a round.
+- **A cut at the output limit is unchanged.** `StopReason::MaxTokens` is still
+  `PlanError::Truncated`: never closed, never parsed, never asked again.
+- **Never silent.** Each closing and each re-ask is written to the run's trace as
+  `answer_repaired` (call, agent, kind, `appended`; no call added) or `answer_reasked` (call,
+  agent, kind, `reason`), with a notice in the run's output naming the call.
+- **Measured.** A cheaper path can be taken more often, so the canary records `answer_repairs`
+  and `answer_reasks`, with counts per call kind, for every model scenario. Neither is a wasted
+  ask.
+- **Accounting.** A closed answer costs no call. The re-ask's tokens go through the same
+  ledgered path.
+
+The JSON repair crates guess quotes, commas and brackets; this rule appends only closers, and
+only where nothing else can follow.
+
+Tests: `kgraf-orchestrator` `incomplete_answer_tests.rs`, built from recorded answers
+(`tests/fixtures/incomplete-answers/`); `malformed_answer_retry.rs`; `intake.rs`.

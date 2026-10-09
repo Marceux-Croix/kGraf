@@ -199,11 +199,11 @@ pub use partition::{
     score_pairs, score_serialization, score_write_sets,
 };
 pub use plan::{
-    ContractSpec, CostBasis, Decomposer, GroundOutput, GroundRequest, Grounder, ModelAnswerer,
-    ModelCaller, ModelDecomposer, ModelGrounder, PlanError, PlanOutput, PlanRequest, answer_prompt,
-    judge_prompt, normalize_plan, parse_answer, parse_grounding, parse_plan, parse_verdicts,
-    sanitize_id, sanitize_interfaces, sanitize_plan, valid_write_path, validate_plan,
-    validate_plan_with,
+    ContractSpec, CostBasis, Decomposer, GroundOutput, GroundRequest, Grounder,
+    INCOMPLETE_ANSWER_NOTE, ModelAnswerer, ModelCaller, ModelDecomposer, ModelGrounder, PlanError,
+    PlanOutput, PlanRequest, answer_prompt, judge_prompt, normalize_plan, parse_answer,
+    parse_grounding, parse_plan, parse_verdicts, sanitize_id, sanitize_interfaces, sanitize_plan,
+    valid_write_path, validate_plan, validate_plan_with,
 };
 pub use port::{InboundKind, InboundMessage, MessagePort, OutboundReply, PortError, UntrustedText};
 pub use question_route::{

@@ -18,6 +18,15 @@
 //! answer around the point the parser stopped, marked, so a re-ask shows the
 //! model its own mistake instead of the first lines of its answer.
 //!
+//! An answer the model ended itself inside its object (a normal stop, far
+//! below the output limit) is read by [`closing`]: when the text is a prefix
+//! of a document that lacks only closing brackets and braces, and stops right
+//! after a complete value, the closers are the only thing that can follow, so
+//! they are appended. Anything else (a stop inside a string, after a key, a
+//! comma, an opening bracket or a number that may be cut) is not guessed at.
+//! The caller parses the closed answer exactly as it parses a whole one and
+//! records that it closed it.
+//!
 //! Searched before writing: `serde_json_lenient` (MIT/Apache-2.0, Google)
 //! accepts control characters in strings, but finding the top-level objects
 //! needs a string-aware scan of its own, which makes the escape a few lines and
@@ -258,6 +267,152 @@ pub fn json_object_with(text: &str, key: Option<&str>) -> Result<serde_json::Val
         reason: "no JSON object".into(),
         excerpt: body.chars().take(200).collect(),
     }))
+}
+
+/// The byte where the answer's open object starts: the first top-level
+/// object, found as [`json_object_with`] finds them, that never closes before
+/// the text ends. `None` when every object the answer starts also closes.
+fn open_object_start(text: &str) -> Option<usize> {
+    let body = after_reasoning(text);
+    let bytes = text.as_bytes();
+    let mut i = text.len() - body.len();
+    while let Some(rel) = text[i..].find('{') {
+        let start = i + rel;
+        if let Ok((_, used)) = parse_prefix(&text[start..]) {
+            i = start + used.max(1);
+            continue;
+        }
+        match balanced_end(bytes, start) {
+            Some(end) => i = end + 1,
+            None => return Some(start),
+        }
+    }
+    None
+}
+
+/// How an answer that may end inside an open JSON object can be closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// Every object the answer starts also closes, or the open one breaks
+    /// before the text ends (a parser meets an error before it runs out of
+    /// text, such as a line break inside a string that was never closed): the
+    /// answer has a mistake of its own, and it did not merely stop early.
+    NotStoppedEarly,
+    /// The answer ends inside an open object right after a complete value:
+    /// `text` is the answer (without trailing white space or a closing code
+    /// fence) with `appended`, the closing brackets and braces in order.
+    Closable { text: String, appended: String },
+    /// The answer ends inside an open object at a point no closing bracket
+    /// completes; the reason says where it stops.
+    Unclosable(&'static str),
+}
+
+/// Whether, and how, the answer's open object can be closed by appending
+/// closing brackets and braces only (see the module rules). Never inside a
+/// string: a string cut mid-way may have been cut mid-word.
+pub fn closing(text: &str) -> Closing {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Last {
+        Open,
+        Comma,
+        Colon,
+        Key,
+        Value,
+    }
+    let Some(start) = open_object_start(text) else {
+        return Closing::NotStoppedEarly;
+    };
+    let mut tail = text[start..].trim_end();
+    // A model that closes its code fence but not its object: the fence is
+    // not part of the JSON.
+    if let Some(t) = tail.strip_suffix("```") {
+        tail = t.trim_end();
+    }
+    // Stopped early only when the parser reads to the end of the text
+    // without an error of another kind. A string left open in the middle of
+    // an answer the model finished turns the rest into string text: the
+    // parser stops at the first raw line break, far from the end, and the
+    // refusal that says so is what the model needs, not a request to finish.
+    match parse_prefix(tail) {
+        Err(e) if e.is_eof() => {}
+        _ => return Closing::NotStoppedEarly,
+    }
+    let mut stack: Vec<char> = Vec::new();
+    let mut last = Last::Open;
+    let mut in_string = false;
+    let mut is_key = false;
+    let mut escaped = false;
+    let mut word = String::new();
+    for c in tail.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+                last = if is_key { Last::Key } else { Last::Value };
+            }
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '.') {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            // A number or a literal followed by a delimiter is complete.
+            word.clear();
+            last = Last::Value;
+        }
+        match c {
+            '{' => {
+                stack.push('}');
+                last = Last::Open;
+            }
+            '[' => {
+                stack.push(']');
+                last = Last::Open;
+            }
+            '}' | ']' => {
+                if stack.pop() != Some(c) {
+                    return Closing::Unclosable("a closing bracket does not match its opening one");
+                }
+                last = Last::Value;
+            }
+            '"' => {
+                in_string = true;
+                is_key = stack.last() == Some(&'}') && matches!(last, Last::Open | Last::Comma);
+            }
+            ':' => last = Last::Colon,
+            ',' => last = Last::Comma,
+            c if c.is_whitespace() => {}
+            _ => return Closing::Unclosable("a character JSON does not allow there"),
+        }
+    }
+    if in_string {
+        return Closing::Unclosable("the answer stops inside a string");
+    }
+    if !word.is_empty() {
+        if !matches!(word.as_str(), "true" | "false" | "null") {
+            return Closing::Unclosable(
+                "the answer stops after a number or a word that may be cut",
+            );
+        }
+        last = Last::Value;
+    }
+    match last {
+        Last::Value if !stack.is_empty() => {
+            let appended: String = stack.iter().rev().collect();
+            Closing::Closable {
+                text: format!("{}{appended}", &text[..start + tail.len()]),
+                appended,
+            }
+        }
+        Last::Value => Closing::NotStoppedEarly,
+        Last::Open => Closing::Unclosable("the answer stops right after an opening bracket"),
+        Last::Comma => Closing::Unclosable("the answer stops after a comma"),
+        Last::Colon | Last::Key => Closing::Unclosable("the answer stops after a key"),
+    }
 }
 
 #[cfg(test)]

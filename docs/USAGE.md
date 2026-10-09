@@ -2169,6 +2169,16 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   answered 200, in the body or mid-stream, is an error and never part of the answer; one
   that names a model-output parse failure (`EOF`, `error parsing tool call`) is retried as
   the 500 is (0039).
+- An orchestrator answer the model ended itself before its JSON object closed no longer
+  costs an ask. When only closing brackets and braces are missing after a complete value,
+  kGraf appends them, reads the answer as any answer, and says so in a run notice ("the
+  interfaces answer of call ... ended before its JSON object closed; kGraf appended `}` to
+  close it ...") and in the trace (`answer_repaired`). When it cannot be closed (it stops
+  inside a string, after a key, a comma or a number), the same request is sent once more,
+  with one sentence saying the previous answer was incomplete. That call is ledgered and
+  accounted like any other but does not count as one of the asks; a notice and the trace
+  (`answer_reasked`) say so. A second incomplete answer is refused and counts as before. An
+  answer cut at the output limit is unchanged (0030, amended 2026-10-09, fourth).
 - A worker whose contract writes files and which ends an attempt as done with no successful
   write and no command that changed the tree (it only said what it would do, or only read)
   has not finished. It is told once: "You ended without making any change; this contract
