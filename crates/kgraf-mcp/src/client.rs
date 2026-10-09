@@ -337,13 +337,20 @@ impl RmcpCaller {
         #[cfg(windows)]
         wrapped.wrap(process_wrap::tokio::JobObject);
 
-        let (child, stderr) = TokioChildProcess::builder(wrapped)
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| McpConnectError::Setup {
-                server: config.name().to_owned(),
-                reason: e.to_string(),
-            })?;
+        // Under the process-wide spawn lock: on Windows this spawn marks its
+        // child's pipe ends inheritable for the moment of the creation call,
+        // and a sandboxed command's start must not copy them (nor this spawn
+        // copy that command's). The builder's `spawn` creates the process
+        // and returns; nothing here waits for it.
+        let (child, stderr) = kgraf_core::child_run::spawn_locked(|| {
+            TokioChildProcess::builder(wrapped)
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .map_err(|e| McpConnectError::Setup {
+            server: config.name().to_owned(),
+            reason: e.to_string(),
+        })?;
         if let Some(stderr) = stderr {
             spawn_bounded_stderr_reader(config.name().to_owned(), stderr);
         }

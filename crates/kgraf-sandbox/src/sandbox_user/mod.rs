@@ -42,6 +42,7 @@ pub mod blob;
 pub mod dns_check;
 pub mod firewall;
 pub mod handshake;
+pub mod launch_record;
 pub mod names;
 pub mod password;
 pub mod plan;

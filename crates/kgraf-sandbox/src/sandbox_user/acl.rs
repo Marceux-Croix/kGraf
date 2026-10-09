@@ -185,6 +185,118 @@ pub fn closed_folders(loc: &Locations) -> Vec<PathBuf> {
     out
 }
 
+// ---- the runner's own access lists ---------------------------------------------
+
+/// `ACCESS_ALLOWED_ACE_TYPE`: the one allow entry whose layout (header, mask,
+/// SID) the check below reads.
+pub const ACE_ALLOWED: u8 = 0x00;
+/// The deny entry types (`ACCESS_DENIED_ACE_TYPE`, `..._OBJECT_...`,
+/// `..._CALLBACK_...`, `..._CALLBACK_OBJECT_...`). A deny entry grants
+/// nothing, so it can never break the check.
+pub const ACE_DENY_TYPES: [u8; 4] = [0x01, 0x06, 0x0A, 0x0C];
+/// The allow entry types other than [`ACE_ALLOWED`]: compound, object,
+/// callback and callback-object. Each grants access, and each puts its SID
+/// at another offset (object entries after their flags and GUIDs), so
+/// reading one as a plain entry would check the wrong bytes.
+pub const ACE_OTHER_ALLOW_TYPES: [u8; 4] = [0x04, 0x05, 0x09, 0x0B];
+
+/// The bytes of `S-1-5-18` (SYSTEM) as a binary SID.
+const SYSTEM_SID_BYTES: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+
+/// What a runner access list grants that it must not, or why it cannot be
+/// read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelfAclProblem {
+    /// The list's bytes do not hold the entries its header says.
+    Malformed(&'static str),
+    /// An entry of a type this check does not read. An allow entry other than
+    /// the plain one, or an unknown type, could grant anything.
+    Unchecked { index: usize, ace_type: u8 },
+    /// An allow entry for a principal other than SYSTEM holds some of the
+    /// forbidden rights (`mask` is that part).
+    Grants { index: usize, mask: u32 },
+}
+
+impl std::fmt::Display for SelfAclProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(why) => write!(f, "the access list is malformed: {why}"),
+            Self::Unchecked { index, ace_type } => write!(
+                f,
+                "entry {index} is of type 0x{ace_type:02x}, which this check cannot read; \
+                 only plain allow entries and deny entries are accepted"
+            ),
+            Self::Grants { index, mask } => write!(
+                f,
+                "entry {index}, for a principal other than SYSTEM, still allows access \
+                 0x{mask:08x}"
+            ),
+        }
+    }
+}
+
+fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]))
+}
+
+fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Check a binary access list (`ACL` and its entries, as Windows returns it)
+/// written on one of the runner's own objects: every entry that allows
+/// access to anyone but SYSTEM must stay clear of `forbidden`. Deny entries
+/// are skipped. Any other entry type fails the check (fail loud): the lists
+/// kGraf writes hold plain allow entries only, so another type means the list
+/// is not the one written.
+///
+/// Platform-neutral, so it is tested on every host with lists built by hand;
+/// `windows::runner` passes the bytes `GetSecurityInfo` returned.
+pub fn check_self_acl(acl: &[u8], forbidden: u32) -> Result<(), SelfAclProblem> {
+    // ACL header: revision u8, Sbz1 u8, AclSize u16, AceCount u16, Sbz2 u16.
+    let size = u16_at(acl, 2).ok_or(SelfAclProblem::Malformed("no header"))? as usize;
+    let count = u16_at(acl, 4).ok_or(SelfAclProblem::Malformed("no header"))? as usize;
+    if size < 8 || size > acl.len() {
+        return Err(SelfAclProblem::Malformed("its size is outside its bytes"));
+    }
+    let acl = &acl[..size];
+    let mut at = 8;
+    for index in 0..count {
+        // ACE header: type u8, flags u8, size u16.
+        let (Some(&ace_type), Some(ace_size)) = (acl.get(at), u16_at(acl, at + 2)) else {
+            return Err(SelfAclProblem::Malformed("an entry runs past the list"));
+        };
+        let ace_size = ace_size as usize;
+        if ace_size < 4 || at + ace_size > acl.len() {
+            return Err(SelfAclProblem::Malformed("an entry runs past the list"));
+        }
+        let ace = &acl[at..at + ace_size];
+        at += ace_size;
+        if ACE_DENY_TYPES.contains(&ace_type) {
+            continue;
+        }
+        if ace_type != ACE_ALLOWED {
+            return Err(SelfAclProblem::Unchecked { index, ace_type });
+        }
+        // Plain allow entry: header (4), mask u32, then the SID: revision u8,
+        // sub-authority count u8, authority (6), 4 bytes per sub-authority.
+        let mask = u32_at(ace, 4).ok_or(SelfAclProblem::Malformed("an allow entry is short"))?;
+        let subs = *ace
+            .get(9)
+            .ok_or(SelfAclProblem::Malformed("an allow entry is short"))?;
+        let sid = ace
+            .get(8..16 + 4 * subs as usize)
+            .ok_or(SelfAclProblem::Malformed("a SID runs past its entry"))?;
+        if sid != SYSTEM_SID_BYTES && mask & forbidden != 0 {
+            return Err(SelfAclProblem::Grants {
+                index,
+                mask: mask & forbidden,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +422,137 @@ mod tests {
         assert_eq!(CLOSED_FOLDER_DENY & 0x0012_00a9, 0);
         assert_eq!(CLOSED_FOLDER_DENY & !WRITE_RIGHTS, 0);
         assert_eq!(closed_folders(&Locations::default()), Vec::<PathBuf>::new());
+    }
+
+    // ---- check_self_acl, on lists built by hand ----
+
+    /// `S-1-5-21-1-2-3-1001`, a local user, as a binary SID.
+    const USER_SID: [u8; 28] = [
+        1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xe9, 3, 0, 0,
+    ];
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_VM_WRITE: u32 = 0x0020;
+    const FORBIDDEN: u32 = PROCESS_VM_WRITE | 0x0001;
+
+    /// An entry of `ace_type` with `body` (everything after the header).
+    fn entry(ace_type: u8, body: &[u8]) -> Vec<u8> {
+        let size = (4 + body.len()) as u16;
+        let mut out = vec![ace_type, 0];
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A plain allow or deny entry: mask, then SID.
+    fn plain(ace_type: u8, mask: u32, sid: &[u8]) -> Vec<u8> {
+        let mut body = mask.to_le_bytes().to_vec();
+        body.extend_from_slice(sid);
+        entry(ace_type, &body)
+    }
+
+    /// An allowed-object entry: mask, flags (object type present), the
+    /// object type GUID, then the SID, 20 bytes later than in a plain entry.
+    fn object(mask: u32, sid: &[u8]) -> Vec<u8> {
+        let mut body = mask.to_le_bytes().to_vec();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0xAB; 16]);
+        body.extend_from_slice(sid);
+        entry(0x05, &body)
+    }
+
+    fn list(entries: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = entries.concat();
+        let size = (8 + body.len()) as u16;
+        let mut out = vec![2, 0];
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn a_runner_list_that_lets_the_user_only_wait_passes() {
+        let acl = list(&[
+            plain(ACE_ALLOWED, 0x001f_ffff, &SYSTEM_SID_BYTES),
+            plain(ACE_ALLOWED, SYNCHRONIZE, &USER_SID),
+            // A deny entry never grants, whatever its mask.
+            plain(0x01, u32::MAX, &USER_SID),
+        ]);
+        assert_eq!(check_self_acl(&acl, FORBIDDEN), Ok(()));
+    }
+
+    #[test]
+    fn a_plain_allow_entry_with_a_forbidden_right_fails() {
+        let acl = list(&[
+            plain(ACE_ALLOWED, 0x001f_ffff, &SYSTEM_SID_BYTES),
+            plain(ACE_ALLOWED, SYNCHRONIZE | PROCESS_VM_WRITE, &USER_SID),
+        ]);
+        assert_eq!(
+            check_self_acl(&acl, FORBIDDEN),
+            Err(SelfAclProblem::Grants {
+                index: 1,
+                mask: PROCESS_VM_WRITE
+            })
+        );
+    }
+
+    /// The defect: object and callback allow entries were skipped, so one
+    /// that let the user write the runner's memory passed.
+    #[test]
+    fn an_allow_entry_of_any_other_type_fails_whatever_it_grants() {
+        for (what, bad) in [
+            ("object", object(PROCESS_VM_WRITE, &USER_SID)),
+            ("object, harmless mask", object(SYNCHRONIZE, &USER_SID)),
+            ("callback", plain(0x09, PROCESS_VM_WRITE, &USER_SID)),
+            ("callback object", plain(0x0B, PROCESS_VM_WRITE, &USER_SID)),
+            ("compound", plain(0x04, PROCESS_VM_WRITE, &USER_SID)),
+            ("unknown type", plain(0x7F, 0, &USER_SID)),
+        ] {
+            let acl = list(&[plain(ACE_ALLOWED, SYNCHRONIZE, &USER_SID), bad.clone()]);
+            assert_eq!(
+                check_self_acl(&acl, FORBIDDEN),
+                Err(SelfAclProblem::Unchecked {
+                    index: 1,
+                    ace_type: bad[0]
+                }),
+                "{what}"
+            );
+        }
+        for t in ACE_OTHER_ALLOW_TYPES {
+            let acl = list(&[plain(t, 0, &USER_SID)]);
+            assert!(check_self_acl(&acl, FORBIDDEN).is_err(), "type {t}");
+        }
+    }
+
+    #[test]
+    fn a_list_whose_bytes_do_not_match_its_header_fails() {
+        let good = list(&[plain(ACE_ALLOWED, SYNCHRONIZE, &USER_SID)]);
+        assert_eq!(check_self_acl(&good, FORBIDDEN), Ok(()));
+        assert!(matches!(
+            check_self_acl(&good[..good.len() - 1], FORBIDDEN),
+            Err(SelfAclProblem::Malformed(_))
+        ));
+        assert!(matches!(
+            check_self_acl(&good[..3], FORBIDDEN),
+            Err(SelfAclProblem::Malformed(_))
+        ));
+        // Two entries announced, one present.
+        let mut short = good.clone();
+        short[4] = 2;
+        assert!(matches!(
+            check_self_acl(&short, FORBIDDEN),
+            Err(SelfAclProblem::Malformed(_))
+        ));
+        // A SID that claims more sub-authorities than its entry holds.
+        let mut sid = USER_SID;
+        sid[1] = 9;
+        let bad = list(&[plain(ACE_ALLOWED, SYNCHRONIZE, &sid)]);
+        assert!(matches!(
+            check_self_acl(&bad, FORBIDDEN),
+            Err(SelfAclProblem::Malformed(_))
+        ));
+        // An empty list grants nothing.
+        assert_eq!(check_self_acl(&list(&[]), FORBIDDEN), Ok(()));
     }
 }

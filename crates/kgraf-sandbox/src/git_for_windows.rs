@@ -333,17 +333,21 @@ mod system {
             find_git_bash(&Self::inputs(), Path::is_file)
         }
 
+        // Both spawns go through the spawn lock, as every spawn: see
+        // `kgraf_core::child_run::spawn_locked`.
         fn winget_available(&self) -> bool {
-            no_window(std::process::Command::new("winget").arg("--version"))
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            kgraf_core::child_run::output(no_window(
+                std::process::Command::new("winget").arg("--version"),
+            ))
+            .map(|o| o.status.success())
+            .unwrap_or(false)
         }
 
         fn run_winget(&self) -> Result<(), String> {
-            let out = no_window(std::process::Command::new("winget").args(winget_install_args()))
-                .output()
-                .map_err(|e| format!("winget did not start: {e}"))?;
+            let out = kgraf_core::child_run::output(no_window(
+                std::process::Command::new("winget").args(winget_install_args()),
+            ))
+            .map_err(|e| format!("winget did not start: {e}"))?;
             if out.status.success() {
                 return Ok(());
             }

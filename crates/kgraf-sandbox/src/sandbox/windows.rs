@@ -2631,9 +2631,10 @@ mod imp {
     /// accepts only inheritable handles, and `CreateProcessWithLogonW`'s
     /// handling of non-inheritable standard handles is not documented. The
     /// handle list keeps the sandboxed command from inheriting anything else;
-    /// the lock keeps a spawn that takes it from inheriting these. A spawn
-    /// through std or tokio that does not take the lock can still copy them,
-    /// but only during the creation call.
+    /// the lock keeps every other spawn from inheriting these. Every spawn in
+    /// kGraf takes it (`kgraf_core::child_run::spawn_locked`); a test that
+    /// reads every crate's source keeps it that way. A process another
+    /// library starts on its own (none known) would not.
     pub(crate) struct InheritWindow {
         marked: Vec<HANDLE>,
         // Declared last: released after `Drop::drop` has cleared the flags.
@@ -2918,8 +2919,9 @@ mod imp {
         /// See [`Self::runner_lists_before_resume`].
         runner_protection: Option<Result<(), String>>,
         /// Keeps the (shared, per-workspace) desktop alive while the child
-        /// runs. `None` for a command that runs as the sandbox user: its
-        /// runner holds the command's own window station.
+        /// runs. `None` for a command that runs as the sandbox user: this
+        /// process keeps that user's window station and desktop for its whole
+        /// life (`sandbox_user::windows::launch`).
         _desktop: Option<DesktopGuard>,
         /// The worker slot of a command that runs as a sandbox user. Last, so
         /// it is released after the job handle is closed, which ends the
@@ -3460,13 +3462,16 @@ mod imp {
             command_line: line,
             directory: strip_verbatim(cwd).as_os_str().encode_wide().collect(),
             environment: env,
+            // Named by `launch::start`: the desktop this process made for the
+            // command of this sandbox user.
+            desktop: Vec::new(),
         };
         // No UI limits. Windows nests a job inside another only if neither
         // sets them, and the runner may already be in a job (the secondary
         // logon service's, or one kGraf itself runs in). The runner and the
         // command stay in this job: kill on close, no breakaway. The
-        // command's UI isolation is its own window station and desktop
-        // (`sandbox_user::windows::runner`).
+        // command's UI isolation is its own window station and desktop,
+        // which this process makes (`sandbox_user::windows::launch`).
         let job = create_job(0)?;
         let [stdin, stdout, stderr] = [
             user_stream(STD_INPUT_HANDLE, stdio[0])?,
@@ -3487,7 +3492,7 @@ mod imp {
             user.runner,
             [raw(&stdin), raw(&stdout), raw(&stderr)],
             &job,
-            &request,
+            request,
         )?;
         Ok(SandboxedChild {
             stdin: stdin.parent.map(ChildStdin::from),

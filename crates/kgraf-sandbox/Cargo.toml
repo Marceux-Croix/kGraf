@@ -159,6 +159,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
+# `tests/stdio_windows.rs` starts unrelated tokio children beside sandboxed
+# commands, as kGraf's MCP and shell spawns do. Already a workspace
+# dependency.
+tokio = { workspace = true, features = ["process"] }
 
 [[bench]]
 name = "lifecycle"

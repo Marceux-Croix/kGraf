@@ -88,21 +88,25 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Every spawn of this binary goes through the spawn lock, as in all of
+/// kGraf (`kgraf_core::child_run::spawn_locked`): it runs the host, and so
+/// sandboxed commands, in this process.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "user.name=kgraf-soak",
-            "-c",
-            "user.email=kgraf-soak@localhost",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+    let out = kgraf_core::child_run::output(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=kgraf-soak",
+                "-c",
+                "user.email=kgraf-soak@localhost",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args),
+    )
+    .map_err(|e| format!("cannot run git: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git {args:?}: {}",
@@ -133,13 +137,14 @@ fn ensure_repo(repo: &Path) -> Result<(), String> {
 /// ends it.
 fn start_stub() -> Result<(std::process::Child, u16), String> {
     let exe = std::env::current_exe().map_err(|e| format!("no executable path: {e}"))?;
-    let mut child = Command::new(exe)
-        .arg("--serve-stub")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("cannot start the stub: {e}"))?;
+    let mut child = kgraf_core::child_run::spawn(
+        Command::new(exe)
+            .arg("--serve-stub")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()),
+    )
+    .map_err(|e| format!("cannot start the stub: {e}"))?;
     let mut line = String::new();
     let stdout = child.stdout.take().ok_or("no stub stdout")?;
     std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)

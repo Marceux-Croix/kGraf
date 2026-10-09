@@ -252,6 +252,86 @@ fn a_concurrent_unrelated_spawn_does_not_hold_a_sandboxed_commands_output() {
     println!("20 sandboxed commands beside {spawned} unrelated spawns; slowest {slowest:?}");
 }
 
+/// Unrelated tokio children (as kGraf's MCP servers start), each started
+/// through the spawn lock, read to their end on one thread until `stop` is
+/// set. Returns how many ran and the slowest one, from its spawn to the end
+/// of its output.
+fn tokio_spawns(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<(u32, Duration)> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let mut n = 0;
+            let mut slowest = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let mut cmd = tokio::process::Command::new("cmd.exe");
+                cmd.args(["/d", "/c", "echo unrelated"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                let child = kgraf_core::child_run::spawn_locked(|| cmd.spawn()).expect("spawn");
+                // From the spawn on: the wait for the lock (a logon of a few
+                // seconds) is not what is measured.
+                let started = Instant::now();
+                let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+                    .await
+                    .expect("an unrelated child's output ended within 60 s")
+                    .expect("output");
+                assert!(String::from_utf8_lossy(&out.stdout).contains("unrelated"));
+                slowest = slowest.max(started.elapsed());
+                n += 1;
+            }
+            (n, slowest)
+        })
+    })
+}
+
+/// The other direction from the test above: while a sandboxed command
+/// starts (on the sandbox user, `CreateProcessWithLogonW` copies every
+/// inheritable handle of this process into the runner), an unrelated tokio
+/// child's pipe ends, which its spawn marks inheritable for a moment, must
+/// not be copied. A copy held by a runner that lives for 12 s would keep the
+/// unrelated child's reader waiting until that runner ends.
+#[test]
+fn a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start() {
+    let e = env();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = tokio_spawns(stop.clone());
+    let mut long = Vec::new();
+    for _ in 0..3 {
+        long.push(
+            sandboxed_command(&policy(&e.ws), "cmd.exe", e.ws.root())
+                .unwrap()
+                .args(["/d", "/c", "ping -n 13 127.0.0.1 >NUL"])
+                .stdin(Redirect::Null)
+                .stdout(Redirect::Piped)
+                .stderr(Redirect::Piped)
+                .spawn()
+                .unwrap(),
+        );
+    }
+    // Let the spawner run a while longer beside the three live commands.
+    std::thread::sleep(Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+    let (spawned, slowest) = spawner.join().unwrap();
+    for child in long {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    for line in kgraf_sandbox::sandbox_user::launch_record::lines() {
+        println!("{line}");
+    }
+    println!("3 sandboxed commands beside {spawned} tokio spawns; slowest {slowest:?}");
+    assert!(spawned > 0, "no unrelated spawn ran");
+    assert!(
+        slowest < Duration::from_secs(8),
+        "an unrelated tokio child took {slowest:?}: a sandboxed process held its pipe"
+    );
+}
+
 #[test]
 fn a_commands_standard_input_is_never_a_console() {
     let e = env();

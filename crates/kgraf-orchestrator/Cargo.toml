@@ -30,6 +30,7 @@ kgraf-schedule = { path = "../kgraf-schedule" }
 kgraf-session = { path = "../kgraf-session" }
 kgraf-tools = { path = "../kgraf-tools" }
 async-trait = "0.1"
+futures-util.workspace = true
 # Workflow template shape ids.
 blake3 = "1"
 # `RunStarter::start_run` takes a `chrono::DateTime<Utc>`; same pin as kgraf-schedule.

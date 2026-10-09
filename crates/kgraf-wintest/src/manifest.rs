@@ -211,6 +211,13 @@ pub const CORE: &[(&str, &[&str], f64)] = &[
     // service; the online user and the owner still resolve. Returns at once
     // without the sandbox user set up.
     ("kgraf-sandbox/test/dns_windows", &[], 5.0),
+    // The runner's own process, threads and token refuse the command; the
+    // command runs on a window station and desktop the owner made. Returns at
+    // once without the sandbox user set up.
+    ("kgraf-sandbox/test/runner_windows", &[], 2.0),
+    // A command's pipe ends do not leak into concurrent spawns, and its
+    // standard input is never the owner's console.
+    ("kgraf-sandbox/test/stdio_windows", &[], 2.0),
     // The sandbox user setup end to end; runs only elevated with
     // KGRAF_SANDBOX_SETUP_TEST=1 (a hosted runner), else it says why.
     ("kgraf-cli/test/sandbox_setup_windows", &[], 1.0),

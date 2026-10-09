@@ -244,3 +244,72 @@ fn a_spawn_waits_for_the_spawn_lock_and_fails_named_when_it_stays_held() {
     .expect("the lock is free");
     assert!(String::from_utf8_lossy(&got.stdout).contains("ran"));
 }
+
+/// Hold the spawn lock for `hold` on another thread, run `f`, and return
+/// what it returned and how long it took. The lock is taken before `f`
+/// starts.
+fn while_locked<T: Send + 'static>(
+    hold: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (T, Duration) {
+    let (taken_tx, taken_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let lock = spawn_lock(Duration::from_secs(10)).expect("free");
+        let _ = taken_tx.send(());
+        std::thread::sleep(hold);
+        drop(lock);
+    });
+    taken_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the holder took the lock");
+    let started = Instant::now();
+    let got = bounded(Duration::from_secs(60), f);
+    let took = started.elapsed();
+    holder.join().expect("holder");
+    (got, took)
+}
+
+/// The helpers every spawn site uses wait for the spawn lock: none creates
+/// its process while another holder (a sandboxed command's creation call)
+/// has handles marked inheritable.
+#[test]
+fn spawn_output_and_status_wait_for_the_spawn_lock() {
+    let _serial = spawn_lock::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let hold = Duration::from_millis(400);
+    let at_least = Duration::from_millis(300);
+
+    let (out, took) = while_locked(hold, || output(&mut sh("echo through")));
+    let out = out.expect("output");
+    assert!(took >= at_least, "output did not wait: {took:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("through"));
+
+    let (status_got, took) = while_locked(hold, || status(&mut sh("exit 4")));
+    assert_eq!(status_got.expect("status").code(), Some(4));
+    assert!(took >= at_least, "status did not wait: {took:?}");
+
+    let (child, took) = while_locked(hold, || spawn(&mut sh("exit 0")));
+    assert!(child.expect("spawn").wait().expect("wait").success());
+    assert!(took >= at_least, "spawn did not wait: {took:?}");
+
+    // The generic form, as tokio and process-wrap spawns use it.
+    let (got, took) = while_locked(hold, || spawn_locked(|| Ok(7)));
+    assert_eq!(got.expect("ran"), 7);
+    assert!(took >= at_least, "spawn_locked did not wait: {took:?}");
+}
+
+/// `output` gives the child no standard input, as `Command::output` does: a
+/// child that reads it sees its end at once.
+#[test]
+fn output_gives_the_child_no_input() {
+    #[cfg(unix)]
+    let script = "cat; echo done";
+    #[cfg(windows)]
+    let script = "more & echo done";
+    let out = bounded(Duration::from_secs(60), move || output(&mut sh(script))).expect("output");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("done"),
+        "{out:?}"
+    );
+}

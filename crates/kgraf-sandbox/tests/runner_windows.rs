@@ -281,6 +281,47 @@ fn check_own_token() -> std::io::Result<(bool, String)> {
     Ok((true, "own token opened".into()))
 }
 
+/// The name of a window station or desktop handle.
+fn object_name(h: *mut std::ffi::c_void) -> std::io::Result<String> {
+    use windows_sys::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+    let mut buf = [0u16; 512];
+    let mut needed = 0u32;
+    // SAFETY: `h` is a station or desktop handle the caller does not close;
+    // `buf` has the stated size in bytes.
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            h,
+            UOI_NAME,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(&buf) as u32,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// The command's own `<window station>\<desktop>`. The host side checks it
+/// against what the owner's process recorded making.
+fn check_desktop() -> std::io::Result<(bool, String)> {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetThreadDesktop,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    // SAFETY: plain calls; neither handle needs closing.
+    let (station, desktop) = unsafe {
+        (
+            GetProcessWindowStation(),
+            GetThreadDesktop(GetCurrentThreadId()),
+        )
+    };
+    let full = format!("{}\\{}", object_name(station)?, object_name(desktop)?);
+    Ok((true, full))
+}
+
 /// Copy standard input to standard output: the runner passes both through
 /// although it has no console.
 fn check_stdio() -> std::io::Result<(bool, String)> {
@@ -301,6 +342,7 @@ fn probe_entry() {
         "console" => check_runner_console(),
         "own_token" => check_own_token(),
         "stdio" => check_stdio(),
+        "desktop" => check_desktop(),
         other => Err(std::io::Error::other(format!("unknown probe {other}"))),
     };
     let (code, line) = match result {
@@ -463,4 +505,28 @@ fn standard_input_and_output_pass_through_a_runner_without_a_console() {
         let line = assert_holds("stdio", Some("through the runner"));
         assert_eq!(line, "echo through the runner");
     }
+}
+
+/// The command runs on a window station and desktop that this process, the
+/// owner, made for it (the runner makes none), not on the runner's or the
+/// owner's. Prints the launch record, the lines a Windows run sends back.
+#[test]
+fn the_command_runs_on_a_desktop_the_owner_made() {
+    if !sandbox_user_mode("desktop") {
+        return;
+    }
+    let line = assert_holds("desktop", None);
+    let record = kgraf_sandbox::sandbox_user::launch_record::lines();
+    for l in &record {
+        println!("{l}");
+    }
+    let (station, desktop) = line.split_once('\\').expect("station\\desktop");
+    assert!(station.starts_with("kgraf-cmd-"), "{line}");
+    assert_eq!(desktop, "Default", "{line}");
+    assert!(
+        record.iter().any(|l| l.contains(&format!(
+            "made window station {station} and desktop Default for the command"
+        ))),
+        "the command's station {station} is not one this process made: {record:?}"
+    );
 }

@@ -516,19 +516,20 @@ pub struct RealLauncher;
 impl Launcher for RealLauncher {
     fn launch(&self, installer: &Installer) -> Result<InstallOutcome, UpdateError> {
         match installer {
+            // Under the spawn lock, as every spawn
+            // (`kgraf_core::child_run::spawn_locked`): an installer can run
+            // for minutes, and a pipe end of a sandboxed command it copied
+            // would keep that command's reader waiting as long.
             Installer::MacDmg(path) => {
-                std::process::Command::new("open")
-                    .arg(path)
-                    .spawn()
+                kgraf_core::child_run::spawn(std::process::Command::new("open").arg(path))
                     .map_err(|e| UpdateError::Launch(e.to_string()))?;
                 Ok(InstallOutcome::Launched)
             }
             Installer::WindowsMsi(path) => {
-                std::process::Command::new("msiexec")
-                    .arg("/i")
-                    .arg(path)
-                    .spawn()
-                    .map_err(|e| UpdateError::Launch(e.to_string()))?;
+                kgraf_core::child_run::spawn(
+                    std::process::Command::new("msiexec").arg("/i").arg(path),
+                )
+                .map_err(|e| UpdateError::Launch(e.to_string()))?;
                 Ok(InstallOutcome::Launched)
             }
             Installer::LinuxDeb(path) => Ok(InstallOutcome::ManualInstructions(format!(

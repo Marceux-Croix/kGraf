@@ -9,13 +9,17 @@
 //! no desktop named the call adds the new user to the access lists of the
 //! caller's window station and desktop, and that with one named, the
 //! application must add that permission itself, even for `WinSta0\Default`.
-//! kGraf changes no access list of the owner's session. It creates a window
-//! station and desktop of its own for each sandbox user, once per process
-//! ([`runner_desktop`]), whose access lists admit SYSTEM, the owner and that
-//! user, and names that desktop when it starts the runner. The runner's start
-//! therefore depends on no logon SID and no entry on the owner's window
-//! station. The command itself runs on a second window station the runner
-//! creates.
+//! kGraf changes no access list of the owner's session. It creates two window
+//! stations, each with one desktop, for each sandbox user, once per process
+//! ([`desktops`]), whose access lists admit SYSTEM, the owner and that user:
+//! one for the runner, named when it starts the runner, and one for the
+//! command, named in the runner request. The runner's start therefore depends
+//! on no logon SID and no entry on the owner's window station, and the runner
+//! creates no window station itself: whether a local user started through the
+//! secondary logon service may do that is not documented. The command's
+//! station keeps it away from the owner's windows, clipboard and global atoms,
+//! and from the runner's. Each station made is recorded
+//! ([`launch_record`]).
 //!
 //! **Job.** The runner, and through it the command, runs in the job the
 //! caller passes, which kills on close, allows no breakaway and sets no user
@@ -80,6 +84,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{CWF_CREATE_ONLY, WINSTA_ALL_ACCESS};
 
+use super::super::launch_record;
 use super::super::password::Password;
 use super::super::runner::{
     MAX_REPLY, Reply, Request, RunnerArgs, describe_runner_exit, logon_error_hint,
@@ -215,13 +220,13 @@ fn system_directory() -> Result<Vec<u16>, SandboxError> {
     Ok(buf)
 }
 
-/// What the sandbox user may do on the window station kGraf makes for its
-/// runner: `WINSTA_ALL_ACCESS` and reading the access list, never rewriting
-/// it, taking ownership or deleting it.
-const RUNNER_STATION_ACCESS: u32 = WINSTA_ALL_ACCESS as u32 | READ_CONTROL;
+/// What the sandbox user may do on a window station kGraf makes for it:
+/// `WINSTA_ALL_ACCESS` and reading the access list, never rewriting it,
+/// taking ownership or deleting it.
+const USER_STATION_ACCESS: u32 = WINSTA_ALL_ACCESS as u32 | READ_CONTROL;
 /// The same on its desktop: every desktop right but switching to it
 /// (`DESKTOP_SWITCHDESKTOP`), and reading the access list.
-const RUNNER_DESKTOP_ACCESS: u32 = DESKTOP_READOBJECTS
+const USER_DESKTOP_ACCESS: u32 = DESKTOP_READOBJECTS
     | DESKTOP_CREATEWINDOW
     | DESKTOP_CREATEMENU
     | DESKTOP_HOOKCONTROL
@@ -231,20 +236,102 @@ const RUNNER_DESKTOP_ACCESS: u32 = DESKTOP_READOBJECTS
     | DESKTOP_WRITEOBJECTS
     | READ_CONTROL;
 
-/// A window station and its one desktop, made by this process for the
-/// runners of one sandbox user. Kept for the life of the process: a window
-/// station ends with its last handle, and a runner may start on it at any
-/// time.
-struct RunnerStation {
-    _station: HWINSTA,
-    _desktop: HDESK,
-    /// `<station>\Default`, NUL-terminated, for `STARTUPINFOW::lpDesktop`.
-    startup_name: Vec<u16>,
+/// Who a window station kGraf makes is for. Both kinds are made by this
+/// process, never by the sandbox user: whether a local user started through
+/// the secondary logon service may create a window station in the session
+/// is not documented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The runner starts here (`STARTUPINFOW::lpDesktop` of the logon call).
+    Runner,
+    /// The command starts here (named in the runner request). It is a
+    /// second station, so the command shares no desktop, clipboard or atom
+    /// table with the runner, which holds the owner's logon SID.
+    Command,
+}
+
+impl Role {
+    fn prefix(self) -> &'static str {
+        match self {
+            Role::Runner => "kgraf-run-",
+            Role::Command => "kgraf-cmd-",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Role::Runner => "runner",
+            Role::Command => "command",
+        }
+    }
+
+    // Each step names the Win32 call, so a failure on Windows says which
+    // call refused and, through the error's source, with which Win32 error.
+    fn steps(self) -> Steps {
+        match self {
+            Role::Runner => Steps {
+                name: "name the runner's window station (getrandom)",
+                station_sd: "build the runner window station's access list \
+                             (ConvertStringSecurityDescriptorToSecurityDescriptorW)",
+                desktop_sd: "build the runner desktop's access list \
+                             (ConvertStringSecurityDescriptorToSecurityDescriptorW)",
+                create: "make the runner's window station (CreateWindowStationW)",
+                current: "read this process's window station (GetProcessWindowStation)",
+                enter: "enter the runner's window station (SetProcessWindowStation)",
+                desktop: "make the runner's desktop (CreateDesktopW)",
+                leave: "leave the runner's window station (SetProcessWindowStation)",
+            },
+            Role::Command => Steps {
+                name: "name the command's window station (getrandom)",
+                station_sd: "build the command window station's access list \
+                             (ConvertStringSecurityDescriptorToSecurityDescriptorW)",
+                desktop_sd: "build the command desktop's access list \
+                             (ConvertStringSecurityDescriptorToSecurityDescriptorW)",
+                create: "make the command's window station (CreateWindowStationW)",
+                current: "read this process's window station (GetProcessWindowStation)",
+                enter: "enter the command's window station (SetProcessWindowStation)",
+                desktop: "make the command's desktop (CreateDesktopW)",
+                leave: "leave the command's window station (SetProcessWindowStation)",
+            },
+        }
+    }
+}
+
+struct Steps {
+    name: &'static str,
+    station_sd: &'static str,
+    desktop_sd: &'static str,
+    create: &'static str,
+    current: &'static str,
+    enter: &'static str,
+    desktop: &'static str,
+    leave: &'static str,
+}
+
+/// A window station and its one desktop, made by this process for one
+/// sandbox user. Closed on drop; the ones in use are kept for the life of
+/// the process ([`desktops`]), since a window station ends with its last
+/// handle and a command may start on it at any time.
+struct Station {
+    station: HWINSTA,
+    desktop: HDESK,
+    /// `<station>\Default`.
+    full_name: String,
 }
 
 // SAFETY: window station and desktop handles are process-wide kernel handles
 // with no thread affinity, and these are only kept, never used, once made.
-unsafe impl Send for RunnerStation {}
+unsafe impl Send for Station {}
+
+impl Drop for Station {
+    fn drop(&mut self) {
+        // SAFETY: closes the handles made in `create`, once.
+        unsafe {
+            CloseDesktop(self.desktop);
+            CloseWindowStation(self.station);
+        }
+    }
+}
 
 /// A security descriptor from SDDL, freed on drop.
 struct Sddl(PSECURITY_DESCRIPTOR);
@@ -285,45 +372,81 @@ impl Drop for Sddl {
     }
 }
 
-/// The `<station>\Default` name of the window station and desktop this
-/// process made for the runners of the sandbox user `user_sid`, made on first
-/// use. A failure is not kept, so a later command tries again.
-fn runner_desktop(owner_sid: &str, user_sid: &str) -> Result<Vec<u16>, SandboxError> {
-    static STATIONS: OnceLock<Mutex<HashMap<String, RunnerStation>>> = OnceLock::new();
+/// The window stations of one sandbox user in this process.
+struct UserStations {
+    runner: Station,
+    command: Station,
+}
+
+/// The desktops this process made for the sandbox user `user_sid`, made on
+/// first use: the runner's `<station>\Default`, NUL-terminated for
+/// `STARTUPINFOW::lpDesktop`, and the command's `<station>\Default` for the
+/// runner request. A failure is not kept, so a later command tries again.
+///
+/// One pair per sandbox user and process, not per command: making a desktop
+/// switches the whole process's window station for a moment (below), and
+/// the commands of one sandbox user already share that user's objects.
+fn desktops(owner_sid: &str, user_sid: &str) -> Result<(Vec<u16>, String), SandboxError> {
+    static STATIONS: OnceLock<Mutex<HashMap<String, UserStations>>> = OnceLock::new();
     let mut stations = STATIONS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .map_err(|_| failed("make the runner's window station", "a lock was poisoned"))?;
+        .map_err(|_| {
+            failed(
+                "make the sandbox user's window stations",
+                "a lock was poisoned",
+            )
+        })?;
     if let Some(found) = stations.get(user_sid) {
-        return Ok(found.startup_name.clone());
+        return Ok((
+            wide(&found.runner.full_name),
+            found.command.full_name.clone(),
+        ));
     }
-    let made = RunnerStation::create(owner_sid, user_sid)?;
-    let name = made.startup_name.clone();
+    let made = UserStations {
+        runner: Station::create(Role::Runner, owner_sid, user_sid)?,
+        command: Station::create(Role::Command, owner_sid, user_sid)?,
+    };
+    let names = (wide(&made.runner.full_name), made.command.full_name.clone());
     stations.insert(user_sid.to_owned(), made);
-    Ok(name)
+    Ok(names)
 }
 
-impl RunnerStation {
-    fn create(owner_sid: &str, user_sid: &str) -> Result<Self, SandboxError> {
+/// Who the access lists of both stations and desktops admit, for the record.
+const ADMITTED: &str = "SYSTEM, the owner and that sandbox user";
+
+impl Station {
+    /// Make a window station and its `Default` desktop for `role`, whose
+    /// lists admit SYSTEM fully, the owner fully, and the sandbox user
+    /// `user_sid` to [`USER_STATION_ACCESS`] and [`USER_DESKTOP_ACCESS`].
+    ///
+    /// The owner's entry lets this process make the desktop on the station
+    /// it entered; the command holds neither the owner's SID nor, enabled,
+    /// the owner's logon SID (`runner::command_token`), so the entry admits
+    /// no sandboxed program. Called with the lock of [`desktops`] held, so two
+    /// of these never overlap.
+    fn create(role: Role, owner_sid: &str, user_sid: &str) -> Result<Self, SandboxError> {
+        let steps = role.steps();
         let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|e| failed("name the runner's window station", e))?;
+        getrandom::fill(&mut nonce).map_err(|e| failed(steps.name, e))?;
         let name = format!(
-            "kgraf-run-{}",
+            "{}{}",
+            role.prefix(),
             nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
         // Both SIDs come from Windows' own SID-to-string conversion, so
         // neither holds SDDL syntax characters. `P`: inherit nothing.
         let station_sd = Sddl::new(
             &format!(
-                "D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})(A;;0x{RUNNER_STATION_ACCESS:08x};;;{user_sid})"
+                "D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})(A;;0x{USER_STATION_ACCESS:08x};;;{user_sid})"
             ),
-            "build the runner window station's access list",
+            steps.station_sd,
         )?;
         let desktop_sd = Sddl::new(
             &format!(
-                "D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})(A;;0x{RUNNER_DESKTOP_ACCESS:08x};;;{user_sid})"
+                "D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})(A;;0x{USER_DESKTOP_ACCESS:08x};;;{user_sid})"
             ),
-            "build the runner desktop's access list",
+            steps.desktop_sd,
         )?;
         let wname = wide(&name);
         let sa = station_sd.attributes();
@@ -333,18 +456,23 @@ impl RunnerStation {
         let station =
             unsafe { CreateWindowStationW(wname.as_ptr(), CWF_CREATE_ONLY, GENERIC_ALL, &sa) };
         if station.is_null() {
-            return Err(last_error("make the runner's window station"));
+            return Err(last_error(steps.create));
         }
         // `CreateDesktopW` makes the desktop on this process's window
         // station, so enter the new one and return at once. Every thread of
-        // this process sees the switch for that moment; it happens once per
-        // sandbox user and process, and the lock above keeps two of these
-        // from overlapping.
+        // this process sees the switch for that moment; it happens twice per
+        // sandbox user and process. Chromium's broker does the same.
         // SAFETY: reads this process's window station.
         let original = unsafe { GetProcessWindowStation() };
+        if original.is_null() {
+            let e = last_error(steps.current);
+            // SAFETY: closes the station made above.
+            unsafe { CloseWindowStation(station) };
+            return Err(e);
+        }
         // SAFETY: `station` is the handle made above.
-        if original.is_null() || unsafe { SetProcessWindowStation(station) } == 0 {
-            let e = last_error("enter the runner's window station");
+        if unsafe { SetProcessWindowStation(station) } == 0 {
+            let e = last_error(steps.enter);
             // SAFETY: closes the station made above.
             unsafe { CloseWindowStation(station) };
             return Err(e);
@@ -365,14 +493,18 @@ impl RunnerStation {
         let made = std::io::Error::last_os_error();
         // SAFETY: returns to the window station this process started on.
         let back = unsafe { SetProcessWindowStation(original) };
+        let left = std::io::Error::last_os_error();
         if desktop.is_null() || back == 0 {
             let e = if desktop.is_null() {
                 SandboxError::PlatformSetup {
-                    step: "make the runner's desktop",
+                    step: steps.desktop,
                     source: made,
                 }
             } else {
-                last_error("leave the runner's window station")
+                SandboxError::PlatformSetup {
+                    step: steps.leave,
+                    source: left,
+                }
             };
             // SAFETY: closes what was made above.
             unsafe {
@@ -383,27 +515,27 @@ impl RunnerStation {
             }
             return Err(e);
         }
+        launch_record::note_station(role.name(), &name, "Default", user_sid, ADMITTED);
         Ok(Self {
-            _station: station,
-            _desktop: desktop,
-            startup_name: wide(&format!("{name}\\Default")),
+            station,
+            desktop,
+            full_name: format!("{name}\\Default"),
         })
     }
 }
 
 /// Start the runner at `runner_exe` as `user`, with `std` as its standard
-/// handles, in `job`, and have it start `request`. On any failure the job is
-/// ended, so nothing started here keeps running.
+/// handles, in `job`, and have it start `request` on the command's desktop,
+/// which this function names in the request (any `desktop` the caller set is
+/// replaced). On any failure the job is ended, so nothing started here keeps
+/// running.
 pub(crate) fn start(
     user: &Credential<'_>,
     runner_exe: &Path,
     std: [HANDLE; 3],
     job: &OwnedHandle,
-    request: &Request,
+    mut request: Request,
 ) -> Result<Started, SandboxError> {
-    let frame = request
-        .encode()
-        .map_err(|e| failed("write the runner request", e))?;
     // SAFETY: reads this process's ID.
     let owner_pid = unsafe { GetCurrentProcessId() };
     let args = RunnerArgs::fresh(owner_pid).map_err(|e| failed("name the runner pipe", e))?;
@@ -426,7 +558,11 @@ pub(crate) fn start(
     line.push(0);
     let app = wide(&runner_exe.to_string_lossy());
     let cwd = system_directory()?;
-    let mut desktop = runner_desktop(&owner_sid, user.sid)?;
+    let (mut desktop, command_desktop) = desktops(&owner_sid, user.sid)?;
+    request.desktop = command_desktop.encode_utf16().collect();
+    let frame = request
+        .encode()
+        .map_err(|e| failed("write the runner request", e))?;
     let name = wide(user.name);
     let domain = wide(".");
     // One buffer of the exact size, cleared when it is dropped. `wide` grows
@@ -450,7 +586,19 @@ pub(crate) fn start(
     // The standard handles are inheritable only for this call, under the
     // spawn lock (`InheritWindow`): the call's handling of non-inheritable
     // standard handles is not documented.
+    //
+    // The lock is held for the whole call and cannot be held for less: the
+    // handles must stay inheritable until seclogon has copied them, at a
+    // point inside the call that is not documented, and the call copies
+    // every inheritable handle of this process, so no other spawn may run
+    // beside it, whatever the standard handles are. The call logs the user
+    // on and may take seconds; its duration and the wait for the lock are
+    // recorded (`launch_record`) so a Windows run measures what other spawns
+    // wait for.
+    let asked = Instant::now();
     let window = InheritWindow::open(&std)?;
+    let lock_wait = asked.elapsed();
+    let called = Instant::now();
     // SAFETY: every pointer is NUL-terminated or a valid struct that outlives
     // the call; `line` is mutable as the API requires.
     let ok = unsafe {
@@ -469,6 +617,7 @@ pub(crate) fn start(
         )
     };
     let err = std::io::Error::last_os_error();
+    launch_record::note_logon(lock_wait, called.elapsed(), ok != 0);
     drop(password);
     if ok == 0 {
         drop(window);

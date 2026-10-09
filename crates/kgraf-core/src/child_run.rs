@@ -50,7 +50,37 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 mod spawn_lock;
-pub use spawn_lock::{SPAWN_LOCK_NAME, SPAWN_LOCK_WAIT, SpawnLock, spawn_lock};
+pub use spawn_lock::{
+    SPAWN_LOCK_NAME, SPAWN_LOCK_WAIT, SpawnLock, SpawnLockStats, spawn_lock, spawn_lock_stats,
+    spawn_locked,
+};
+
+#[cfg(test)]
+mod spawn_sites;
+
+/// `cmd.spawn()` under the spawn lock ([`spawn_locked`]).
+pub fn spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    spawn_locked(|| cmd.spawn())
+}
+
+/// What `cmd.output()` does, with the spawn under the spawn lock and the
+/// wait outside it. Standard input is the null device and output and error
+/// are piped, as `Command::output` sets them; a caller's own settings of
+/// these three are replaced. Like `Command::output`, the wait is not
+/// bounded; use [`run`] for a child that may not end.
+pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(cmd)?.wait_with_output()
+}
+
+/// What `cmd.status()` does, with the spawn under the spawn lock and the
+/// wait outside it. Standard streams are inherited unless the caller set
+/// them, as with `Command::status`.
+pub fn status(cmd: &mut Command) -> std::io::Result<ExitStatus> {
+    spawn(cmd)?.wait()
+}
 
 /// How long a killed tree has to end before [`RunError::Stuck`]. A killed
 /// process ends in milliseconds; 10 s covers a loaded machine flushing a

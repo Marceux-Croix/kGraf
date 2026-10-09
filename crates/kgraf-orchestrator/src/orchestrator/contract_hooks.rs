@@ -1109,20 +1109,39 @@ impl RunLoop {
         let Some(handshaker) = self.contracts.as_ref().map(|d| d.handshaker.clone()) else {
             return Ok(Err("no handshaker".into()));
         };
-        let mut statements = Vec::new();
+        // Three phases, so the calls overlap while everything that touches
+        // the record or the budget stays on the loop, in party order:
+        //
+        // 1. Every party's route is picked and recorded, then saved once,
+        //    before any call: the model that states the assumptions is the
+        //    one that works to them (0030), a resume included. A party with
+        //    no configured route fails the gate before any call is made.
+        // 2. Every call is reserved, then all are made at once. The calls
+        //    take no new limiter: each goes through its route's provider, so
+        //    the route's rate limiter admits it exactly as it admits a
+        //    worker's round. At most one call per open party is in flight; a
+        //    local server with fewer parallel slots queues the rest itself.
+        //    The orchestrator holds no per-route slot count, so a semaphore
+        //    here would be a second limiter with a guessed size.
+        // 3. Every call is settled, in party order, failed ones included,
+        //    before the first failure (in party order) is reported. No call
+        //    is cancelled by another's failure, so no started call goes
+        //    unsettled.
+        //
+        // Serial calls cost one model round trip per party; overlapped, a
+        // gate costs about its slowest party. The calls made on success are
+        // the same ones, one per open party. On a failure the calls after the
+        // failing party are still made (they were already in flight), where
+        // a serial loop would stop at the failure.
+        let mut requests = Vec::with_capacity(open.len());
         for party in &open {
-            // The party's route: where its first attempt will run. Recorded
-            // before the call, so the model that states the assumptions is the
-            // one that works to them (0030), a resume included.
             let Some(route) = self.party_route(&party.contract) else {
                 return Ok(Err(format!(
                     "party `{}` names a route that is not configured",
                     party.contract
                 )));
             };
-            self.save()?;
-            let basis = handshaker.cost_basis_for(&route);
-            let request = HandshakeRequest {
+            requests.push(HandshakeRequest {
                 interface: ic.label(),
                 party: party.contract.clone(),
                 route,
@@ -1134,10 +1153,24 @@ impl RunLoop {
                     .filter(|o| o.contract != party.contract)
                     .map(|o| o.contract.clone())
                     .collect(),
-            };
-            let input = estimate_tokens(&request.brief) + 600;
-            let reservation = self.reserve_call(&basis, input);
-            match handshaker.state(&request).await {
+            });
+        }
+        self.save()?;
+        let reservations: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let basis = handshaker.cost_basis_for(&request.route);
+                let input = estimate_tokens(&request.brief) + 600;
+                self.reserve_call(&basis, input)
+            })
+            .collect();
+        // `join_all` keeps the input order and waits for every call.
+        let results =
+            futures_util::future::join_all(requests.iter().map(|r| handshaker.state(r))).await;
+        let mut statements = Vec::with_capacity(requests.len());
+        let mut first_failure: Option<String> = None;
+        for ((request, reservation), result) in requests.iter().zip(reservations).zip(results) {
+            match result {
                 Ok((mut statement, calls)) => {
                     self.settle_call(reservation, Some(&calls))?;
                     self.note_malformed_retries("handshake", calls.len().saturating_sub(1));
@@ -1157,9 +1190,12 @@ impl RunLoop {
                 }
                 Err(e) => {
                     self.settle_call(reservation, e.calls())?;
-                    return Ok(Err(format!("party `{}`: {e}", party.contract)));
+                    first_failure.get_or_insert_with(|| format!("party `{}`: {e}", request.party));
                 }
             }
+        }
+        if let Some(failure) = first_failure {
+            return Ok(Err(failure));
         }
         let writes = self.party_writes(ic);
         let only_open = InterfaceContract {

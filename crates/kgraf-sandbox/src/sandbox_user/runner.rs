@@ -11,13 +11,16 @@
 //!
 //! ```text
 //!   owner                                   runner (sandbox user)
+//!     create the command's window station
+//!       and desktop (once per sandbox user)
 //!     create pipe (first instance, DACL:
 //!       owner and sandbox user)
 //!     CreateProcessWithLogonW(runner --pipe <name> --owner-pid <pid>)
 //!                                           connect; server PID == owner PID?
 //!     client PID == runner PID?
 //!     --- request (binary, below) --------->
-//!                                           start the command
+//!                                           start the command on the
+//!                                             named desktop
 //!     <-------------- "started <pid>\n" ---  or "fail <step> <code> <text>\n"
 //!                                           wait; exit with the command's code
 //! ```
@@ -25,13 +28,21 @@
 //! The request is one binary frame, little-endian:
 //!
 //! ```text
-//! "KGRUNREQ" | version u8 = 1
-//! 4 fields, each: length u32 (UTF-16 units) | UTF-16LE units
+//! "KGRUNREQ" | version u8 = 2
+//! 5 fields, each: length u32 (UTF-16 units) | UTF-16LE units
 //!   application   full path of the program, no NUL
 //!   command line  argv[0] and the arguments, quoted, no NUL
 //!   directory     the working directory, no NUL
 //!   environment   a CreateProcess environment block: NAME=value\0 ...\0
+//!   desktop       <window station>\<desktop> for the command, no NUL
 //! ```
+//!
+//! **The command's desktop comes from the owner.** The owner's process makes
+//! the window station and desktop the command runs on, with access lists that
+//! admit SYSTEM, the owner and that sandbox user, and names them here. The
+//! runner only uses them: whether a local user started through the secondary
+//! logon service may create a window station in the session is not
+//! documented, and a refusal there would stop every command.
 //!
 //! Everything here is platform-neutral, so the format is tested on every
 //! host; the Windows calls are in `windows::runner` and `windows::launch`.
@@ -42,11 +53,15 @@ use std::io::Read;
 use super::handshake::{is_nonce, new_nonce};
 
 pub const REQUEST_MAGIC: &[u8; 8] = b"KGRUNREQ";
-pub const REQUEST_VERSION: u8 = 1;
+pub const REQUEST_VERSION: u8 = 2;
 
 /// The longest path, command line or working directory a Windows process
 /// call accepts, in UTF-16 units (`CreateProcessW`'s command line limit).
 pub const MAX_TEXT_UNITS: usize = 32_767;
+
+/// The longest `<window station>\<desktop>` name accepted, in UTF-16 units.
+/// Windows limits each part to `MAX_PATH`.
+pub const MAX_DESKTOP_UNITS: usize = 2 * 260 + 1;
 
 /// The largest environment block accepted, in UTF-16 units. Windows sets no
 /// fixed limit; this bounds what the runner reads before it has checked
@@ -86,6 +101,9 @@ pub struct Request {
     pub command_line: Vec<u16>,
     pub directory: Vec<u16>,
     pub environment: Vec<u16>,
+    /// `<window station>\<desktop>`, which the owner's process made for this
+    /// sandbox user; filled in by `windows::launch::start`.
+    pub desktop: Vec<u16>,
 }
 
 impl Request {
@@ -95,7 +113,8 @@ impl Request {
         text("application", &self.application)?;
         text("command line", &self.command_line)?;
         text("directory", &self.directory)?;
-        env_block(&self.environment)
+        env_block(&self.environment)?;
+        desktop_name(&self.desktop)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, RunnerError> {
@@ -103,8 +122,9 @@ impl Request {
         let units = self.application.len()
             + self.command_line.len()
             + self.directory.len()
-            + self.environment.len();
-        let mut out = Vec::with_capacity(9 + 16 + units * 2);
+            + self.environment.len()
+            + self.desktop.len();
+        let mut out = Vec::with_capacity(9 + 20 + units * 2);
         out.extend_from_slice(REQUEST_MAGIC);
         out.push(REQUEST_VERSION);
         for field in [
@@ -112,6 +132,7 @@ impl Request {
             &self.command_line,
             &self.directory,
             &self.environment,
+            &self.desktop,
         ] {
             // Validated above: each length fits in u32.
             out.extend_from_slice(&(field.len() as u32).to_le_bytes());
@@ -140,6 +161,7 @@ impl Request {
             command_line: read_field(r, "command line", MAX_TEXT_UNITS)?,
             directory: read_field(r, "directory", MAX_TEXT_UNITS)?,
             environment: read_field(r, "environment", MAX_ENV_UNITS)?,
+            desktop: read_field(r, "desktop", MAX_DESKTOP_UNITS)?,
         };
         request.validate()?;
         Ok(request)
@@ -179,6 +201,25 @@ fn text(what: &'static str, units: &[u16]) -> Result<(), RunnerError> {
         return Err(RunnerError::Field(what));
     }
     Ok(())
+}
+
+/// `<window station>\<desktop>`: both parts present, one backslash between
+/// them, no NUL, at most [`MAX_DESKTOP_UNITS`].
+fn desktop_name(units: &[u16]) -> Result<(), RunnerError> {
+    const WHAT: &str = "desktop";
+    if units.len() > MAX_DESKTOP_UNITS {
+        return Err(RunnerError::TooLong(WHAT));
+    }
+    let slash = u16::from(b'\\');
+    let mut parts = units.split(|&u| u == slash);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(station), Some(desktop), None)
+            if !station.is_empty() && !desktop.is_empty() && !units.contains(&0) =>
+        {
+            Ok(())
+        }
+        _ => Err(RunnerError::Field(WHAT)),
+    }
 }
 
 /// A `CreateProcess` environment block: each entry `NAME=value` and a NUL,
@@ -527,6 +568,7 @@ mod tests {
             command_line: w(r#""C:\Program Files\Git\bin\bash.exe" -c "echo hi""#),
             directory: w(r"C:\work\tree"),
             environment: env,
+            desktop: w(r"kgraf-cmd-0123456789abcdef\Default"),
         }
     }
 
@@ -574,6 +616,43 @@ mod tests {
     }
 
     #[test]
+    fn the_commands_desktop_travels_in_the_request_and_must_name_a_station_and_a_desktop() {
+        let req = sample();
+        let back = Request::read_from(&mut req.encode().unwrap().as_slice()).unwrap();
+        assert_eq!(
+            String::from_utf16(&back.desktop).unwrap(),
+            r"kgraf-cmd-0123456789abcdef\Default"
+        );
+        for bad in [
+            "",
+            "Default",
+            r"\Default",
+            r"kgraf-cmd-1\",
+            r"a\b\c",
+            "kgraf-cmd-1\0\\Default",
+            "kgraf-cmd-1\\Def\0ault",
+        ] {
+            let mut req = sample();
+            req.desktop = w(bad);
+            assert_eq!(
+                req.encode().unwrap_err(),
+                RunnerError::Field("desktop"),
+                "{bad:?}"
+            );
+        }
+        let mut req = sample();
+        req.desktop = w(&format!(r"{}\Default", "s".repeat(MAX_DESKTOP_UNITS)));
+        assert_eq!(req.encode().unwrap_err(), RunnerError::TooLong("desktop"));
+        // A frame cut before the desktop field is refused, not read short.
+        let good = sample().encode().unwrap();
+        let cut = good.len() - sample().desktop.len() * 2 - 4;
+        assert_eq!(
+            Request::read_from(&mut &good[..cut]).unwrap_err(),
+            RunnerError::Truncated
+        );
+    }
+
+    #[test]
     fn a_nul_or_an_empty_path_is_refused() {
         let mut req = sample();
         req.application = w("C:\\a\0b.exe");
@@ -593,11 +672,13 @@ mod tests {
             Request::read_from(&mut &b"NOTKGRAF\x01"[..]).unwrap_err(),
             RunnerError::Magic
         );
-        let mut v2 = good.clone();
-        v2[8] = 2;
+        // A runner from before the desktop field reads version 1 only, and
+        // this one refuses it: neither side acts on the other's frame.
+        let mut v1 = good.clone();
+        v1[8] = 1;
         assert_eq!(
-            Request::read_from(&mut v2.as_slice()).unwrap_err(),
-            RunnerError::Version(2)
+            Request::read_from(&mut v1.as_slice()).unwrap_err(),
+            RunnerError::Version(1)
         );
         for cut in [3, 9, 12, good.len() - 1] {
             assert_eq!(
@@ -618,7 +699,7 @@ mod tests {
         let mut req = sample();
         req.directory = w("C:\\x");
         let mut bytes = req.encode().unwrap();
-        let at = bytes.len() - req.environment.len() * 2 - 4 - 2;
+        let at = bytes.len() - req.desktop.len() * 2 - 4 - req.environment.len() * 2 - 4 - 2;
         bytes[at] = 0;
         bytes[at + 1] = 0;
         assert_eq!(

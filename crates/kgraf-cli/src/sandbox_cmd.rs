@@ -275,6 +275,10 @@ pub fn selfcheck() -> Result<()> {
     let backend = kgraf_sandbox::platform_isolation()
         .context("the sandbox has no backend on this machine")?
         .backend;
+    // On every way out, a pass or a failure: what the launch path made and
+    // measured, on standard error so the report lines above stay as they are.
+    #[cfg(windows)]
+    let _launch_record = PrintLaunchRecord;
 
     let origin = bind_origin().context("bind the local origin")?;
     let port = origin.local_addr().context("origin address")?.port();
@@ -357,6 +361,22 @@ pub fn selfcheck() -> Result<()> {
 }
 
 // ---- the Windows sandbox user (decision 0097) -------------------------------
+
+/// Prints the launch record (`kgraf_sandbox::sandbox_user::launch_record`)
+/// to standard error when dropped: the window stations made, the logon
+/// calls' durations and the spawn lock's use. A Windows run sends these
+/// lines back with the selfcheck output.
+#[cfg(windows)]
+struct PrintLaunchRecord;
+
+#[cfg(windows)]
+impl Drop for PrintLaunchRecord {
+    fn drop(&mut self) {
+        for line in kgraf_sandbox::sandbox_user::launch_record::lines() {
+            eprintln!("  {line}");
+        }
+    }
+}
 
 /// Where this user's sandbox passwords are kept (sealed for this user).
 #[cfg(windows)]

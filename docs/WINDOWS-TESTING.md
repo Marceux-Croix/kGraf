@@ -201,6 +201,22 @@ What the report part "Sandbox user phase" shows:
 
 The totals and the verdict at the top of the report count the baseline only.
 
+What the phase collects about the launch path, in the output of selfcheck (b0) and (d):
+after the report lines, selfcheck prints its launch record on standard error, each line
+starting with `  launch:`. On the sandbox user (d) they are: one line for each window
+station and desktop kGraf made (`made window station kgraf-run-... and desktop Default for
+the runner of sandbox user S-1-5-21-...` and the same with `kgraf-cmd-...` for the
+command), the logon calls (`CreateProcessWithLogonW calls N (F failed): last ..., mean ...,
+longest ...; spawn lock wait before them: ...`), and the spawn lock (`spawn lock, every
+spawn in this process: taken N, waits that ran out T; wait mean ..., longest ...; longest
+hold ...`). The report keeps them with the rest of the output. Read the station lines
+first when the gate fails: a missing `kgraf-cmd-` line with an error naming
+`CreateWindowStationW` or `CreateDesktopW` and a Win32 error means the command's station
+could not be made; an error naming `OpenWindowStationW` means the runner could not open it.
+The longest logon call is what every other spawn may wait for. `runner_windows` and
+`stdio_windows` are not among the binaries the phase re-runs; run them by hand (3b, 3c)
+to collect their lines.
+
 What the phase collects about the DNS filter, and what to read in the report:
 
 - The `dns:` line of selfcheck before setup (b0) and after it (d). Before: `dns: not
@@ -449,15 +465,29 @@ process environment.
    **3b.** What a command can do to its runner, once `kgraf sandbox setup` has run (the
    sandbox user backend). The command must not open the runner's process, any of its
    threads, or its token for more than waiting and reading; the runner must have no console
-   host; the command must still open its own token; and standard input and output must pass
-   through the runner:
+   host; the command must still open its own token; standard input and output must pass
+   through the runner; and the command must run on a window station and desktop that
+   kGraf's own process made for it (the runner makes none):
 
    ```powershell
-   cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3b-runner-windows.txt"
+   cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\3b-runner-windows.txt"
    ```
 
-   Expected: all six pass, and none prints a "skipped" line (a skipped line means the
+   Expected: all seven pass, and none prints a "skipped" line (a skipped line means the
    backend is not the sandbox user: send the output of `kgraf sandbox status`).
+   `the_command_runs_on_a_desktop_the_owner_made` prints the launch record, lines that
+   start with `launch:`. Send them all:
+   `launch: made window station kgraf-run-... and desktop Default for the runner ...` and
+   `... kgraf-cmd-... for the command ...` (one each per sandbox user: the stations kGraf
+   made, and that each creation worked), `launch: CreateProcessWithLogonW calls N (F
+   failed): last ..., mean ..., longest ...; spawn lock wait before them: ...` (how long the
+   logon call takes on this machine; every other spawn of the process waits for it), and
+   `launch: spawn lock, every spawn in this process: ...` (the longest wait of any spawn for
+   the lock; one near 60 s means spawns queue behind logons for too long). If the command's
+   station cannot be made, the error names the call and the Win32 error, for example
+   `make the command's window station (CreateWindowStationW): Access is denied. (os error
+   5)`; if the runner cannot open it, `open the command's window station
+   (OpenWindowStationW)` with the error. Send the full text.
    `the_runners_lists_are_written_before_it_runs_and_read_back` prints one line,
    `runner lists before resume: ...`. `Some(Ok(()))` means kGraf wrote the protected
    access lists on the runner's process and main thread while it was still suspended,
@@ -479,7 +509,13 @@ process environment.
    cargo test -p kgraf-sandbox --test stdio_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\3c-stdio-windows.txt"
    ```
 
-   Expected: all three pass.
+   Expected: all four pass.
+   `a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start` starts three
+   sandboxed commands that live about 12 seconds while a thread starts short tokio children
+   through the spawn lock, and prints `3 sandboxed commands beside N tokio spawns; slowest
+   ...` and the `launch:` lines. Send them. A failure (`an unrelated tokio child took ...`)
+   means a sandboxed process, on the sandbox user the runner, took a copy of that child's
+   pipe end during its start.
    `a_concurrent_unrelated_spawn_does_not_hold_a_sandboxed_commands_output` runs 20
    sandboxed commands while four threads start unrelated processes that live about five
    seconds each, and prints `20 sandboxed commands beside N unrelated spawns; slowest
@@ -695,6 +731,11 @@ sandbox selfcheck: ok
   hidden folder: not writable
   tree: writable
 ```
+
+Both runs also print lines that start with `  launch:` on standard error (on the sandbox
+user, the window stations kGraf made, the duration of each logon call, and the spawn
+lock's use; see "The sandbox user phase" above). They are not part of the verdict; send
+them with the rest.
 
 Any other output is a failure. A failure starts with `sandbox selfcheck failed (backend: ...)`
 and names the step. If only the `dns:` line failed, the first line is

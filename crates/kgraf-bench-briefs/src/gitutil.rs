@@ -32,9 +32,9 @@ fn host_git(
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let (_repo, mut cmd) = host_git(dir, args)?;
-    let out = cmd
-        .stdin(std::process::Stdio::null())
-        .output()
+    // Under the spawn lock; standard input is the null device
+    // (`kgraf_core::child_run::output`).
+    let out = kgraf_core::child_run::output(&mut cmd)
         .with_context(|| format!("cannot run git {args:?} in {}", dir.display()))?;
     if !out.status.success() {
         bail!(
@@ -96,9 +96,8 @@ pub fn files_at(root: &Path, commit: &str, pathspecs: &[&str]) -> Result<Vec<(St
     let mut files = Vec::new();
     for path in git(root, &args)?.lines() {
         let (_repo, mut cmd) = host_git(root, &["show", &format!("{commit}:{path}")])?;
-        let out = cmd
-            .stdin(std::process::Stdio::null())
-            .output()
+        // Standard input is the null device (`child_run::output`).
+        let out = kgraf_core::child_run::output(&mut cmd)
             .with_context(|| format!("cannot run git show {commit}:{path}"))?;
         if !out.status.success() {
             bail!(
@@ -144,23 +143,27 @@ pub(crate) fn copy_tree(from: &Path, to: &Path, skip_top: &[&str]) -> Result<()>
 pub fn checkout_commit(root: &Path, commit: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("cannot create {}", dest.display()))?;
     let (_repo, mut cmd) = host_git(root, &["archive", "--format=tar", commit])?;
-    let mut archive = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("cannot run `git archive` in {}", root.display()))?;
+    // Every spawn here goes through the spawn lock, as in all of kGraf
+    // (`kgraf_core::child_run::spawn_locked`): the benchmark runs sandboxed
+    // commands in this process.
+    let mut archive = kgraf_core::child_run::spawn(
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .with_context(|| format!("cannot run `git archive` in {}", root.display()))?;
     let Some(stdout) = archive.stdout.take() else {
         let _ = archive.kill();
         let _ = archive.wait();
         bail!("git archive gave no stdout pipe");
     };
-    let tar_status = Command::new("tar")
-        .arg("-x")
-        .arg("-C")
-        .arg(dest)
-        .stdin(stdout)
-        .status();
+    let tar_status = kgraf_core::child_run::status(
+        Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(dest)
+            .stdin(stdout),
+    );
     // Always wait for git (no zombie) and read its verdict first.
     let archived = archive
         .wait_with_output()

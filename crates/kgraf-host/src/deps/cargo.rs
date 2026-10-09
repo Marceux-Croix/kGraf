@@ -1019,7 +1019,8 @@ fn run_bounded(mut cmd: Command, timeout: Duration, watch: Watch<'_>) -> std::io
     }
     #[cfg(target_os = "linux")]
     super::group::die_with_parent(&mut cmd);
-    let mut child = cmd.spawn()?;
+    // Under the spawn lock, as every spawn: see `kgraf_core::child_run::spawn_locked`.
+    let mut child = kgraf_core::child_run::spawn(&mut cmd)?;
     // The group dies with kGraf (see `group`). A registry that cannot take
     // the group, or handlers that cannot be installed, fail the command
     // rather than let it outlive an interrupt.

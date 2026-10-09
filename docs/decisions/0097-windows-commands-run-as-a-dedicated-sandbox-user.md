@@ -637,3 +637,67 @@ Choices made with this amendment:
   Other folders of that kind under the Windows folder belong to TrustedInstaller,
   whose lists an administrator cannot change without taking ownership, so they stay
   open, and the gaps text says so.
+
+**Amendment (2026-10-08): the command's window station from the owner's process, every
+spawn under the spawn lock, the logon call measured, the runner's list check.** None of
+it has run on Windows yet.
+
+- **The runner makes no window station.** The runner, running as the sandbox user, made
+  a window station and desktop for the command with `CreateWindowStationW`. Nothing
+  documents that a local user started through the secondary logon service may create a
+  window station in the session, and a refusal there would stop every command; the
+  upstream Codex sandbox makes only a desktop, from the parent's side. kGraf's own
+  process now makes the command's window station and its `Default` desktop as well as
+  the runner's, once per sandbox user and process, with lists that admit SYSTEM, the
+  owner and that sandbox user (the sandbox user gets every station right, and every
+  desktop right but switching to it; never rewriting the list, taking ownership or
+  deleting). The owner's entry lets kGraf's process make the desktop on the station it
+  entered; the command holds neither the owner's SID nor, enabled, the logon SID, so the
+  entry admits no sandboxed program. The runner request (version 2) names
+  `<station>\Default` in a new field; the runner checks that it can open the station
+  (`OpenWindowStationW`) and starts the command there. Each creation step names its
+  Win32 call in its error, and each station made is recorded with its name and the
+  sandbox user's SID. The commands of one sandbox user share that station, as they share
+  that user's other objects; it stays apart from the owner's session and from the
+  runner's station.
+- **Every spawn takes the spawn lock.** On Windows, std marks its child's pipe ends
+  inheritable during its own spawn, and `CreateProcessWithLogonW` copies the caller's
+  inheritable handles into the runner, so a spawn that did not take the lock could leave
+  a pipe end in a runner, and its reader then waited as long as that runner lived (up to
+  `WAIT_BOUND`). Every process creation in kGraf now goes through the lock:
+  `child_run::run`, the new `child_run::spawn`, `output` and `status` for std commands
+  (the wait outside the lock), and `child_run::spawn_locked` for tokio, process-wrap and
+  rmcp spawns. A test reads every crate's source and fails on a direct `spawn`, `output`
+  or `status` call outside test code that is not one of these, unless it is listed with
+  the reason it cannot overlap a sandboxed command's start (the sandbox's own Unix
+  spawns, `SandboxedCommand::spawn`, which takes the lock on Windows, a macOS and Linux
+  `cp`, test-support code). The sites routed: the pytest probe of the gates, the cargo
+  dependency fetch, the MCP stdio servers, the check runner's `tar`, the `winget` probe
+  and install, the update installer launch, and the benchmark and soak programs' `git`,
+  `tar` and stub spawns. The Windows self-test runner is a separate program and is not
+  read. **Not closed:** a process a library starts on its own; none is known.
+- **The logon call holds the lock for its whole length, and is measured.** The window
+  cannot be narrowed: the standard handles must stay inheritable until seclogon has
+  copied them, at a point inside the call that is not documented, and the call copies
+  every inheritable handle, so it must exclude other spawns whatever the standard handles
+  are. Each call's duration and the wait for the lock before it are recorded, and the
+  spawn lock counts its takes, timeouts, longest wait and longest hold. `kgraf sandbox
+  selfcheck` prints these lines on standard error, so the Windows self-test collects them.
+- **The runner's list check reads every entry type.** It skipped every entry that was not
+  a plain allow entry, so an allowed-object, callback or compound entry granting the
+  sandbox user write access to the runner passed unchecked. The check now reads the list's
+  bytes in a platform-neutral function: plain allow entries are checked, deny entries
+  skipped, any other type fails.
+
+Choices made with this amendment:
+
+- (q) The command's station and desktop also admit the owner, as the runner's do, so that
+  kGraf's process can make the desktop on the station it entered whatever `CreateDesktopW`
+  checks; the command holds no SID that entry names. A list without the owner is one
+  change of two SDDL strings once a Windows run shows `CreateDesktopW` succeeds without it.
+- (r) One command station per sandbox user and process, not one per command: making a
+  desktop switches the whole process's window station for a moment, and commands of one
+  sandbox user already share that user's files and objects.
+- (s) The runner's list check fails on any entry type it does not read, unknown types
+  included, not only the other allow types: the lists kGraf writes hold plain allow
+  entries only.

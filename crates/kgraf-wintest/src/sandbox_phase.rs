@@ -100,6 +100,8 @@ pub const ALWAYS: &[&str] = &[
     "kgraf-sandbox/test/shell_windows",
     "kgraf-sandbox/test/startup_windows",
     "kgraf-sandbox/test/dns_windows",
+    "kgraf-sandbox/test/runner_windows",
+    "kgraf-sandbox/test/stdio_windows",
 ];
 
 /// Output of a failed test that names a limit the sandbox user may lift, as

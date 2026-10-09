@@ -43,13 +43,13 @@ fn python_program() -> &'static str {
 
 /// Whether the interpreter can import pytest.
 pub fn pytest_importable() -> bool {
-    std::process::Command::new(python_program())
-        .args(["-c", "import pytest"])
+    let mut cmd = std::process::Command::new(python_program());
+    cmd.args(["-c", "import pytest"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(std::process::Stdio::null());
+    // Under the spawn lock, as every spawn: see `kgraf_core::child_run::spawn_locked`.
+    kgraf_core::child_run::status(&mut cmd).is_ok_and(|s| s.success())
 }
 
 /// Whether `program` is an executable file in a folder of `PATH`. The gate

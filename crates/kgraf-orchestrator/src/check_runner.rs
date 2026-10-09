@@ -656,13 +656,11 @@ impl SandboxRunner {
                 let tree = tree.to_path_buf();
                 blocking(move || {
                     let tar = tarball.0.clone();
-                    let out = std::process::Command::new("tar")
-                        .arg("-xf")
-                        .arg(&tar)
-                        .arg("-C")
-                        .arg(&tree)
-                        .output()
-                        .map_err(io(&tar))?;
+                    let mut extract = std::process::Command::new("tar");
+                    extract.arg("-xf").arg(&tar).arg("-C").arg(&tree);
+                    // Under the spawn lock, as every spawn: see
+                    // `kgraf_core::child_run::spawn_locked`.
+                    let out = kgraf_core::child_run::output(&mut extract).map_err(io(&tar))?;
                     if !out.status.success() {
                         return Err(CheckError::Config(format!(
                             "cannot extract {}: {}",

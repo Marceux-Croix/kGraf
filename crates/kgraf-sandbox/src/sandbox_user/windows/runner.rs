@@ -17,14 +17,18 @@
 //!
 //! **Window station.** A program that loads `user32.dll` stops at start with
 //! STATUS_DLL_INIT_FAILED unless it can open its window station and desktop.
-//! The runner creates a window station and a desktop for the command, whose
-//! DACLs admit the sandbox user and SYSTEM only, and starts the command
-//! there. No object of the owner's session is changed, and the command cannot
-//! reach the owner's windows, clipboard or global atoms. This, not a job's
-//! user interface limits, is the command's user interface isolation.
-//! Chromium's sandbox runs untrusted processes on an alternate
-//! window station the same way (`sandbox/win/src/window.cc`, BSD-3-Clause;
-//! followed in design, not copied).
+//! The owner's process makes a window station and a desktop for the commands
+//! of this sandbox user, whose DACLs admit SYSTEM, the owner and that user,
+//! and names them in the request (`launch.rs`); the runner checks that it can
+//! open the station ([`command_desktop`]) and starts the command there. The
+//! runner creates no window station: whether a local user started through
+//! the secondary logon service may do so is not documented. No object of the
+//! owner's session is changed, and the command cannot reach the owner's
+//! windows, clipboard or global atoms. This, not a job's user interface
+//! limits, is the command's user interface isolation. Chromium's sandbox runs
+//! untrusted processes on an alternate window station the same way
+//! (`sandbox/win/src/window.cc`, BSD-3-Clause; followed in design, not
+//! copied), also made by its broker.
 //!
 //! **Default DACL.** What the command creates without an inheritable ACL
 //! grants the sandbox user and SYSTEM only, never the logon SID.
@@ -68,16 +72,16 @@ use windows_sys::Win32::Foundation::{
     LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT, SetSecurityInfo,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CreateRestrictedToken, DACL_SECURITY_INFORMATION,
-    DISABLE_MAX_PRIVILEGE, EqualSid, GetAce, GetSecurityDescriptorDacl, GetTokenInformation,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
-    TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser,
+    ACL, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
+    GetSecurityDescriptorDacl, GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_GROUPS, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE,
+    TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
@@ -89,12 +93,13 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
-use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
-    GetProcessWindowStation, HDESK, HWINSTA, SetProcessWindowStation,
-};
+use windows_sys::Win32::System::StationsAndDesktops::{CloseWindowStation, OpenWindowStationW};
 use windows_sys::Win32::System::SystemServices::{
-    ACCESS_ALLOWED_ACE_TYPE, SE_GROUP_LOGON_ID, SE_GROUP_USE_FOR_DENY_ONLY,
+    ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+    ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+    ACCESS_ALLOWED_OBJECT_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE,
+    ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE, SE_GROUP_LOGON_ID,
+    SE_GROUP_USE_FOR_DENY_ONLY,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
@@ -108,8 +113,9 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SET_LIMITED_INFORMATION, THREAD_SET_THREAD_TOKEN, THREAD_SUSPEND_RESUME,
     THREAD_TERMINATE, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::CWF_CREATE_ONLY;
+use windows_sys::Win32::UI::WindowsAndMessaging::WINSTA_ENUMDESKTOPS;
 
+use super::super::acl;
 use super::super::runner::{Reply, Request, RunnerArgs};
 use crate::sandbox::AttributeList;
 
@@ -214,13 +220,12 @@ pub fn main() -> i32 {
     wait(&command.process)
 }
 
-/// The running command, with what must stay open while it runs: its window
-/// station and desktop (a window station is destroyed with its last handle).
-/// The owner's job, which holds the runner and the command, ends it.
+/// The running command. Its window station and desktop stay open in the
+/// owner's process, which made them. The owner's job, which holds the runner
+/// and the command, ends it.
 struct Command {
     process: OwnedHandle,
     pid: u32,
-    _station: Station,
 }
 
 /// How long the runner waits for a pipe another process holds. The owner
@@ -284,14 +289,9 @@ fn connect(args: &RunnerArgs) -> Result<File, Failure> {
 fn start(pipe: &mut File, token: &OwnedHandle) -> Result<Command, Failure> {
     let request =
         Request::read_from(pipe).map_err(|e| Failure::other("read the runner request", e))?;
-    let user = token_user_sid(token)?;
-    let station = Station::create(&user)?;
-    let (process, pid) = spawn(&request, token, &station)?;
-    Ok(Command {
-        process,
-        pid,
-        _station: station,
-    })
+    let desktop = command_desktop(&request)?;
+    let (process, pid) = spawn(&request, token, &desktop)?;
+    Ok(Command { process, pid })
 }
 
 // ---- token ------------------------------------------------------------------
@@ -415,33 +415,6 @@ fn token_user_sid(token: &OwnedHandle) -> Result<String, Failure> {
     Ok(out)
 }
 
-/// A SID the system allocated from its text, freed on drop.
-struct LocalSid(PSID);
-
-impl LocalSid {
-    fn from_string(text: &str) -> Result<Self, Failure> {
-        let w = wide(text);
-        let mut sid: PSID = ptr::null_mut();
-        // SAFETY: `w` is NUL-terminated; the call allocates `sid`, freed on
-        // drop.
-        if unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut sid) } == 0 {
-            return Err(Failure::last("read a SID"));
-        }
-        Ok(Self(sid))
-    }
-
-    fn as_psid(&self) -> PSID {
-        self.0
-    }
-}
-
-impl Drop for LocalSid {
-    fn drop(&mut self) {
-        // SAFETY: frees the SID the conversion allocated, once.
-        unsafe { LocalFree(self.0 as HLOCAL) };
-    }
-}
-
 /// A security descriptor from SDDL, freed on drop.
 struct Descriptor(PSECURITY_DESCRIPTOR);
 
@@ -470,14 +443,6 @@ impl Descriptor {
             return Err(Failure::last("build an access list for the sandbox user"));
         }
         Ok(Self(sd))
-    }
-
-    fn attributes(&self) -> SECURITY_ATTRIBUTES {
-        SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.0,
-            bInheritHandle: 0,
-        }
     }
 
     /// The access list inside the descriptor, valid while it lives.
@@ -806,9 +771,10 @@ fn write_self_dacl(
 /// allows access to anyone but SYSTEM stays clear of `forbidden`. A list that
 /// is absent means full access for everyone, so that fails too (fail loud).
 /// Every entry, not only the sandbox user's, because a group the user is in
-/// would serve as well.
+/// would serve as well. An allow entry of any type but the plain one (object,
+/// callback, compound) fails as well: its SID sits at another offset, and it
+/// grants access as surely ([`acl::check_self_acl`]).
 fn verify_self_dacl(handle: HANDLE, forbidden: u32, what: &'static str) -> Result<(), Failure> {
-    let system = LocalSid::from_string("S-1-5-18")?;
     let mut acl: *mut ACL = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: a valid handle; the call allocates `sd`, freed below.
@@ -838,119 +804,60 @@ fn verify_self_dacl(handle: HANDLE, forbidden: u32, what: &'static str) -> Resul
             format!("the runner's {what} has no access list, which admits every program"),
         ));
     }
-    // SAFETY: `acl` points into the descriptor freed by `_owned`.
-    let count = unsafe { (*acl).AceCount };
-    for i in 0..u32::from(count) {
-        let mut ace: *mut c_void = ptr::null_mut();
-        // SAFETY: `i` is below the entry count of a valid list.
-        if unsafe { GetAce(acl, i, &mut ace) } == 0 {
-            return Err(Failure::last("read back the runner's own access list"));
-        }
-        // SAFETY: every entry starts with an ACE_HEADER.
-        let header = unsafe { &*(ace as *const ACE_HEADER) };
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
-            continue;
-        }
-        // SAFETY: an allowed entry has the ACCESS_ALLOWED_ACE layout, whose
-        // SID starts at `SidStart`.
-        let body = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-        let ace_sid = ptr::addr_of!(body.SidStart) as PSID;
-        // SAFETY: both are valid SIDs.
-        let is_system = unsafe { EqualSid(ace_sid, system.as_psid()) } != 0;
-        if !is_system && body.Mask & forbidden != 0 {
-            return Err(Failure::other(
-                "verify access to the runner's own objects",
-                format!(
-                    "an entry other than SYSTEM's still allows access 0x{:08x} to the \
-                     runner's {what}",
-                    body.Mask & forbidden
-                ),
-            ));
-        }
-    }
-    Ok(())
+    // SAFETY: `acl` points into the descriptor freed by `_owned`; a valid
+    // list's header gives the size of the list and its entries, all inside
+    // that descriptor.
+    let bytes = unsafe { std::slice::from_raw_parts(acl as *const u8, (*acl).AclSize as usize) };
+    acl::check_self_acl(bytes, forbidden).map_err(|problem| {
+        Failure::other(
+            "verify access to the runner's own objects",
+            format!("the runner's {what}: {problem}"),
+        )
+    })
 }
 
-// ---- window station ---------------------------------------------------------
+// The entry types the platform-neutral check names are Windows' own.
+const _: () = assert!(acl::ACE_ALLOWED as u32 == ACCESS_ALLOWED_ACE_TYPE);
+const _: () = assert!(acl::ACE_DENY_TYPES[0] as u32 == ACCESS_DENIED_ACE_TYPE);
+const _: () = assert!(acl::ACE_DENY_TYPES[1] as u32 == ACCESS_DENIED_OBJECT_ACE_TYPE);
+const _: () = assert!(acl::ACE_DENY_TYPES[2] as u32 == ACCESS_DENIED_CALLBACK_ACE_TYPE);
+const _: () = assert!(acl::ACE_DENY_TYPES[3] as u32 == ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE);
+const _: () = assert!(acl::ACE_OTHER_ALLOW_TYPES[0] as u32 == ACCESS_ALLOWED_COMPOUND_ACE_TYPE);
+const _: () = assert!(acl::ACE_OTHER_ALLOW_TYPES[1] as u32 == ACCESS_ALLOWED_OBJECT_ACE_TYPE);
+const _: () = assert!(acl::ACE_OTHER_ALLOW_TYPES[2] as u32 == ACCESS_ALLOWED_CALLBACK_ACE_TYPE);
+const _: () =
+    assert!(acl::ACE_OTHER_ALLOW_TYPES[3] as u32 == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE);
 
-/// A window station and one desktop on it, both admitting the sandbox user
-/// and SYSTEM only.
-struct Station {
-    station: HWINSTA,
-    desktop: HDESK,
-    /// `<station>\Default`, NUL-terminated, for `STARTUPINFO::lpDesktop`.
-    startup_name: Vec<u16>,
-}
+// ---- the command's desktop --------------------------------------------------
 
-impl Station {
-    fn create(user: &str) -> Result<Self, Failure> {
-        let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| Failure::other("name the command's window station", e))?;
-        let name = format!(
-            "kgraf-sandbox-{}",
-            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
-        let sd = Descriptor::for_user(user)?;
-        let sa = sd.attributes();
-        let wname = wide(&name);
-        // SAFETY: creates a new window station (CWF_CREATE_ONLY: never opens
-        // one another program made under this name); `wname` and `sa` live
-        // across the call.
-        let station =
-            unsafe { CreateWindowStationW(wname.as_ptr(), CWF_CREATE_ONLY, GENERIC_ALL, &sa) };
-        if station.is_null() {
-            return Err(Failure::last("create the command's window station"));
-        }
-        // `CreateDesktopW` creates on the calling process's window station, so
-        // switch to the new one and back.
-        // SAFETY: reads this process's window station.
-        let original = unsafe { GetProcessWindowStation() };
-        // SAFETY: `station` is the handle created above.
-        if original.is_null() || unsafe { SetProcessWindowStation(station) } == 0 {
-            let f = Failure::last("enter the command's window station");
-            // SAFETY: closes the station created above.
-            unsafe { CloseWindowStation(station) };
-            return Err(f);
-        }
-        let desk = wide("Default");
-        // SAFETY: creates a desktop on the window station entered above.
-        let desktop =
-            unsafe { CreateDesktopW(desk.as_ptr(), ptr::null(), ptr::null(), 0, GENERIC_ALL, &sa) };
-        let created = Failure::last("create the command's desktop");
-        // SAFETY: returns to the window station this process started on.
-        let back = unsafe { SetProcessWindowStation(original) };
-        if desktop.is_null() || back == 0 {
-            let f = if desktop.is_null() {
-                created
-            } else {
-                Failure::last("leave the command's window station")
-            };
-            // SAFETY: closes what was created above.
-            unsafe {
-                if !desktop.is_null() {
-                    CloseDesktop(desktop);
-                }
-                CloseWindowStation(station);
-            }
-            return Err(f);
-        }
-        Ok(Self {
-            station,
-            desktop,
-            startup_name: wide(&format!("{name}\\Default")),
-        })
+/// The command's `<window station>\<desktop>` from the request,
+/// NUL-terminated for `STARTUPINFOW::lpDesktop`, after checking that this
+/// runner can open that window station. The owner's process made the station
+/// and its desktop, admitting this sandbox user (`launch.rs`); the runner
+/// makes none. Without the check, a station the command cannot open would
+/// show only as the command's own exit code `STATUS_DLL_INIT_FAILED`; with
+/// it, the failure names the call and the Win32 error.
+fn command_desktop(request: &Request) -> Result<Vec<u16>, Failure> {
+    let slash = u16::from(b'\\');
+    let station: Vec<u16> = request
+        .desktop
+        .split(|&u| u == slash)
+        .next()
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .chain([0])
+        .collect();
+    // SAFETY: `station` is NUL-terminated; the handle is closed below.
+    let h = unsafe { OpenWindowStationW(station.as_ptr(), 0, WINSTA_ENUMDESKTOPS as u32) };
+    if h.is_null() {
+        return Err(Failure::last(
+            "open the command's window station (OpenWindowStationW)",
+        ));
     }
-}
-
-impl Drop for Station {
-    fn drop(&mut self) {
-        // SAFETY: closes the handles created in `create`, once.
-        unsafe {
-            CloseDesktop(self.desktop);
-            CloseWindowStation(self.station);
-        }
-    }
+    // SAFETY: the handle opened above, closed once.
+    unsafe { CloseWindowStation(h) };
+    Ok(request.desktop.iter().copied().chain([0]).collect())
 }
 
 // ---- start and wait ---------------------------------------------------------
@@ -977,10 +884,12 @@ fn std_handles() -> Result<[HANDLE; 3], Failure> {
     Ok(out)
 }
 
+/// Start `request` with `token` on `desktop` (NUL-terminated, from
+/// [`command_desktop`]), in the runner's job.
 fn spawn(
     request: &Request,
     token: &OwnedHandle,
-    station: &Station,
+    desktop: &[u16],
 ) -> Result<(OwnedHandle, u32), Failure> {
     let std = std_handles()?;
     let mut listed: Vec<HANDLE> = Vec::new();
@@ -1001,7 +910,7 @@ fn spawn(
     // SAFETY: zeroed is a valid initial STARTUPINFOEXW.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.lpDesktop = station.startup_name.as_ptr().cast_mut();
+    si.StartupInfo.lpDesktop = desktop.as_ptr().cast_mut();
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = std[0];
     si.StartupInfo.hStdOutput = std[1];

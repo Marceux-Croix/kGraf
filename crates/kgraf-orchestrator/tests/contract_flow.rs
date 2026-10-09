@@ -2322,6 +2322,288 @@ async fn each_partys_first_attempt_runs_on_the_route_of_its_handshake() {
     }
 }
 
+/// A handshake model whose every answer takes `delay`, through the real
+/// ledger. It records how many calls are in flight at once, and when the first
+/// call started and the last one ended. `peers > 1` makes each call wait (up to
+/// [`SlowHandshake::PEER_WAIT`]) until that many calls were in flight, so an
+/// overlap is proven by a count, not by a clock. A party named in `fail`
+/// answers with a transport failure after its own delay.
+struct SlowHandshake {
+    delay: Duration,
+    peers: usize,
+    /// `(party, delay)`: the party's call fails after this delay instead.
+    fail: Vec<(&'static str, Duration)>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    parties: std::sync::Mutex<Vec<String>>,
+    span: std::sync::Mutex<(Option<Instant>, Option<Instant>)>,
+}
+
+impl SlowHandshake {
+    const PEER_WAIT: Duration = Duration::from_secs(10);
+
+    fn new(delay: Duration, peers: usize, fail: Vec<(&'static str, Duration)>) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            peers,
+            fail,
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            parties: Default::default(),
+            span: Default::default(),
+        })
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// From the first call's start to the last call's end.
+    fn wall(&self) -> Duration {
+        match *self.span.lock().expect("lock") {
+            (Some(a), Some(b)) => b - a,
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl kgraf_provider::Provider for SlowHandshake {
+    fn adapter(&self) -> &'static str {
+        "fake-slow-handshake"
+    }
+
+    fn protocol(&self) -> kgraf_core::Protocol {
+        kgraf_core::Protocol::Additive
+    }
+
+    async fn complete(
+        &self,
+        request: &kgraf_provider::Request,
+        token: &kgraf_provider::CallToken,
+    ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+        use std::sync::atomic::Ordering;
+        let prompt = request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(kgraf_provider::Content::as_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let party = ["prod", "cons", "extra"]
+            .into_iter()
+            .find(|p| prompt.contains(&format!("You are party `{p}`")))
+            .expect("a known party");
+        self.parties.lock().expect("lock").push(party.to_owned());
+        self.span
+            .lock()
+            .expect("lock")
+            .0
+            .get_or_insert_with(Instant::now);
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let waited = Instant::now();
+        while self.max_in_flight() < self.peers && waited.elapsed() < Self::PEER_WAIT {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let failing = self.fail.iter().find(|(p, _)| *p == party);
+        tokio::time::sleep(failing.map_or(self.delay, |(_, d)| *d)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.span.lock().expect("lock").1 = Some(Instant::now());
+        if failing.is_some() {
+            token.fail().expect("close the failed row");
+            return Err(kgraf_provider::ProviderError::Transport {
+                adapter: "fake-slow-handshake",
+                reason: format!("{party} could not be reached"),
+            });
+        }
+        let text = if party == "extra" {
+            serde_json::json!({"expect": [CONS_SAYS], "touch": ["extra.py"]}).to_string()
+        } else {
+            agreeing(&prompt)
+        };
+        let usage = kgraf_core::TokenUsage {
+            uncached_input: 200,
+            text_output: 50,
+            ..kgraf_core::TokenUsage::default()
+        };
+        token.settle(&usage, None).expect("settle");
+        Ok(kgraf_provider::Response {
+            finish_reason: None,
+            model: request.model.clone(),
+            content: vec![kgraf_provider::Content::text(text)],
+            stop_reason: kgraf_provider::StopReason::EndTurn,
+            usage,
+            request_id: None,
+        })
+    }
+}
+
+/// The ledger rows of the run's handshake calls.
+fn handshake_rows(rig: &Rig) -> Vec<kgraf_provider::CallRecord> {
+    rig.parts
+        .ledger
+        .calls()
+        .expect("calls")
+        .into_iter()
+        .filter(|c| c.trace.kind.as_deref() == Some("handshake"))
+        .collect()
+}
+
+/// Run a three-party interface whose handshake model is `slow`, through the
+/// real `ModelHandshaker` and ledger, as in a run.
+async fn run_slow_handshake(
+    dir: &Path,
+    slow: Arc<SlowHandshake>,
+) -> (
+    Rig,
+    Result<RunReport, kgraf_orchestrator::OrchestratorError>,
+) {
+    let mut plan = parties_plan(false);
+    plan.push(c("extra", "use the parser too", "extra.py", &[]));
+    let rig = Rig::new(
+        dir,
+        plan_json(&plan),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let mut ic = py_ic();
+    ic.parties.push("extra".into());
+    let mut checks = rig.checks(vec![ic]);
+    checks.handshaker = Arc::new(ModelHandshaker(ModelCaller {
+        reasoning: Default::default(),
+        provider: slow,
+        ledger: rig.parts.ledger.clone(),
+        model: PLAN_MODEL.into(),
+        max_output_tokens: 1_000,
+        agent: "orchestrator:r1".into(),
+        task: "r1".into(),
+    }));
+    let run = Orchestrator::new(config(), rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(checks)
+        .expect("contracts")
+        .start(RunId::new("r1"), "parse the config".into());
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends");
+    (rig, report)
+}
+
+/// The calls of one gate overlap: all three parties' calls are in flight at
+/// once. A faster gate must not make more calls, so the count is checked too:
+/// one call per open party, each a ledger row attributed to the orchestrator
+/// and the run, and every hold settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handshake_calls_of_one_gate_overlap_and_their_count_is_unchanged() {
+    let dir = tempfile::tempdir().expect("dir");
+    let slow = SlowHandshake::new(Duration::from_millis(200), 3, Vec::new());
+    let (rig, report) = run_slow_handshake(dir.path(), slow.clone()).await;
+    let report = report.expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        slow.max_in_flight(),
+        3,
+        "every party's call is in flight at once"
+    );
+    let mut parties = slow.parties.lock().expect("lock").clone();
+    parties.sort();
+    assert_eq!(parties, ["cons", "extra", "prod"], "one call per party");
+    let rows = handshake_rows(&rig);
+    assert_eq!(rows.len(), 3, "one ledger row per call: {rows:?}");
+    for row in &rows {
+        assert_eq!(row.agent_id, "orchestrator:r1");
+        assert_eq!(row.task_id, "r1");
+        assert_eq!(
+            row.settlement,
+            kgraf_provider::Settlement::Counted,
+            "{row:?}"
+        );
+    }
+    let events = rig.contract_events().await;
+    let handshake = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::ChecksPassed { handshake, .. } => Some(handshake),
+            _ => None,
+        })
+        .expect("checks passed");
+    let order: Vec<&str> = handshake.iter().map(|s| s.party.as_str()).collect();
+    assert_eq!(
+        order,
+        ["prod", "cons", "extra"],
+        "statements in party order"
+    );
+    assert_eq!(rig.parts.admission.budget().held(), kgraf_core::Money::ZERO);
+}
+
+/// The wall time of one gate whose three calls each take 300 ms. Printed for
+/// the record (`--nocapture`), never asserted: a clock in a loaded test
+/// binary is not a count. The call count is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wall_time_of_a_gate_with_three_slow_handshake_calls() {
+    let dir = tempfile::tempdir().expect("dir");
+    let slow = SlowHandshake::new(Duration::from_millis(300), 1, Vec::new());
+    let (rig, report) = run_slow_handshake(dir.path(), slow.clone()).await;
+    assert_eq!(report.expect("run").status, RunStatus::Completed);
+    assert_eq!(handshake_rows(&rig).len(), 3);
+    eprintln!(
+        "handshake wall time, 3 calls of 300 ms each: {} ms (max in flight {})",
+        slow.wall().as_millis(),
+        slow.max_in_flight()
+    );
+}
+
+/// One party's failure is reported as before, by the first failing party in
+/// party order, even when a later party fails sooner. The other calls are not
+/// cancelled: every row is closed and every hold settled, so no token is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_handshake_call_names_the_first_failing_party_and_settles_every_call() {
+    let dir = tempfile::tempdir().expect("dir");
+    let slow = SlowHandshake::new(
+        Duration::from_millis(200),
+        3,
+        vec![
+            ("cons", Duration::from_millis(300)),
+            ("extra", Duration::from_millis(10)),
+        ],
+    );
+    let (rig, report) = run_slow_handshake(dir.path(), slow.clone()).await;
+    let report = report.expect("run");
+    assert_ne!(report.status, RunStatus::Completed, "{report:?}");
+    let events = rig.contract_events().await;
+    let errors: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            ContractEvent::CheckNotRun { error, .. } => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:?}");
+    assert!(
+        errors[0].starts_with("party `cons`:") && errors[0].contains("cons could not be reached"),
+        "{}",
+        errors[0]
+    );
+    let rows = handshake_rows(&rig);
+    assert_eq!(rows.len(), 3, "every party's call was made once: {rows:?}");
+    let settled = |s: kgraf_provider::Settlement| rows.iter().filter(|r| r.settlement == s).count();
+    assert_eq!(
+        (
+            settled(kgraf_provider::Settlement::Counted),
+            settled(kgraf_provider::Settlement::Failed)
+        ),
+        (1, 2),
+        "{rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row.agent_id, "orchestrator:r1");
+        assert!(!rig.parts.ledger.is_in_flight(&row.id).expect("row"));
+    }
+    assert_eq!(rig.parts.admission.budget().held(), kgraf_core::Money::ZERO);
+}
+
 /// An interface a split writes may bind a contract outside the split. The
 /// name is resolved against the whole plan, as before, and the split's
 /// own parties are renamed to the children.
