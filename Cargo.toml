@@ -53,6 +53,10 @@ members = [
     # scripts/package-wintest.sh builds. `publish = false`, `dist = false`.
     "crates/kgraf-wintest",
 ]
+# Vendored third-party code (see third_party/pdf-extract/UPSTREAM). A path
+# dependency inside the workspace directory would otherwise become a member and
+# be linted and tested with kGraf code.
+exclude = ["third_party/pdf-extract"]
 
 [workspace.package]
 # Every crate inherits this (`version.workspace = true`); the git tags the

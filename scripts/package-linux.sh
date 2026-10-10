@@ -43,7 +43,7 @@ esac
 echo "packaging for $rust_target ($deb_arch)"
 
 # --- build dependencies -----------------------------------------------
-# tray-icon (libappindicator on Linux) needs GTK; winit/eframe need X11 and
+# The Linux tray speaks D-Bus in pure Rust (no GTK); winit/eframe need X11 and
 # Wayland client headers; dpkg-deb builds the .deb. The icon is a copy of the
 # designed asset PNG, not generated, so no rasterizer is needed here.
 # KGRAF_LINUX_NATIVE=1 runs the script as an ordinary user on a Linux host (the
@@ -54,11 +54,11 @@ SUDO=""
 if [[ "${KGRAF_LINUX_NATIVE:-}" == "1" ]]; then
   SUDO="sudo"
 fi
-if [[ -n "$SUDO" ]] || ! dpkg -s libgtk-3-dev >/dev/null 2>&1; then
+if [[ -n "$SUDO" ]] || ! dpkg -s libx11-dev >/dev/null 2>&1; then
   $SUDO apt-get update
   $SUDO apt-get install -y --no-install-recommends \
-    pkg-config libgtk-3-dev libayatana-appindicator3-dev \
-    libxdo-dev libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
+    pkg-config \
+    libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
     libxkbcommon-dev libwayland-dev libssl-dev libglib2.0-dev \
     dpkg-dev
 fi
@@ -163,9 +163,9 @@ done
 installed_size="$(du -sk "$deb_root/usr" | cut -f1)"
 
 # Depends: computed from what the binaries actually link (ldd), not a
-# hand-maintained guess -- kgraf-app pulls in GTK (tray-icon's
-# libappindicator) and libxdo (tray-icon's global hotkeys) only on Linux, and
-# a hand-written list silently goes stale the next time a dependency changes.
+# hand-maintained guess -- a hand-written list silently goes stale the next time a
+# dependency changes. (The Linux tray is pure Rust over D-Bus, so no GTK or libxdo
+# package appears here.)
 # `linux-vdso`/`ld-linux` are kernel-provided, not owned by any package; skip
 # them. `dpkg -S` needs the realpath, since ldd may print a dev symlink name.
 depends="libc6"

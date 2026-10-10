@@ -120,11 +120,75 @@ fn install_handlers(tx: Sender<TrayCommand>, wake: egui::Context, show: MenuId, 
             }
         }
     }));
-    // A double click on the icon reopens the window. Other icon events are ignored.
+    // A double click on the icon reopens the window (Windows only). On Linux the
+    // StatusNotifierItem host sends `Activate` for a primary click, which the
+    // backend reports as a left Click; it reopens the window too. Other icon events
+    // are ignored.
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        if matches!(event, TrayIconEvent::DoubleClick { .. }) && tx.send(TrayCommand::Show).is_ok()
-        {
+        if icon_event_command(&event).is_some() && tx.send(TrayCommand::Show).is_ok() {
             wake.request_repaint();
         }
     }));
+}
+
+/// What an icon event asks for. Pure, so a test can drive it without a tray.
+fn icon_event_command(event: &TrayIconEvent) -> Option<TrayCommand> {
+    match event {
+        TrayIconEvent::DoubleClick { .. } => Some(TrayCommand::Show),
+        #[cfg(target_os = "linux")]
+        TrayIconEvent::Click {
+            button: tray_icon::MouseButton::Left,
+            button_state: tray_icon::MouseButtonState::Up,
+            ..
+        } => Some(TrayCommand::Show),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tray_icon::dpi::PhysicalPosition;
+    use tray_icon::{MouseButton, MouseButtonState, Rect, TrayIconId};
+
+    fn click(button: MouseButton) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: TrayIconId::new("t"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button,
+            button_state: MouseButtonState::Up,
+        }
+    }
+
+    #[test]
+    fn double_click_shows_the_window() {
+        let ev = TrayIconEvent::DoubleClick {
+            id: TrayIconId::new("t"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button: MouseButton::Left,
+        };
+        assert_eq!(icon_event_command(&ev), Some(TrayCommand::Show));
+    }
+
+    #[test]
+    fn a_middle_click_does_nothing() {
+        assert_eq!(icon_event_command(&click(MouseButton::Middle)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_left_click_shows_the_window_on_linux() {
+        assert_eq!(
+            icon_event_command(&click(MouseButton::Left)),
+            Some(TrayCommand::Show)
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_left_click_does_nothing_off_linux() {
+        assert_eq!(icon_event_command(&click(MouseButton::Left)), None);
+    }
 }

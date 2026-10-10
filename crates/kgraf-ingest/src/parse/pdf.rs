@@ -110,9 +110,9 @@ mod tests {
 
     /// Builds a minimal one-page PDF with a `Tj` text-show operation, using
     /// `lopdf` directly rather than committing a binary fixture. `lopdf` is
-    /// `pdf-extract`'s own PDF object-model dependency (transitively, at a
-    /// different pinned version here as a dev-dependency), so this exercises
-    /// the same object model `pdf-extract` reads.
+    /// `pdf-extract`'s own PDF object-model dependency (the same 0.45 release,
+    /// here as a dev-dependency), so this exercises the same object model
+    /// `pdf-extract` reads.
     fn build_fixture(text: &str) -> Vec<u8> {
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();

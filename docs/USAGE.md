@@ -1571,7 +1571,10 @@ cargo run -p kgraf-shell --bin kgraf-app -- --probe
   software (CPU) adapter. The window always states when it renders on the CPU.
 - `--screenshot FILE` captures the window to a PNG after the first frame and
   `--screenshot-after` seconds (default 3), then quits.
-- Closing the window can leave the app in the tray, where scheduled runs fire.
+- Closing the window can leave the app in the tray, where scheduled runs fire. On Linux the
+  tray uses the StatusNotifierItem D-Bus service (no GTK needed). Your desktop must run a
+  host for it: KDE Plasma has one; GNOME needs the AppIndicator and KStatusNotifierItem
+  extension. A click on the icon shows the window.
 - **Updates.** Off by default: Settings > General > "Check for updates on start" lets the app read
   the GitHub Releases of `Marceux-Croix/kGraf` at start, and "Check now" always checks.
   This is the only network request the setting causes. An offered release counts on the

@@ -23,7 +23,10 @@ serde.workspace = true
 # and .ignore aware traversal) with no unused surface. Verified on crates.io 2026-09-26.
 ignore.workspace = true
 pulldown-cmark = "0.13.4"
-pdf-extract = "0.12.1"
+# pdf-extract 0.12.1 with lopdf 0.45, vendored because lopdf 0.42 pulls the unmaintained
+# ttf-parser (RUSTSEC-2026-0192) and no pdf-extract release requires a newer lopdf.
+# Origin and change: third_party/pdf-extract/UPSTREAM.
+pdf-extract = { path = "../../third_party/pdf-extract" }
 docx-rs = "0.4.22"
 text-splitter = "0.33.0"
 

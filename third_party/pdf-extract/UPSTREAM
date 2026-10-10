@@ -1,0 +1,26 @@
+Repository: https://github.com/jrmuizel/pdf-extract
+Version:    0.12.1 (crates.io, published 2026-09-16)
+License:    MIT, as declared in the crate's Cargo.toml and on crates.io. The
+            published package carries no license file; the MIT text is in LICENSE.
+
+Copied from the crates.io package: src/ and README.md, unchanged except below.
+
+Modified:
+  Cargo.toml    lopdf "0.42" -> "0.45" (same default-features = false, features =
+                ["wasm_js"]); dev-dependencies and the release profile dropped; an empty [workspace]
+                table added so the crate is its own root.
+  src/lib.rs    inner allow(warnings, clippy::all) and rustfmt skip attributes (so cargo fmt --all leaves it alone), and one line in output_doc_inner: lopdf 0.45 returns the page content
+                bytes from Document::get_page_content, not a Result, so the
+                .unwrap() is removed.
+
+Why: lopdf 0.42 depends on ttf-parser unconditionally. ttf-parser is unmaintained
+(RUSTSEC-2026-0192) and has no safe upgrade. lopdf 0.45 makes its font parser
+(skrifa) optional behind font_embedding, which stays off. pdf-extract 0.12.1
+requires lopdf ^0.42, and no newer pdf-extract is published. The same change is
+open upstream as pull request 163 of jrmuizel/pdf-extract (head
+gianlucamazza/pdf-extract, commit 58244c85b3eb27da1298914d9659b1dcd89c72b0),
+not merged on 2026-10-10. Checked and not taken: anymd-pdf-extract 0.12.3 (a fork
+that still requires lopdf 0.42); hygg-pdf-extract (a fork of 0.10.0).
+
+Remove this directory and use crates.io pdf-extract again once a release that
+requires lopdf 0.45 or later is published.

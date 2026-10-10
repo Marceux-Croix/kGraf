@@ -925,7 +925,10 @@ created against an existing node or a new one from an instruction.
 ### Desktop shell and event bus
 
 **One native Rust binary** (decision 0054): `winit` for the window and
-taskbar icon, `tray-icon`, egui for panels, and `wgpu` for the galaxy.
+taskbar icon, `tray-icon`, egui for panels, and `wgpu` for the galaxy. `tray-icon` runs
+with its `ksni` backend on Linux (the StatusNotifierItem D-Bus protocol in pure Rust), so
+Linux links no GTK; `winit` keeps Wayland client-side frames without the title font
+(`wayland-csd-adwaita-notitle`).
 
 The design constraints behind it:
 

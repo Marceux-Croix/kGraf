@@ -1,0 +1,27 @@
+# pdf-extract 0.12.1 from crates.io with one change: lopdf 0.45 in place of 0.42.
+# lopdf 0.42 depends on ttf-parser, which is unmaintained (RUSTSEC-2026-0192);
+# lopdf 0.45 makes its font parser (skrifa) optional and off here. See UPSTREAM.
+# Not a workspace member (see the workspace `exclude`); kgraf-ingest depends on it by path.
+[package]
+authors = ["Jeff Muizelaar <jmuizelaar@mozilla.com>"]
+description = "A library to extract content from pdfs"
+edition = "2018"
+keywords = ["pdf2text", "text", "pdf", "pdf2txt"]
+license = "MIT"
+name = "pdf-extract"
+repository = "https://github.com/jrmuizel/pdf-extract"
+version = "0.12.1"
+publish = false
+
+[dependencies]
+adobe-cmap-parser = "0.4.1"
+encoding_rs = "0.8.34"
+euclid = "0.20.5"
+lopdf = { version = "0.45", default-features = false, features = ["wasm_js"] }
+postscript = "0.14"
+type1-encoding-parser = "0.1.1"
+unicode-normalization = "0.1.19"
+cff-parser = "0.2.0"
+log = "0.4.22"
+
+[workspace]

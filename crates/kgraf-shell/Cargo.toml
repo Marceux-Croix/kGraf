@@ -84,9 +84,19 @@ eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "de
 egui = "0.36.2"
 egui-wgpu = "0.36.2"
 wgpu = "30.0.1"
-winit = "0.30.13"
+# Winit's default features, except `wayland-csd-adwaita` is replaced by
+# `wayland-csd-adwaita-notitle`: Wayland client-side window frames stay, but the
+# title text is not drawn, which drops the ab_glyph/owned_ttf_parser/ttf-parser font
+# stack (ttf-parser is unmaintained, RUSTSEC-2026-0192). Listed one by one because
+# the default set cannot be reduced by one entry.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 # Tray presence for background mode (decision 0052). Same crate Tauri uses.
-tray-icon = "0.26.0"
+# Default features are off and `ksni` is on: the default Linux backend links GTK 3
+# through libappindicator (gtk-rs 0.18, unmaintained, so proc-macro-error,
+# RUSTSEC-2024-0370). `ksni` speaks the StatusNotifierItem D-Bus protocol in pure
+# Rust on zbus, so Linux needs no GTK, no libappindicator and no libxdo. macOS and
+# Windows backends are unchanged. The menu API is the same on every platform.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 log = "0.4.34"
 # Binary only: routes wgpu/egui-wgpu warnings to stderr. Default features off to skip
 # the regex filter engine; module-prefix filters still work.

@@ -359,12 +359,12 @@ for arch in aarch64 amd64; do
     debian:trixie-slim bash -c '
       set -euo pipefail
       apt-get update -qq
-      # Mesa (llvmpipe/lavapipe software rendering) plus the tray/X11 shared
+      # Mesa (llvmpipe/lavapipe software rendering) plus the X11 shared
       # libraries the shell links -- same package list the 2026-09-28
       # x86_64 verification run used; the tarball ships no
       # runtime dependencies of its own.
       apt-get install -y -qq --no-install-recommends \
-        libgtk-3-0 libayatana-appindicator3-1 libxdo3 mesa-utils \
+        mesa-utils \
         libgl1-mesa-dri libvulkan1 >/dev/null
       mkdir /check
       tar -xzf /artifacts/'"$(basename "$tarball")"' -C /check
