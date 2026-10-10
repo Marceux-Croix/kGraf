@@ -3737,6 +3737,136 @@ async fn a_narrowed_check_is_not_deferred_for_an_open_contract_it_does_not_need(
     assert!(!reason.contains("dispatch base"), "{reason}");
 }
 
+/// A greenfield workspace after its first contract: both member manifests,
+/// a stub `wcl-core/src/lib.rs` and a stub `wcl/src/main.rs`.
+const WCL_BASE: [(&str, &str); 6] = [
+    (".gitignore", "target/\n"),
+    (
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"wcl-core\", \"wcl\"]\n",
+    ),
+    (
+        "wcl-core/Cargo.toml",
+        "[package]\nname = \"wcl-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    ("wcl-core/src/lib.rs", "// empty stub\n"),
+    (
+        "wcl/Cargo.toml",
+        "[package]\nname = \"wcl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    ("wcl/src/main.rs", "fn main() {}\n"),
+];
+
+/// The CLI contract's manifest, with the dependency on the library.
+const WCL_MANIFEST: &str = "[package]\nname = \"wcl\"\nversion = \"0.1.0\"\nedition = \
+     \"2021\"\n\n[dependencies]\nwcl-core = { path = \"../wcl-core\" }\n";
+
+/// A CLI that calls the library's `count`, as the library's contract
+/// announced it.
+const WCL_MAIN: &str = "use std::io::Read;\n\nfn main() {\n    let mut s = String::new();\n    \
+     std::io::stdin().read_to_string(&mut s).expect(\"stdin\");\n    let c = \
+     wcl_core::count(&s);\n    println!(\"{} {} {}\", c.lines, c.words, c.bytes);\n}\n";
+
+/// The CLI contract `c4` is dispatched on the tree above. While it runs, the
+/// library contract `c2` (which it does not wait on) merges `count`. Then
+/// `c4`'s attempt is verified, and the tree it was given lacks `count`.
+async fn wcl_with_count_merged_after_dispatch(worker: &str) -> (Repo, OpenContract, PathBuf) {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(dir, root.clone(), &base, &WCL_BASE);
+    owner_only_modes(&root, &WCL_BASE);
+    let mut c4 = named("wcl/src/main.rs", "c4");
+    c4.writes = ["wcl/Cargo.toml", "wcl/src/main.rs"]
+        .iter()
+        .map(|p| kgraf_orchestrator::WriteTarget {
+            path: (*p).into(),
+            node: None,
+        })
+        .collect();
+    let ws4 = prepared(&r, &c4, worker).await;
+    let c2 = named("wcl-core/src/lib.rs", "c2");
+    let ws2 = prepared(&r, &c2, "w-c2").await;
+    std::fs::write(
+        ws2.join("wcl-core/src/lib.rs"),
+        "pub struct Counts {\n    pub lines: usize,\n    pub words: usize,\n    pub bytes: \
+         usize,\n}\n\npub fn count(text: &str) -> Counts {\n    Counts { lines: \
+         text.lines().count(), words: text.split_whitespace().count(), bytes: text.len() }\n}\n",
+    )
+    .expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c2, &ws2, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
+    let merged = r.workspaces.integrate(&c2, &ws2).await.expect("integrate");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+    r.workspaces.release(&ws2, true).await;
+    std::fs::write(ws4.join("wcl/Cargo.toml"), WCL_MANIFEST).expect("manifest");
+    (r, c4, ws4)
+}
+
+/// The attempt calls the API the library contract merged after the attempt
+/// was dispatched. Its check fails on its own tree (`count` is not in the
+/// stub it was given) and passes on the attempt merged onto the integration
+/// tip, which is what merge-back lands: the attempt passes, and a notice
+/// says where its check passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempt_that_needs_work_merged_after_its_dispatch_passes_on_the_merged_tip() {
+    let (r, c4, ws) = wcl_with_count_merged_after_dispatch("w-c4").await;
+    std::fs::write(ws.join("wcl/src/main.rs"), WCL_MAIN).expect("main");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v.verify_among(&c4, &ws, &result(), &[]).await.expect("ran");
+    let Verdict::Pass {
+        by,
+        notices,
+        commit,
+    } = &verdict
+    else {
+        panic!("it passes on the tree that merges: {verdict:?}");
+    };
+    assert!(commit.is_some(), "the attempt's work is committed");
+    assert_eq!(by, "cargo test -p wcl --offline");
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("passed on the attempt merged onto the integration tip"))
+        .unwrap_or_else(|| panic!("said in a notice: {notices:?}"));
+    assert!(notice.contains("contract c4"), "{notice}");
+    // It merges cleanly onto the tip that holds `count`.
+    let merged = r.workspaces.integrate(&c4, &ws).await.expect("integrate");
+    assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
+}
+
+/// The same attempt with an error of its own (a duplicate import): it fails
+/// on the merged tip too, and the reason quotes that run, where `count`
+/// exists, so the retry is told only what is still wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempt_that_also_fails_on_the_merged_tip_is_told_what_is_wrong_there() {
+    let (r, c4, ws) = wcl_with_count_merged_after_dispatch("w-c4-dup").await;
+    std::fs::write(
+        ws.join("wcl/src/main.rs"),
+        format!("use std::io::Read;\n{WCL_MAIN}"),
+    )
+    .expect("main");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v.verify_among(&c4, &ws, &result(), &[]).await.expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("a duplicate import fails on the merged tip too: {verdict:?}");
+    };
+    assert!(reason.contains("E0252"), "{reason}");
+    assert!(
+        reason.contains("this output is from the attempt merged onto the integration tip"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cannot find function `count`"), "{reason}");
+}
+
 /// A run whose first contract `c1` merged a `src/lib.rs` that says `broken`;
 /// at the run's start it said `ok`.
 async fn repo_where_c1_merged_a_break() -> Repo {

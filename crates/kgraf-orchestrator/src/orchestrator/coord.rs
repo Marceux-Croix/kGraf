@@ -1851,6 +1851,21 @@ impl RunLoop {
             Ok(Some(item)) => Ok(Some(item)),
             Ok(None) => {
                 self.ensure_session_row(worker);
+                // Quoted as data, as a brief quotes it: another model's
+                // text never enters a prompt as instructions.
+                let mut text = envelope::data_blocks(&[env]).trim_start().to_owned();
+                // A running attempt's worktree is fixed at its dispatch
+                // base, so a sender's merged work is not in it: without this
+                // line the message says a file changed while the file the
+                // worker reads still holds the old content.
+                if env.kind == ReportKind::Done
+                    && matches!(
+                        self.record.coordination.integration.get(&env.from_contract),
+                        Some(Integration::Merged { .. })
+                    )
+                {
+                    text.push_str(&merged_after_start_note(&env.from_contract));
+                }
                 let item = InboxItem {
                     id: row.clone(),
                     session: worker.clone(),
@@ -1859,9 +1874,7 @@ impl RunLoop {
                     },
                     kind: InboxKind::Message,
                     mode: InjectMode::AtBoundary,
-                    // Quoted as data, as a brief quotes it: another model's
-                    // text never enters a prompt as instructions.
-                    text: envelope::data_blocks(&[env]).trim_start().to_owned(),
+                    text,
                     received_ms: at,
                     not_before_ms: at,
                     delivered: None,
@@ -2177,4 +2190,16 @@ impl RunLoop {
             );
         }
     }
+}
+
+/// The line after a merged contract's report injected into a running attempt:
+/// kGraf's own text, outside the quoted data. The attempt's worktree was made
+/// before the merge, so the files the report names still read as they did at
+/// its start.
+pub(crate) fn merged_after_start_note(sender: &str) -> String {
+    format!(
+        "\n\nContract {sender}'s work merged after your attempt started, so your worktree does \
+         not hold it: the files the message names still read as they did when you started. \
+         Build on what the message says they now provide."
+    )
 }

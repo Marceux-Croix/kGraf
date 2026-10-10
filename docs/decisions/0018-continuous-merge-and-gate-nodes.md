@@ -529,3 +529,61 @@ Tests: `kgraf-host` `tests.rs`
 `a_narrowed_check_is_not_deferred_for_an_open_contract_it_does_not_need`; `scoped_check`
 `a_narrowed_check_needs_the_absent_target_roots_and_files_of_its_own_tests`. With the base run
 limited to whole checks again, the first two fail.
+
+## Amendment (2026-10-10, second): a failing check runs again on the attempt merged onto a moved tip
+
+A plan gave the CLI contract of a new cargo workspace a dependency on the manifests contract
+only, although its instruction calls a function the library contract writes. Its attempts were
+dispatched on a tree where the library is a stub. While an attempt ran, the library contracts
+merged and their messages described the new API; the attempt wrote code for it. Its check ran
+on its own tree, which still held the stub: "cannot find function `count` in crate `wcl_core`".
+The tree merge-back would have landed held `count`. The deferral covers work of contracts still
+open; nothing covered work that merged after the dispatch base.
+
+- **The rule.** When a committed attempt's check fails (not a remediation, not deferred) and the
+  integration tip is no longer its dispatch base, the same command runs once more on the attempt
+  merged onto the tip: an unreferenced merge commit (`MergeBack::trial_merge`), checked out in a
+  throwaway worktree (`verifier::check_on_tip`). No branch moves.
+- **Passing there passes the attempt.** That merge is the tree merge-back lands, and the root
+  gate still runs the whole command on the merged result. A notice says so.
+- **Failing there replaces the output.** The reason quotes the run on the merge and says where
+  it ran. A retry starts from the tip, so what is still wrong there is what it must fix.
+- **Could not run there.** A merge conflict or a failure to read the tip leaves the attempt's own
+  output and adds a line saying why.
+- **Cost.** One more run of the check, only for a failing check after the tip moved.
+
+Rejected: merging the tip into the attempt's worktree before the check: it changes the
+attempt's commit and its scope check. Rejected: inferring the missing plan dependency from
+instruction text: it is a guess about names.
+
+Tests: `kgraf-host` `tests.rs`
+`an_attempt_that_needs_work_merged_after_its_dispatch_passes_on_the_merged_tip`,
+`an_attempt_that_also_fails_on_the_merged_tip_is_told_what_is_wrong_there`. With `check_on_tip`
+returning "not moved", both fail.
+
+## Amendment (2026-10-10, third): a verifier refusal reaches an attempt before the contract is held
+
+With the default retry budget (`max_retries: 1`, two attempts), a contract's first attempt ended
+before verification (the model announced the work and ended its turn twice). The second
+attempt's brief carried that stop note; it wrote code, and its check was refused with compile
+errors. That refusal spent the budget, so the contract was held and no attempt was ever shown
+a verifier's errors, which the retry brief exists to carry. An empty finish is a common failure
+of a working model, and a compile error a fresh attempt can fix when it reads it; the hold came
+from the order of the failures, not from their number.
+
+- **The rule** (`refusal_never_shown`). When a round that spends the last retry has a verifier
+  refusal, and the brief its attempts ran from carried none, the contract is planned again
+  instead of held. The next attempt starts from the integration tip, and its brief quotes the
+  refusal.
+- **Bounded.** At most one extra attempt per contract: the extra attempt carries a refusal, so
+  its own failure holds. A run with `max_retries: 0` gets none.
+- **Unchanged.** A contract whose earlier attempt was refused already carries the refusal, and
+  holds after the plain budget.
+
+Rejected: raising the default retry budget: it adds an attempt to every contract that fails
+twice. Rejected: not counting an empty finish as a failure: a model that never writes would loop.
+
+Tests: `kgraf-orchestrator` `tests/retry_unseen_refusal.rs`
+`a_refusal_no_attempt_saw_gets_one_more_attempt_that_carries_it`,
+`a_refusal_an_attempt_already_saw_holds_after_the_retry_budget`. With `refusal_never_shown`
+false, the first fails.

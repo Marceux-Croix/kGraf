@@ -731,7 +731,10 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   narrowing selects for both, or, under cargo, a member's `src/lib.rs` or `src/main.rs`, without
   which cargo loads no package of the workspace. A contract that writes only a new workspace's
   manifests is then deferred, and the notice names the missing files and their contracts. A
-  narrowed check that needs no such file fails as before.
+  narrowed check that needs no such file fails as before. A check that fails on an attempt
+  after other contracts merged since its dispatch runs once more on the attempt merged onto
+  the integration tip, which is the tree that merges: passing there passes the attempt, with a
+  notice; failing there, the reason quotes that run, since a retry starts from the tip.
 - A worker that asks for a file another contract of the plan writes is told not to edit it,
   and is told the check the verifier will run on its attempt (the narrowed or whole command, read
   in its worktree), and whether a failure that comes from the other contracts' missing files is

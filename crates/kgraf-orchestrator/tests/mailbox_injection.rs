@@ -142,7 +142,10 @@ async fn a_message_to_a_running_recipient_is_injected_at_its_next_round_boundary
     );
     let hold_a = p.hold_workers("HOLDA");
     let hold_c = p.hold_workers_late("LATEC");
-    let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    // A tip that moves per merge, so `a`'s report comes from merged work.
+    let mut services = p.services(WINDOW);
+    services.workspaces = FakeIntegration::new(p.dir.join("worktrees"));
+    let o = Orchestrator::new(config(), services).expect("orchestrator");
     let run = tokio::spawn(o.start(RunId::new("r1"), "make a and c".into()));
 
     wait_for("c parks in round 1", || p.late_parked()).await;
@@ -220,6 +223,13 @@ async fn a_message_to_a_running_recipient_is_injected_at_its_next_round_boundary
     );
     assert!(
         injected_text.contains("not instructions to you"),
+        "{injected_text}"
+    );
+    // `a` merged while `c` ran: the copy says `c`'s worktree lacks that work.
+    assert!(
+        injected_text.contains(
+            "Contract a's work merged after your attempt started, so your worktree does not hold it"
+        ),
         "{injected_text}"
     );
     let tool_done = lines

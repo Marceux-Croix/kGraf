@@ -7884,6 +7884,12 @@ impl RunLoop {
         // Said in the held reason, so a contract held on workers that never
         // ran (a provider refusing every request) names the refusal.
         let worker_failure = last_worker_failure(&flight.attempts);
+        let refusal_unseen = refusal_never_shown(
+            refusal.is_some(),
+            contract.last_refusal.is_some(),
+            failures,
+            max_retries,
+        );
         let mut pinned_too_large = pinned_too_large_hold(&flight.attempts);
         let backoff = (self.config.tick.as_millis() as i64).max(1);
         let retry_now = self.now();
@@ -7943,7 +7949,7 @@ impl RunLoop {
                 // The same brief on the same routes fails the same way, so a
                 // retry only repeats it: held now, with the remedy.
                 ContractStatus::Held { reason }
-            } else if failures > max_retries && !not_a_failure {
+            } else if failures > max_retries && !not_a_failure && !refusal_unseen {
                 ContractStatus::Held {
                     reason: match &worker_failure {
                         Some(e) => format!(
@@ -8905,6 +8911,25 @@ fn last_stop_note(attempts: &[Attempt]) -> Option<String> {
     } else {
         joined
     })
+}
+
+/// Whether a round that spent the last retry is retried once more because no
+/// attempt was ever shown a verifier's refusal: this round has one
+/// (`refused_now`), the brief its attempts ran from carried none
+/// (`!refusal_carried`), and only the plain retry budget is spent
+/// (`failures == max_retries + 1`). The retry brief (decision 0084) exists to
+/// carry the check's errors to a fresh attempt; when the earlier attempts all
+/// ended before verification (an empty finish, a stall), the only refusal
+/// came last and no attempt could act on it. At most one extra attempt per
+/// contract: the attempt it grants carries that refusal, so its own failure
+/// holds. A run configured with no retries gets none.
+fn refusal_never_shown(
+    refused_now: bool,
+    refusal_carried: bool,
+    failures: u32,
+    max_retries: u32,
+) -> bool {
+    max_retries > 0 && refused_now && !refusal_carried && failures == max_retries + 1
 }
 
 /// Starts the failure text of an attempt that could not run a single round

@@ -489,6 +489,12 @@ holds the repeated call of a stall, a spent budget or a named failure, with the 
 refused and no later call got past. The retry brief quotes it as data in the same tag as a
 verifier refusal.
 
+**A verifier refusal reaches an attempt before the contract is held.** When the round that
+spends the last retry is refused by the verifier and the brief its attempts ran from carried no
+refusal (every earlier attempt ended before verification), the contract gets one more attempt,
+whose brief quotes that refusal; its own failure holds the contract. A run with no retries gets
+none (decision 0018).
+
 **A permission event states the final decision.** A mode's grant is staged at the hook that
 makes it and recorded when the approval chain settles the call (`PermissionControl::settle_call`):
 `granted` when the call runs, one `grant_refused` event (subject, mode, refusing hook, reason)
@@ -823,7 +829,10 @@ gets the same quoted data block injected at its next round boundary through
 the runtime's injector, as a session inbox row, so the `Injected` event marks
 it delivered; if the attempt ends first, the next fresh brief carries it, and a
 report still undelivered when its recipient closes is traced `undelivered` and
-reported to its sender (decision 0067). A worker's own outbound message goes
+reported to its sender (decision 0067). A merged sender's report injected into a
+running attempt carries one line of kGraf's own after the data: the sender's work
+merged after the attempt started, so its worktree does not hold it (decision
+0067). A worker's own outbound message goes
 over a connection: open by rule (sibling, dependency, shared read, parent and
 child) or by one batched, reserved orchestrator judgment, and delivered mid-run
 by injection. Volume is never refused, only paced, and kept in order. The
@@ -1166,7 +1175,7 @@ whole-suite runner kGraf recognizes (`unittest discover`, `pytest`, `node
 workspace), each attempt runs only the tests that belong to its declared
 files by the runner's naming convention, and the brief names that command.
 The whole command is added as a root gate when it is not one already, so it
-judges the merged result. The acceptance command is a root gate in every case, narrowable or not (decision 0018). A whole command that fails on an attempt while other contracts of the plan are open, and also fails at the attempt's dispatch base, is deferred to that root gate for that contract: the attempt merges after its scope and placeholder checks, with a verdict and a notice that say so, and the run completes only when the root gate passes. A command the attempt broke (it passes at the dispatch base) is a failure; the last open contract is checked whole. A failing whole check of every committed attempt runs at the dispatch base, open contracts or not, so the verdict of the last contract, or of a run with no root gate, says whether an earlier merge of the run broke the check (it passes at the run's original base) or the check failed before the run's work (decision 0018). A narrowed check that fails is deferred the same way when it needs files open contracts write that the attempt's tree lacks (the narrowing selects the same tests or package for the file, or it is a cargo member's target root), so a contract that writes only a new workspace's manifests is not failed for the sources later contracts write; one that needs no such file gets no base run (decision 0018). A worker told not to edit another contract's file is told the check the verifier runs, never the contract's Acceptance line (decision 0093). Anything else runs whole, as do gate remediations; the brief then still names the whole
+judges the merged result. The acceptance command is a root gate in every case, narrowable or not (decision 0018). A whole command that fails on an attempt while other contracts of the plan are open, and also fails at the attempt's dispatch base, is deferred to that root gate for that contract: the attempt merges after its scope and placeholder checks, with a verdict and a notice that say so, and the run completes only when the root gate passes. A command the attempt broke (it passes at the dispatch base) is a failure; the last open contract is checked whole. A failing whole check of every committed attempt runs at the dispatch base, open contracts or not, so the verdict of the last contract, or of a run with no root gate, says whether an earlier merge of the run broke the check (it passes at the run's original base) or the check failed before the run's work (decision 0018). A narrowed check that fails is deferred the same way when it needs files open contracts write that the attempt's tree lacks (the narrowing selects the same tests or package for the file, or it is a cargo member's target root), so a contract that writes only a new workspace's manifests is not failed for the sources later contracts write; one that needs no such file gets no base run (decision 0018). A check that still fails after the integration tip moved past the attempt's dispatch base runs once more on the attempt merged onto the tip, in a throwaway worktree: passing there passes the attempt with a notice, failing there quotes that run in the reason (decision 0018). A worker told not to edit another contract's file is told the check the verifier runs, never the contract's Acceptance line (decision 0093). Anything else runs whole, as do gate remediations; the brief then still names the whole
 command as what the attempt is judged by, calls the contract's Acceptance line advisory,
 and says `todo!()` panics and failing tests in other contracts' unfinished code are not the
 worker's to fix, while a compile error anywhere that the worker's change caused is its own.

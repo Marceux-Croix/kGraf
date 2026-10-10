@@ -172,6 +172,17 @@ fn passes_at(
     command: &str,
     timeout: Duration,
 ) -> Result<bool, String> {
+    run_at(manager, base, denies, command, timeout).map(|(passed, _)| passed)
+}
+
+/// [`passes_at`], with the check's output (capped as an attempt's is).
+fn run_at(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    base: &str,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+) -> Result<(bool, String), String> {
     let name = crate::workspaces::harness_worktree_name(crate::workspaces::PROBE_PREFIX);
     let ws = manager
         .create(&kgraf_sandbox::WorkspaceSpec {
@@ -190,9 +201,9 @@ fn passes_at(
         None,
     );
     let removed = manager.remove(ws);
-    let (passed, _) = ran?;
+    let ran = ran?;
     removed.map_err(|e| format!("cannot remove the worktree at {base}: {e}"))?;
-    Ok(passed)
+    Ok(ran)
 }
 
 /// What the verdict of an attempt says when its whole check also fails at
@@ -247,6 +258,100 @@ fn base_attribution(
              at the run's original base {short} to tell whether one of them broke it: {e})"
         ),
     }
+}
+
+/// What an attempt's failed check said when run again on the attempt merged
+/// onto the integration tip ([`check_on_tip`]).
+enum OnTip {
+    /// The tip is still the attempt's dispatch base: nothing merged since.
+    NotMoved,
+    /// It passes on the merge; `tip` is the tip it merged onto.
+    Passed { tip: String },
+    /// It fails on the merge too: that output, with a line saying where it
+    /// ran.
+    Failed { output: String },
+    /// It could not run on the merge (a conflict, a git failure): a line
+    /// saying why, for the attempt's own output.
+    NotRun { note: String },
+}
+
+/// Run `command` on `attempt` (the attempt's commit) merged onto the
+/// integration tip, when the tip moved past `dispatch_base`. The merge is an
+/// unreferenced commit (`MergeBack::trial_merge`): no branch moves and no
+/// working tree of the run is touched; the check runs in a throwaway
+/// worktree of it, as [`passes_at`] runs one.
+fn check_on_tip(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    merge_back: &kgraf_sandbox::MergeBack,
+    dispatch_base: &str,
+    attempt: &str,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+) -> OnTip {
+    let tip = match merge_back.integration_tip() {
+        Ok(tip) => tip,
+        Err(e) => {
+            return OnTip::NotRun {
+                note: format!(
+                    "\n(the integration tip could not be read to run it on this attempt merged \
+                     with the work merged after its dispatch base: {e})"
+                ),
+            };
+        }
+    };
+    if tip == dispatch_base {
+        return OnTip::NotMoved;
+    }
+    let short: String = tip.chars().take(12).collect();
+    match merge_back.trial_merge(&[attempt.to_owned()]) {
+        Ok(kgraf_sandbox::merge::TrialMerge::Clean { commit, .. }) => {
+            match run_at(manager, &commit, denies, command, timeout) {
+                Ok((true, _)) => OnTip::Passed { tip },
+                Ok((false, out)) => OnTip::Failed {
+                    output: format!(
+                        "{}\n(this output is from the attempt merged onto the integration tip \
+                         {short}, which holds work merged after the attempt's dispatch base; \
+                         the attempt's own tree failed too)",
+                        out.trim_end()
+                    ),
+                },
+                Err(e) => OnTip::NotRun {
+                    note: format!(
+                        "\n(it could not be run on this attempt merged onto the integration tip \
+                         {short}, which holds work merged after its dispatch base: {e})"
+                    ),
+                },
+            }
+        }
+        Ok(kgraf_sandbox::merge::TrialMerge::Conflicted { paths, .. }) => OnTip::NotRun {
+            note: format!(
+                "\n(it was not run on this attempt merged onto the integration tip {short}, \
+                 which holds work merged after its dispatch base: the merge conflicts on {})",
+                clean(&paths.join(", "))
+            ),
+        },
+        Err(e) => OnTip::NotRun {
+            note: format!(
+                "\n(this attempt could not be merged onto the integration tip {short}, which \
+                 holds work merged after its dispatch base, to run it there: {e})"
+            ),
+        },
+    }
+}
+
+/// The notice of an attempt whose check failed on its own tree and passed on
+/// the attempt merged onto the integration tip. Named per contract: the run's
+/// notices are a set.
+fn on_tip_notice(contract: &str, command: &str, tip: &str) -> String {
+    let short: String = tip.chars().take(12).collect();
+    format!(
+        "contract {}: `{}` failed on the attempt's own tree, which lacks work merged after its \
+         dispatch base, and passed on the attempt merged onto the integration tip {short}, which \
+         is what merges",
+        clean(contract),
+        clean(command)
+    )
 }
 
 /// What a worker checked by the whole command is told about deferral.
@@ -1049,6 +1154,41 @@ impl Verifier for CommandVerifier {
                     )),
                 }
             }
+            // Work merged after the dispatch base: contracts that merged while
+            // this attempt ran are on the integration tip, not in its tree,
+            // so a check that needs their work fails on the attempt alone,
+            // though merge-back lands the attempt on the tip. The check runs
+            // once more on the attempt merged onto the tip, in a throwaway
+            // worktree: passing there passes the attempt (that tree is what
+            // merges, and the root gate still runs on the merged result);
+            // failing there, its output replaces the attempt's, since what is
+            // still wrong on the tree that would land is what a retry, which
+            // starts from the tip, must fix.
+            let mut on_tip_passed: Option<String> = None;
+            if !passed
+                && failing == command
+                && deferred.is_none()
+                && contract.gate_commands.is_empty()
+                && let Some(sha) = &commit
+            {
+                match check_on_tip(
+                    &manager,
+                    &merge_back,
+                    ws.head(),
+                    sha,
+                    &denies,
+                    &command,
+                    timeout,
+                ) {
+                    OnTip::NotMoved => {}
+                    OnTip::Passed { tip } => {
+                        passed = true;
+                        on_tip_passed = Some(tip);
+                    }
+                    OnTip::Failed { output: merged } => output = merged,
+                    OnTip::NotRun { note } => output.push_str(&note),
+                }
+            }
             // 5. Quiet again, held through the cleanup. A process that escaped
             // the group fails the verification and nothing is cleaned: the
             // worktree is left as it is, never merged, never continued.
@@ -1096,6 +1236,9 @@ impl Verifier for CommandVerifier {
                 return fail(attempt, changed_reason(&command, &left.changed));
             }
             let mut notices = worker_notices(attempt.excluded());
+            if let Some(tip) = &on_tip_passed {
+                notices.push(on_tip_notice(&contract.contract, &command, tip));
+            }
             notices.extend(check_notices(&command, &left, attempt.excluded()));
             let Some(commit) = commit else {
                 // The general-path stub refusal (decision 0086, generalizing

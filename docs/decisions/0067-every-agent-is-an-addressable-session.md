@@ -361,3 +361,25 @@ Tests: `an_orchestrator_first_answer_is_one_ledgered_call_settled_at_its_row`,
 `a_late_answer_answers_the_question_still_open_in_the_box` and
 `session_texts_are_stored_scrubbed_and_read_by_the_model_whole` (each fails without the lead),
 `the_answer_prompt_says_a_permission_question_is_not_answerable`.
+
+## Amendment (2026-10-10): a merged report injected into a running attempt says its worktree lacks the work
+
+A library contract's `done` report, with the API it now provides, was injected into a running
+CLI attempt. The attempt then read the library file three times and got the stub each time: its
+worktree was made before the merge. Its reasoning spent rounds on the contradiction.
+
+- **The rule.** When a `done` report is queued for a running attempt and its sender's attempt
+  merged, kGraf adds one line after the quoted data, as its own text: "Contract <id>'s work merged
+  after your attempt started, so your worktree does not hold it: the files the message names
+  still read as they did when you started. Build on what the message says they now provide."
+- **Not added** to a fresh brief (it starts from the integration tip), to a report of an empty
+  integration, or with plain-directory workspaces.
+- The attempt's check copes with the same gap: a failing check runs again on the attempt merged
+  onto the tip (decision 0018).
+
+Rejected: merging the tip into the running worktree at the round boundary: the worker may be
+mid-edit, and the merge would change the scope of its commit.
+
+Test: `kgraf-orchestrator` `tests/mailbox_injection.rs`
+`a_message_to_a_running_recipient_is_injected_at_its_next_round_boundary`. With the line not
+added, it fails.
