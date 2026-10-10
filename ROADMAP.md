@@ -86,8 +86,10 @@ what is planned next, as things you can do or expect, not as an internal project
   with the cloud routes (Gemini, Vertex AI, Bedrock and Azure OpenAI).
 - Full sandbox confinement on Windows. Sandboxed commands are to run as dedicated
   low-privilege local users (decision 0097), set up once with `kgraf sandbox setup`.
-  Setup and removal run on a hosted Windows machine; the command path has not yet run
-  there, and the DNS filter is refused by Windows Server 2025 and reported as a gap.
+  On a hosted Windows machine, setup, removal and the command path run; loopback
+  connections are confined by WFP filters; a launcher service starts commands in
+  session 0, where a sandbox user can make the named objects cargo and rustc need.
+  The DNS filter is refused by Windows Server 2025 and reported as a gap.
   macOS and Linux confinement is in daily use.
 - Signed, notarized installers for macOS, Linux and Windows. Local packaging scripts
   already build the app and the command line for all three platforms; the packages are
