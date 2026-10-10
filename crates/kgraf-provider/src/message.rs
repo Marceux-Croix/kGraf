@@ -245,6 +245,59 @@ pub struct Request {
     pub tools: Vec<ToolDefinition>,
     /// Reasoning effort, where the provider has the capability.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether the reply must be a tool call. [`ToolChoice::Auto`] sends no
+    /// field. [`ToolChoice::Required`] is sent only by an adapter with a wire
+    /// form for it ([`crate::Provider::forces_tool_choice`]); every other
+    /// adapter refuses the request before it goes out.
+    #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]
+    pub tool_choice: ToolChoice,
+}
+
+/// Whether the model may answer in text or must call a tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    /// The model chooses: a tool call or text. No field is sent.
+    #[default]
+    Auto,
+    /// The reply must call one of the request's tools (Chat Completions
+    /// `tool_choice: "required"`, Messages `tool_choice: {"type": "any"}`).
+    /// A request with no tools cannot ask for it.
+    Required,
+}
+
+impl ToolChoice {
+    /// Whether this is the default, which is not serialized.
+    pub fn is_auto(&self) -> bool {
+        *self == ToolChoice::Auto
+    }
+}
+
+/// Refuse, before sending, a request whose [`ToolChoice::Required`] the
+/// adapter cannot send (`has_wire_form` false) or that lists no tool to call.
+/// Every adapter calls this; one that dropped the field would turn a forced
+/// call into a free choice with no sign of it.
+pub fn check_tool_choice(
+    adapter: &'static str,
+    request: &Request,
+    has_wire_form: bool,
+) -> Result<(), crate::ProviderError> {
+    if request.tool_choice != ToolChoice::Required {
+        return Ok(());
+    }
+    if !has_wire_form {
+        return Err(crate::ProviderError::CapabilityNotHonored {
+            adapter,
+            capability: "a forced tool choice (this protocol has no wire form for it here)",
+        });
+    }
+    if request.tools.is_empty() {
+        return Err(crate::ProviderError::CapabilityNotHonored {
+            adapter,
+            capability: "a forced tool choice with no tools",
+        });
+    }
+    Ok(())
 }
 
 impl Request {
@@ -262,6 +315,7 @@ impl Request {
             temperature: None,
             tools: Vec::new(),
             reasoning_effort: None,
+            tool_choice: ToolChoice::Auto,
         }
     }
 }
@@ -500,6 +554,38 @@ pub const SPECIAL_TOKEN_ALLOWANCE: u64 = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adapter with no wire form refuses a forced tool choice; one with a
+    /// form refuses it only when no tool is listed; the default always passes.
+    /// The default is not serialized, so a stored request reads as before.
+    #[test]
+    fn a_forced_tool_choice_is_refused_where_it_cannot_be_sent() {
+        let mut request = Request::new("m", "hi", 10);
+        assert!(check_tool_choice("a", &request, false).is_ok());
+        assert!(
+            !serde_json::to_string(&request)
+                .expect("json")
+                .contains("tool_choice")
+        );
+        request.tool_choice = ToolChoice::Required;
+        assert!(matches!(
+            check_tool_choice("a", &request, true),
+            Err(crate::ProviderError::CapabilityNotHonored { .. })
+        ));
+        request.tools = vec![ToolDefinition {
+            name: "t".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        assert!(check_tool_choice("a", &request, true).is_ok());
+        assert!(matches!(
+            check_tool_choice("a", &request, false),
+            Err(crate::ProviderError::CapabilityNotHonored { .. })
+        ));
+        let round_trip: Request =
+            serde_json::from_str(&serde_json::to_string(&request).expect("json")).expect("read");
+        assert_eq!(round_trip.tool_choice, ToolChoice::Required);
+    }
 
     #[test]
     fn a_call_with_no_arguments_replays_as_an_empty_object_on_both_wires() {

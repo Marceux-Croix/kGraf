@@ -132,6 +132,10 @@ pub struct Assembly {
     /// The reasoning setting (decision 0098): the worker's rounds and its
     /// compaction summaries carry the levels they resolve to.
     pub reasoning: kgraf_provider::ReasoningLevels,
+    /// What is recorded about the route and model acting on a forced tool
+    /// choice ([`tool_choice_support`]): the round after a no-change notice
+    /// asks for one unless it is recorded as ignored.
+    pub tool_choice: kgraf_runtime::ToolChoiceSupport,
     pub path_case: PathCase,
     /// Paths no shell command may read: directories, or single files (see
     /// the module docs and [`state_read_denies`]).
@@ -741,6 +745,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     env.settings.max_output_tokens = a.max_output_tokens;
     env.settings.max_checkpoints = a.max_checkpoints;
     env.settings.reasoning = a.reasoning;
+    env.settings.tool_choice = a.tool_choice;
     env.settings.path_case = a.path_case;
     Ok(Assembled {
         env: Arc::new(env),
@@ -749,6 +754,24 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
         connections,
         mcp_home: home,
     })
+}
+
+/// What `kgraf_fleet::TOOL_CHOICE_MEASUREMENTS` records about `route` with
+/// `model` acting on a forced tool choice (decision 0098's rule). A route
+/// that is not in the catalog (an in-process one) has no record.
+pub fn tool_choice_support(route: &str, model: &str) -> kgraf_runtime::ToolChoiceSupport {
+    use kgraf_runtime::ToolChoiceSupport;
+    match kgraf_fleet::tool_choice_measurement(route, model) {
+        None => ToolChoiceSupport::Unmeasured,
+        Some(m) => match m.outcome {
+            kgraf_fleet::ToolChoiceOutcome::Honored => ToolChoiceSupport::Honored {
+                record: m.record.to_owned(),
+            },
+            kgraf_fleet::ToolChoiceOutcome::Ignored => ToolChoiceSupport::Ignored {
+                record: m.record.to_owned(),
+            },
+        },
+    }
 }
 
 /// Every path the worker's shell may not read: the state directory, and each

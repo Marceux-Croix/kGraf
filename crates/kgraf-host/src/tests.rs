@@ -1366,6 +1366,16 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
             model: "m".into(),
         },
     );
+    // A catalog route with a tool-choice record: its attempt's loop gets it.
+    routes.insert(
+        "ollama:qwen3.6:35b".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake (ollama)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
     let assembler = AttemptAssembler {
         root: r.root.clone(),
         state: state.clone(),
@@ -1392,11 +1402,11 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
     };
     let context = ContextConfig::for_model(200_000).expect("context");
     let mut seen = Vec::new();
-    for worker in ["w-one", "w-two"] {
+    for (worker, route_name) in [("w-one", "fake:m"), ("w-two", "ollama:qwen3.6:35b")] {
         let ws = worktree(&r, worker).await;
         std::fs::write(ws.join(format!("mark-{worker}")), "x").expect("mark");
         let route = Route {
-            name: "fake:m".into(),
+            name: route_name.into(),
             vendor: "fake".into(),
             // The route's own environment is not what the worker runs in.
             env: Arc::new(kgraf_runtime::WorkerEnv::new(
@@ -1417,6 +1427,15 @@ async fn each_attempt_gets_a_shell_bound_to_its_own_worktree() {
             built.env.settings.max_checkpoints, 3,
             "the run's checkpoint ceiling reaches the assembled worker's loop settings"
         );
+        // The route's tool-choice record reaches the loop: none for a route
+        // outside the catalog, "ignored" for the recorded one.
+        match (route_name, &built.env.settings.tool_choice) {
+            ("fake:m", kgraf_runtime::ToolChoiceSupport::Unmeasured) => {}
+            ("ollama:qwen3.6:35b", kgraf_runtime::ToolChoiceSupport::Ignored { record }) => {
+                assert!(record.contains("Ollama 0.34.4"), "{record}")
+            }
+            (name, other) => panic!("{name}: {other:?}"),
+        }
         assert!(built.env.tools.names().any(|n| n == "shell"));
         assert!(
             built

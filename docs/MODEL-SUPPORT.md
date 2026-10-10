@@ -291,6 +291,25 @@ otherwise.
   adapter's tests (`2026-10-08-ollama-qwen3.6-chat-reasoning-none.json`,
   `2026-10-08-ollama-qwen3.6-chat-think-false-ignored.json`). Another model on the same server
   can behave differently.
+- **A forced tool choice by route.** After a worker's model ends a turn with no tool call and
+  no change on a contract that writes files, the next request asks for a tool call (decision
+  0096, amendment of 2026-10-10; decision 0098, amendment of 2026-10-10). An answer does not
+  show whether the server read the field, so the route record decides, and every decision is a
+  `tool_choice` event in the worker's transcript.
+
+  | Adapter | Wire form |
+  |---|---|
+  | Chat Completions (every route on this protocol) | `tool_choice: "required"`. BUILT, UNTESTED: no live exchange. |
+  | Anthropic Messages (`anthropic`, `kimi-anthropic`, `vertex-anthropic`) | `tool_choice: {"type": "any"}`. BUILT, UNTESTED: no live exchange. |
+  | Responses, Bedrock Converse, Gemini | None built: a request that asks for it is refused before sending, and a worker never asks. |
+
+  | Route | Model | Forced tool choice | Record |
+  |---|---|---|---|
+  | `ollama` | every model | IGNORED: not sent | Ollama 0.34.4 source, `openai/openai.go`: the Chat Completions request type has no `tool_choice` field, and the handler binds the body with gin's `ShouldBindJSON`, which drops fields it does not know (read 2026-10-10) |
+  | Every other route and model | | BUILT, UNTESTED: sent, the event says `UNVERIFIED` | None |
+
+  On `ollama` the worker therefore relies on the notice alone: it quotes what the model said
+  and names the tool to call.
 - **A model name is not a verified model.** A VERIFIED row covers the models named in its
   record. A different model on the same route can behave differently. DeepSeek is known to
   replace an unsupported model name with a cheaper one and return HTTP 200. The model echo
@@ -325,3 +344,7 @@ otherwise.
 - 2026-10-08: the `reasoning` setting covers every model call (decision 0098). A route
   profile records the measured levels; `low`, `medium` and `high` on `ollama` with
   `qwen3.6:35b` are refused when a run opens. No route status changes.
+- 2026-10-10: a forced tool choice after a worker's no-change notice. Chat Completions and
+  Anthropic Messages send it (BUILT, UNTESTED); Responses, Bedrock and Gemini refuse it. It is
+  recorded as ignored on `ollama` from the 0.34.4 source and not sent there (see Known
+  limits). No route status changes.

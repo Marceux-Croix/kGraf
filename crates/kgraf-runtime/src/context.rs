@@ -254,6 +254,7 @@ impl PrefixSnapshot {
             temperature,
             tools: self.inner.prefix.tools.clone(),
             reasoning_effort: None,
+            tool_choice: kgraf_provider::ToolChoice::Auto,
         }
     }
 

@@ -428,6 +428,7 @@ async fn run_one(
         max_checkpoints: kgraf_host::limits::DEFAULT_MAX_CHECKPOINTS,
         // A brief run sends no reasoning field: the measured baseline.
         reasoning: Default::default(),
+        tool_choice: kgraf_host::worker::assemble::tool_choice_support(&route.route, &route.model),
         path_case: kgraf_tools::detect_path_case(ws.root())
             .context("cannot probe the worktree's filesystem case behavior")?,
         read_denies: vec![state.clone()],

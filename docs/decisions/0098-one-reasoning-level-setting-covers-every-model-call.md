@@ -158,3 +158,33 @@ level answers with HTTP 200 and the default amount of reasoning; nothing in the 
   universal level; a not-honored level is refused at open; an unmeasured one is said.
 - Reopens if: a probe command exists (item 6), a route needs a different level per route rather
   than per process, or refusing unverified graded levels is preferred.
+
+## Amendment (2026-10-10): a forced tool choice follows the same rule
+
+A worker whose model announces an action and ends its turn now asks, on the round after the
+notice, for a forced tool call (decision 0096, amendment of 2026-10-10). Like a graded
+reasoning level, the field is one an answer cannot prove was read: a server that drops it
+answers 200 as if it were absent. It follows item 7's rule, per route and model, at the round
+that would carry it:
+
+- Recorded as ignored: not sent. The worker records why in a `WorkerEvent::ToolChoice` event
+  that names the record. The run still opens: the forced choice is the worker's own fallback,
+  not a setting the user asked for, so leaving it out changes nothing the user chose.
+- Nothing recorded: sent, and the event says "UNVERIFIED".
+- Recorded as acted on: sent, and the event names the record.
+- An adapter with no wire form for it never sends it and refuses a request that asks for it
+  (`kgraf_provider::check_tool_choice`). Chat Completions sends `tool_choice: "required"`,
+  Messages sends `tool_choice: {"type": "any"}`; Responses, Converse and Gemini have none built.
+
+The records are `kgraf_fleet::TOOL_CHOICE_MEASUREMENTS`, keyed by route and, optionally,
+model: whether the field is read is the server's doing, so a row may cover every model on a
+route. A row may come from a recorded live exchange, or from the server's own source when it
+shows the field is never read; a source read can record "ignored" and never "acted on", and it
+is deterministic where a sample is not. The one row: `ollama`, every model, ignored. In Ollama
+0.34.4, `openai/openai.go`'s Chat Completions request type has no `tool_choice` field and the
+handler binds the body with gin's `ShouldBindJSON`, which drops fields it does not know
+(read 2026-10-10; `docs/MODEL-SUPPORT.md`, Known limits). A newer Ollama that reads the field
+needs a new record before kGraf sends it there.
+
+Tests: `kgraf-fleet` `tool_choice.rs`; `kgraf-runtime` `announce_without_tool_call.rs`;
+`kgraf-provider` `a_forced_tool_choice_is_refused_where_it_cannot_be_sent`.

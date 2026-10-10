@@ -1376,9 +1376,25 @@ async fn an_announcement_with_no_tool_call_is_not_a_completion_when_the_contract
         "{text}"
     );
     assert!(text.contains("report_shortfall"), "{text}");
+    // The dropped turn is not resent as the model's own turn; the notice
+    // quotes it, so the model sees what it said it would do.
     assert!(
-        !text.contains("I'll implement all 8 classes"),
+        requests[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .all(|c| !c
+                .as_text()
+                .is_some_and(|t| t.contains("I'll implement all 8 classes"))),
         "the dropped turn is not resent"
+    );
+    assert!(
+        text.contains(
+            "Your reply said: \"I'll implement all 8 classes in `shapes/library.py` and run the \
+             tests.\""
+        ),
+        "{text}"
     );
 }
 
@@ -1409,7 +1425,11 @@ async fn a_second_end_with_no_tool_call_fails_the_attempt_with_a_named_reason() 
         error.contains("a.py, b.py"),
         "the writes are named: {error}"
     );
-    assert_eq!(provider.requests().len(), 2, "one notice, no third round");
+    assert_eq!(
+        provider.requests().len(),
+        1 + kgraf_runtime::MAX_NO_CHANGE_NOTICES as usize,
+        "one round per notice, no round past the bound"
+    );
 }
 
 #[tokio::test]
@@ -1434,8 +1454,8 @@ async fn an_answer_with_no_tool_call_still_completes_a_contract_that_writes_noth
 
 /// Round evidence (polyglot attempt 2): two `read_file` calls, then the turn
 /// ended as done with nothing written, and the attempt was recorded completed.
-/// A read is not a change, so the contract that writes gets the notice, and a
-/// second read-only end fails the attempt.
+/// A read is not a change, so the contract that writes gets the notices, and
+/// a read-only end past their bound fails the attempt.
 #[tokio::test]
 async fn a_read_only_attempt_that_used_a_tool_is_not_a_completion_when_the_contract_writes() {
     let dir = tempfile::tempdir().expect("dir");
@@ -1452,7 +1472,10 @@ async fn a_read_only_attempt_that_used_a_tool_is_not_a_completion_when_the_contr
     .await
     .expect("spawn");
     let (events, result) = drain(handle).await;
-    assert_eq!(notices(&events, kgraf_runtime::NoticeKind::NoChange), 1);
+    assert_eq!(
+        notices(&events, kgraf_runtime::NoticeKind::NoChange),
+        kgraf_runtime::MAX_NO_CHANGE_NOTICES as usize
+    );
     let WorkerOutcome::Failed { error } = &result.outcome else {
         panic!("expected Failed, got {:?}", result.outcome);
     };

@@ -520,6 +520,7 @@ fn drive(d: DriveArgs<'_>) -> Result<kgraf_runtime::WorkerResult> {
             max_output_tokens: args.max_tokens,
             max_checkpoints: args.max_checkpoints,
             reasoning: args.reasoning,
+            tool_choice: kgraf_host::worker::assemble::tool_choice_support(route.0, &args.model),
             path_case: kgraf_tools::detect_path_case(ws.root())
                 .context("cannot probe the worktree's filesystem case behavior")?,
             read_denies,
@@ -718,6 +719,10 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
             slices.len()
         ),
         WorkerEvent::Notice { text, .. } => println!("\n[notice {text}]"),
+        WorkerEvent::ToolChoice { forced, detail } => println!(
+            "\n[tool call {}: {detail}]",
+            if *forced { "required" } else { "not required" }
+        ),
         WorkerEvent::ModelCall { call } => println!("\n[model call {call}]"),
         WorkerEvent::Injected { source, text, .. } => {
             println!("\n[injected from {source:?}: {text}]")

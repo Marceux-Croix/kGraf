@@ -339,6 +339,7 @@ impl AnthropicAdapter {
                 capability: "reasoning effort",
             });
         }
+        kgraf_provider::check_tool_choice(self.adapter_name(), request, true)?;
         Ok(())
     }
 
@@ -487,6 +488,12 @@ impl AnthropicAdapter {
                     })
                     .collect(),
             );
+        }
+        if request.tool_choice == kgraf_provider::ToolChoice::Required {
+            // https://docs.anthropic.com/en/api/messages (`tool_choice`):
+            // `any` makes the model use one of the listed tools. This adapter
+            // sends no extended thinking, which allows only `auto` and `none`.
+            body["tool_choice"] = serde_json::json!({"type": "any"});
         }
         if stream {
             body["stream"] = serde_json::json!(true);
@@ -762,6 +769,11 @@ impl kgraf_provider::Provider for AnthropicAdapter {
 
     fn protocol(&self) -> Protocol {
         self.config.protocol
+    }
+
+    /// `tool_choice: {"type": "any"}` is part of this protocol.
+    fn forces_tool_choice(&self) -> bool {
+        true
     }
 
     async fn complete(
@@ -1773,6 +1785,47 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert!(matches!(err, ProviderError::CapabilityNotHonored { .. }));
+    }
+
+    /// A forced tool choice goes out as `{"type": "any"}`, in the buffered
+    /// and the streamed body; the default sends no field; one with no tools
+    /// is refused before any connection.
+    #[tokio::test]
+    async fn a_forced_tool_choice_is_sent_as_any_and_needs_a_tool() {
+        let adapter = AnthropicAdapter::new(config("http://127.0.0.1:1")).expect("adapter");
+        assert!(kgraf_provider::Provider::forces_tool_choice(&adapter));
+        let mut request = Request::new("model-a", "hi", 10);
+        request.tools = vec![kgraf_provider::message::ToolDefinition {
+            name: "apply_patch".into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        assert!(
+            adapter
+                .to_wire(&request, false)
+                .get("tool_choice")
+                .is_none()
+        );
+        request.tool_choice = kgraf_provider::ToolChoice::Required;
+        for stream in [false, true] {
+            assert_eq!(
+                adapter.to_wire(&request, stream)["tool_choice"],
+                json!({"type": "any"})
+            );
+        }
+        request.tools.clear();
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Additive, "model-a", "a", "t")
+            .expect("begin");
+        let err = adapter
+            .complete(&request, &token)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, ProviderError::CapabilityNotHonored { .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

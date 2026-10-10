@@ -243,3 +243,49 @@ them out of the commit; decision 0084, 2026-10-06 third amendment). A lockfile o
 generated file the contract declares is still measured.
 
 Tests: `kgraf-runtime` `an_install_is_left_out_of_the_change_list_and_the_work_stays`.
+
+## Amendment (2026-10-10): an announced action gets a quoted notice, a forced tool call and a bound of two
+
+In recorded runs with a local model (Ollama, `qwen3.6:35b`, reasoning on), the model reasoned
+about creating the files with `apply_patch`, wrote "I'll create all three files in one patch."
+and ended its turn (`finish_reason: stop`, no tool call). The loop dropped the turn and sent
+"You ended without making any change; ... Continue with tool calls, or call report_shortfall
+...". The dropped turn is not resent, so the model never saw what it had said; it did the same
+again, the attempt failed, and the retry repeated it.
+
+Across 77 such ended turns from models in those records, the one notice was followed by a
+write or a command in 58 attempts; 16 ended with text and no change again (14 with no tool
+call at all) and failed. Of the 77 ended turns, 37 announced an action, 20 claimed work that
+was never written, 11 wrote a patch or a call as plain text, and 9 said something else.
+
+Now:
+
+- The notice keeps its first sentence ("You ended without making any change; this contract
+  writes <paths>.") and adds what the model said, quoted (at most 400 characters, a cut marked
+  with " ..."), that no tool ran, and the tool to call: `apply_patch` to create or edit the
+  files, or `shell` for a command that must change them, each named only when the worker has
+  it; then `report_shortfall`.
+- The next request requires a tool call (`kgraf_provider::ToolChoice::Required`: Chat
+  Completions `tool_choice: "required"`, Messages `tool_choice: {"type": "any"}`), by decision
+  0098's rule for parameters an answer cannot prove were read (its amendment of 2026-10-10):
+  not sent when the route and model are recorded as ignoring it
+  (`kgraf_fleet::TOOL_CHOICE_MEASUREMENTS`; Ollama is, from its 0.34.4 source), sent with
+  "UNVERIFIED" when nothing is recorded. It is never sent where the adapter has no wire form
+  (Responses, Converse and Gemini refuse such a request before sending) or on a final round.
+  The choice lasts until that round has a response, so a round sent again keeps it.
+- Each decision is a `WorkerEvent::ToolChoice { forced, detail }` in the transcript, once per
+  notice, before the round's model call; never model input.
+- An attempt gets `MAX_NO_CHANGE_NOTICES` = 2 notices, each a counted round. The second says
+  "This is the last notice: another end with no change fails the attempt." The next such end
+  fails: "the model ended the attempt as done again after being told to continue N time(s)
+  with no write and no mutating command, although its contract writes ...".
+- **The bound is two.** The records have no data past one notice, because the code gave one.
+  One more costs one round in an affected attempt; a repeat comes in nearly the same words, so
+  more of the same notice is not expected to help; on a route that acts on the forced choice,
+  a compliant server cannot answer the round after a notice without a tool call.
+- Unchanged: the retry policy, the planner, the empty-turn and lost-output paths. A resumed
+  attempt still starts its notice count at zero, as before.
+
+Tests: `kgraf-runtime` `announce_without_tool_call.rs`, the `compaction.rs` no-change tests,
+`kgraf-host` `each_attempt_gets_a_shell_bound_to_its_own_worktree`, and the adapter wire tests
+in `kgraf-provider-openai` and `kgraf-provider-anthropic`.

@@ -244,6 +244,19 @@ pub trait Provider: Send + Sync {
         let _ = response;
         None
     }
+
+    /// Whether this adapter has a wire form for [`crate::ToolChoice::Required`]
+    /// and sends it. The default is `false`: such an adapter refuses a request
+    /// that asks for it, before sending, so the parameter is never dropped in
+    /// silence.
+    ///
+    /// `true` says only that the field goes out. Whether a server acts on it
+    /// is a property of the server, which an answer does not show; the caller
+    /// keeps that knowledge per route and model (decision 0098's rule for
+    /// measured parameters).
+    fn forces_tool_choice(&self) -> bool {
+        false
+    }
 }
 
 /// Assert the response model is the requested model.

@@ -326,6 +326,9 @@ impl GeminiAdapter {
     /// Refuse a request this adapter cannot serve as asked, before any connection.
     fn check_request(&self, request: &Request) -> Result<(), ProviderError> {
         self.config.check_model(self.name, &request.model)?;
+        // Gemini has a `toolConfig` mode for this, but none is built or
+        // exchanged here.
+        kgraf_provider::check_tool_choice(self.name, request, false)?;
         // The model is a URL path segment.
         let model = bare_model(&request.model);
         let safe = !model.is_empty()

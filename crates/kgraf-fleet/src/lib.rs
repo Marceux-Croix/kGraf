@@ -49,9 +49,13 @@
 //! embeddings were exchanged with the live service.
 
 pub mod reasoning;
+pub mod tool_choice;
 
 pub use reasoning::{
     LevelOutcome, REASONING_MEASUREMENTS, ReasoningMeasurement, reasoning_measurement,
+};
+pub use tool_choice::{
+    TOOL_CHOICE_MEASUREMENTS, ToolChoiceMeasurement, ToolChoiceOutcome, tool_choice_measurement,
 };
 
 use kgraf_core::session::ReasoningVisibility;

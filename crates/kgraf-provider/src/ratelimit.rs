@@ -554,6 +554,10 @@ impl Provider for RouteRecorded {
         self.inner.undelivered_output_tokens(response)
     }
 
+    fn forces_tool_choice(&self) -> bool {
+        self.inner.forces_tool_choice()
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -701,6 +705,10 @@ impl Provider for RateLimited {
         self.inner.undelivered_output_tokens(response)
     }
 
+    fn forces_tool_choice(&self) -> bool {
+        self.inner.forces_tool_choice()
+    }
+
     async fn complete(
         &self,
         request: &Request,
@@ -796,6 +804,9 @@ mod tests {
         fn undelivered_output_tokens(&self, _response: &Response) -> Option<u64> {
             Some(900)
         }
+        fn forces_tool_choice(&self) -> bool {
+            true
+        }
         async fn complete(
             &self,
             request: &Request,
@@ -822,6 +833,16 @@ mod tests {
         let recorded = RouteRecorded::new(Arc::new(Counts), "r");
         assert_eq!(recorded.undelivered_output_tokens(&response), Some(900));
         assert_eq!(Instant0.undelivered_output_tokens(&response), None);
+    }
+
+    /// A wrapper that kept the default would hide the adapter's wire form for
+    /// a forced tool choice, and the worker would never send one.
+    #[test]
+    fn both_wrappers_pass_the_forced_tool_choice_question_to_the_adapter() {
+        let limiter = RouteLimiter::new("r", RateLimit::parse("60/5").expect("spec")).expect("lim");
+        assert!(RateLimited::new(Arc::new(Counts), limiter).forces_tool_choice());
+        assert!(RouteRecorded::new(Arc::new(Counts), "r").forces_tool_choice());
+        assert!(!Instant0.forces_tool_choice());
     }
 
     fn limited(spec: &str) -> RateLimited {

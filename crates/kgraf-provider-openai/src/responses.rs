@@ -209,6 +209,8 @@ impl OpenAiAdapter {
         self.config
             .check_model(self.adapter_name(), &request.model)?;
         self.echo_target(&request.model)?;
+        // No forced tool choice is built or exchanged on this protocol here.
+        kgraf_provider::check_tool_choice(self.adapter_name(), request, false)?;
         if request.reasoning_effort == Some(kgraf_provider::ReasoningEffort::Off) {
             // No off form of `reasoning.effort` has been exchanged with a
             // running server on this protocol, so none is sent on a guess.

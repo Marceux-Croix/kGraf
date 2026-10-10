@@ -2232,11 +2232,18 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   answer cut at the output limit is unchanged (0030, amended 2026-10-09, fourth).
 - A worker whose contract writes files and which ends an attempt as done with no successful
   write and no command that changed the tree (it only said what it would do, or only read)
-  has not finished. It is told once: "You ended without making any change; this contract
-  writes <paths>. Continue with tool calls, or call report_shortfall if the work cannot be
-  done." If it ends again the same way, the attempt fails and the failure names the contract's
-  write paths. A contract that writes nothing, and an attempt that wrote or changed
-  something, end as before (0096).
+  has not finished. The turn is dropped and the worker is told: "You ended without making any
+  change; this contract writes <paths>. Your reply said: "<what it wrote>" It called no tool,
+  so nothing ran. Call apply_patch now to create or edit those files (or shell for a command
+  that must change them). If the work cannot be done, call report_shortfall." The quote is at
+  most 400 characters, and a tool is named only when the worker has it. The next request
+  requires a tool call where the provider can send that field and the route is not recorded
+  as ignoring it (Ollama is; see [MODEL-SUPPORT.md](MODEL-SUPPORT.md), Known limits); the
+  worker's transcript records each such decision and why (a `tool_choice` line, shown as
+  "tool call required" or "tool call not required"). An attempt gets two such notices, and
+  the second says it is the last. If it ends the same way again, the attempt fails ("... told
+  to continue 2 time(s) ...") and the failure names the contract's write paths. A contract
+  that writes nothing, and an attempt that wrote or changed something, end as before (0096).
 - A contract whose pinned context (the prefix, its slices and its instruction) already reaches
   the worker's stop point cannot run one round, and a second attempt of the same brief fails
   the same way. It is not retried: the contract is held with the reason and the remedy (split

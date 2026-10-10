@@ -181,6 +181,10 @@ impl AttemptAssembler {
             max_output_tokens: self.max_output_tokens,
             max_checkpoints: self.max_checkpoints,
             reasoning: self.reasoning,
+            tool_choice: {
+                let (route_id, model) = crate::config::split_route(route)?;
+                crate::worker::assemble::tool_choice_support(&route_id, &model)
+            },
             path_case,
             read_denies: self.read_denies.clone(),
             mcp_home: self.state.join("mcp-home"),

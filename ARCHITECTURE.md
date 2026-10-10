@@ -480,9 +480,14 @@ parent to compact (0095), and `resplit` refuses the split at the first hand-back
 
 **A turn that only announces work is not a completion.** When an attempt would end as completed
 with no successful write and no mutating command in the whole attempt (reads do not count) and
-its contract declares writes, the runtime drops the turn, counts the round, sends one notice
-(`NoticeKind::NoChange`) and continues; a second such end fails the attempt with the contract's
-write paths named. A compaction does not lift this guard (0095).
+its contract declares writes, the runtime drops the turn, counts the round, sends a notice
+(`NoticeKind::NoChange`) that quotes what the model said and names the tool that does it, and
+continues. The next request requires a tool call (`kgraf_provider::ToolChoice::Required`) where
+the adapter has a wire form and the route is not recorded as ignoring it
+(`kgraf_fleet::TOOL_CHOICE_MEASUREMENTS`, decision 0098's rule); a `WorkerEvent::ToolChoice`
+records each decision and why. After `MAX_NO_CHANGE_NOTICES` (2) notices, the next such end
+fails the attempt with the count and the contract's write paths named (0096). A compaction does
+not lift this guard (0095).
 
 **A retry carries what stopped the last attempt.** The stop note (`OpenContract::last_stop`)
 holds the repeated call of a stall, a spent budget or a named failure, with the calls a policy

@@ -558,10 +558,13 @@ impl ChatCompletionsAdapter {
     }
 
     /// Checks that run before a request leaves: the model is one this adapter
-    /// serves, and a response for it has a model to be checked against.
-    fn preflight(&self, model: &str) -> Result<(), ProviderError> {
-        self.config.check_model(self.adapter_name(), model)?;
-        self.echo_target(model).map(|_| ())
+    /// serves, a response for it has a model to be checked against, and a
+    /// forced tool choice has tools to choose from.
+    fn preflight(&self, request: &Request) -> Result<(), ProviderError> {
+        self.config
+            .check_model(self.adapter_name(), &request.model)?;
+        kgraf_provider::check_tool_choice(self.adapter_name(), request, true)?;
+        self.echo_target(&request.model).map(|_| ())
     }
 
     /// The model the response must name for a request to `requested`.
@@ -808,6 +811,13 @@ impl ChatCompletionsAdapter {
                     })
                     .collect(),
             );
+        }
+        if request.tool_choice == kgraf_provider::ToolChoice::Required {
+            // https://platform.openai.com/docs/api-reference/chat/create
+            // (`tool_choice`). A server that does not read the field answers
+            // 200 as if it were absent, so whether it is honored is recorded
+            // per route, not assumed here.
+            body["tool_choice"] = serde_json::json!("required");
         }
         if let Some(effort) = request.reasoning_effort {
             // Spelled as OpenAI spells it. A vendor that does not support a
@@ -1083,7 +1093,7 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
         request: &Request,
         token: &CallToken,
     ) -> Result<Response, ProviderError> {
-        if let Err(error) = self.preflight(&request.model) {
+        if let Err(error) = self.preflight(request) {
             // Refused before sending, so nothing billed; close the row as such
             // rather than letting the dropped token report a hole.
             token.close_on_async(&error, None).await?;
@@ -1239,6 +1249,11 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
     fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
         Some(response.undelivered_output_floor())
     }
+
+    /// `tool_choice: "required"` is part of this protocol, on every transport.
+    fn forces_tool_choice(&self) -> bool {
+        true
+    }
 }
 
 impl Reasoning for ChatCompletionsAdapter {
@@ -1316,7 +1331,7 @@ impl Streaming for ChatCompletionsAdapter {
         token: &CallToken,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response, ProviderError> {
-        if let Err(error) = self.preflight(&request.model) {
+        if let Err(error) = self.preflight(request) {
             token.close_on_async(&error, None).await?;
             return Err(error);
         }
@@ -3765,6 +3780,72 @@ mod tests {
             request.reasoning_effort = Some(effort);
             assert_eq!(adapter.to_wire(&request)["reasoning_effort"], json!(wire));
         }
+    }
+
+    fn one_tool() -> kgraf_provider::message::ToolDefinition {
+        kgraf_provider::message::ToolDefinition {
+            name: "apply_patch".into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    /// A forced tool choice goes out as `tool_choice: "required"`; the default
+    /// sends no field, so every other body is unchanged.
+    #[tokio::test]
+    async fn a_forced_tool_choice_is_sent_as_required_and_the_default_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"tool_choice": "required"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "compatible-model",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c1", "type": "function", "function": {
+                        "name": "apply_patch", "arguments": "{}"}}]}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            })))
+            .mount(&server)
+            .await;
+        let adapter = ChatCompletionsAdapter::new(config(&server.uri()), UsageDialect::Details)
+            .expect("adapter");
+        assert!(kgraf_provider::Provider::forces_tool_choice(&adapter));
+        let mut request = Request::new("compatible-model", "hi", 100);
+        request.tools = vec![one_tool()];
+        assert!(adapter.to_wire(&request).get("tool_choice").is_none());
+        request.tool_choice = kgraf_provider::ToolChoice::Required;
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let response = adapter
+            .complete(&request, &token)
+            .await
+            .expect("the mock answers only a body that carries the field");
+        assert_eq!(response.tool_uses().len(), 1);
+    }
+
+    /// A forced tool choice with no tool to call is refused before sending.
+    #[tokio::test]
+    async fn a_forced_tool_choice_with_no_tools_is_refused_before_sending() {
+        let adapter =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        let mut request = Request::new("compatible-model", "hi", 100);
+        request.tool_choice = kgraf_provider::ToolChoice::Required;
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let token = ledger
+            .begin(ADAPTER, Protocol::Inclusive, "compatible-model", "w", "t")
+            .expect("begin");
+        let error = adapter
+            .complete(&request, &token)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(error, ProviderError::CapabilityNotHonored { .. }),
+            "{error:?}"
+        );
     }
 
     /// Serve one recorded Ollama answer and ask for it with reasoning off.

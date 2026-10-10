@@ -212,6 +212,29 @@ pub struct LoopSettings {
     /// level `worker_round` resolves to, each compaction summary the level
     /// of `worker_compaction`. Empty by default: no reasoning field.
     pub reasoning: kgraf_provider::ReasoningLevels,
+    /// What is recorded about this route and model acting on a forced tool
+    /// choice. The round after a no-change notice asks for one unless it is
+    /// recorded as ignored or the adapter has no wire form; each such round
+    /// records a [`WorkerEvent::ToolChoice`] that says which and why.
+    pub tool_choice: ToolChoiceSupport,
+}
+
+/// What a recorded measurement found a route and model do with a forced tool
+/// choice (`kgraf_provider::ToolChoice::Required`). The answer to one request
+/// does not show it: a server that does not read the field answers 200 as if
+/// it were absent. So the knowledge is kept per route and model, as decision
+/// 0098 keeps it for reasoning levels.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoiceSupport {
+    /// Nothing is recorded: the field is sent, and the event says it is
+    /// unverified.
+    #[default]
+    Unmeasured,
+    /// Recorded as acted on: the field is sent, and the event names the record.
+    Honored { record: String },
+    /// Recorded as ignored: the field is not sent (it would be an ignored
+    /// parameter), and the event names the record.
+    Ignored { record: String },
 }
 
 impl Default for LoopSettings {
@@ -229,6 +252,7 @@ impl Default for LoopSettings {
             tool_cancel_grace: std::time::Duration::from_secs(2),
             max_checkpoints: crate::progress::DEFAULT_MAX_CHECKPOINTS,
             reasoning: kgraf_provider::ReasoningLevels::new(),
+            tool_choice: ToolChoiceSupport::Unmeasured,
         }
     }
 }
@@ -805,7 +829,9 @@ async fn prepare(
         empty_turn_retried: false,
         malformed_retries: 0,
         lost_output_retries: 0,
-        no_change_retried: false,
+        no_change_notices: 0,
+        force_tool_call: false,
+        tool_choice_recorded: false,
         phase: CancelPhase::BetweenRounds,
         calls,
         last_stop: None,
@@ -1138,11 +1164,46 @@ pub fn lost_output_notice(counted: u64, missing: u64) -> String {
     )
 }
 
-/// The notice that follows an end with no change: one continuation round.
-fn no_change_notice(paths: String) -> String {
+/// How many notices one attempt gets for ending as done with no tool call
+/// and no change although its contract writes files; the next such end fails
+/// the attempt. Each notice is a counted round.
+///
+/// Two. In recorded runs on a local model, one notice was followed by a
+/// write in 58 of 77 attempts, and most of the rest ended the same way in
+/// nearly the same words. A second notice quotes the model again, says it is
+/// the last, and comes with a forced tool choice where the route takes one;
+/// more of the same notice would spend rounds on a repeat.
+pub const MAX_NO_CHANGE_NOTICES: u32 = 2;
+
+/// The most characters of the model's own text a no-change notice quotes.
+const NO_CHANGE_QUOTE_CHARS: usize = 400;
+
+/// The notice that follows an end with no change. The ended turn is dropped
+/// from the transcript, so the quote is the only place the model sees what
+/// it said it would do; the notice then names the tool that does it.
+/// `apply_patch` and `shell` are named only when the worker has them.
+fn no_change_notice(paths: &str, said: &str, apply_patch: bool, shell: bool, last: bool) -> String {
+    let said = said.trim();
+    let quote: String = said.chars().take(NO_CHANGE_QUOTE_CHARS).collect();
+    let cut = if quote.len() < said.len() { " ..." } else { "" };
+    let act = match (apply_patch, shell) {
+        (true, true) => {
+            "Call apply_patch now to create or edit those files (or shell for a command that \
+             must change them)."
+        }
+        (true, false) => "Call apply_patch now to create or edit those files.",
+        (false, true) => "Call shell now to run the command that writes those files.",
+        (false, false) => "Continue with tool calls.",
+    };
+    let last = if last {
+        " This is the last notice: another end with no change fails the attempt."
+    } else {
+        ""
+    };
     format!(
-        "You ended without making any change; this contract writes {paths}. Continue with tool \
-         calls, or call report_shortfall if the work cannot be done."
+        "You ended without making any change; this contract writes {paths}. Your reply said: \
+         \"{quote}{cut}\" It called no tool, so nothing ran. {act} If the work cannot be done, \
+         call report_shortfall.{last}"
     )
 }
 
@@ -1180,9 +1241,16 @@ struct Worker {
     /// part of them; capped at [`MAX_LOST_OUTPUT_RETRIES`]. Never cleared: it
     /// bounds the extra rounds a server fault can cost one attempt.
     lost_output_retries: u32,
-    /// Whether the attempt already got its one notice for ending as done with
-    /// no tool call although its contract writes files.
-    no_change_retried: bool,
+    /// Notices this attempt got for ending as done with no tool call although
+    /// its contract writes files; capped at [`MAX_NO_CHANGE_NOTICES`].
+    no_change_notices: u32,
+    /// Set by a no-change notice: the next request asks for a forced tool
+    /// choice where the route and adapter allow. Cleared when a response
+    /// arrives, so a round sent again (a steer, a malformed reply) keeps it.
+    force_tool_call: bool,
+    /// Whether the [`WorkerEvent::ToolChoice`] for the current notice is
+    /// recorded, so a round sent again does not record it twice.
+    tool_choice_recorded: bool,
     phase: CancelPhase,
     calls: Vec<CallId>,
     /// The stop reason of the last round that ended naturally, this segment.
@@ -1762,6 +1830,8 @@ impl Worker {
                 .settings
                 .reasoning
                 .effort(kgraf_provider::ReasoningProcess::WorkerRound);
+            self.choose_tool_choice(ep, &mut request, final_round)
+                .await?;
             self.env
                 .prefix
                 .check(&request)
@@ -1834,6 +1904,8 @@ impl Worker {
                 other => other?,
             };
             self.malformed_retries = 0;
+            // The forced choice was for this round, which has its answer.
+            self.force_tool_call = false;
             let uses: Vec<(String, String, serde_json::Value)> = response
                 .tool_uses()
                 .into_iter()
@@ -2010,21 +2082,33 @@ impl Worker {
                 // The model announced work and ended the turn: no successful
                 // write and no mutating command in the whole attempt (reads
                 // may have happened), and its contract writes files. That is not
-                // a completion. The text stays in the transcript; the model
-                // gets one notice (counted in the budget) and a second such
-                // end fails the attempt with a named reason. The round is
-                // already counted, so a checkpoint (decision 0096) sees it as a
-                // round without progress.
+                // a completion. The turn is dropped; the model gets a notice
+                // (counted in the budget) that quotes what it said and names
+                // the tool that does it, and the next request asks for a
+                // forced tool call where the route takes one. After
+                // `MAX_NO_CHANGE_NOTICES` notices, the next such end fails the
+                // attempt with a named reason. The round is already counted,
+                // so a checkpoint (decision 0096) sees it as a round without
+                // progress.
                 (StopReason::EndTurn | StopReason::StopSequence, true)
                     if self.ended_without_change() =>
                 {
-                    if !final_round && !self.no_change_retried && self.budget.rounds_left() >= 2 {
-                        self.no_change_retried = true;
+                    if !final_round
+                        && self.no_change_notices < MAX_NO_CHANGE_NOTICES
+                        && self.budget.rounds_left() >= 2
+                    {
+                        self.no_change_notices += 1;
                         // The turn is dropped, as an empty turn is: a `Stop`
                         // would end the run's event sequence.
                         self.abandon(ep, CancelPhase::ModelStream, None, NO_CHANGE_ABANDON_REASON)
                             .await?;
-                        let text = no_change_notice(self.write_scope_paths());
+                        let text = no_change_notice(
+                            &self.write_scope_paths(),
+                            &response.text(),
+                            self.env.tools.get("apply_patch").is_some(),
+                            self.env.tools.get("shell").is_some(),
+                            self.no_change_notices == MAX_NO_CHANGE_NOTICES,
+                        );
                         self.emit(
                             ep,
                             WorkerEvent::Notice {
@@ -2033,13 +2117,18 @@ impl Worker {
                             },
                         )
                         .await?;
+                        self.force_tool_call = true;
+                        self.tool_choice_recorded = false;
                         continue;
                     }
                     self.emit_stop(ep, reason, &response).await?;
-                    let why = if self.no_change_retried {
-                        "again after being told to continue"
+                    let why = if self.no_change_notices > 0 {
+                        format!(
+                            "again after being told to continue {} time(s)",
+                            self.no_change_notices
+                        )
                     } else {
-                        "on its last round"
+                        "on its last round".to_owned()
                     };
                     return Ok((
                         WorkerOutcome::Failed {
@@ -2272,6 +2361,70 @@ impl Worker {
     /// Record an abandoned round: `RoundAbandoned` closes it (the rebuild drops
     /// its partial text and pairs any open tool use), then the partial usage of
     /// its cancelled call, if the stream reported any (every token is attributed).
+    /// After a no-change notice, whether this round's request requires a tool
+    /// call, recorded once per notice as a [`WorkerEvent::ToolChoice`] that
+    /// says why. Sent unless the round is the final one (its calls do not
+    /// run), the adapter has no wire form, the request lists no tools, or
+    /// the route and model are recorded as ignoring it; sent with
+    /// "UNVERIFIED" when nothing is recorded. Never silent either way.
+    async fn choose_tool_choice(
+        &mut self,
+        ep: &WorkerEndpoint,
+        request: &mut Request,
+        final_round: bool,
+    ) -> Result<(), Halt> {
+        if !self.force_tool_call {
+            return Ok(());
+        }
+        let (forced, detail) = if final_round {
+            (
+                false,
+                "not sent: this is the final round, and its tool calls do not run".to_owned(),
+            )
+        } else if !self.env.provider.forces_tool_choice() {
+            (
+                false,
+                format!(
+                    "not sent: the `{}` adapter has no wire form for a forced tool choice",
+                    self.env.provider.adapter()
+                ),
+            )
+        } else if request.tools.is_empty() {
+            (false, "not sent: the request lists no tools".to_owned())
+        } else {
+            match &self.env.settings.tool_choice {
+                ToolChoiceSupport::Ignored { record } => (
+                    false,
+                    format!(
+                        "not sent: this route and model are recorded as ignoring it ({record})"
+                    ),
+                ),
+                ToolChoiceSupport::Honored { record } => (
+                    true,
+                    format!("sent: this route and model are recorded as acting on it ({record})"),
+                ),
+                ToolChoiceSupport::Unmeasured => (
+                    true,
+                    "sent, UNVERIFIED: nothing is recorded about this route and model acting on \
+                     a forced tool choice, and an answer does not show whether the server read it"
+                        .to_owned(),
+                ),
+            }
+        };
+        if forced {
+            request.tool_choice = kgraf_provider::ToolChoice::Required;
+        } else {
+            // Nothing to keep for a round sent again.
+            self.force_tool_call = false;
+        }
+        if !self.tool_choice_recorded {
+            self.tool_choice_recorded = true;
+            self.emit(ep, WorkerEvent::ToolChoice { forced, detail })
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn abandon(
         &mut self,
         ep: &WorkerEndpoint,

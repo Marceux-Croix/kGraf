@@ -201,6 +201,10 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::Notice { kind, text } => {
             turns.push(Turn::Event(format!("notice ({kind:?}): {text}")))
         }
+        WorkerEvent::ToolChoice { forced, detail } => turns.push(Turn::Event(format!(
+            "tool call {}: {detail}",
+            if forced { "required" } else { "not required" }
+        ))),
         // A ledger id with no content.
         WorkerEvent::ModelCall { .. } => {}
         WorkerEvent::Injected { source, text, .. } => turns.push(Turn::Message {

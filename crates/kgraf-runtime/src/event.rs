@@ -156,6 +156,13 @@ pub enum WorkerEvent {
     /// Text the loop added to the next user turn (a step-budget warning, the
     /// final-round notice). Recorded so a rebuilt transcript carries it.
     Notice { kind: NoticeKind, text: String },
+    /// Whether the round after a [`NoticeKind::NoChange`] notice asks the
+    /// provider to require a tool call (`kgraf_provider::ToolChoice`), and
+    /// why. Recorded once per notice, before that round's
+    /// [`WorkerEvent::ModelCall`]. Built by the loop alone from the route's
+    /// recorded support and the adapter; never model input (the rebuild's
+    /// arm for it is a no-op).
+    ToolChoice { forced: bool, detail: String },
     /// A message from the inbox reached this worker's transcript (decision
     /// 0067, point 3): joins the user turn the way [`WorkerEvent::Notice`]
     /// does. Refused by [`EventSequence`] mid-stream or mid-tool-round: an
@@ -354,6 +361,12 @@ impl WorkerEvent {
             WorkerEvent::Notice { kind, text } => WorkerEvent::Notice {
                 kind,
                 text: scrub(text, counts),
+            },
+            // kGraf-written: a route's support and a measurement record.
+            // Scrubbed on both paths anyway, as a notice is.
+            WorkerEvent::ToolChoice { forced, detail } => WorkerEvent::ToolChoice {
+                forced,
+                detail: scrub(detail, counts),
             },
             WorkerEvent::Approval { record } => WorkerEvent::Approval {
                 record: scrub_approval_record(record, scrub, counts),
@@ -691,6 +704,10 @@ impl EventSequence {
             }
             // Decision 0096: a checkpoint is measured between rounds.
             WorkerEvent::Checkpoint { .. } if self.streaming || !self.open.is_empty() => {
+                return Err(SequenceError::NotBetweenRounds);
+            }
+            // Decided for the next request, so between rounds.
+            WorkerEvent::ToolChoice { .. } if self.streaming || !self.open.is_empty() => {
                 return Err(SequenceError::NotBetweenRounds);
             }
             WorkerEvent::RoundAbandoned { .. } => {

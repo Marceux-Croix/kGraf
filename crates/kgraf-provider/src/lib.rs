@@ -53,8 +53,8 @@ pub use limits::{
     record_429_now,
 };
 pub use message::{
-    Content, Message, ReasoningEffort, Request, Response, Role, Signature, StopReason,
-    check_reasoning_off, tool_arguments_object, tool_arguments_text,
+    Content, Message, ReasoningEffort, Request, Response, Role, Signature, StopReason, ToolChoice,
+    check_reasoning_off, check_tool_choice, tool_arguments_object, tool_arguments_text,
 };
 pub use provider::{Provider, ProviderConfig};
 pub use ratelimit::{
