@@ -28,8 +28,10 @@ cargo test --workspace
 
 ## Dependency updates
 
-No bot opens update pull requests, and no workflow starts on its own: updates are applied by
-hand, about once a month and before each release.
+No bot opens update pull requests, and no workflow starts on its own. Every checkpoint (closeout)
+applies the compatible updates first: `cargo update`, then the full gate and the advisory check; the
+new lock file is committed only when all of them pass. An update that breaks the gate is held back
+and named in the checkpoint record.
 
 ```bash
 cargo update --dry-run               # compatible updates; then cargo update to apply
