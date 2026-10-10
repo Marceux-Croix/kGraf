@@ -354,3 +354,30 @@ Tests: `kgraf-runtime` `shortfall.rs` `the_next_step_comes_before_a_long_refusal
 `the_header_and_the_policy_name_are_kept`; `kgraf-host` `build_allowlist_tests.rs`
 `a_granted_program_runs_under_a_scope_and_another_is_still_refused` (a real unattended shell
 refusal: the step comes before the quoted allowlist).
+
+## Amendment (2026-10-10): an answer names the check the verifier runs
+
+The answers to a report about another contract's file (a permission report, and an
+instructions report) said "Your attempt is judged by its own acceptance check (<the contract's
+Acceptance line>)". The command verifier never runs that line: it runs the run's acceptance
+command, narrowed to the tests of the contract's files or whole (decision 0018). A worker told
+that `[ -f Cargo.toml ] && ...` judged it was then failed on `cargo test -p ...`.
+
+- **The judge comes from the verifier.** `Verifier::judge(contract, workspace, unmerged)` says
+  what judges the attempt, read in its worktree as it is when the report arrives, by the rule
+  `verify_among` applies: the command (narrowed with its selection, or whole), and, when the
+  check needs work of open contracts the tree lacks (decision 0018, amended 2026-10-10), that a
+  failure on the attempt and on the dispatched tree alike is deferred to the root gate, which
+  runs the whole command; without a root gate, that the check cannot be deferred. A narrowed
+  answer says that the tests are chosen again at verification.
+- **No judge is better than a wrong one.** `path_answer` and `instructions_answer` take the
+  judge text and quote it (at most 1,500 characters). A verifier that cannot say (`None`, the
+  trait default) gets an answer that names no judge; the contract's Acceptance line is never
+  quoted in its place.
+
+Tests: `kgraf-orchestrator` `shortfall.rs`
+`a_path_answer_names_the_verifier_s_judge_never_the_acceptance_line`; `kgraf-host` `tests.rs`
+`the_judge_named_to_a_worker_is_the_check_the_verifier_runs`; `shortfall_tests.rs`
+`bypass_answers_a_sibling_contracts_file_and_never_grants_it` and
+`an_instructions_report_about_a_sibling_contracts_file_is_answered_not_amended`. With the old
+answer text, or with the verifier saying nothing, they fail.

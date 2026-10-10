@@ -67,16 +67,17 @@ pub trait Verifier: Send + Sync {
     ) -> Result<Verdict, String>;
 
     /// [`Verifier::verify`], told which other contracts of the plan are still
-    /// open (`unmerged`): their work may be missing from the attempt's tree.
-    /// A verifier whose check judges the whole instruction may defer that
-    /// check to the root gate for such an attempt, saying so in the verdict
-    /// (decision 0018, amended 2026-10-02). The default ignores the list.
+    /// open (`unmerged`, with the files each writes): their work may be
+    /// missing from the attempt's tree. A verifier whose check needs that
+    /// work may defer the check to the root gate for such an attempt, saying
+    /// so in the verdict (decision 0018, amended 2026-10-02 and 2026-10-10).
+    /// The default ignores the list.
     async fn verify_among(
         &self,
         contract: &OpenContract,
         workspace: &Path,
         result: &WorkerResult,
-        unmerged: &[String],
+        unmerged: &[OpenContract],
     ) -> Result<Verdict, String> {
         let _ = unmerged;
         self.verify(contract, workspace, result).await
@@ -91,6 +92,21 @@ pub trait Verifier: Send + Sync {
     /// example, narrowed to the tests of the contract's files). `workspace` is
     /// the attempt's worktree as dispatched. `None` adds nothing.
     fn acceptance_brief(&self, _contract: &OpenContract, _workspace: &Path) -> Option<String> {
+        None
+    }
+
+    /// What judges an attempt of `contract` whose worktree is `workspace`, as
+    /// the tree is now, said to a worker that may not write another
+    /// contract's file: the command the verifier runs, and what happens to a
+    /// failure that comes from files of the `unmerged` contracts the tree
+    /// lacks. One or more sentences, or `None` when the verifier cannot say;
+    /// an answer then names no judge, never one the verifier does not apply.
+    fn judge(
+        &self,
+        _contract: &OpenContract,
+        _workspace: &Path,
+        _unmerged: &[OpenContract],
+    ) -> Option<String> {
         None
     }
 

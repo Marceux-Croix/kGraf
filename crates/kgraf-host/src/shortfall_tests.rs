@@ -920,6 +920,14 @@ async fn bypass_answers_a_sibling_contracts_file_and_never_grants_it() {
     assert_eq!(lines.len(), 1, "{trace}");
     assert!(lines[0].contains("belongs to contract `b`"), "{}", lines[0]);
     assert!(lines[0].contains("answered:"), "{}", lines[0]);
+    // The answer names the check the verifier runs, never the plan's
+    // Acceptance line, which the verifier does not run.
+    assert!(
+        lines[0].contains("judged by `test -f a.txt -o -f b.txt`"),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].contains("a.txt exists"), "{}", lines[0]);
     assert!(
         !trace.contains("writes to `b.txt`"),
         "never granted\n{trace}"
@@ -954,6 +962,12 @@ async fn an_instructions_report_about_a_sibling_contracts_file_is_answered_not_a
     assert!(
         lines[0].contains("`b.txt` belongs to contract `b`")
             && lines[0].contains("Keep the public shape"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("judged by `test -f a.txt -o -f b.txt`")
+            && !lines[0].contains("a.txt exists"),
         "{}",
         lines[0]
     );

@@ -283,6 +283,36 @@ pub(crate) fn scope(command: &str, root: &Path, writes: &[&str]) -> Scope {
     }
 }
 
+/// Whether a check narrowed to `selected` in the tree at `root` needs
+/// `write`, a file of another contract that the tree does not hold yet. It
+/// does when the narrowing rule selects one of the same tests or packages
+/// for that file (the check runs code or tests the file supplies), or, under
+/// cargo, when the file is the target root (`src/lib.rs`, `src/main.rs`) of a
+/// package whose manifest the tree holds: cargo cannot load a workspace with
+/// a member that has no target, so no `cargo test -p` of any member runs.
+/// The caller checks that the file is absent; this reads only the rule.
+pub(crate) fn needs_absent(command: &str, root: &Path, selected: &[String], write: &str) -> bool {
+    let write = write.trim_start_matches("./");
+    if let Scope::Narrowed {
+        selected: theirs, ..
+    } = scope(command, root, &[write])
+        && theirs.iter().any(|t| selected.contains(t))
+    {
+        return true;
+    }
+    if !matches!(runner(command, root), Ok(Runner::Cargo { .. })) {
+        return false;
+    }
+    let dir = ["src/lib.rs", "src/main.rs"].iter().find_map(|target| {
+        if write == *target {
+            Some("")
+        } else {
+            write.strip_suffix(&format!("/{target}"))
+        }
+    });
+    dir.is_some_and(|dir| package_name(&root.join(dir)).is_some())
+}
+
 /// Every single-part command [`scope`] can produce for `command` in the tree at
 /// `root` as it is now: one per test file, or one per cargo package. Added to
 /// what a worker may run, so a worker can run the check its attempt is judged
@@ -1304,6 +1334,45 @@ mod tests {
         ] {
             assert!(!narrowable(whole, t.path()), "{whole}");
         }
+    }
+
+    /// A contract that wrote only the manifests of a new workspace: its check
+    /// narrows to the two packages, and cannot run without the target roots
+    /// other contracts write. A file another contract writes in an unrelated
+    /// place, or under a runner that is not cargo, is not needed.
+    #[test]
+    fn a_narrowed_check_needs_the_absent_target_roots_and_files_of_its_own_tests() {
+        let t = tree(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n",
+            ),
+            ("wcl-core/Cargo.toml", "[package]\nname = \"wcl-core\"\n"),
+            ("wcl/Cargo.toml", "[package]\nname = \"wcl\"\n"),
+        ]);
+        let cmd = "cargo test --workspace --offline";
+        let s = scope(cmd, t.path(), &["wcl/Cargo.toml", "wcl-core/Cargo.toml"]);
+        let (_, selected) = narrowed(&s);
+        assert_eq!(selected, ["package wcl", "package wcl-core"]);
+        let needs = |w: &str| needs_absent(cmd, t.path(), &selected, w);
+        assert!(needs("wcl-core/src/lib.rs"));
+        assert!(needs("wcl/src/main.rs"));
+        // In a selected package, though not a target root.
+        assert!(needs("wcl/src/args.rs"));
+        assert!(!needs("docs/usage.md"));
+        // A target root of a directory with no manifest is no package's.
+        assert!(!needs("other/src/lib.rs"));
+        // Only the package of `wcl` selected: `wcl-core`'s target root is
+        // still needed, since cargo cannot load the workspace without it.
+        let only = vec!["package wcl".to_owned()];
+        assert!(needs_absent(cmd, t.path(), &only, "wcl-core/src/lib.rs"));
+
+        let py = tree(PY);
+        let pycmd = "python3 -m unittest discover -s tests";
+        let own = vec!["tests/test_slug.py".to_owned()];
+        assert!(needs_absent(pycmd, py.path(), &own, "textkit/slug.py"));
+        assert!(!needs_absent(pycmd, py.path(), &own, "textkit/counts.py"));
+        assert!(!needs_absent(pycmd, py.path(), &own, "src/lib.rs"));
     }
 
     #[test]

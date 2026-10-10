@@ -259,22 +259,107 @@ pub(crate) const DEFERRED_BRIEF: &str = "If that command can only pass once othe
 /// Characters of a deferred check's failing output quoted in its notice.
 const DEFERRED_OUTPUT_CHARS: usize = 300;
 
-/// The notice of an attempt whose whole check was deferred to the root gate
-/// (decision 0018, amended 2026-10-02). Named per contract: the run's notices
-/// are a set.
-fn deferred_notice(contract: &str, command: &str, unmerged: &[String], failed: &str) -> String {
+/// The notice of an attempt whose check was deferred to the root gate
+/// (decision 0018, amended 2026-10-02 and 2026-10-10). Named per contract:
+/// the run's notices are a set.
+fn deferred_notice(contract: &str, command: &str, waits: &Waits, failed: &str) -> String {
     let failed: String = failed.trim().chars().take(DEFERRED_OUTPUT_CHARS).collect();
     format!(
         "contract {}: `{}` is deferred to the root gate: it failed on this attempt and also at \
-         its dispatch base while contracts {} of the plan were not merged, so the failure \
-         cannot be told apart from their missing work. The attempt passed its scope and \
-         placeholder checks and merges; the whole command runs on the merged result before the \
-         run can complete. It said: {}",
+         its dispatch base, and it needs the work of {} not merged yet, so the failure cannot \
+         be told apart from their missing work. The attempt passed its scope and placeholder \
+         checks and merges; the whole command runs on the merged result before the run can \
+         complete. It said: {}",
         clean(contract),
         clean(command),
-        clean(&unmerged.join(", ")),
+        clean(&waits.describe()),
         clean(&failed)
     )
+}
+
+/// Files of a waited-on contract named in a notice or an answer, at most.
+const NAMED_FILES: usize = 6;
+
+/// The open contracts of the plan whose work an attempt's check needs, so a
+/// failure of that check, on the attempt and at its dispatch base alike,
+/// cannot be told apart from their missing work.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Waits {
+    /// The contracts, in plan order.
+    contracts: Vec<String>,
+    /// For a narrowed check, the files it needs that the tree lacks, each
+    /// with its contract. Empty for a whole check, which needs every open
+    /// contract's work.
+    files: Vec<(String, String)>,
+}
+
+impl Waits {
+    /// What `scope`, in the attempt's tree at `root`, waits on among
+    /// `unmerged`. A whole check judges the whole instruction, so it waits on
+    /// every open contract. A narrowed check waits only on a file the tree
+    /// lacks that it needs ([`crate::scoped_check::needs_absent`]): a contract
+    /// whose narrowed tests fail on its own stub, while unrelated contracts
+    /// are open, is failed as before.
+    pub(crate) fn of(
+        whole: &str,
+        scope: &crate::scoped_check::Scope,
+        root: &Path,
+        unmerged: &[OpenContract],
+    ) -> Self {
+        let selected = match scope {
+            crate::scoped_check::Scope::Whole { .. } => {
+                return Self {
+                    contracts: unmerged.iter().map(|o| o.contract.clone()).collect(),
+                    files: Vec::new(),
+                };
+            }
+            crate::scoped_check::Scope::Narrowed { selected, .. } => selected,
+        };
+        let mut waits = Self::default();
+        for o in unmerged {
+            for w in &o.writes {
+                let path = w.path.trim_start_matches("./");
+                // Absent, read without following a link: a file the tree
+                // holds is not the missing work of another contract.
+                if root.join(path).symlink_metadata().is_ok()
+                    || !crate::scoped_check::needs_absent(whole, root, selected, path)
+                {
+                    continue;
+                }
+                if !waits.contracts.contains(&o.contract) {
+                    waits.contracts.push(o.contract.clone());
+                }
+                waits.files.push((o.contract.clone(), path.to_owned()));
+            }
+        }
+        waits
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.contracts.is_empty()
+    }
+
+    /// "contracts c1, c2", or, for a narrowed check, the files it lacks:
+    /// "`a/src/lib.rs` of c1, `b/src/main.rs` of c2".
+    pub(crate) fn describe(&self) -> String {
+        if self.files.is_empty() {
+            return format!("contracts {}", self.contracts.join(", "));
+        }
+        let mut named: Vec<String> = self
+            .files
+            .iter()
+            .take(NAMED_FILES)
+            .map(|(c, p)| format!("`{p}` of {c}"))
+            .collect();
+        if self.files.len() > NAMED_FILES {
+            named.push(format!("{} more", self.files.len() - NAMED_FILES));
+        }
+        format!(
+            "contracts {} ({})",
+            self.contracts.join(", "),
+            named.join(", ")
+        )
+    }
 }
 
 /// The refusal of an attempt that changed none of its declared files.
@@ -721,15 +806,14 @@ impl Verifier for CommandVerifier {
         contract: &OpenContract,
         workspace: &Path,
         _result: &WorkerResult,
-        unmerged: &[String],
+        unmerged: &[OpenContract],
     ) -> Result<Verdict, String> {
-        // Only with the whole command also a root gate: a deferred check
-        // must still run before the run can complete.
-        let unmerged: Vec<String> = if self.root_gate {
-            unmerged.to_vec()
-        } else {
-            Vec::new()
-        };
+        // Only with the whole command also a root gate may a check be
+        // deferred: a deferred check must still run before the run can
+        // complete. Without one, a check that waits on open contracts fails
+        // and says why it cannot judge this contract alone.
+        let root_gate = self.root_gate;
+        let unmerged = unmerged.to_vec();
         let Some(ws) = self.workspaces.get(workspace) else {
             return Err(format!(
                 "{} is not a live worktree of this run",
@@ -911,22 +995,37 @@ impl Verifier for CommandVerifier {
             //
             // The run at the dispatch base is made for every such failure,
             // not only when contracts are open: for the plan's last contract
-            // (or without a root gate) nothing is deferred, but whether the
-            // base already fails is what tells an earlier delivery's break
-            // from this attempt's own. The verdict stays a failure; its
-            // reason says which (`base_attribution`).
+            // nothing is deferred, but whether the base already fails is what
+            // tells an earlier delivery's break from this attempt's own. The
+            // verdict stays a failure; its reason says which
+            // (`base_attribution`).
+            //
+            // Amended 2026-10-10: a narrowed check is treated the same way
+            // when it needs files open contracts write that the tree lacks
+            // (`Waits`). A contract that writes only a new workspace's
+            // manifests has its check narrowed to the new packages, which
+            // cannot build before their sources merge; it was failed for
+            // their absence on every attempt. A narrowed check that needs
+            // no such file runs at the base only as before: never.
             let mut deferred: Option<String> = None;
+            let waits = Waits::of(&whole, &scope, ws.root(), &unmerged);
             let at_base = !passed
                 && failing == command
                 && commit.is_some()
                 && contract.gate_commands.is_empty()
-                && matches!(scope, crate::scoped_check::Scope::Whole { .. });
+                && (matches!(scope, crate::scoped_check::Scope::Whole { .. }) || !waits.is_empty());
             if at_base {
                 match passes_at(&manager, ws.head(), &denies, &command, timeout) {
-                    Ok(false) if !unmerged.is_empty() => {
+                    Ok(false) if root_gate && !waits.is_empty() => {
                         deferred = Some(clean_lines(&output));
                         passed = true;
                     }
+                    Ok(false) if !waits.is_empty() => output.push_str(&format!(
+                        "\n(it also fails at the dispatch base, and it needs the work of {} not \
+                         merged yet: it cannot judge this contract alone, and the run has no \
+                         root gate to defer it to, so it fails until that work merges first)",
+                        waits.describe()
+                    )),
                     Ok(false) => output.push_str(&base_attribution(
                         &manager,
                         merge_back.integration_branch(),
@@ -939,10 +1038,10 @@ impl Verifier for CommandVerifier {
                         "\n(it passes at the dispatch base, so this attempt's change makes it \
                          fail)",
                     ),
-                    Err(e) if !unmerged.is_empty() => output.push_str(&format!(
-                        "\n(it could not be run at the dispatch base to tell whether the \
-                         contracts not merged yet ({}) cause the failure: {e})",
-                        unmerged.join(", ")
+                    Err(e) if !waits.is_empty() => output.push_str(&format!(
+                        "\n(it could not be run at the dispatch base to tell whether the missing \
+                         work of {}, not merged yet, causes the failure: {e})",
+                        waits.describe()
                     )),
                     Err(e) => output.push_str(&format!(
                         "\n(it could not be run at the dispatch base to tell whether an \
@@ -1108,7 +1207,7 @@ impl Verifier for CommandVerifier {
                     notices.push(deferred_notice(
                         &contract.contract,
                         &command,
-                        &unmerged,
+                        &waits,
                         failed,
                     ));
                     format!("{command} (deferred to the root gate)")
@@ -1160,6 +1259,60 @@ impl Verifier for CommandVerifier {
         // contracts that the check needs.
         if self.root_gate && matches!(scope, crate::scoped_check::Scope::Whole { .. }) {
             return Some(format!("{text} {DEFERRED_BRIEF}"));
+        }
+        Some(text)
+    }
+
+    /// The check [`Verifier::verify_among`] runs on the tree as it is now, by
+    /// the same rule, and what it does with a failure that comes from the
+    /// open contracts' missing work. The narrowing is read again when the
+    /// attempt is verified, so the answer says so.
+    fn judge(
+        &self,
+        contract: &OpenContract,
+        workspace: &Path,
+        unmerged: &[OpenContract],
+    ) -> Option<String> {
+        let whole = &self.command;
+        if !contract.gate_commands.is_empty() {
+            return Some(format!(
+                "Your attempt is judged by `{}` and the failing gate's own commands, run in \
+                 your worktree when you finish.",
+                clean(whole)
+            ));
+        }
+        let scope = check_scope(whole, contract, workspace);
+        let command = clean(&scope.command(whole));
+        let mut text = match &scope {
+            crate::scoped_check::Scope::Whole { .. } => format!(
+                "Your attempt is judged by `{command}`, run in your worktree when you finish."
+            ),
+            crate::scoped_check::Scope::Narrowed { selected, .. } => format!(
+                "Your attempt is judged by `{command}` (the tests of your files: {}), run in \
+                 your worktree when you finish; the tests are chosen again then, from your \
+                 files as you leave them.",
+                clean(&selected.join(", "))
+            ),
+        };
+        let waits = Waits::of(whole, &scope, workspace, unmerged);
+        if waits.is_empty() {
+            return Some(text);
+        }
+        let needs = clean(&waits.describe());
+        if self.root_gate {
+            text.push_str(&format!(
+                " It needs the work of {needs}, not merged yet: if it fails on your attempt and \
+                 also on the tree you were given, it is deferred to the root gate, which runs \
+                 `{}` on the merged result. A failure your change causes where the check passed \
+                 before is still a failure.",
+                clean(whole)
+            ));
+        } else {
+            text.push_str(&format!(
+                " It needs the work of {needs}, not merged yet, and the run has no root gate to \
+                 defer it to: if it fails for that missing work, this attempt fails, and the \
+                 plan must order that work first."
+            ));
         }
         Some(text)
     }

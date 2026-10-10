@@ -3457,7 +3457,7 @@ async fn a_whole_check_a_dependent_split_cannot_pass_is_deferred_to_the_root_gat
         ..verifier(&r, BOTH_FILES)
     };
     let verdict = v
-        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .verify_among(&c, &ws, &result(), &[named("out/sha.txt", "c2")])
         .await
         .expect("ran");
     let Verdict::Pass {
@@ -3515,7 +3515,7 @@ async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_g
     let ungated = verifier(&r, BOTH_FILES);
     let (c, ws) = greeting_attempt(&r, "w-ungated").await;
     let verdict = ungated
-        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .verify_among(&c, &ws, &result(), &[named("out/sha.txt", "c2")])
         .await
         .expect("ran");
     let Verdict::Fail { reason } = &verdict else {
@@ -3525,6 +3525,216 @@ async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_g
         reason.contains("also fails at the dispatch base"),
         "{reason}"
     );
+}
+
+/// Round 16 greenfield, as planned: from a tree with only a README, `c0`
+/// writes the workspace manifest and both member manifests, `c1` writes
+/// `wcl-core/src/lib.rs` and `c2` writes `wcl/src/main.rs`; the run's check is
+/// `cargo test --workspace --offline`. On `c0`'s tree the check narrows to
+/// the two new packages, which cargo cannot load without their sources.
+const GREENFIELD_CHECK: &str = "cargo test --workspace --offline";
+
+fn greenfield_contracts() -> (OpenContract, Vec<OpenContract>) {
+    let mut c0 = named("Cargo.toml", "c0");
+    c0.acceptance =
+        "[ -f Cargo.toml ] && [ -f wcl-core/Cargo.toml ] && [ -f wcl/Cargo.toml ]".into();
+    c0.writes = ["Cargo.toml", "wcl-core/Cargo.toml", "wcl/Cargo.toml"]
+        .iter()
+        .map(|p| kgraf_orchestrator::WriteTarget {
+            path: (*p).into(),
+            node: None,
+        })
+        .collect();
+    let open = vec![
+        named("wcl-core/src/lib.rs", "c1"),
+        named("wcl/src/main.rs", "c2"),
+    ];
+    (c0, open)
+}
+
+/// `c0`'s attempt: the three manifests, as its worker wrote them.
+async fn greenfield_attempt(r: &Repo, c0: &OpenContract, worker: &str) -> PathBuf {
+    let ws = prepared(r, c0, worker).await;
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"wcl-core\", \"wcl\"]\n",
+    )
+    .expect("root manifest");
+    for (dir, name) in [("wcl-core", "wcl-core"), ("wcl", "wcl")] {
+        std::fs::create_dir_all(ws.join(dir)).expect("mkdir");
+        std::fs::write(
+            ws.join(dir).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("member manifest");
+    }
+    ws
+}
+
+fn readme_repo() -> Repo {
+    let r = repo();
+    owner_only_modes(&r.root, &[("README", "")]);
+    r
+}
+
+/// The check needs the sources `c1` and `c2` write, which no attempt of
+/// `c0` may write: it fails on the attempt and at the dispatch base, so with
+/// a root gate it is deferred there, loudly, instead of failing `c0` for
+/// their absence on every attempt.
+#[tokio::test]
+async fn a_narrowed_check_that_needs_open_contracts_sources_is_deferred_to_the_root_gate() {
+    let r = readme_repo();
+    let (c0, open) = greenfield_contracts();
+    let ws = greenfield_attempt(&r, &c0, "w-green").await;
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v
+        .verify_among(&c0, &ws, &result(), &open)
+        .await
+        .expect("ran");
+    let Verdict::Pass {
+        by,
+        notices,
+        commit,
+    } = &verdict
+    else {
+        panic!("deferred while c1 and c2 are open: {verdict:?}");
+    };
+    assert!(commit.is_some(), "the manifests are committed");
+    assert_eq!(
+        by,
+        "cargo test -p wcl --offline && cargo test -p wcl-core --offline (deferred to the root \
+         gate)"
+    );
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("is deferred to the root gate"))
+        .unwrap_or_else(|| panic!("said in a notice: {notices:?}"));
+    assert!(notice.contains("contract c0"), "{notice}");
+    assert!(
+        notice.contains("`wcl-core/src/lib.rs` of c1")
+            && notice.contains("`wcl/src/main.rs` of c2"),
+        "{notice}"
+    );
+}
+
+/// The worker hears the same rule before it finishes: the answer to its
+/// report names the narrowed command the verifier runs and the deferral,
+/// never the contract's Acceptance line, which the verifier does not run.
+#[tokio::test]
+async fn the_judge_named_to_a_worker_is_the_check_the_verifier_runs() {
+    let r = readme_repo();
+    let (c0, open) = greenfield_contracts();
+    let ws = greenfield_attempt(&r, &c0, "w-judge").await;
+    let gated = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let judge = gated.judge(&c0, &ws, &open).expect("a judge");
+    assert!(
+        judge.contains(
+            "judged by `cargo test -p wcl --offline && cargo test -p wcl-core --offline`"
+        ),
+        "{judge}"
+    );
+    assert!(judge.contains("deferred to the root gate"), "{judge}");
+    assert!(judge.contains("`wcl/src/main.rs` of c2"), "{judge}");
+    assert!(judge.contains(GREENFIELD_CHECK), "{judge}");
+    assert!(!judge.contains("[ -f"), "{judge}");
+    // On the tree as dispatched (no manifest yet) the whole command judges,
+    // and every open contract's work is waited on.
+    let fresh = prepared(&r, &c0, "w-judge-fresh").await;
+    let judge = gated.judge(&c0, &fresh, &open).expect("a judge");
+    assert!(
+        judge.contains(&format!("judged by `{GREENFIELD_CHECK}`")),
+        "{judge}"
+    );
+    assert!(judge.contains("contracts c1, c2"), "{judge}");
+    // Without a root gate the answer says the check cannot be deferred.
+    let ungated = verifier(&r, GREENFIELD_CHECK)
+        .judge(&c0, &ws, &open)
+        .expect("a judge");
+    assert!(ungated.contains("no root gate"), "{ungated}");
+    assert!(!ungated.contains("deferred to the root gate"), "{ungated}");
+}
+
+/// Without a root gate nothing could judge a deferred check, so the attempt
+/// fails, and the reason says plainly that the check cannot judge this
+/// contract alone and which work it waits on.
+#[tokio::test]
+async fn without_a_root_gate_the_reason_says_the_check_cannot_judge_the_contract_alone() {
+    let r = readme_repo();
+    let (c0, open) = greenfield_contracts();
+    let ws = greenfield_attempt(&r, &c0, "w-green-ungated").await;
+    let verdict = verifier(&r, GREENFIELD_CHECK)
+        .verify_among(&c0, &ws, &result(), &open)
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("no root gate would run it: {verdict:?}");
+    };
+    assert!(
+        reason.contains("cannot judge this contract alone"),
+        "{reason}"
+    );
+    assert!(reason.contains("`wcl/src/main.rs` of c2"), "{reason}");
+}
+
+/// A narrowed check that fails on the contract's own package is not
+/// deferred because some other contract is open: `c1` writes a new file of
+/// another package, which these tests do not need. No base run is made.
+#[tokio::test]
+async fn a_narrowed_check_is_not_deferred_for_an_open_contract_it_does_not_need() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let files = [
+        (
+            "Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\"]\n",
+        ),
+        (
+            "Cargo.lock",
+            "# This file is automatically @generated by Cargo.\nversion = 4\n\n\
+             [[package]]\nname = \"a\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"b\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("a/src/lib.rs", "#[test]\nfn stub() { panic!(\"todo\") }\n"),
+        (
+            "b/Cargo.toml",
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("b/src/lib.rs", "pub fn b() {}\n"),
+    ];
+    let r = repo_in(dir, root.clone(), &base, &files);
+    owner_only_modes(&root, &files);
+    let c0 = named("a/src/lib.rs", "c0");
+    let ws = prepared(&r, &c0, "w-own").await;
+    std::fs::write(
+        ws.join("a/src/lib.rs"),
+        "// still a stub\n#[test]\nfn stub() { panic!(\"todo\") }\n",
+    )
+    .expect("write");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v
+        .verify_among(&c0, &ws, &result(), &[named("b/src/extra.rs", "c1")])
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("its own stub fails its own tests: {verdict:?}");
+    };
+    assert!(reason.contains("cargo test -p a --offline"), "{reason}");
+    assert!(!reason.contains("deferred"), "{reason}");
+    assert!(!reason.contains("dispatch base"), "{reason}");
 }
 
 /// A run whose first contract `c1` merged a `src/lib.rs` that says `broken`;
@@ -3632,7 +3842,7 @@ async fn a_whole_check_the_attempt_broke_is_never_deferred() {
     };
     let (c, ws) = greeting_attempt(&r, "w-broke").await;
     let verdict = v
-        .verify_among(&c, &ws, &result(), &["c2".to_owned()])
+        .verify_among(&c, &ws, &result(), &[named("out/sha.txt", "c2")])
         .await
         .expect("ran");
     let Verdict::Fail { reason } = &verdict else {

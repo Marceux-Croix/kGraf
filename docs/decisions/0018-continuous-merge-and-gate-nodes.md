@@ -491,3 +491,41 @@ Tests: `kgraf-host` `tests.rs`
 `the_last_contract_s_failure_is_told_apart_from_a_check_that_failed_before_the_run`,
 `a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_gate`. With the base run
 gated on open contracts again, all three fail.
+
+## Amendment (2026-10-10): a narrowed check that needs open contracts' absent files is deferred too
+
+From a tree with only a README, a plan gave `c0` the three manifests of a new cargo workspace,
+`c1` one member's `src/lib.rs` and `c2` the other's `src/main.rs`, with
+`cargo test --workspace --offline` as the run's check. On `c0`'s tree the check narrowed to the
+two new packages, which cargo cannot load without their sources ("no targets specified in the
+manifest"). Only a whole check ran at the dispatch base, so nothing was deferred, and `c0` failed
+every attempt for files it may not write.
+
+- **What a narrowed check waits on** (`verifier::Waits`). An open contract's declared file that
+  the attempt's tree does not hold (read without following a link) and that the check needs
+  (`scoped_check::needs_absent`): the narrowing rule selects one of the same tests or packages
+  for it, or, under cargo, it is the target root (`src/lib.rs`, `src/main.rs`) of a package whose
+  manifest the tree holds, since cargo loads no member of a workspace with a member that has no
+  target. A whole check still waits on every open contract.
+- **When it is deferred.** As for a whole check: a committed attempt, not a remediation, whose
+  check fails on the attempt and at its dispatch base, with a root gate. The orchestrator passes
+  the open contracts with their files (`Verifier::verify_among` takes `&[OpenContract]`).
+- **What it does not change.** A narrowed check that waits on nothing gets no base run: a
+  contract whose own tests fail on its own stub, while unrelated contracts are open, is failed as
+  before. A file the tree already holds is never waited on.
+- **Said, never silent.** The verdict reads `<narrowed command> (deferred to the root gate)`;
+  the notice names the files waited on and their contracts, at most six, then a count.
+- **Without a root gate.** The host makes the acceptance command a root gate whenever it is not
+  blank. A verifier built without one fails the attempt and says "it cannot judge this contract
+  alone, and the run has no root gate to defer it to".
+
+Rejected: deferring every failing narrowed check while any contract is open: a contract's own
+tests normally fail at the base on its own stub. Rejected: refusing the plan at intake: a plan of
+manifests first and sources later is valid.
+
+Tests: `kgraf-host` `tests.rs`
+`a_narrowed_check_that_needs_open_contracts_sources_is_deferred_to_the_root_gate`,
+`without_a_root_gate_the_reason_says_the_check_cannot_judge_the_contract_alone`,
+`a_narrowed_check_is_not_deferred_for_an_open_contract_it_does_not_need`; `scoped_check`
+`a_narrowed_check_needs_the_absent_target_roots_and_files_of_its_own_tests`. With the base run
+limited to whole checks again, the first two fail.

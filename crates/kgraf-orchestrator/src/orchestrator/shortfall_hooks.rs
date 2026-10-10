@@ -58,6 +58,30 @@ impl RunLoop {
         )
     }
 
+    /// What judges the attempt of `worker` at `contract`, as the verifier
+    /// reads it in the attempt's worktree now, with the plan's other open
+    /// contracts ([`crate::Verifier::judge`]). Quoted in an answer that tells
+    /// the worker not to write another contract's file, so the worker hears
+    /// the rule the verifier applies. `None` when the attempt has no known
+    /// worktree or the verifier cannot say.
+    fn judge_of(&self, contract: &OpenContract, worker: &AgentId) -> Option<String> {
+        let workspace = self
+            .in_flight
+            .get(&contract.contract)?
+            .attempts
+            .iter()
+            .find(|a| &a.worker == worker)
+            .map(|a| a.workspace.clone())?;
+        let unmerged: Vec<OpenContract> = self
+            .record
+            .open_contracts
+            .iter()
+            .filter(|o| o.contract != contract.contract)
+            .cloned()
+            .collect();
+        self.s.verifier.judge(contract, &workspace, &unmerged)
+    }
+
     /// Seven arguments: the six fields of the report as the control carries
     /// them, plus `self`. Bundling them would rebuild the control variant.
     #[allow(clippy::too_many_arguments)]
@@ -127,7 +151,14 @@ impl RunLoop {
                 let answer = plan_shape_hold
                     .is_none()
                     .then(|| {
-                        instructions_answer(&asked, &why, &contract, &self.record.open_contracts)
+                        let judge = self.judge_of(&contract, &worker);
+                        instructions_answer(
+                            &asked,
+                            &why,
+                            &contract,
+                            &self.record.open_contracts,
+                            judge.as_deref(),
+                        )
                     })
                     .flatten();
                 if let Some(answer) = answer {
@@ -172,7 +203,16 @@ impl RunLoop {
                     plan_shape_hold = Some(package_fetch_hold(&subject, &reason));
                 }
                 let answer = (scope == RequestScope::File && plan_shape_hold.is_none())
-                    .then(|| path_answer(&subject, &contract, &self.record.open_contracts, &reason))
+                    .then(|| {
+                        let judge = self.judge_of(&contract, &worker);
+                        path_answer(
+                            &subject,
+                            &contract,
+                            &self.record.open_contracts,
+                            &reason,
+                            judge.as_deref(),
+                        )
+                    })
                     .flatten();
                 if let Some(answer) = answer {
                     return self

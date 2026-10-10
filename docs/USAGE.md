@@ -726,7 +726,16 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   that fails on the attempt and at its dispatch base with nothing to defer to (the last
   contract, or no root gate) is still a failure, and its reason says why: an earlier merge of
   the run broke it (it passes at the run's original base, and the contracts merged since are
-  named), or it failed before the run's work.
+  named), or it failed before the run's work. A narrowed check is deferred the same way when it
+  needs files that open contracts write and the attempt's tree lacks: a test or package the
+  narrowing selects for both, or, under cargo, a member's `src/lib.rs` or `src/main.rs`, without
+  which cargo loads no package of the workspace. A contract that writes only a new workspace's
+  manifests is then deferred, and the notice names the missing files and their contracts. A
+  narrowed check that needs no such file fails as before.
+- A worker that asks for a file another contract of the plan writes is told not to edit it,
+  and is told the check the verifier will run on its attempt (the narrowed or whole command, read
+  in its worktree), and whether a failure that comes from the other contracts' missing files is
+  deferred to the root gate. The contract's own Acceptance line is never quoted as the judge.
 - A worker's round budget (`worker --budget`, default 12; orchestrated workers 30) is a
   checkpoint, not a wall (decision 0096). Near the end of each block of that many rounds,
   kGraf measures what the worker did since the last checkpoint: files changed on net, its

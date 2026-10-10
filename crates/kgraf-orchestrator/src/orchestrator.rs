@@ -6876,13 +6876,15 @@ impl RunLoop {
                 let review_setup = self.interface_review_setup(&c, &f.worker);
                 // The plan's other open contracts: work this attempt's tree
                 // may lack, so a check of the whole instruction can fail on
-                // it (decision 0018, amended 2026-10-02).
-                let unmerged: Vec<String> = self
+                // it (decision 0018, amended 2026-10-02). With their files: a
+                // narrowed check is deferred only for files it needs
+                // (amended 2026-10-10).
+                let unmerged: Vec<OpenContract> = self
                     .record
                     .open_contracts
                     .iter()
                     .filter(|o| o.contract != f.contract)
-                    .map(|o| o.contract.clone())
+                    .cloned()
                     .collect();
                 // The producer's definition of done (0076 step 3, 0081
                 // requirement 3): read here, off `self`, since the spawn below

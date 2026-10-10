@@ -203,8 +203,9 @@ impl StepId {
                 names.service()
             ),
             StepId::NamedObjects => format!(
-                "fallback, used only where the launcher service does not work: group {} may \
-                 make named objects in the owner's session object directory",
+                "measurement of the owner's session object directory, for the fallback that \
+                 lets group {} make named objects there (the grant itself is a separate \
+                 action, asked for only after a probe was refused)",
                 names.group()
             ),
             StepId::Record => "undo record".into(),

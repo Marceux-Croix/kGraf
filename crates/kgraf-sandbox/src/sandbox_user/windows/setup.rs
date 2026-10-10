@@ -108,6 +108,21 @@ pub fn observe(names: &OwnerNames, with_rights: bool) -> Result<Observed, Sandbo
         }
         Err(why) => o.wfp_unreadable = Some(why),
     }
+    // The launcher service and the fallback grant, so status reports what is
+    // on the machine and a re-run plans an update, not a second install. A
+    // read this account is refused leaves its field unknown, as the other
+    // reads above do.
+    let facts = service::read(&names.service())?;
+    o.service = facts.description;
+    o.service_running = facts.running;
+    if let (Ok(session), Some(sid)) = (
+        named_object_dir::session_of_current_process(),
+        o.group_sid.as_deref(),
+    ) && named_object_dir::is_granted(session, sid, named_object_grant::GRANT_MASK)
+        .unwrap_or(false)
+    {
+        o.named_objects_grant = Some(named_object_grant::GRANT_MASK);
+    }
     Ok(o)
 }
 
@@ -613,7 +628,9 @@ fn install_service(names: &OwnerNames) -> Result<(), SandboxError> {
     // installed image path.
     service_args::ServiceArgs::parse(args.to_args())
         .map_err(|e| setup_error("build the launcher service's arguments", e.0))?;
-    let args = args.to_args();
+    // The subcommand first, so the program enters the service at once
+    // (`ServiceArgs::command_line`).
+    let args = args.command_line();
     service::install(
         &names.service(),
         &names.service_display(),

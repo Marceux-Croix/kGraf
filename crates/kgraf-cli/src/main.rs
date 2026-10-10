@@ -1034,6 +1034,31 @@ fn fetch_choice(fetch: bool, no_fetch: bool) -> kgraf_host::deps::RunFetch {
 /// Prints the report `fn main() -> Result` prints and exits 1 for a failure;
 /// an interrupted run exits with 128 plus its signal.
 fn main() -> std::process::ExitCode {
+    // The launcher service's command line is read before anything else: the
+    // service manager allows a service a short time to report in, so the
+    // program enters the service before the command-line parser and before
+    // any of the work an ordinary command does first.
+    #[cfg(windows)]
+    {
+        let argv: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if let Some(parsed) =
+            kgraf_sandbox::sandbox_user::service_args::ServiceArgs::from_command_line(&argv)
+        {
+            return match parsed {
+                Ok(args) => {
+                    let code = kgraf_sandbox::sandbox_user::windows::service_main::main(args);
+                    std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+    }
     match run_cli() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {

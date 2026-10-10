@@ -52,6 +52,25 @@ impl ServiceArgs {
     /// The arguments after the subcommand, in the order the installer writes
     /// them. None of them needs quoting but the runner's path, which the
     /// installer quotes.
+    /// The service's whole command line after the program: the subcommand
+    /// kGraf's program dispatches on ([`super::session0::SERVICE_SUBCOMMAND`]),
+    /// then [`Self::to_args`]. The installed image path is built from this,
+    /// so the program the service manager starts enters the service at once.
+    pub fn command_line(&self) -> Vec<String> {
+        let mut out = vec![super::session0::SERVICE_SUBCOMMAND.to_owned()];
+        out.extend(self.to_args());
+        out
+    }
+
+    /// The service's arguments when `argv` (a program's arguments, without
+    /// the program name) starts with the service subcommand; `None` for any
+    /// other command line, which is not the service's.
+    pub fn from_command_line<S: AsRef<str>>(argv: &[S]) -> Option<Result<Self, ArgsError>> {
+        let (first, rest) = argv.split_first()?;
+        (first.as_ref() == super::session0::SERVICE_SUBCOMMAND)
+            .then(|| Self::parse(rest.iter().map(|s| s.as_ref())))
+    }
+
     pub fn to_args(&self) -> [String; 6] {
         [
             "--owner-sid".to_owned(),
@@ -352,6 +371,31 @@ mod tests {
             pipe: "kgraf-launcher-00ff".to_owned(),
             runner: RUNNER.to_owned(),
         }
+    }
+
+    /// The image path setup installs starts with the subcommand the program
+    /// dispatches on, and the program reads it back. Without the subcommand
+    /// the service manager started the program with bare flags, the program
+    /// refused them as an unknown command, and the service never reported to
+    /// the manager (error 1053).
+    #[test]
+    fn the_installed_command_line_enters_the_service_and_reads_back() {
+        let built = ServiceArgs {
+            owner_sid: "S-1-5-21-1-2-3-1001".to_owned(),
+            pipe: "kgraf-launcher-1a2b3c4d".to_owned(),
+            runner: r"C:\Program Files\kGraf\kgraf-sandbox-runner.exe".to_owned(),
+        };
+        let line = built.command_line();
+        assert_eq!(line[0], super::super::session0::SERVICE_SUBCOMMAND);
+        assert_eq!(
+            ServiceArgs::from_command_line(&line)
+                .expect("the service's line")
+                .unwrap(),
+            built
+        );
+        assert!(ServiceArgs::from_command_line(&built.to_args()).is_none());
+        assert!(ServiceArgs::from_command_line::<&str>(&[]).is_none());
+        assert!(ServiceArgs::from_command_line(&["sandbox", "status"]).is_none());
     }
 
     #[test]

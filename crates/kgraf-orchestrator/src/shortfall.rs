@@ -579,11 +579,18 @@ fn how_to_allow(grant: &Grant) -> String {
 /// write, or that another contract of the run owns. Neither is granted in
 /// any mode: the first needs no grant, and the second would break disjoint
 /// writes. `None`: neither, and the report goes on to [`decide`].
+///
+/// `judge`: what the verifier says judges the attempt
+/// ([`crate::Verifier::judge`]), quoted as it is. The contract's own
+/// Acceptance line is not quoted in its place: a verifier that runs the run's
+/// command does not run it, and an answer must not name a judge the verifier
+/// does not apply. With `None` the answer names no judge.
 pub fn path_answer<'a>(
     path: &str,
     contract: &OpenContract,
     others: impl IntoIterator<Item = &'a OpenContract>,
     refusal: &str,
+    judge: Option<&str>,
 ) -> Option<String> {
     let same = |w: &crate::run_state::WriteTarget| w.path.trim_start_matches("./") == path;
     if contract.writes.iter().any(same) {
@@ -597,12 +604,28 @@ pub fn path_answer<'a>(
         .into_iter()
         .find(|o| o.contract != contract.contract && o.writes.iter().any(same))?;
     Some(format!(
-        "Nothing was granted or held: `{path}` belongs to contract `{}`; do not edit it. Your \
-         attempt is judged by its own acceptance check ({}), not by that file. Continue your \
-         work within your declared files.",
+        "Nothing was granted or held: `{path}` belongs to contract `{}`; do not edit it.{} \
+         Continue your work within your declared files.",
         owner.contract,
-        quoted_error(contract.acceptance.trim())
+        judge_sentence(judge)
     ))
+}
+
+/// Characters of a verifier's judge text kept in an answer: it names a
+/// command, its selection and the files it waits on, longer than an error
+/// quote.
+const MAX_JUDGE_CHARS: usize = 1_500;
+
+/// ` <judge>` with a leading space, or nothing.
+fn judge_sentence(judge: Option<&str>) -> String {
+    let Some(j) = judge.map(str::trim).filter(|j| !j.is_empty()) else {
+        return String::new();
+    };
+    let mut out: String = j.chars().take(MAX_JUDGE_CHARS).collect();
+    if out.len() < j.len() {
+        out.push_str("...");
+    }
+    format!(" {out}")
 }
 
 /// The answer to an `instructions` report that asks for a change to a file
@@ -610,12 +633,13 @@ pub fn path_answer<'a>(
 /// files. Amending this contract's own instruction cannot change that file,
 /// and a worker re-dispatched on it would be told to do what it cannot, so the
 /// worker is answered instead and keeps working. `None`: the report names no
-/// such file, and goes on to [`decide`].
+/// such file, and goes on to [`decide`]. `judge`: as for [`path_answer`].
 pub fn instructions_answer<'a>(
     need: &str,
     why: &str,
     contract: &OpenContract,
     others: impl IntoIterator<Item = &'a OpenContract>,
+    judge: Option<&str>,
 ) -> Option<String> {
     let named: Vec<String> = format!("{need} {why}")
         .split(|c: char| {
@@ -653,10 +677,9 @@ pub fn instructions_answer<'a>(
     Some(format!(
         "Nothing was amended: `{path}` belongs to contract `{}`; do not edit it and do not ask \
          for it to change. Keep the public shape that `{path}` uses of your items as the \
-         existing code defines it, and change your own files so that it compiles as it is. \
-         Your attempt is judged by its own acceptance check ({}).",
+         existing code defines it, and change your own files so that it compiles as it is.{}",
         holder.contract,
-        quoted_error(contract.acceptance.trim())
+        judge_sentence(judge)
     ))
 }
 
@@ -1553,13 +1576,51 @@ mod tests {
         assert_eq!(subject, "checkout/src/lib.rs");
         let mine = contract_writing("discount_flat", &["discount_flat/src/lib.rs"]);
         let sibling = contract_writing("checkout", &["checkout/src/lib.rs"]);
-        let answer = path_answer(&subject, &mine, [&mine, &sibling], &reason).expect("answered");
+        let judge = "Your attempt is judged by `cargo test -p discount_flat`.";
+        let answer = path_answer(&subject, &mine, [&mine, &sibling], &reason, Some(judge))
+            .expect("answered");
         assert!(
             answer.contains("belongs to contract `checkout`"),
             "{answer}"
         );
         assert!(answer.contains("do not edit it"), "{answer}");
-        assert!(answer.contains("cargo test -p checkout"), "{answer}");
+        assert!(answer.contains(judge), "{answer}");
+    }
+
+    /// Round 16 greenfield: the answer named the contract's Acceptance line
+    /// (`[ -f Cargo.toml ] && ...`) as the judge, while the verifier judged
+    /// the attempt by the run's cargo command. The answer quotes only what the
+    /// verifier says judges the attempt, and names no judge when it says
+    /// nothing.
+    #[test]
+    fn a_path_answer_names_the_verifier_s_judge_never_the_acceptance_line() {
+        let mut mine = contract_writing("c0", &["Cargo.toml", "wcl/Cargo.toml"]);
+        mine.acceptance = "[ -f Cargo.toml ] && [ -f wcl/Cargo.toml ]".into();
+        let owner = contract_writing("c2", &["wcl/src/main.rs"]);
+        let judge = "Your attempt is judged by `cargo test -p wcl --offline`. It needs the work \
+                     of contracts c2 (`wcl/src/main.rs` of c2), not merged yet: if it fails on \
+                     your attempt and also on the tree you were given, it is deferred to the \
+                     root gate.";
+        let answer = path_answer("wcl/src/main.rs", &mine, [&mine, &owner], "r", Some(judge))
+            .expect("answered");
+        assert!(answer.contains(judge), "{answer}");
+        assert!(!answer.contains("[ -f Cargo.toml ]"), "{answer}");
+        assert!(!answer.contains("its own acceptance check"), "{answer}");
+        let silent =
+            path_answer("wcl/src/main.rs", &mine, [&mine, &owner], "r", None).expect("answered");
+        assert!(!silent.contains("judged"), "{silent}");
+        assert!(!silent.contains("[ -f Cargo.toml ]"), "{silent}");
+        assert!(silent.contains("Continue your work"), "{silent}");
+        let asked = instructions_answer(
+            "wcl/src/main.rs must exist",
+            "",
+            &mine,
+            [&mine, &owner],
+            Some(judge),
+        )
+        .expect("answered");
+        assert!(asked.contains(judge), "{asked}");
+        assert!(!asked.contains("[ -f Cargo.toml ]"), "{asked}");
     }
 
     /// The prose need that was held as "writes to `write`" is grounded in
@@ -1709,7 +1770,7 @@ mod tests {
         let sibling = contract_writing("checkout", &["checkout/src/lib.rs"]);
         let others = [mine.clone(), sibling];
         let answer =
-            path_answer("checkout/src/lib.rs", &mine, &others, "refused").expect("answered");
+            path_answer("checkout/src/lib.rs", &mine, &others, "refused", None).expect("answered");
         assert!(
             answer.contains("belongs to contract `checkout`"),
             "{answer}"
@@ -1724,10 +1785,13 @@ mod tests {
             ),
             ShortfallDecision::Grant { .. }
         ));
-        let own =
-            path_answer("discount_flat/src/lib.rs", &mine, &others, "fenced").expect("answered");
+        let own = path_answer("discount_flat/src/lib.rs", &mine, &others, "fenced", None)
+            .expect("answered");
         assert!(own.contains("you may write it"), "{own}");
-        assert_eq!(path_answer("docs/new.md", &mine, &others, "refused"), None);
+        assert_eq!(
+            path_answer("docs/new.md", &mine, &others, "refused", None),
+            None
+        );
     }
 
     /// A prose need about a tool a skill refused grounds in that tool, and
@@ -2468,6 +2532,7 @@ mod tests {
             "my struct has a field now",
             &own,
             [&own, &owner],
+            None,
         )
         .expect("answered");
         assert!(
@@ -2481,7 +2546,7 @@ mod tests {
     fn an_instructions_report_is_amended_when_it_names_no_foreign_file_or_its_own() {
         let own = contract_writing("c3", &["tax_us/src/lib.rs"]);
         let owner = contract_writing("c5", &["pricing_engine/src/lib.rs"]);
-        let ask = |need: &str| instructions_answer(need, "", &own, [&own, &owner]);
+        let ask = |need: &str| instructions_answer(need, "", &own, [&own, &owner], None);
         assert_eq!(ask("the dataset is missing"), None);
         assert_eq!(
             ask("a file nobody owns, other/src/lib.rs, must change"),
