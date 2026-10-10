@@ -209,6 +209,23 @@ pub enum SandboxError {
     },
 }
 
+impl SandboxError {
+    /// This error's reason, for an error that carries it inside another one
+    /// whose step is `outer_step`: without the "sandbox setup failed at"
+    /// frame and the refusal at the end, which the outer error says once,
+    /// and without the step where it is the outer one's. The message a
+    /// command gets then says its reason and what to do once, on one line.
+    pub fn reason_within(&self, outer_step: &str) -> String {
+        match self {
+            SandboxError::PlatformSetup { step, source } if *step == outer_step => {
+                source.to_string()
+            }
+            SandboxError::PlatformSetup { step, source } => format!("{step}: {source}"),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl kgraf_diag::DiagCode for SandboxError {
     fn diag_code(&self) -> &'static str {
         match self {
@@ -276,5 +293,48 @@ mod diag_code_tests {
                 "{e:?} names code {code}, which is not in kgraf_diag::GLOSSARY"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    fn setup(step: &'static str, why: &str) -> SandboxError {
+        SandboxError::PlatformSetup {
+            step,
+            source: std::io::Error::other(why.to_owned()),
+        }
+    }
+
+    /// An error carried inside another says its reason once: no second
+    /// "sandbox setup failed at" and no second refusal, and its step only
+    /// where it differs from the outer one.
+    #[test]
+    fn a_carried_error_says_its_frame_and_refusal_once() {
+        let outer = "use the Windows sandbox user";
+        let inner = setup(
+            outer,
+            "the sandbox user kgraf-s00 no longer exists; run setup",
+        );
+        let carried = setup(outer, &inner.reason_within(outer)).to_string();
+        assert_eq!(
+            carried.matches("sandbox setup failed at").count(),
+            1,
+            "{carried}"
+        );
+        assert_eq!(
+            carried.matches("refusing to run unconfined").count(),
+            1,
+            "{carried}"
+        );
+        assert_eq!(carried.matches(outer).count(), 1, "{carried}");
+        let other = setup("read the stored sandbox passwords", "Access is denied.");
+        assert_eq!(
+            other.reason_within(outer),
+            "read the stored sandbox passwords: Access is denied."
+        );
+        let invalid = SandboxError::InvalidPolicy("no root".into());
+        assert_eq!(invalid.reason_within(outer), invalid.to_string());
     }
 }

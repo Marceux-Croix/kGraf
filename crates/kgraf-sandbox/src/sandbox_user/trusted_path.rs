@@ -283,9 +283,32 @@ pub fn refusal_message(why: &str) -> String {
     )
 }
 
+/// The whole message of a refused launch: the same rule as the install, read
+/// again by a process before its first command through the service. One
+/// line, what failed, then what to do; the caller adds nothing but its step.
+pub fn launch_refusal_message(why: &str) -> String {
+    format!(
+        "the launcher service runs as LocalSystem and the owner's own account may start it, so \
+         kGraf starts no command through it while a program it trusts lies on a path another \
+         principal can write: {why}. {ADVICE}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused launch says what failed and what to do on one line, and does
+    /// not speak of an install, which the command did not ask for.
+    #[test]
+    fn a_refused_launch_says_what_to_do_on_one_line() {
+        let why = r"C:\k\tests\kgraf-sandbox-runner.exe is owned by S-1-5-21-1-2-3-500";
+        let message = launch_refusal_message(why);
+        assert!(message.contains(why), "{message}");
+        assert!(message.ends_with(ADVICE), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(!message.contains("install it"), "{message}");
+    }
 
     fn allow(sid: &str, mask: u32) -> AceView {
         AceView {

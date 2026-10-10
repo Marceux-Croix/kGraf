@@ -406,6 +406,11 @@ impl Drop for Sddl {
 /// without `FILE_CREATE_PIPE_INSTANCE` ([`PIPE_OWNER_MASK`]): a program
 /// running as the owner must not be able to add an instance of the name and
 /// answer in the service's place.
+///
+/// Windows checks `FILE_CREATE_PIPE_INSTANCE` on the existing pipe before it
+/// makes another instance, so only SYSTEM can call this with `first` false.
+/// The service runs as SYSTEM; a caller running as the owner is refused with
+/// `ERROR_ACCESS_DENIED`, which is the property above.
 fn create_instance(
     path: &[u16],
     sa: &SECURITY_ATTRIBUTES,
@@ -1573,11 +1578,24 @@ mod tests {
 
     /// The service's own pipe name and access list come from its arguments,
     /// and the list carries no right to add an instance of the name.
+    ///
+    /// Windows asks for `FILE_CREATE_PIPE_INSTANCE` on the pipe that exists
+    /// before it makes another instance of it (`CreateNamedPipeW`). The
+    /// service runs as SYSTEM, which the list grants every right, so it makes
+    /// as many instances as it needs. This test runs as the owner, whom the
+    /// list grants [`PIPE_OWNER_MASK`] alone, so here another instance must be
+    /// refused: that refusal is the property, because a program running as
+    /// the owner must not add an instance of the name and answer in the
+    /// service's place. A list that grants the owner every right then shows
+    /// that the refusal comes from the list and not from the flags.
     /// Compile-checked on the development host; it runs on Windows.
     #[test]
     fn the_pipes_access_list_is_accepted_by_windows() {
+        const ACCESS_DENIED: u32 = 5;
+        let owner_sid = super::super::accounts::current_user_sid().expect("own SID");
+        let as_system = owner_sid == "S-1-5-18";
         let args = ServiceArgs {
-            owner_sid: super::super::accounts::current_user_sid().expect("own SID"),
+            owner_sid: owner_sid.clone(),
             pipe: format!("kgraf-launcher-test-{}", std::process::id()),
             runner: r"C:\Windows\System32\cmd.exe".to_owned(),
         };
@@ -1585,13 +1603,29 @@ mod tests {
         let sa = sddl.attributes();
         let path = wide(&args.pipe_path());
         let first = create_instance(&path, &sa, true).expect("the first instance");
-        let second = create_instance(&path, &sa, false).expect("another instance");
         // A second first instance of the same name is refused, so no other
-        // program can take the name from the service.
-        assert!(
-            create_instance(&path, &sa, true).is_err(),
-            "a second first instance was allowed"
-        );
+        // program can take the name from the service. Windows documents
+        // ERROR_ACCESS_DENIED for it.
+        let again = create_instance(&path, &sa, true).expect_err("a second first instance");
+        assert_eq!(again.code, ACCESS_DENIED, "{again:?}");
+        let another = create_instance(&path, &sa, false);
+        if as_system {
+            drop(another.expect("SYSTEM makes another instance"));
+        } else {
+            let refused = another.expect_err("the owner made another instance of the pipe");
+            assert_eq!(refused.code, ACCESS_DENIED, "{refused:?}");
+        }
+        drop(first);
+
+        // The same calls under a list that grants the owner every right: the
+        // second instance is made, so the refusal above is the list's.
+        let open = Sddl::new(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{owner_sid})"))
+            .expect("a list that grants the owner every right");
+        let open_sa = open.attributes();
+        let open_path = wide(&format!("{}-open", args.pipe_path()));
+        let first = create_instance(&open_path, &open_sa, true).expect("the first instance");
+        let second =
+            create_instance(&open_path, &open_sa, false).expect("another instance, right held");
         drop(second);
         drop(first);
     }
@@ -1674,10 +1708,16 @@ mod tests {
             runner: r"C:\Windows\System32\cmd.exe".to_owned(),
         };
         let sddl = Sddl::new(&args.pipe_sddl()).expect("the access list");
-        let path = wide(&args.pipe_path());
-        // Three different handles, as a request's three standard handles are.
+        // Three different handles, as a request's three standard handles are:
+        // the first instance of three pipes. Three instances of one pipe are
+        // not a choice here, because the list refuses the owner, whom this
+        // test runs as, the right to make another instance
+        // (`the_pipes_access_list_is_accepted_by_windows`).
         let instances: Vec<OwnedHandle> = (0..3)
-            .map(|i| create_instance(&path, &sddl.attributes(), i == 0).expect("an instance"))
+            .map(|i| {
+                let path = wide(&format!("{}-{i}", args.pipe_path()));
+                create_instance(&path, &sddl.attributes(), true).expect("an instance")
+            })
             .collect();
         let stdio = [
             instances[0].as_raw_handle(),

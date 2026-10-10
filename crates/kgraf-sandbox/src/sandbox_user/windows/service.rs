@@ -34,13 +34,13 @@ use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPT
 use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
-    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceConfig2W,
-    QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
-    SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DESCRIPTION,
-    SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL,
-    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
-    SetServiceObjectSecurity, StartServiceW,
+    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+    QueryServiceConfig2W, QueryServiceConfigW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_CHANGE_CONFIG,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_DESCRIPTIONW,
+    SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    SERVICE_START, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED,
+    SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, StartServiceW,
 };
 
 use super::super::service_dacl;
@@ -312,6 +312,63 @@ fn description(service: &ScHandle) -> Result<Option<String>, SandboxError> {
         from_wide(d.lpDescription)
     };
     Ok((!text.is_empty()).then_some(text))
+}
+
+/// The image path the service `name` is installed with, as the service
+/// control manager holds it; `None` when no service has the name. Read with
+/// the query right the install gives the owner
+/// (`super::super::service_dacl::OWNER_RIGHTS`), so the owner's unelevated
+/// process reads what the service trusts, the runner path among it
+/// (`super::super::session0::runner_for`). A refused read is an error, not
+/// `None`: a launch must not guess which runner the service starts.
+pub fn installed_image(name: &str) -> Result<Option<String>, SandboxError> {
+    const STEP: &str = "read the launcher service's image path";
+    let manager = manager(SC_MANAGER_CONNECT, "open the service control manager")?;
+    let service = match open_service(&manager, name, SERVICE_QUERY_CONFIG) {
+        Ok(h) => h,
+        Err(ERROR_SERVICE_DOES_NOT_EXIST) => return Ok(None),
+        Err(e) => return Err(service_error(OPEN, e)),
+    };
+    let mut needed = 0u32;
+    // SAFETY: a live service handle; a null buffer of size zero asks for the
+    // size, which the call writes to `needed`.
+    let ok = unsafe { QueryServiceConfigW(service.raw(), ptr::null_mut(), 0, &mut needed) };
+    if ok == 0 {
+        match code() {
+            ERROR_INSUFFICIENT_BUFFER => {}
+            other => return Err(service_error(STEP, other)),
+        }
+    }
+    // The call writes a `QUERY_SERVICE_CONFIGW` and the strings it points at
+    // into one buffer, so the buffer must be aligned for that structure: a
+    // vector of u64 is aligned for a pointer on every Windows target.
+    let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; words.max(1)];
+    let size = (words.max(1) * std::mem::size_of::<u64>()) as u32;
+    // SAFETY: the buffer holds at least `needed` bytes, is aligned for
+    // QUERY_SERVICE_CONFIGW, and the call is told its size.
+    let ok = unsafe {
+        QueryServiceConfigW(
+            service.raw(),
+            buffer.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>(),
+            size,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(service_error(STEP, code()));
+    }
+    // SAFETY: on success the call wrote a QUERY_SERVICE_CONFIGW at the start
+    // of the buffer, whose `lpBinaryPathName` is null or a NUL-terminated
+    // string inside the same buffer.
+    let image = unsafe {
+        let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+        from_wide(config.lpBinaryPathName)
+    };
+    if image.is_empty() {
+        return Err(failed(STEP, "the service has no image path"));
+    }
+    Ok(Some(image))
 }
 
 // ---- install ----------------------------------------------------------------

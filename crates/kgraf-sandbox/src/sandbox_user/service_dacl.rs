@@ -155,6 +155,74 @@ pub fn quote_argument(arg: &str) -> String {
     out
 }
 
+/// The program and the arguments of a command line, as a Rust program on
+/// Windows reads its own (`std::env::args_os`), which is how kGraf's service
+/// reads the image path it was installed with. The other side of
+/// [`image_path`], so the owner's side can read what the installed service
+/// trusts (the runner path above all) from the service's configuration.
+///
+/// The program name has no escapes: a quote toggles quoting and a space or
+/// tab outside quotes ends it. In the arguments, backslashes are literal
+/// unless a quote follows them: then each pair is one backslash, and an odd
+/// one left makes the quote literal. Inside quotes, two quotes are one
+/// literal quote. These are the rules of the Rust standard library, which
+/// follow those `CommandLineToArgvW` documents.
+pub fn split_command_line(line: &str) -> (String, Vec<String>) {
+    let mut units = line.chars().peekable();
+    let mut program = String::new();
+    let mut in_quotes = false;
+    for c in units.by_ref() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ' ' | '\t' if !in_quotes => break,
+            _ => program.push(c),
+        }
+    }
+    while units.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    while let Some(c) = units.next() {
+        match c {
+            ' ' | '\t' if !in_quotes => {
+                args.push(std::mem::take(&mut current));
+                while units.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+            }
+            '\\' => {
+                let mut count = 1usize;
+                while units.next_if_eq(&'\\').is_some() {
+                    count += 1;
+                }
+                if units.peek() == Some(&'"') {
+                    current.extend(std::iter::repeat_n('\\', count / 2));
+                    if count % 2 == 1 {
+                        units.next();
+                        current.push('"');
+                    }
+                } else {
+                    current.extend(std::iter::repeat_n('\\', count));
+                }
+            }
+            '"' if in_quotes => match units.peek() {
+                Some('"') => {
+                    current.push('"');
+                    units.next();
+                }
+                Some(_) => in_quotes = false,
+                // The end of the line inside quotes: the argument is kept
+                // even when it is empty.
+                None => break,
+            },
+            '"' => in_quotes = true,
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() || in_quotes {
+        args.push(current);
+    }
+    (program, args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +284,59 @@ mod tests {
         }
         flush(&mut current, &mut out, &mut started);
         out
+    }
+
+    /// The image path reads back as the program and the arguments it was
+    /// built from, so the owner's side reads the runner path the service
+    /// itself trusts.
+    #[test]
+    fn an_image_path_splits_back_into_its_program_and_arguments() {
+        let exe = r"C:\Program Files\kGraf\kgraf.exe";
+        let args: Vec<String> = [
+            "sandbox-launcher-service",
+            "--runner",
+            r"C:\Program Files\kGraf\kgraf-sandbox-runner.exe",
+            "a tag with spaces",
+            r"C:\a folder\\",
+            r#"holds "quotes""#,
+            "",
+            "plain",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let path = image_path(Path::new(exe), &args).expect("image path");
+        let (program, back) = split_command_line(&path);
+        assert_eq!(program, exe);
+        assert_eq!(back, args, "{path}");
+        assert_eq!(back, argv(path.split_once(r#".exe""#).expect("exe").1));
+    }
+
+    /// The rules of the Rust standard library, case by case: a program name
+    /// without quotes, backslashes before a quote and elsewhere, two quotes
+    /// inside quotes, runs of white space, and an empty last argument.
+    #[test]
+    fn a_command_line_splits_as_the_rust_standard_library_splits_it() {
+        let split = |line: &str| split_command_line(line);
+        let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(split(r"C:\k.exe"), (r"C:\k.exe".to_owned(), vec![]));
+        assert_eq!(
+            split("C:\\k.exe  a\t b  "),
+            ("C:\\k.exe".to_owned(), owned(&["a", "b"]))
+        );
+        assert_eq!(
+            split(r#"k a\\b "c\\" d\"e"#),
+            ("k".to_owned(), owned(&[r"a\\b", r"c\", r#"d"e"#]))
+        );
+        assert_eq!(
+            split(r#"k "a""b" """#),
+            ("k".to_owned(), owned(&[r#"a"b"#, ""]))
+        );
+        assert_eq!(
+            split(r#""a b\c"d e"#),
+            (r"a b\cd".to_owned(), owned(&["e"]))
+        );
+        assert_eq!(split(""), (String::new(), vec![]));
     }
 
     /// The trap this quoting exists for: an unquoted path with a space in it

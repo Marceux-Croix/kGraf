@@ -195,7 +195,6 @@ const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 ///   changed.
 fn via_service(
     user: &Credential<'_>,
-    runner_exe: &Path,
     std: [HANDLE; 3],
     job: &OwnedHandle,
     mut request: Request,
@@ -206,6 +205,12 @@ fn via_service(
             "the sandbox users are not loaded",
         )
     })?;
+    // The runner the service was installed with, read from the service's
+    // own image path when the users were loaded
+    // (`super::super::session0::runner_for`). Taken from there and not from
+    // the caller, so no other runner can reach a request: the service would
+    // refuse it, and its trust check below would judge the wrong file.
+    let runner_exe = users.runner.as_path();
     // SAFETY: reads this process's ID.
     let owner_pid = unsafe { GetCurrentProcessId() };
     let args = RunnerArgs::fresh(owner_pid)
@@ -248,7 +253,7 @@ fn via_service(
         &ServiceRequest {
             owner_pid,
             runner_exe: runner_exe.as_os_str().encode_wide().collect(),
-            command_line: runner_command_line(runner_exe, &args)?,
+            command_line: runner_command_line(runner_exe, &args).map_err(end_job)?,
             user_name: user.name.encode_utf16().collect(),
             user_sid: user.sid.encode_utf16().collect(),
             // One buffer of the exact size: a buffer that grows as it
@@ -303,7 +308,11 @@ fn launcher_image_is_trusted(runner_exe: &Path) -> Result<(), SandboxError> {
         let exe = std::env::current_exe().map_err(|e| {
             format!("kGraf's own program could not be found to check where it lives: {e}")
         })?;
-        super::setup::only_administrators_may_write(&[&exe, runner_exe]).map_err(|e| e.to_string())
+        // The bare reason, put in a launch's words: the error that carries it
+        // is the one a command gets, so it must say what to do on one line
+        // and not wrap an install's whole error inside its own.
+        super::setup::first_untrusted(&[&exe, runner_exe])
+            .map_err(|why| super::super::trusted_path::launch_refusal_message(&why))
     });
     outcome.clone().map_err(|why| {
         failed(
@@ -912,7 +921,9 @@ impl Station {
 }
 
 /// Start the runner at `runner_exe` as `user`, with `std` as its standard
-/// handles, in `job`, and have it start `request`.
+/// handles, in `job`, and have it start `request`. On the session-0 path the
+/// runner is the one the launcher service was installed with
+/// ([`super::state::Users::runner`]), which is also what callers pass.
 ///
 /// Which path starts the runner is the one setup proved on this machine and
 /// recorded ([`super::super::session0`]): kGraf's launcher service in session
@@ -932,7 +943,7 @@ pub(crate) fn start(
     let session0 = super::state::users()?
         .is_some_and(|users| users.launch.path == session0::LaunchPath::Session0);
     if session0 {
-        return via_service(user, runner_exe, std, job, request);
+        return via_service(user, std, job, request);
     }
     in_owner_session(user, runner_exe, std, job, request)
 }

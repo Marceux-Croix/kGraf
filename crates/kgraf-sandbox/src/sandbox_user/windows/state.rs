@@ -5,10 +5,14 @@
 //!   the token sandbox of decision 0011, and every notice that names its
 //!   gaps says how to close them. With [`TAG_ENV`] set, this is an error
 //!   instead: the tag asked for one setup's users by name.
-//! - Stored passwords that open, and the runner beside this executable:
-//!   commands run as the sandbox users.
+//! - Stored passwords that open, and the runner the launch path names:
+//!   commands run as the sandbox users. On the session-0 path that is the
+//!   runner kGraf's launcher service was installed with, read from the
+//!   service's image path; on the owner-session path, the runner beside this
+//!   executable ([`super::super::session0::runner_for`]).
 //! - Anything between (a store that does not open, a store for other names,
-//!   one user missing, no runner): an error for every sandboxed command.
+//!   one user missing, no runner, a launcher service that is missing or not
+//!   the one setup installed): an error for every sandboxed command.
 //!   Setup ran, so a command must not quietly get less confinement than it
 //!   promised (fail loud).
 
@@ -18,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use super::super::names::{OwnerNames, Role};
 use super::super::password::Password;
 use super::super::runner::RUNNER_NAME;
-use super::super::session0::Active;
+use super::super::session0::{Active, ExpectedService, runner_for};
 use super::super::slots::{Lease, Leases, Pool};
 use super::super::store::{
     credentials_path, grants_path, launch_path_file, load_slot_users, missing_store, slots_dir,
@@ -62,6 +66,9 @@ pub(crate) struct Users {
     pub online_slots: Vec<LoadedUser>,
     /// Which folder holds which slot ([`super::super::slots`]).
     pub leases: Leases,
+    /// The runner every command starts through: on the session-0 path the
+    /// one the launcher service was installed with, never a copy beside
+    /// this program ([`super::super::session0::runner_for`]).
     pub runner: PathBuf,
     /// The list of the owner's folders granted to the sandbox users
     /// ([`grants_path`]).
@@ -162,9 +169,11 @@ impl Users {
     }
 }
 
+const STEP: &str = "use the Windows sandbox user";
+
 fn error(why: impl std::fmt::Display) -> SandboxError {
     SandboxError::PlatformSetup {
-        step: "use the Windows sandbox user",
+        step: STEP,
         source: std::io::Error::other(why.to_string()),
     }
 }
@@ -173,7 +182,9 @@ fn error(why: impl std::fmt::Display) -> SandboxError {
 /// result, an error included, holds for the life of the process.
 pub(crate) fn users() -> Result<Option<&'static Users>, SandboxError> {
     static USERS: OnceLock<Result<Option<Users>, String>> = OnceLock::new();
-    match USERS.get_or_init(|| load().map_err(|e| e.to_string())) {
+    // The reason alone is kept, so the error every later call builds from it
+    // says its frame and its refusal once.
+    match USERS.get_or_init(|| load().map_err(|e| e.reason_within(STEP))) {
         Ok(users) => Ok(users.as_ref()),
         Err(why) => Err(error(why)),
     }
@@ -240,13 +251,36 @@ fn load() -> Result<Option<Users>, SandboxError> {
             )));
         }
     }
-    let exe = std::env::current_exe().map_err(error)?;
-    let runner = find_runner(&exe).ok_or_else(|| {
-        error(format!(
-            "{RUNNER_NAME}.exe is not installed beside {}",
-            exe.display()
-        ))
-    })?;
+    // A record that cannot be read is the same as none: the owner's session
+    // with no grant, which gives a command no named object and says so in
+    // the note a failed cargo gets. Nothing is refused here, because this
+    // path is the one every setup before the launcher service made.
+    let launch = std::fs::read_to_string(launch_path_file(&store))
+        .map(|text| Active::decode(&text))
+        .unwrap_or_else(|_| Active::decode(""));
+    let (service, service_pipe) = (names.service(), names.service_pipe());
+    // The session-0 path names the runner the service was installed with,
+    // which the service compares every request against; the owner-session
+    // path starts the runner beside this program itself.
+    let runner = runner_for(
+        launch.path,
+        ExpectedService {
+            name: &service,
+            owner_sid: names.owner_sid(),
+            pipe: &service_pipe,
+        },
+        || super::service::installed_image(&service).map_err(|e| e.to_string()),
+        || {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            find_runner(&exe).ok_or_else(|| {
+                format!(
+                    "{RUNNER_NAME}.exe is not installed beside {}",
+                    exe.display()
+                )
+            })
+        },
+    )
+    .map_err(error)?;
     let count = u8::try_from(slots.len()).unwrap_or(u8::MAX);
     let loaded = |list: Vec<(super::super::blob::StoredUser, Password)>| -> Vec<LoadedUser> {
         list.into_iter()
@@ -273,16 +307,9 @@ fn load() -> Result<Option<Users>, SandboxError> {
         leases: Leases::new(slots_dir(&store), count),
         runner,
         grants: grants_path(&store),
-        // A record that cannot be read is the same as none: the owner's
-        // session with no grant, which gives a command no named object and
-        // says so in the note a failed cargo gets. Nothing is refused here,
-        // because this path is the one every setup before the launcher
-        // service made.
-        launch: std::fs::read_to_string(launch_path_file(&store))
-            .map(|text| Active::decode(&text))
-            .unwrap_or_else(|_| Active::decode("")),
-        service: names.service(),
-        service_pipe: names.service_pipe(),
+        launch,
+        service,
+        service_pipe,
     }))
 }
 

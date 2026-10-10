@@ -332,6 +332,20 @@ the sandbox user; none of the changes has run on Windows since):
      the directory the owner's own programs read. The grant is gone at the next sign-out in
      any case, and remove takes it off as well. If the first probe was not refused, the
      report says the fallback did not run.
+  10. Commands from a program other than `programs\kgraf.exe`. A test binary in `tests\`
+     starts its commands through the runner the launcher service was installed with, which
+     the owner's side reads from the service's image path: the one in `programs\`, never the
+     copy the phase puts beside the test binaries (that copy serves the owner-session path
+     alone). The sandbox user re-run of the shell, startup, escape, runner, stdio and
+     contract tests must not fail with "check where kGraf's launcher service starts its
+     program from". Where the service is missing, unreadable or set up for another user or
+     pipe, every command fails with one line that names the service and ends "run `kgraf
+     sandbox setup` again", and no command runs on another path. A refused launch says
+     "sandbox setup failed at" and "refusing to run unconfined" once each. The sandbox crate
+     tests `the_pipes_access_list_is_accepted_by_windows` and
+     `the_creation_attributes_bound_inheritance_and_join_the_job` pass: a test runs as the
+     owner, and the owner is refused another instance of the launcher pipe with error 5,
+     which is the result the first of them expects.
   If the process that runs kGraf is in session 0, items 4, 5 and 9 describe one machine-wide
   directory and prove less than they do from an interactive session. Say so when you send the
   report.

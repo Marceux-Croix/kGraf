@@ -336,6 +336,77 @@ pub fn select(a: &Attempt) -> Active {
     }
 }
 
+// ---- the runner a launch names ----------------------------------------------
+
+/// The launcher service a session-0 launch asks, as this Windows user's names
+/// give it (`super::names::OwnerNames`).
+#[derive(Clone, Copy, Debug)]
+pub struct ExpectedService<'a> {
+    pub name: &'a str,
+    pub owner_sid: &'a str,
+    pub pipe: &'a str,
+}
+
+/// The runner the owner's side names when it starts a command on `path`.
+///
+/// - [`LaunchPath::Session0`]: the runner kGraf's launcher service was
+///   installed with, read from the service's image path (`installed_image`,
+///   `None` where no service has the name). The service starts that runner
+///   and refuses any other, so a copy beside the calling program is never
+///   named, wherever that program lives: a test binary, or a second copy of
+///   kGraf. A service that is missing, unreadable, or set up for another
+///   user or pipe is an error that says to run setup again (fail loud).
+/// - [`LaunchPath::OwnerSession`]: the runner beside the calling program
+///   (`beside`), which this process starts itself.
+///
+/// Each source is read only on its own path, so a session-0 launch does not
+/// depend on a runner beside the program at all.
+pub fn runner_for(
+    path: LaunchPath,
+    service: ExpectedService<'_>,
+    installed_image: impl FnOnce() -> Result<Option<String>, String>,
+    beside: impl FnOnce() -> Result<std::path::PathBuf, String>,
+) -> Result<std::path::PathBuf, String> {
+    if path == LaunchPath::OwnerSession {
+        return beside();
+    }
+    let again = "run `kgraf sandbox setup` again";
+    let name = service.name;
+    let image = match installed_image() {
+        Ok(Some(image)) => image,
+        Ok(None) => {
+            return Err(format!(
+                "setup recorded the session-0 launch path, but kGraf's launcher service {name} \
+                 is not installed; {again}"
+            ));
+        }
+        Err(why) => {
+            return Err(format!(
+                "the runner kGraf's launcher service {name} starts could not be read from the \
+                 service's configuration: {why}; {again}"
+            ));
+        }
+    };
+    let args = super::service_args::ServiceArgs::from_image_path(&image).map_err(|e| {
+        format!(
+            "kGraf's launcher service {name} is not configured as setup installs it: {e}; {again}"
+        )
+    })?;
+    if args.owner_sid != service.owner_sid {
+        return Err(format!(
+            "kGraf's launcher service {name} answers {}, not this Windows user {}; {again}",
+            args.owner_sid, service.owner_sid
+        ));
+    }
+    if args.pipe != service.pipe {
+        return Err(format!(
+            "kGraf's launcher service {name} listens on the pipe {}, not {}; {again}",
+            args.pipe, service.pipe
+        ));
+    }
+    Ok(std::path::PathBuf::from(args.runner))
+}
+
 // ---- the service protocol ---------------------------------------------------
 
 pub const REQUEST_MAGIC: &[u8; 8] = b"KGRSVCRQ";
@@ -705,6 +776,115 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    const SERVICE: ExpectedService<'static> = ExpectedService {
+        name: "kgraf-launcher-1a2b3c4d",
+        owner_sid: OWNER,
+        pipe: "kgraf-launcher-1a2b3c4d",
+    };
+    const INSTALLED_RUNNER: &str = r"C:\Program Files\kGraf\kgraf-sandbox-runner.exe";
+
+    /// The image path setup installs for [`SERVICE`].
+    fn installed_image() -> String {
+        let args = super::super::service_args::ServiceArgs {
+            owner_sid: OWNER.to_owned(),
+            pipe: SERVICE.pipe.to_owned(),
+            runner: INSTALLED_RUNNER.to_owned(),
+        };
+        super::super::service_dacl::image_path(
+            std::path::Path::new(r"C:\Program Files\kGraf\kgraf.exe"),
+            &args.command_line(),
+        )
+        .expect("image path")
+    }
+
+    /// A session-0 launch names the runner the service was installed with,
+    /// never the copy beside the calling program: the service starts only
+    /// its own, so a test binary in another folder that named its own copy
+    /// had every command refused.
+    #[test]
+    fn a_session0_launch_names_the_installed_runner_and_never_the_one_beside() {
+        let runner = runner_for(
+            LaunchPath::Session0,
+            SERVICE,
+            || Ok(Some(installed_image())),
+            || panic!("a session-0 launch looked for a runner beside the program"),
+        )
+        .expect("the installed runner");
+        assert_eq!(runner, std::path::PathBuf::from(INSTALLED_RUNNER));
+    }
+
+    /// The owner-session path starts the runner itself, so it takes the one
+    /// beside the program and never asks the service.
+    #[test]
+    fn an_owner_session_launch_names_the_runner_beside_the_program() {
+        let beside = std::path::PathBuf::from(r"C:\kgraf\tests\kgraf-sandbox-runner.exe");
+        let runner = runner_for(
+            LaunchPath::OwnerSession,
+            SERVICE,
+            || panic!("an owner-session launch read the service"),
+            || Ok(beside.clone()),
+        )
+        .expect("the runner beside");
+        assert_eq!(runner, beside);
+        let missing = runner_for(
+            LaunchPath::OwnerSession,
+            SERVICE,
+            || panic!("an owner-session launch read the service"),
+            || Err("kgraf-sandbox-runner.exe is not installed beside kgraf.exe".to_owned()),
+        );
+        assert!(missing.is_err());
+    }
+
+    /// Where the installed runner cannot be known, the launch is refused with
+    /// one line that says to run setup again; it never falls back to the
+    /// runner beside the program.
+    #[test]
+    fn a_missing_or_foreign_service_is_refused_with_what_to_run() {
+        let session0 = |image: Result<Option<String>, String>| {
+            runner_for(
+                LaunchPath::Session0,
+                SERVICE,
+                || image,
+                || {
+                    Ok(std::path::PathBuf::from(
+                        r"C:\elsewhere\kgraf-sandbox-runner.exe",
+                    ))
+                },
+            )
+            .expect_err("refused")
+        };
+        let other_owner = installed_image().replace(OWNER, "S-1-5-21-9-9-9-1002");
+        let other_pipe = installed_image().replace(
+            &format!("--pipe {}", SERVICE.pipe),
+            "--pipe kgraf-launcher-ffffffff",
+        );
+        for (case, why) in [
+            ("not installed", session0(Ok(None))),
+            (
+                "unreadable",
+                session0(Err("Access is denied. (os error 5)".into())),
+            ),
+            (
+                "no subcommand",
+                session0(Ok(Some(r#""C:\k\kgraf.exe" --pipe x"#.into()))),
+            ),
+            ("another owner", session0(Ok(Some(other_owner)))),
+            ("another pipe", session0(Ok(Some(other_pipe)))),
+        ] {
+            assert!(
+                why.ends_with("run `kgraf sandbox setup` again"),
+                "{case}: {why}"
+            );
+            assert!(!why.contains('\n'), "{case}: one line: {why}");
+            assert!(
+                why.contains(SERVICE.name),
+                "{case}: names the service: {why}"
+            );
+            assert!(!why.contains("elsewhere"), "{case}: no fallback: {why}");
+        }
+    }
 
     fn request() -> ServiceRequest {
         ServiceRequest {

@@ -1284,8 +1284,12 @@ impl Exec for PhaseExec<'_> {
                 "the bundle has no programs/kgraf.exe and programs/{runner} side by side"
             ));
         }
-        // kGraf looks for the runner beside the running executable. The test
-        // binaries are in `tests/`, so the runner needs a copy there.
+        // On the owner-session path kGraf starts the runner beside the
+        // running executable. The test binaries are in `tests/`, so that path
+        // needs a copy there. The session-0 path never uses the copy: it
+        // names the runner the launcher service was installed with, the one
+        // in `programs/`, so the copy's owner and the trust check of the
+        // service's files do not meet.
         let copy = self.bundle.join("tests").join(&runner);
         if !copy.is_file() {
             std::fs::copy(&built, &copy)

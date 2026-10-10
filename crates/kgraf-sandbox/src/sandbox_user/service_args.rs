@@ -71,6 +71,22 @@ impl ServiceArgs {
             .then(|| Self::parse(rest.iter().map(|s| s.as_ref())))
     }
 
+    /// The arguments an installed service starts with, read from its image
+    /// path as the service control manager holds it
+    /// ([`super::service_dacl::image_path`]). The program is not judged here:
+    /// the caller checks where it lives. An image path that does not enter
+    /// the service is an error, because that service is not one kGraf's setup
+    /// installed.
+    pub fn from_image_path(image: &str) -> Result<Self, ArgsError> {
+        let (_, argv) = super::service_dacl::split_command_line(image);
+        Self::from_command_line(&argv).unwrap_or_else(|| {
+            Err(ArgsError(format!(
+                "the installed image path does not start the {} subcommand",
+                super::session0::SERVICE_SUBCOMMAND
+            )))
+        })
+    }
+
     pub fn to_args(&self) -> [String; 6] {
         [
             "--owner-sid".to_owned(),
@@ -396,6 +412,26 @@ mod tests {
         assert!(ServiceArgs::from_command_line(&built.to_args()).is_none());
         assert!(ServiceArgs::from_command_line::<&str>(&[]).is_none());
         assert!(ServiceArgs::from_command_line(&["sandbox", "status"]).is_none());
+    }
+
+    /// The owner's side reads the service's arguments back from the image
+    /// path the service control manager holds, a runner path with spaces
+    /// included, and refuses an image path that does not enter the service.
+    #[test]
+    fn the_installed_image_path_reads_back_as_the_service_arguments() {
+        let built = args();
+        let image = super::super::service_dacl::image_path(
+            std::path::Path::new(r"C:\Program Files\kGraf\kgraf.exe"),
+            &built.command_line(),
+        )
+        .expect("image path");
+        assert_eq!(ServiceArgs::from_image_path(&image), Ok(built.clone()));
+        let bare = super::super::service_dacl::image_path(
+            std::path::Path::new(r"C:\Program Files\kGraf\kgraf.exe"),
+            &built.to_args(),
+        )
+        .expect("image path");
+        assert!(ServiceArgs::from_image_path(&bare).is_err(), "{bare}");
     }
 
     #[test]

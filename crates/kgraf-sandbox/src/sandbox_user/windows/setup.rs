@@ -570,10 +570,17 @@ fn path_object(path: &Path) -> Result<trusted_path::Object, String> {
 /// Windows. This function only reads the machine and reports the first object
 /// that fails.
 pub(crate) fn only_administrators_may_write(paths: &[&Path]) -> Result<(), SandboxError> {
-    let refuse = |why: String| setup_error(IMAGE_CHECK_STEP, trusted_path::refusal_message(&why));
+    first_untrusted(paths)
+        .map_err(|why| setup_error(IMAGE_CHECK_STEP, trusted_path::refusal_message(&why)))
+}
+
+/// The rule of [`only_administrators_may_write`], with the bare reason of the
+/// first object that fails, so a launch can put it in its own words
+/// (`trusted_path::launch_refusal_message`) rather than in an install's.
+pub(crate) fn first_untrusted(paths: &[&Path]) -> Result<(), String> {
     for path in paths {
         if let Some(why) = trusted_path::shape_refusal(&path.to_string_lossy()) {
-            return Err(refuse(why));
+            return Err(why);
         }
         // The volume root first, so the first refusal names the outermost
         // object that has to be put right. Two paths in one folder read that
@@ -583,10 +590,9 @@ pub(crate) fn only_administrators_may_write(paths: &[&Path]) -> Result<(), Sandb
         let chain: Vec<trusted_path::Object> = up
             .into_iter()
             .map(path_object)
-            .collect::<Result<_, String>>()
-            .map_err(refuse)?;
+            .collect::<Result<_, String>>()?;
         if let Some(why) = trusted_path::first_refusal(&chain) {
-            return Err(refuse(why));
+            return Err(why);
         }
     }
     Ok(())

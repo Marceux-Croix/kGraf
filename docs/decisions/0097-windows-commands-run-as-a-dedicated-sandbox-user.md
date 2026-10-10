@@ -2058,3 +2058,69 @@ Left open, with the reason:
    off where it was made, and nothing of kGraf's left behind.
 7. Where the fallback is the active path, the same proof through it, and the risk line in
    setup, status, selfcheck and the report.
+
+## Amendment (2026-10-10): a session-0 launch names the runner the service was installed with
+
+A Windows self-test (Windows Server 2025 Datacenter 24H2, build 26100.33438) proved the
+launcher service: setup installed it, status read it as "installed, running", and setup's
+probe through it reported "a sandbox user made a named semaphore and an unprefixed named mutex
+through this path". The process that ran kGraf was in session 2, so the proof is not the
+session-0 shortcut that item 1 above warns about. The same run found three defects. The fixes
+below stand on code reading, Microsoft's documentation and host and cross-compiled checks;
+each bullet says what a Windows run must show.
+
+- **The owner's side named a runner the service does not start.** Most sandbox user tests
+  could not start any command: "sandbox setup failed at check where kGraf's launcher service
+  starts its program from: ...\tests\kgraf-sandbox-runner.exe is owned by S-1-5-21-...-500,
+  which is not SYSTEM, the Administrators group or TrustedInstaller". Two faults met. The
+  owner's side took the runner beside the calling program (`windows::state::find_runner`),
+  so a test binary in `tests\` named the copy the self-test puts there, while the service
+  compares every request against the runner in its image path, recorded at setup
+  (`programs\kgraf-sandbox-runner.exe`), and refuses any other. And that copy was made after
+  the self-test set the folder's owner, so the trust check refused it first. The fix is in
+  the design, not in the test: on the session-0 path the owner's side now reads the
+  service's image path with the query right the install gives it (`QueryServiceConfigW`,
+  `windows::service::installed_image`), splits it as the service's own argument parser does
+  (`service_dacl::split_command_line`, `ServiceArgs::from_image_path`), and names that
+  runner (`session0::runner_for`). The per-process trust check judges that file. The image
+  path was chosen over a line in the launch-path record because it is what the service
+  itself compares against, so the two cannot drift apart, and the owner cannot write it. A
+  service that is missing, unreadable, or set up for another owner SID or pipe refuses every
+  command with one line that names the service and says to run `kgraf sandbox setup` again.
+  There is no fallback to the runner beside the program. The owner-session path keeps the
+  runner beside the program, which it starts itself. The self-test's copy now serves that
+  path alone, so its owner is left as it is: the session-0 path no longer names it, and the
+  owner-session path does not run the trust check. Host tests:
+  `a_session0_launch_names_the_installed_runner_and_never_the_one_beside`,
+  `an_owner_session_launch_names_the_runner_beside_the_program`,
+  `a_missing_or_foreign_service_is_refused_with_what_to_run`,
+  `an_image_path_splits_back_into_its_program_and_arguments`,
+  `a_command_line_splits_as_the_rust_standard_library_splits_it`,
+  `the_installed_image_path_reads_back_as_the_service_arguments`.
+- **Two pipe tests expected a right the pipe's list withholds by design.**
+  `the_pipes_access_list_is_accepted_by_windows` and
+  `the_creation_attributes_bound_inheritance_and_join_the_job` failed with "create the
+  launcher pipe (CreateNamedPipeW)" code 5. The cause is not a name collision (each test's
+  name holds its process ID and a prefix of its own, and the live service's name is
+  `kgraf-launcher-<hash>`). Windows asks for `FILE_CREATE_PIPE_INSTANCE` on an existing pipe
+  before it makes another instance, and the list grants that right to SYSTEM alone, so a
+  program running as the owner cannot add an instance and answer in the service's place. The
+  tests run as the owner and asked for a second instance. The real service runs as SYSTEM
+  and is not affected: the same run's selfcheck asked it three times, each on a new
+  instance, with none failed. The first test now asserts the refusal (code 5) for the owner,
+  the refusal of a second first instance, and that a list granting the owner every right
+  does make the second instance; the second test takes the first instance of three pipes.
+- **A refused launch said its frame twice.** The trust-check refusal carried the install's
+  whole error inside the launch's: "sandbox setup failed at" twice, "refusing to run
+  unconfined" twice, and words about refusing an install. The check now gives its bare
+  reason and a launch states it once with the same advice
+  (`trusted_path::launch_refusal_message`); the users' load keeps its reason alone
+  (`SandboxError::reason_within`). No fallback was added: a refused session-0 launch fails
+  loud, which is the degradation this boundary allows. Host tests
+  `a_refused_launch_says_what_to_do_on_one_line` and
+  `a_carried_error_says_its_frame_and_refusal_once`.
+
+What a Windows run must show: item 10 of the named-objects list in `docs/WINDOWS-TESTING.md`.
+The sandbox user re-run of the shell, startup, escape, runner, stdio and contract tests no
+longer fails on the trust check; the two pipe tests pass; and a refused launch, where one
+happens, is one line that says what to run.
