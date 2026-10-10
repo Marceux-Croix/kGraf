@@ -10,10 +10,20 @@
 //! (pipes, events, sections, processes) grant that SID, so a command that
 //! kept it could open them. The
 //! runner starts the command with a restricted copy of its own token in which
-//! the logon SID is deny-only, checks that it is, and adds no restricting SIDs:
-//! restricting SIDs are what make Schannel TLS and the MSYS2 runtime fail in
-//! the token sandbox (decision 0011). All privileges but
+//! the logon SID is deny-only, checks that it is, and adds no restricting
+//! SIDs: restricting SIDs are what make Schannel TLS and the MSYS2 runtime
+//! fail in the token sandbox (decision 0011). All privileges but
 //! `SeChangeNotifyPrivilege` are removed (`DISABLE_MAX_PRIVILEGE`).
+//!
+//! That is what `--logon-sid deny` asks for, the default and what the owner's
+//! own session needs. Where a launcher service started the runner in session
+//! 0 the option is `keep`, and the runner checks that the SID is still
+//! enabled instead: that token comes from `LogonUser` for the sandbox user
+//! alone, so its logon SID names a logon session nothing else shares, nothing
+//! of the owner's admits it, and the object directory of session 0 is reached
+//! through it ([`command_token`]). Either way the token is checked against
+//! what was asked for, so a token that is not what the path needs starts no
+//! command.
 //!
 //! **Window station.** A program that loads `user32.dll` stops at start with
 //! STATUS_DLL_INIT_FAILED unless it can open its window station and desktop.
@@ -116,7 +126,8 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::WindowsAndMessaging::WINSTA_ENUMDESKTOPS;
 
 use super::super::acl;
-use super::super::runner::{Reply, Request, RunnerArgs};
+use super::super::runner::{LogonSidPolicy, Reply, Request, RunnerArgs};
+use super::super::service_args;
 use crate::sandbox::AttributeList;
 
 /// Exit codes for a runner that cannot report over its pipe; defined beside
@@ -173,7 +184,7 @@ pub fn main() -> i32 {
     // Before anything else, and before the command exists: the runner's own
     // objects admit the sandbox user to no more than waiting and reading
     // basic information (`protect_self`).
-    let protected = protect_self();
+    let protected = protect_self(args.logon_sid);
     let Ok(mut pipe) = connect(&args) else {
         return if protected.is_err() {
             EXIT_SELF_PROTECT
@@ -325,10 +336,25 @@ fn is_logon(g: &SID_AND_ATTRIBUTES) -> bool {
     g.Attributes & (SE_GROUP_LOGON_ID as u32) == SE_GROUP_LOGON_ID as u32
 }
 
-/// A restricted copy of the runner's token `own`: the logon SID deny-only, no
-/// privileges but `SeChangeNotifyPrivilege`, no restricting SIDs, and a
-/// default DACL that grants the sandbox user and SYSTEM only.
-fn command_token(own: &OwnedHandle) -> Result<OwnedHandle, Failure> {
+/// A restricted copy of the runner's token `own`: the logon SID as `policy`
+/// asks, no privileges but `SeChangeNotifyPrivilege`, no restricting SIDs,
+/// and a default DACL that grants the sandbox user and SYSTEM only.
+///
+/// The two launch paths need opposite answers for the logon SID, and the
+/// token the runner built is checked against the one that was asked for
+/// either way ([`check_logon_sid`]).
+///
+/// - [`LogonSidPolicy::Deny`], the owner's own session: the runner's token
+///   carries the **caller's** logon SID, because that is what
+///   `CreateProcessWithLogonW` gives its child, and the objects the owner's
+///   processes make admit it. So every logon SID in the command's token is
+///   made deny-only.
+/// - [`LogonSidPolicy::Keep`], a command the launcher service started in
+///   session 0: the token comes from `LogonUser` for the sandbox user alone,
+///   so its logon SID names a logon session nothing else shares, nothing of
+///   the owner's admits it, and the object directory of session 0 is reached
+///   through it, which is the point of that path.
+fn command_token(own: &OwnedHandle, policy: LogonSidPolicy) -> Result<OwnedHandle, Failure> {
     let buf = token_info(own, TokenGroups, "read the runner's groups")?;
     let logon: Vec<SID_AND_ATTRIBUTES> = groups(&buf)
         .iter()
@@ -344,14 +370,21 @@ fn command_token(own: &OwnedHandle) -> Result<OwnedHandle, Failure> {
             "the runner's token has no logon SID",
         ));
     }
+    // With `Keep` no SID is made deny-only, and the call is still needed for
+    // `DISABLE_MAX_PRIVILEGE`: the command keeps no privilege but
+    // `SeChangeNotifyPrivilege` on either path.
+    let (deny_count, deny_sids) = match policy {
+        LogonSidPolicy::Deny => (logon.len() as u32, logon.as_ptr()),
+        LogonSidPolicy::Keep => (0, ptr::null()),
+    };
     let mut restricted: HANDLE = ptr::null_mut();
     // SAFETY: the SID pointers refer into `buf`, alive across the call.
     if unsafe {
         CreateRestrictedToken(
             own.as_raw_handle(),
             DISABLE_MAX_PRIVILEGE,
-            logon.len() as u32,
-            logon.as_ptr(),
+            deny_count,
+            deny_sids,
             0,
             ptr::null(),
             0,
@@ -360,36 +393,31 @@ fn command_token(own: &OwnedHandle) -> Result<OwnedHandle, Failure> {
         )
     } == 0
     {
-        return Err(Failure::last("make the logon SID deny-only"));
+        return Err(Failure::last("build the command's token"));
     }
     // SAFETY: a fresh handle this code now owns.
     let token = unsafe { OwnedHandle::from_raw_handle(restricted) };
-    check_logon_deny_only(&token)?;
+    check_logon_sid(&token, policy)?;
     let user = token_user_sid(&token)?;
     set_default_dacl(&token, &user)?;
     Ok(token)
 }
 
-/// Fails unless every logon SID in `token` is deny-only. The command must not
-/// start with access the design says it lacks (fail loud).
-fn check_logon_deny_only(token: &OwnedHandle) -> Result<(), Failure> {
+/// Fails unless the logon SIDs in `token` are what `policy` asked for. The
+/// command must never start with access the design says it lacks, and never
+/// without access the design says it has (fail loud either way). The rule
+/// itself is [`service_args::logon_sid_check`], which is tested on every
+/// host; this reads the attributes Windows wrote.
+fn check_logon_sid(token: &OwnedHandle, policy: LogonSidPolicy) -> Result<(), Failure> {
     let buf = token_info(token, TokenGroups, "read the command token's groups")?;
     let deny = SE_GROUP_USE_FOR_DENY_ONLY as u32;
-    let mut logon = groups(&buf).iter().filter(|g| is_logon(g)).peekable();
-    if logon.peek().is_none() {
-        return Err(Failure::other(
-            "check the command token",
-            "the command token lost its logon SID instead of making it deny-only",
-        ));
-    }
-    if logon.all(|g| g.Attributes & deny == deny) {
-        Ok(())
-    } else {
-        Err(Failure::other(
-            "check the command token",
-            "the logon SID is still enabled in the command token",
-        ))
-    }
+    let deny_only: Vec<bool> = groups(&buf)
+        .iter()
+        .filter(|g| is_logon(g))
+        .map(|g| g.Attributes & deny == deny)
+        .collect();
+    service_args::logon_sid_check(policy, &deny_only)
+        .map_err(|why| Failure::other("check the command token", why))
 }
 
 /// The token user's SID as a string (`S-1-5-21-...`).
@@ -584,7 +612,7 @@ const TOKEN_FORBIDDEN: u32 = TOKEN_ASSIGN_PRIMARY
 ///
 /// Called before the pipe is opened, so the window in which the lists are the
 /// defaults ends before the command exists.
-fn protect_self() -> Result<OwnedHandle, Failure> {
+fn protect_self(policy: LogonSidPolicy) -> Result<OwnedHandle, Failure> {
     let mut raw: HANDLE = ptr::null_mut();
     // SAFETY: opens this process's own token.
     if unsafe {
@@ -605,7 +633,7 @@ fn protect_self() -> Result<OwnedHandle, Failure> {
     // SAFETY: a fresh handle this code now owns.
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
     let user = token_user_sid(&token)?;
-    let command = command_token(&token)?;
+    let command = command_token(&token, policy)?;
     set_runner_default_dacl(&token, &user)?;
     // SAFETY: a pseudo-handle that needs no close and carries full access to
     // this process.
@@ -837,7 +865,18 @@ const _: () =
 /// makes none. Without the check, a station the command cannot open would
 /// show only as the command's own exit code `STATUS_DLL_INIT_FAILED`; with
 /// it, the failure names the call and the Win32 error.
+///
+/// An empty field means "the window station Windows made for this logon
+/// session": on the session-0 path the launcher service started the runner
+/// with an empty `lpDesktop`, so Windows formed a station name from the logon
+/// session's ID and made that station and its default desktop. The command
+/// then starts on the runner's own station, which no other logon session
+/// shares, and nothing is opened or checked here. The return is empty, and
+/// [`spawn`] passes null.
 fn command_desktop(request: &Request) -> Result<Vec<u16>, Failure> {
+    if request.desktop.is_empty() {
+        return Ok(Vec::new());
+    }
     let slash = u16::from(b'\\');
     let station: Vec<u16> = request
         .desktop
@@ -885,7 +924,9 @@ fn std_handles() -> Result<[HANDLE; 3], Failure> {
 }
 
 /// Start `request` with `token` on `desktop` (NUL-terminated, from
-/// [`command_desktop`]), in the runner's job.
+/// [`command_desktop`]), in the runner's job. An empty `desktop` passes null,
+/// so the command gets this runner's own window station and desktop, the one
+/// Windows made for the runner's logon session.
 fn spawn(
     request: &Request,
     token: &OwnedHandle,
@@ -910,7 +951,11 @@ fn spawn(
     // SAFETY: zeroed is a valid initial STARTUPINFOEXW.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.lpDesktop = desktop.as_ptr().cast_mut();
+    si.StartupInfo.lpDesktop = if desktop.is_empty() {
+        ptr::null_mut()
+    } else {
+        desktop.as_ptr().cast_mut()
+    };
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = std[0];
     si.StartupInfo.hStdOutput = std[1];

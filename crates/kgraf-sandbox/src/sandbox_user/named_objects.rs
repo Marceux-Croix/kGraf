@@ -32,14 +32,20 @@
 //! a jobserver in any namespace cannot save a build that prints a
 //! diagnostic: rustc then aborts with status 0xC0000409.
 //!
-//! **What kGraf does.** It cannot make the session's directory admit the
-//! command without giving the command the logon SID, which would admit it to
-//! the owner's processes, or without changing the access list of a system
-//! object of every session. So it says so: [`note_for`] reads a failed
-//! command's output, and where the output shows one of these failures, the
-//! caller adds [`NOTE`] to it. The self-test measures each part of the cause
+//! **What kGraf does.** In the owner's session it cannot make the directory
+//! admit the command without giving the command the logon SID, which would
+//! admit it to the owner's processes, or without changing the access list of
+//! a system object of every session. A command started in session 0 through
+//! kGraf's launcher service does not meet the problem
+//! ([`super::session0::LaunchPath`]). So the note is for a machine whose
+//! active launch path cannot make the objects: [`note_for`] reads a failed
+//! command's output, and where the output shows one of these failures and the
+//! caller says cargo is not expected to run, the caller adds [`NOTE`] to it.
+//! Where the active path works, the note is not added: the failure then has
+//! another cause, and the note would name the wrong one. The self-test
+//! measures each part of the cause
 //! (`the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` in
-//! `tests/escape_windows.rs`), so a later fix can be judged on evidence.
+//! `tests/escape_windows.rs`), so a fix can be judged on evidence.
 //!
 //! Platform-neutral: the markers are matched on every host. They are texts
 //! Windows builds of rustc, cargo and the `jobserver` crate print.
@@ -80,6 +86,14 @@ const JOBSERVER_OPEN_MARKER: &str = "failed to connect to jobserver from environ
 /// (`Os { code: 5, kind: PermissionDenied, ... }`).
 const ACCESS_DENIED_MARKERS: [&str; 2] = ["Access is denied", "kind: PermissionDenied"];
 
+/// Whether `output` shows Windows refusing access, by the texts a Windows
+/// build prints for ERROR_ACCESS_DENIED. The markers stay private, so one
+/// list of texts serves both [`cause`] and a caller that must tell a refused
+/// named object from a probe that could not run at all.
+pub fn denied(output: &str) -> bool {
+    ACCESS_DENIED_MARKERS.iter().any(|m| output.contains(m))
+}
+
 /// The failure `output` shows, if any. A jobserver failure counts only with
 /// Windows' access-denied text beside it: on other hosts and for other
 /// errors the same words mean something else. The diagnostic lock is made
@@ -90,8 +104,7 @@ pub fn cause(output: &str) -> Option<Cause> {
     if output.contains(DIAGNOSTIC_LOCK_MARKER) {
         return Some(Cause::DiagnosticLock);
     }
-    let denied = ACCESS_DENIED_MARKERS.iter().any(|m| output.contains(m));
-    if !denied {
+    if !denied(output) {
         return None;
     }
     if output.contains(JOBSERVER_CREATE_MARKER) {
@@ -104,21 +117,35 @@ pub fn cause(output: &str) -> Option<Cause> {
 }
 
 /// The note added to a failed command's output whose failure is one of
-/// [`Cause`]. It names the cause and says that the program itself did not
-/// fail. No prefix: each caller adds its own (`[sandbox] `).
+/// [`Cause`], where the active launch path cannot make the named objects. It
+/// names the cause, names the two launch paths and what makes the objects
+/// work, and says that the program itself did not fail. No prefix: each
+/// caller adds its own (`[sandbox] `).
 pub const NOTE: &str = "the program stopped because it could not make or open a named kernel \
      object (a mutex or a semaphore) in the Windows session. cargo and rustc need one: cargo \
      for its jobserver, rustc for its jobserver and for the lock it takes to print any warning \
-     or error. A sandboxed command cannot open the session's object directory: Windows admits \
-     the session's logon SID there, the Windows sandbox user's command holds that SID \
-     deny-only so that it cannot open the owner's own processes and objects, and the token \
-     sandbox's restricted token is refused there too (decision 0097). The program did not \
-     fail on its own; it cannot run in the Windows sandbox on this machine. A smaller job \
-     count (-j1) does not help: cargo makes a jobserver for any job count.";
+     or error. The launch path that is active on this machine cannot make those objects. A \
+     command started in the owner's session cannot open the session's object directory: \
+     Windows admits the session's logon SID there, and the sandbox user's command holds that \
+     SID deny-only so that it cannot open the owner's own processes and objects (decision \
+     0097). A command started in session 0, through kGraf's launcher service, can make them, \
+     because an unprefixed name there is in the machine-wide directory. `kgraf sandbox setup` \
+     installs the launcher service. `kgraf sandbox status` says which path is active. The \
+     program did not fail on its own. A smaller job count (-j1) does not help: cargo makes a \
+     jobserver for any job count.";
 
 /// The note for a failed command's `output`, with what it showed, or `None`
-/// when the output shows no named-object failure.
-pub fn note_for(output: &str) -> Option<String> {
+/// when the output shows no named-object failure, or when `cargo_runs` says
+/// the active launch path makes named objects work.
+///
+/// `cargo_runs` is [`super::session0::Active::cargo_runs`]. It is a plain
+/// `bool` because the callers (the shell tool and the check runner) only
+/// decide whether to add a line. They have no use for the path, the grant or
+/// the proof, and a `bool` keeps those types out of their signatures.
+pub fn note_for(output: &str, cargo_runs: bool) -> Option<String> {
+    if cargo_runs {
+        return None;
+    }
     cause(output).map(|c| format!("{}: {NOTE}", c.seen()))
 }
 
@@ -174,16 +201,58 @@ mod tests {
              `MAKEFLAGS=\"-j --jobserver-auth=3,4\"`: cannot open file descriptor 3",
         ] {
             assert_eq!(cause(text), None, "{text}");
-            assert_eq!(note_for(text), None, "{text}");
+            assert_eq!(note_for(text, false), None, "{text}");
         }
     }
 
     #[test]
     fn the_note_says_what_was_seen_and_why_it_cannot_run() {
-        let note = note_for(RUSTC_LOCK).expect("a note");
+        let note = note_for(RUSTC_LOCK, false).expect("a note");
         assert!(note.starts_with(Cause::DiagnosticLock.seen()), "{note}");
         for part in ["logon SID", "deny-only", "did not fail on its own", "-j1"] {
             assert!(note.contains(part), "{part}: {note}");
+        }
+    }
+
+    /// A Windows access denial counts in both of its texts, the `Display` and
+    /// the `Debug` of an `io::Error`; another failure and no text do not.
+    #[test]
+    fn a_windows_access_denial_is_denied_in_both_texts_and_other_failures_are_not() {
+        assert!(denied("Access is denied. (os error 5)"));
+        assert!(denied(
+            "Os { code: 5, kind: PermissionDenied, message: \"Access is denied.\" }"
+        ));
+        assert!(denied("Os { code: 5, kind: PermissionDenied }"));
+        assert!(!denied("No such file or directory (os error 2)"));
+        assert!(!denied(""));
+    }
+
+    /// The note names the active path as the cause and says how to change it.
+    #[test]
+    fn the_note_names_both_launch_paths_and_the_commands_that_fix_it() {
+        let note = note_for(RUSTC_LOCK, false).expect("a note");
+        for part in [
+            "launch path that is active on this machine",
+            "owner's session",
+            "session 0",
+            "kgraf sandbox setup",
+            "kgraf sandbox status",
+        ] {
+            assert!(note.contains(part), "{part}: {note}");
+        }
+        assert!(
+            !note.contains("cannot run in the Windows sandbox"),
+            "{note}"
+        );
+    }
+
+    /// Where the active path makes named objects work, a failure with these
+    /// markers has another cause, so no note is added.
+    #[test]
+    fn no_note_is_added_where_the_active_path_makes_named_objects_work() {
+        for text in [RUSTC_LOCK, CARGO_OPEN, RUSTC_CREATE] {
+            assert!(note_for(text, false).is_some(), "{text}");
+            assert_eq!(note_for(text, true), None, "{text}");
         }
     }
 }

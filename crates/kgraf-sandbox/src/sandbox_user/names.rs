@@ -220,6 +220,38 @@ impl OwnerNames {
         format!("kgraf-sandbox-{}", self.hash)
     }
 
+    /// kGraf's launcher service, which starts a sandboxed command in session
+    /// 0 so it can make the named kernel objects cargo and rustc need
+    /// (`super::session0`). One service per owner and tag, so two accounts of
+    /// one machine never share one.
+    pub fn service(&self) -> String {
+        format!("kgraf-launcher-{}", self.hash)
+    }
+
+    /// What the service control manager shows for the service.
+    pub fn service_display(&self) -> String {
+        format!("kGraf sandbox launcher ({})", self.hash)
+    }
+
+    /// The service's own comment, as the record and status read it: whose it
+    /// is.
+    pub fn service_comment(&self) -> String {
+        format!("kGraf sandbox launcher for {}", self.owner_sid)
+    }
+
+    /// Whether an installed service's description says kGraf made it for this
+    /// owner. A service with the right name and another description is not
+    /// ours: setup refuses it rather than take it over.
+    pub fn owns_service_comment(&self, description: &str) -> bool {
+        description == self.service_comment()
+    }
+
+    /// The name of the pipe the owner's process asks the service on, without
+    /// the `\\.\pipe\` prefix the Windows call takes.
+    pub fn service_pipe(&self) -> String {
+        format!("kgraf-launcher-{}", self.hash)
+    }
+
     pub fn rule(&self, purpose: RulePurpose) -> String {
         format!("kgraf-sandbox-{}-{}", self.hash, purpose.key())
     }
@@ -332,6 +364,29 @@ mod tests {
         assert_eq!(a.user(Role::Offline), format!("kgraf-off-{}", a.hash));
         assert_eq!(a.hash.len(), 8);
         assert_eq!(a.hash, format!("{:08x}", fnv1a64(SID.as_bytes()) as u32));
+    }
+
+    /// The launcher service and its pipe are named for one owner and tag, so
+    /// two accounts of one machine never share a service or a pipe, and the
+    /// description says whose it is.
+    #[test]
+    fn the_launcher_service_and_pipe_are_named_for_the_owner() {
+        let a = OwnerNames::derive(SID, None).unwrap();
+        assert_eq!(a.service(), format!("kgraf-launcher-{}", a.hash));
+        assert_eq!(a.service_pipe(), format!("kgraf-launcher-{}", a.hash));
+        // A service name may hold no slash or backslash, and the service
+        // control manager keeps it under 256 characters.
+        assert!(!a.service().contains(['/', '\\']), "{}", a.service());
+        assert!(a.service().len() < 256);
+        let tagged = OwnerNames::derive(SID, Some("wintest")).unwrap();
+        assert_ne!(a.service(), tagged.service());
+        assert_ne!(a.service_pipe(), tagged.service_pipe());
+        assert!(a.owns_service_comment(&a.service_comment()));
+        assert!(!a.owns_service_comment("a service somebody else installed"));
+        let other = OwnerNames::derive("S-1-5-21-1-2-3-1002", None).unwrap();
+        assert!(!a.owns_service_comment(&other.service_comment()));
+        assert!(a.service_comment().contains(SID));
+        assert!(a.service_display().contains(&a.hash));
     }
 
     #[test]

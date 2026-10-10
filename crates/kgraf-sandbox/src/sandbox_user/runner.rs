@@ -210,6 +210,15 @@ fn desktop_name(units: &[u16]) -> Result<(), RunnerError> {
     if units.len() > MAX_DESKTOP_UNITS {
         return Err(RunnerError::TooLong(WHAT));
     }
+    // Empty: the window station Windows made for the runner's own logon
+    // session, which is what the session-0 path uses. The owner's process
+    // cannot make a window station in another session, and Windows makes one
+    // for a noninteractive logon session and names it from that session's ID.
+    // The command then runs on the runner's station, which is the same
+    // sandbox user in the same logon session.
+    if units.is_empty() {
+        return Ok(());
+    }
     let slash = u16::from(b'\\');
     let mut parts = units.split(|&u| u == slash);
     match (parts.next(), parts.next(), parts.next()) {
@@ -258,6 +267,50 @@ pub struct RunnerArgs {
     pub pipe: String,
     /// The process that created the pipe and started the runner.
     pub owner_pid: u32,
+    /// What the runner does with the logon SID in its own token.
+    pub logon_sid: LogonSidPolicy,
+}
+
+/// What the runner does with the logon SID in its own token before it starts
+/// the command. The two launch paths need opposite answers, so the owner's
+/// side says which, and the runner checks that the token it built matches
+/// what was asked (fail loud either way).
+///
+/// - [`LogonSidPolicy::Deny`], for a command in the owner's own session:
+///   `CreateProcessWithLogonW` gives the runner the **caller's** logon SID,
+///   which admits it to the objects the owner's processes make, so the
+///   command's token must hold that SID deny-only.
+/// - [`LogonSidPolicy::Keep`], for a command the launcher service starts in
+///   session 0: the token comes from `LogonUser` for the sandbox user alone,
+///   so its logon SID names a logon session of that user that nothing else
+///   shares. Nothing of the owner's admits it, and the object directory of
+///   session 0 is reached through it, which is the point of that path
+///   (`super::session0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogonSidPolicy {
+    /// Make every logon SID in the command's token deny-only. The default:
+    /// a missing or unreadable option must never leave the SID enabled.
+    #[default]
+    Deny,
+    /// Leave the logon SID enabled.
+    Keep,
+}
+
+impl LogonSidPolicy {
+    pub fn key(self) -> &'static str {
+        match self {
+            LogonSidPolicy::Deny => "deny",
+            LogonSidPolicy::Keep => "keep",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "deny" => Some(LogonSidPolicy::Deny),
+            "keep" => Some(LogonSidPolicy::Keep),
+            _ => None,
+        }
+    }
 }
 
 const PIPE_PREFIX: &str = r"\\.\pipe\kgraf-sandbox-run-";
@@ -269,16 +322,26 @@ impl RunnerArgs {
         Ok(Self {
             pipe: format!("{PIPE_PREFIX}{nonce}"),
             owner_pid,
+            logon_sid: LogonSidPolicy::default(),
         })
     }
 
+    /// The same arguments with `logon_sid` set.
+    #[must_use]
+    pub fn with_logon_sid(mut self, policy: LogonSidPolicy) -> Self {
+        self.logon_sid = policy;
+        self
+    }
+
     /// The arguments after the program name. None of them needs quoting.
-    pub fn to_args(&self) -> [String; 4] {
+    pub fn to_args(&self) -> [String; 6] {
         [
             "--pipe".to_owned(),
             self.pipe.clone(),
             "--owner-pid".to_owned(),
             self.owner_pid.to_string(),
+            "--logon-sid".to_owned(),
+            self.logon_sid.key().to_owned(),
         ]
     }
 
@@ -292,6 +355,7 @@ impl RunnerArgs {
         let bad = |why: &str| RunnerError::Args(why.to_owned());
         let mut pipe = None;
         let mut owner_pid = None;
+        let mut logon_sid = None;
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let value = it.next().ok_or_else(|| bad("an option has no value"))?;
@@ -315,12 +379,21 @@ impl RunnerArgs {
                     }
                     owner_pid = Some(pid);
                 }
+                "--logon-sid" if logon_sid.is_none() => {
+                    logon_sid = Some(
+                        LogonSidPolicy::from_key(value)
+                            .ok_or_else(|| bad("the logon SID policy is not understood"))?,
+                    );
+                }
                 other => return Err(bad(&format!("unexpected argument {other:?}"))),
             }
         }
         Ok(Self {
             pipe: pipe.ok_or_else(|| bad("--pipe is missing"))?,
             owner_pid: owner_pid.ok_or_else(|| bad("--owner-pid is missing"))?,
+            // A missing option means the deny-only default, which is what
+            // every launch before this option asked for.
+            logon_sid: logon_sid.unwrap_or_default(),
         })
     }
 }
@@ -623,8 +696,17 @@ mod tests {
             String::from_utf16(&back.desktop).unwrap(),
             r"kgraf-cmd-0123456789abcdef\Default"
         );
+        // Empty is the window station Windows makes for the runner's own
+        // logon session, which the session-0 path asks for.
+        let mut empty = sample();
+        empty.desktop = Vec::new();
+        assert_eq!(
+            Request::read_from(&mut empty.encode().unwrap().as_slice())
+                .unwrap()
+                .desktop,
+            Vec::<u16>::new()
+        );
         for bad in [
-            "",
             "Default",
             r"\Default",
             r"kgraf-cmd-1\",
@@ -733,9 +815,40 @@ mod tests {
             ],
             vec!["--pipe", pipe, "--owner-pid", "7", "--extra", "1"],
             vec!["--pipe", pipe, "--owner-pid"],
+            vec!["--pipe", pipe, "--owner-pid", "7", "--logon-sid", "maybe"],
+            vec![
+                "--pipe",
+                pipe,
+                "--owner-pid",
+                "7",
+                "--logon-sid",
+                "keep",
+                "--logon-sid",
+                "deny",
+            ],
         ] {
             assert!(RunnerArgs::parse(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// The owner's side says what the runner does with the logon SID, and a
+    /// command line that does not say asks for the deny-only default: a
+    /// launch that loses the option must never leave the SID enabled.
+    #[test]
+    fn the_logon_sid_policy_travels_and_defaults_to_deny_only() {
+        let args = RunnerArgs::fresh(7).unwrap();
+        assert_eq!(args.logon_sid, LogonSidPolicy::Deny);
+        for policy in [LogonSidPolicy::Deny, LogonSidPolicy::Keep] {
+            let asked = args.clone().with_logon_sid(policy);
+            assert_eq!(RunnerArgs::parse(asked.to_args()).unwrap(), asked);
+            assert_eq!(LogonSidPolicy::from_key(policy.key()), Some(policy));
+        }
+        let without = ["--pipe", args.pipe.as_str(), "--owner-pid", "7"];
+        assert_eq!(
+            RunnerArgs::parse(without).unwrap().logon_sid,
+            LogonSidPolicy::Deny
+        );
+        assert_eq!(LogonSidPolicy::from_key("Keep"), None);
     }
 
     #[test]

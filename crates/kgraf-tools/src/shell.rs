@@ -266,6 +266,11 @@ pub struct ShellTool {
     /// Set once a result carried the open-network notice: it is said in the
     /// first result of this tool, and the description says it always.
     network_notice_said: std::sync::atomic::AtomicBool,
+    /// Whether the active launch path makes the named objects cargo and rustc
+    /// need (`Active::cargo_runs`). Where it does, a failure that shows a
+    /// named-object marker has another cause and gets no sandbox note. False
+    /// until the host says otherwise: unknown keeps the note.
+    cargo_runs: bool,
     /// The worker slot of this tool's folder (decision 0097), taken at its
     /// first command and held while the tool works in that folder. Where
     /// commands run as a Windows sandbox user, it keeps the worker's user
@@ -300,6 +305,9 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
+            // The launch path this machine proved decides it; a caller
+            // may still set it ([`Self::with_cargo_runs`]).
+            cargo_runs: kgraf_sandbox::sandbox_user::cargo_runs(),
             worker_slot: kgraf_sandbox::WorkerSlotHolder::new(),
         };
         (tool, ShellApprovalHook::new(policy))
@@ -328,6 +336,9 @@ impl ShellTool {
             protected: None,
             network: CheckNetwork::current(),
             network_notice_said: std::sync::atomic::AtomicBool::new(false),
+            // The launch path this machine proved decides it; a caller
+            // may still set it ([`Self::with_cargo_runs`]).
+            cargo_runs: kgraf_sandbox::sandbox_user::cargo_runs(),
             worker_slot: kgraf_sandbox::WorkerSlotHolder::new(),
         }
     }
@@ -477,6 +488,15 @@ impl ShellTool {
     /// to stand in for the Windows backend.
     pub fn with_network_decision(mut self, network: CheckNetwork) -> Self {
         self.network = network;
+        self
+    }
+
+    /// Say whether the active launch path makes the named objects cargo and
+    /// rustc need (`kgraf_sandbox::sandbox_user::session0::Active::cargo_runs`).
+    /// Where it does, a failed command gets no named-object note: the failure
+    /// has another cause. The default is `false`, which keeps the note.
+    pub fn with_cargo_runs(mut self, cargo_runs: bool) -> Self {
+        self.cargo_runs = cargo_runs;
         self
     }
 
@@ -1465,6 +1485,7 @@ impl Tool for ShellTool {
             &notes,
             limit,
             self.output_cap,
+            self.cargo_runs,
         )
         .await;
         let output = match output {
@@ -2074,6 +2095,7 @@ fn sandbox_policy_on(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn run_sandboxed(
     cmd: &[String],
     ctx: &ToolContext,
@@ -2082,6 +2104,7 @@ async fn run_sandboxed(
     notes: &[String],
     limit: &TimeLimit,
     output_cap: usize,
+    cargo_runs: bool,
 ) -> Result<ToolOutput, ToolError> {
     let timeout = limit.timeout;
     let mut sandboxed = sandboxed_command(policy, &cmd[0], &ctx.workspace_root)
@@ -2205,7 +2228,7 @@ async fn run_sandboxed(
             let (stderr_bytes, stderr_trunc) =
                 drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
             let status = status.map_err(|e| internal(format!("wait failed: {e}")))?;
-            let named = named_object_note(&stdout_bytes, &stderr_bytes);
+            let named = named_object_note(&stdout_bytes, &stderr_bytes, cargo_runs);
             let mut output = render_output(
                 status.success(),
                 status.code(),
@@ -2535,6 +2558,7 @@ fn time_limit_sentence(unlisted: Duration, max: Duration, build_listed: bool) ->
 /// it), and closing the job's handle does the same if this future is
 /// dropped.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn run_sandboxed(
     cmd: &[String],
     ctx: &ToolContext,
@@ -2543,6 +2567,7 @@ async fn run_sandboxed(
     notes: &[String],
     limit: &TimeLimit,
     output_cap: usize,
+    cargo_runs: bool,
 ) -> Result<ToolOutput, ToolError> {
     use kgraf_sandbox::Redirect;
     let timeout = limit.timeout;
@@ -2635,7 +2660,7 @@ async fn run_sandboxed(
                 drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
             let (stderr_bytes, stderr_trunc) =
                 drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
-            let named = named_object_note(&stdout_bytes, &stderr_bytes);
+            let named = named_object_note(&stdout_bytes, &stderr_bytes, cargo_runs);
             let mut output = render_output(
                 status.success(),
                 status.code(),
@@ -2674,6 +2699,7 @@ async fn run_sandboxed(
 }
 
 #[cfg(not(any(unix, windows)))]
+#[allow(clippy::too_many_arguments)]
 async fn run_sandboxed(
     _cmd: &[String],
     _ctx: &ToolContext,
@@ -2682,6 +2708,7 @@ async fn run_sandboxed(
     _notes: &[String],
     _limit: &TimeLimit,
     _output_cap: usize,
+    _cargo_runs: bool,
 ) -> Result<ToolOutput, ToolError> {
     Err(internal(
         "sandboxed shell execution is implemented for macOS, Linux and Windows only",
@@ -2926,13 +2953,13 @@ async fn drain_with_cap(
 /// (`kgraf_sandbox::sandbox_user::named_objects`). Read before the output is
 /// cut to the cap, so a marker in the cut part still counts.
 #[cfg(any(unix, windows))]
-fn named_object_note(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+fn named_object_note(stdout: &[u8], stderr: &[u8], cargo_runs: bool) -> Option<String> {
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(stderr),
         String::from_utf8_lossy(stdout)
     );
-    kgraf_sandbox::sandbox_user::named_objects::note_for(&text)
+    kgraf_sandbox::sandbox_user::named_objects::note_for(&text, cargo_runs)
 }
 
 /// Add the sandbox's lines to a failed command's output: the reads it
@@ -3323,6 +3350,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let c = ctx(dir.path().to_path_buf());
         let (tool, _hook) = ShellTool::new(policy());
+        // The note is for a machine whose launch path cannot make the named
+        // objects a build needs, so the tool is told so here: the default
+        // follows the machine this test runs on.
+        let tool = tool.with_cargo_runs(false);
         let marker = "failed to create global mutex named `rustc_errors`";
         let run = |script: String| {
             let tool = &tool;
@@ -3356,6 +3387,23 @@ mod tests {
         assert!(!passed.is_error);
         let passed = passed.render();
         assert!(!passed.contains(&line), "{passed}");
+
+        // Where the active launch path makes named objects work, the same
+        // failure has another cause and gets no note.
+        let (working, _hook) = ShellTool::new(policy());
+        let working = working.with_cargo_runs(true);
+        let failed = working
+            .call(
+                json!({"command": ["/bin/sh", "-c", format!("echo '{marker}' >&2; exit 101")]}),
+                &c,
+                &CallPermit::new(),
+            )
+            .await
+            .expect("call");
+        assert!(failed.is_error);
+        let text = failed.render();
+        assert!(!text.contains(&line), "{text}");
+        assert!(!text.contains("did not fail on its own"), "{text}");
     }
 
     /// Decision 0011, amended 2026-10-07: where the backend cannot deny the

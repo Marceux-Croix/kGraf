@@ -21,6 +21,8 @@
 //! closed S-1-5-21-...-1003 0xd0156 0x0 C:\ProgramData
 //! wfp-provider 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b
 //! dns-refused wfp-filter-name-cache-v4 WFP error 0x80320028 (FWP_E_OUT_OF_BOUNDS)
+//! service kgraf-launcher-1a2b3c4d
+//! named-objects-grant S-1-5-21-...-1003 0x3
 //! ```
 //!
 //! A `closed` line names a folder where setup denied the sandbox group the
@@ -29,6 +31,13 @@
 //! even after the group is gone and even after a later version of kGraf
 //! writes a different mask. Removal matches the mask and the flags exactly:
 //! it never takes off an entry wider than the one it wrote.
+//!
+//! A `service` line names the launcher service setup installed. A
+//! `named-objects-grant` line names the sandbox group's SID and the exact
+//! access mask of the allow entry setup wrote on the owner's session object
+//! directory. It has no path: the owner's session names the directory, and a
+//! later session has its own. Removal takes the entry off only when the
+//! directory still carries exactly that mask for exactly that SID.
 //!
 //! A `dns-refused` line is not an undo entry: it names a DNS filter that
 //! Windows did not add at the last setup, with why. Setup goes on without
@@ -80,6 +89,22 @@ pub enum UndoEntry {
     Wfp {
         object: WfpObject,
         key: u128,
+    },
+    /// The launcher service, by name. Removal matches on the name the record
+    /// holds, not on the name the running version derives, so a service an
+    /// earlier version installed is still found.
+    Service(String),
+    /// The access-allowed entry for the sandbox group (`sid`) on the owner's
+    /// session object directory, with the exact mask that was written. There
+    /// is no path: the directory is named by the session the owner is in, and
+    /// a later session has its own. The entry is gone at the owner's next
+    /// sign-out anyway, because the directory goes with the session. Removal
+    /// takes the entry off only when the directory still carries exactly this
+    /// mask for exactly this SID, so it never takes off an entry wider than
+    /// the one setup wrote, or one that is another principal's.
+    NamedObjectsGrant {
+        sid: String,
+        mask: u32,
     },
 }
 
@@ -161,6 +186,10 @@ impl Record {
                     flags,
                 } => format!("closed {sid} {mask:#x} {flags:#x} {path}"),
                 UndoEntry::Wfp { object, key } => format!("{} {}", object.key(), guid_text(*key)),
+                UndoEntry::Service(n) => format!("service {n}"),
+                UndoEntry::NamedObjectsGrant { sid, mask } => {
+                    format!("named-objects-grant {sid} {mask:#x}")
+                }
             };
             out.push_str(&line);
             out.push('\n');
@@ -230,6 +259,25 @@ impl Record {
                         mask,
                         flags,
                     });
+                }
+                "service" => entries.push(UndoEntry::Service(one_word(rest)?)),
+                "named-objects-grant" => {
+                    let (sid, mask) = rest.split_once(' ').ok_or_else(bad)?;
+                    // An empty mask would make removal match any entry of the
+                    // SID, so it is refused.
+                    let mask = mask
+                        .strip_prefix("0x")
+                        .and_then(|m| u32::from_str_radix(m, 16).ok())
+                        .filter(|m| *m != 0);
+                    match mask {
+                        Some(mask) if is_sid_string(sid) => {
+                            entries.push(UndoEntry::NamedObjectsGrant {
+                                sid: sid.to_owned(),
+                                mask,
+                            })
+                        }
+                        _ => return Err(bad()),
+                    }
                 }
                 "rights" => {
                     let (user, list) = rest.split_once(' ').ok_or_else(bad)?;
@@ -307,7 +355,34 @@ mod tests {
                 key: 0x3c0e5a71_2b9d_8f40_a1c3_5d6e7f809a10 + object as u128,
             });
         }
+        r.add(UndoEntry::Service("kgraf-launcher-1a2b3c4d".into()));
+        r.add(UndoEntry::NamedObjectsGrant {
+            sid: "S-1-5-21-1-2-3-1100".into(),
+            mask: 0x3,
+        });
         r
+    }
+
+    /// The service and the object directory grant are written as their own
+    /// lines and come back as they went in, with the mask the entry carried.
+    #[test]
+    fn a_service_and_a_named_objects_grant_round_trip_with_their_own_mask() {
+        let text = sample().to_text();
+        assert_eq!(Record::parse(&text).unwrap(), sample());
+        assert!(text.contains("service kgraf-launcher-1a2b3c4d\n"), "{text}");
+        assert!(
+            text.contains("named-objects-grant S-1-5-21-1-2-3-1100 0x3\n"),
+            "{text}"
+        );
+        // A later version may write another mask: it comes back unchanged.
+        let mut r = Record::new("S-1-5-21-1-2-3-1001", None);
+        r.add(UndoEntry::NamedObjectsGrant {
+            sid: "S-1-5-21-1-2-3-1100".into(),
+            mask: 0x000f_0003,
+        });
+        let text = r.to_text();
+        assert!(text.contains(" 0xf0003\n"), "{text}");
+        assert_eq!(Record::parse(&text).unwrap(), r);
     }
 
     #[test]
@@ -447,6 +522,16 @@ mod tests {
             "closed S-1-5-21-1-2-3-1003 0xd0156 0x10 C:\\ProgramData",
             "closed S-1-5-21-1-2-3-1003 0xd0156 0x3 C:\\ProgramData",
             "closed S-1-5-21-1-2-3-1003 0xd0156 0x100 C:\\ProgramData",
+            // A service is one word; a grant needs a SID and a hexadecimal
+            // mask that is not empty.
+            "service two words",
+            "service ",
+            "named-objects-grant S-1-5-21-1-2-3-1100",
+            "named-objects-grant not-a-sid 0x3",
+            "named-objects-grant S-1-5-21-1-2-3-1100 3",
+            "named-objects-grant S-1-5-21-1-2-3-1100 0x0",
+            "named-objects-grant S-1-5-21-1-2-3-1100 0xzz",
+            "named-objects-grant S-1-5-21-1-2-3-1100 0x3 extra",
             "wfp-filter not-a-guid",
             "wfp-filter 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b extra",
             "wfp-callout 3c0e5a71-2b9d-8f40-a1c3-5d6e7f809a1b",

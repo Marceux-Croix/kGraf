@@ -102,8 +102,23 @@ jobs:
           icacls $dest /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
           if ($LASTEXITCODE -ne 0) { throw "icacls could not set the access list of $dest" }
           Copy-Item -Recurse (Join-Path $stage '*') $dest
+          # The owner of a folder or a file may rewrite its access list
+          # whatever that list says. This folder and everything copied into
+          # it is created by the job's own account, so the owner is that
+          # account until this runs. Setup refuses to install the launcher
+          # service from a path whose owner is not SYSTEM, the Administrators
+          # group or TrustedInstaller, so the owner is set to the
+          # Administrators group here, for the folder and for every file and
+          # folder below it.
+          icacls $dest /setowner '*S-1-5-32-544' /T /C | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls could not set the owner of $dest" }
           Write-Output "access list of the copy's tests folder:"
           icacls (Join-Path $dest 'tests')
+          Write-Output "owner of the copy and of its program, which the launcher service checks:"
+          (Get-Acl $dest).Owner
+          (Get-Acl (Join-Path $dest 'kgraf.exe')).Owner
+          Write-Output "access list of the volume root, which the same check reads:"
+          icacls C:\
 
       # What the sandbox user phase needs on the machine. Each fails the job
       # loudly: a missing piece would turn a test into a skip or a failure

@@ -55,20 +55,26 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    GENERIC_ALL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_ALL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, READ_CONTROL,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, IsProcessInJob, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW, DESKTOP_CREATEMENU,
@@ -79,18 +85,23 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
-    GetCurrentProcessId, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
+    GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
     TerminateProcess,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{CWF_CREATE_ONLY, WINSTA_ALL_ACCESS};
 
+use zeroize::Zeroize;
+
 use super::super::launch_record;
 use super::super::password::Password;
 use super::super::runner::{
-    MAX_REPLY, Reply, Request, RunnerArgs, describe_runner_exit, logon_error_hint,
+    LogonSidPolicy, MAX_REPLY, Reply, Request, RunnerArgs, describe_runner_exit, logon_error_hint,
 };
+use super::super::service_args;
+use super::super::session0::{self, MAX_REPLY as MAX_LAUNCHER_REPLY, ServiceReply, ServiceRequest};
 use super::runner as runner_side;
-use super::{accounts, last_error, pipe, wide, wide_secret};
+use super::{accounts, from_wide, last_error, pipe, service, wide, wide_secret};
 use crate::error::SandboxError;
 use crate::sandbox::InheritWindow;
 use crate::win_command_line::command_line;
@@ -153,6 +164,382 @@ fn failed(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
         step,
         source: std::io::Error::other(why.to_string()),
     }
+}
+
+/// How long the owner waits for kGraf's launcher service to be running
+/// before a command is refused. The service is demand start, so the first
+/// command of a session pays for its start.
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The SID of the LocalSystem account, which kGraf's launcher service runs
+/// as. The owner checks it on the server of the launcher pipe, so a program
+/// that owns the pipe name before the service does cannot take a request,
+/// and with it a sandbox user's password.
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+/// Start the runner through kGraf's launcher service, in session 0.
+///
+/// The service starts nothing but the runner, as the sandbox user, with the
+/// standard handles and the job of this process; the runner then builds the
+/// command's token and speaks to this process over the runner pipe, as it
+/// does on the owner-session path. Two things differ:
+///
+/// - **The logon SID stays enabled** (`LogonSidPolicy::Keep`). The token the
+///   service makes comes from `LogonUser` for the sandbox user alone, so its
+///   logon SID names a logon session that nothing of the owner's admits, and
+///   the object directory of session 0 is reached through it.
+/// - **No window station is named.** The service passes an empty desktop, so
+///   Windows makes a window station and desktop for the new logon session,
+///   and the command joins the runner's, which is the same sandbox user in
+///   the same logon session. Nothing of the owner's session is named or
+///   changed.
+fn via_service(
+    user: &Credential<'_>,
+    runner_exe: &Path,
+    std: [HANDLE; 3],
+    job: &OwnedHandle,
+    mut request: Request,
+) -> Result<Started, SandboxError> {
+    let users = super::state::users()?.ok_or_else(|| {
+        failed(
+            "ask kGraf's launcher service",
+            "the sandbox users are not loaded",
+        )
+    })?;
+    // SAFETY: reads this process's ID.
+    let owner_pid = unsafe { GetCurrentProcessId() };
+    let args = RunnerArgs::fresh(owner_pid)
+        .map_err(|e| failed("name the runner pipe", e))?
+        .with_logon_sid(LogonSidPolicy::Keep);
+    let owner_sid = accounts::current_user_sid()?;
+    let server = create_pipe(&args.pipe, &owner_sid, user.sid)?;
+    // Empty: the window station Windows made for the runner's logon session.
+    request.desktop = Vec::new();
+    let frame = request
+        .encode()
+        .map_err(|e| failed("write the runner request", e))?;
+
+    // Where this program and its runner live is checked again here, once per
+    // process, and not only at the install.
+    //
+    // The service runs as the local system account and the owner may start
+    // it, so a program file a non-administrator may write is a way to run
+    // code as that account. Setup refuses to install from such a place, but
+    // a grant written later over a tree that holds this program would open
+    // the same door, and Windows reads the image at every start. So a launch
+    // asks the same question before it asks the service for anything.
+    launcher_image_is_trusted(runner_exe).inspect_err(|_| {
+        // SAFETY: a valid job handle; ends anything already in the job.
+        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+    })?;
+    // Every failure from here on ends the job, as the owner-session path
+    // does: nothing kGraf started may keep running after a launch failed.
+    let end_job = |e: SandboxError| {
+        // SAFETY: a valid job handle; ends the runner and anything it
+        // started.
+        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        e
+    };
+    service::start_if_stopped(&users.service, SERVICE_START_TIMEOUT).map_err(end_job)?;
+    let pipe_file = connect_to_launcher(&users.service_pipe).map_err(end_job)?;
+    let asked = Instant::now();
+    let reply = ask_launcher(
+        pipe_file,
+        &ServiceRequest {
+            owner_pid,
+            runner_exe: runner_exe.as_os_str().encode_wide().collect(),
+            command_line: runner_command_line(runner_exe, &args)?,
+            user_name: user.name.encode_utf16().collect(),
+            user_sid: user.sid.encode_utf16().collect(),
+            // One buffer of the exact size: a buffer that grows as it
+            // encodes leaves copies of the password in freed memory that
+            // nothing clears.
+            password: exact_wide(user.password.expose()),
+            stdin: std[0] as u64,
+            stdout: std[1] as u64,
+            stderr: std[2] as u64,
+            job: job.as_raw_handle() as u64,
+        },
+    );
+    launch_record::note_launch(session0::LaunchPath::Session0, asked.elapsed(), &reply);
+    let (runner_pid, handle, protected) = match reply.map_err(end_job)? {
+        ServiceReply::Started {
+            pid,
+            handle,
+            protected,
+        } => (pid, handle, protected),
+        ServiceReply::Failed { step, code, text } => {
+            return Err(end_job(SandboxError::PlatformSetup {
+                step: "start the runner through kGraf's launcher service",
+                source: std::io::Error::other(
+                    ServiceReply::Failed { step, code, text }.to_string(),
+                ),
+            }));
+        }
+    };
+    // SAFETY: the launcher duplicated this handle into this process and holds
+    // no copy of it, so this code now owns it.
+    let runner = unsafe { OwnedHandle::from_raw_handle(handle as HANDLE) };
+    // The runner is already in this job: the launcher put it there while it
+    // was still suspended, so a failure of that step never leaves a command
+    // outside the job.
+    handshake(
+        server, &args.pipe, runner, runner_pid, frame, job, protected,
+    )
+}
+
+/// Whether this program and the runner at `runner_exe` are still where only
+/// administrators may write, read once per process.
+///
+/// Once per process, not once per command: the answer changes only when an
+/// access list above the program changes, a walk of every folder above two
+/// paths costs several opens, and a command that starts after such a change
+/// is a command of the same process. A failure is kept, so every later
+/// command of this process is refused with the same words rather than
+/// quietly taking the weaker path.
+fn launcher_image_is_trusted(runner_exe: &Path) -> Result<(), SandboxError> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    let outcome = CHECKED.get_or_init(|| {
+        let exe = std::env::current_exe().map_err(|e| {
+            format!("kGraf's own program could not be found to check where it lives: {e}")
+        })?;
+        super::setup::only_administrators_may_write(&[&exe, runner_exe]).map_err(|e| e.to_string())
+    });
+    outcome.clone().map_err(|why| {
+        failed(
+            "check where kGraf's launcher service starts its program from",
+            why,
+        )
+    })
+}
+
+/// `text` as UTF-16 in one buffer of its exact size, with no terminator.
+/// For a password: a buffer that grows as it encodes gives up buffers that
+/// keep a copy of the text, and nothing clears those.
+fn exact_wide(text: &str) -> Vec<u16> {
+    let mut out = Vec::with_capacity(text.encode_utf16().count());
+    out.extend(text.encode_utf16());
+    out
+}
+
+/// The runner's command line for the launcher: the runner's own path and its
+/// arguments, quoted as `CreateProcessAsUser` reads them.
+fn runner_command_line(runner_exe: &Path, args: &RunnerArgs) -> Result<Vec<u16>, SandboxError> {
+    let exe: Vec<u16> = runner_exe.as_os_str().encode_wide().collect();
+    if exe.contains(&u16::from(b'"')) {
+        return Err(failed(
+            "start the runner",
+            "the runner's path contains a quote",
+        ));
+    }
+    Ok(command_line(
+        &exe,
+        args.to_args()
+            .iter()
+            .map(|a| a.encode_utf16().collect::<Vec<u16>>()),
+    ))
+}
+
+/// Open kGraf's launcher pipe and check that its server runs as LocalSystem.
+///
+/// The connection offers the server identification alone
+/// (`SECURITY_IDENTIFICATION`), so a program that owned the name first can
+/// read who the owner is and never act as the owner. The server's account is
+/// then checked, so such a program gets no request and no password: kGraf
+/// speaks only to a pipe a service of the local system holds.
+fn connect_to_launcher(pipe: &str) -> Result<File, SandboxError> {
+    let name = format!(r"\\.\pipe\{pipe}");
+    let w = wide(&name);
+    let deadline = kgraf_core::waits::deadline_after(SERVICE_START_TIMEOUT);
+    let file = loop {
+        // SAFETY: `w` is NUL-terminated; the handle is owned by the File.
+        // The exact rights a client needs, never `GENERIC_WRITE`: that
+        // carries `FILE_APPEND_DATA`, which is the same bit as
+        // `FILE_CREATE_PIPE_INSTANCE`, and the service's access list leaves
+        // that bit out on purpose, so a `GENERIC_WRITE` open is refused.
+        let h = unsafe {
+            CreateFileW(
+                w.as_ptr(),
+                service_args::PIPE_CLIENT_MASK,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                ptr::null_mut(),
+            )
+        };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            // SAFETY: a fresh handle this code now owns.
+            break File::from(unsafe { OwnedHandle::from_raw_handle(h) });
+        }
+        let err = std::io::Error::last_os_error();
+        // Busy: every instance is taken. Not found: the service control
+        // manager says the service is running before the service has made
+        // its first instance, so the name can be absent for a moment after
+        // the start. Both are waited out.
+        let again = matches!(
+            err.raw_os_error(),
+            Some(code) if code == ERROR_PIPE_BUSY as i32 || code == ERROR_FILE_NOT_FOUND as i32
+        );
+        if !again || Instant::now() >= deadline {
+            return Err(SandboxError::PlatformSetup {
+                step: "open the pipe of kGraf's launcher service (CreateFileW)",
+                source: std::io::Error::other(format!(
+                    "{err}; the service may not be running, or another program holds the pipe \
+                     name. Run `kgraf sandbox status` to see which launch path this machine \
+                     uses"
+                )),
+            });
+        }
+        // Every instance is busy: wait for one and try again.
+        // SAFETY: `w` is NUL-terminated.
+        unsafe { WaitNamedPipeW(w.as_ptr(), 1_000) };
+    };
+    let mut server_pid = 0u32;
+    // SAFETY: reads the pipe server's process ID.
+    if unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &mut server_pid) } == 0 {
+        return Err(last_error(
+            "identify the server of kGraf's launcher pipe (GetNamedPipeServerProcessId)",
+        ));
+    }
+    let sid = process_user_sid(server_pid)?;
+    if sid != LOCAL_SYSTEM_SID {
+        return Err(failed(
+            "identify the server of kGraf's launcher pipe",
+            format!(
+                "the pipe is held by process {server_pid}, which runs as {sid} and not as the \
+                 local system account, so it is not kGraf's launcher service. Nothing was sent"
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// The SID of the account process `pid` runs as.
+fn process_user_sid(pid: u32) -> Result<String, SandboxError> {
+    // SAFETY: opens the process for the one right the token read needs.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(last_error(
+            "open the server of kGraf's launcher pipe (OpenProcess)",
+        ));
+    }
+    // SAFETY: a fresh handle this code now owns.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: a valid process handle; `token` is written on success.
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error(
+            "read the token of kGraf's launcher pipe's server (OpenProcessToken)",
+        ));
+    }
+    // SAFETY: a fresh handle this code now owns.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut size = 0u32;
+    // SAFETY: asks for the size alone; the call fails with the size written.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            ptr::null_mut(),
+            0,
+            &mut size,
+        )
+    };
+    if size == 0 {
+        return Err(last_error(
+            "size the user of kGraf's launcher pipe's server (GetTokenInformation)",
+        ));
+    }
+    let mut buf = vec![0u8; size as usize];
+    // SAFETY: `buf` holds the size the call just asked for.
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        )
+    } == 0
+    {
+        return Err(last_error(
+            "read the user of kGraf's launcher pipe's server (GetTokenInformation)",
+        ));
+    }
+    // SAFETY: the call wrote a TOKEN_USER into `buf`, whose SID pointer is
+    // valid while `buf` lives.
+    let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+    let mut text: *mut u16 = ptr::null_mut();
+    // SAFETY: a valid SID from the token; the call allocates `text`, freed
+    // below.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
+        return Err(last_error(
+            "name the user of kGraf's launcher pipe's server \
+             (ConvertSidToStringSidW)",
+        ));
+    }
+    // SAFETY: a NUL-terminated string the call allocated.
+    let sid = unsafe { from_wide(text) };
+    // SAFETY: frees what the conversion allocated.
+    unsafe { LocalFree(text as HLOCAL) };
+    Ok(sid)
+}
+
+/// Send one request to kGraf's launcher service and read its one reply line.
+/// The password is cleared from the frame as soon as it is written.
+fn ask_launcher(pipe: File, request: &ServiceRequest) -> Result<ServiceReply, SandboxError> {
+    let mut frame = zeroize::Zeroizing::new(
+        request
+            .encode()
+            .map_err(|e| failed("write the launcher request", e))?,
+    );
+    // The pipe is synchronous, so the send and the reply are read on their own
+    // thread with a deadline, as the runner handshake is. The service bounds
+    // its own pipe work, but a thread of its own that stops inside a Windows
+    // call never reaches the reply, and a sandboxed command must never block
+    // the caller for longer than this. Dropping this side closes the pipe,
+    // which releases that thread.
+    let (tx, rx) = mpsc::channel();
+    let mut sent = zeroize::Zeroizing::new(std::mem::take(&mut *frame));
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let outcome = pipe
+            .write_all(&sent)
+            .and_then(|()| pipe.flush())
+            .and_then(|()| {
+                sent.zeroize();
+                let mut reply = String::new();
+                BufReader::new((&mut pipe).take(MAX_LAUNCHER_REPLY as u64))
+                    .read_line(&mut reply)?;
+                Ok(reply)
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(outcome);
+    });
+    let reply = match rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => return Err(failed("ask kGraf's launcher service", e)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(failed(
+                "ask kGraf's launcher service",
+                "the launcher service did not reply in time",
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(failed(
+                "ask kGraf's launcher service",
+                "the thread that spoke to the launcher service ended without a reply",
+            ));
+        }
+    };
+    if reply.is_empty() {
+        return Err(failed(
+            "read the launcher reply",
+            "kGraf's launcher service ended the connection without a reply",
+        ));
+    }
+    ServiceReply::parse(&reply).map_err(|e| failed("read the launcher reply", e))
 }
 
 /// The runner pipe: one duplex instance, no remote clients, admitting SYSTEM,
@@ -525,11 +912,36 @@ impl Station {
 }
 
 /// Start the runner at `runner_exe` as `user`, with `std` as its standard
-/// handles, in `job`, and have it start `request` on the command's desktop,
-/// which this function names in the request (any `desktop` the caller set is
-/// replaced). On any failure the job is ended, so nothing started here keeps
-/// running.
+/// handles, in `job`, and have it start `request`.
+///
+/// Which path starts the runner is the one setup proved on this machine and
+/// recorded ([`super::super::session0`]): kGraf's launcher service in session
+/// 0, where a command can make the named kernel objects cargo and rustc need,
+/// or the owner's own session through `CreateProcessWithLogonW`, where it
+/// cannot unless setup made the fallback grant. A machine with no record
+/// takes the owner's session: the path every setup before the launcher
+/// service made. On any failure the job is ended, so nothing started here
+/// keeps running.
 pub(crate) fn start(
+    user: &Credential<'_>,
+    runner_exe: &Path,
+    std: [HANDLE; 3],
+    job: &OwnedHandle,
+    request: Request,
+) -> Result<Started, SandboxError> {
+    let session0 = super::state::users()?
+        .is_some_and(|users| users.launch.path == session0::LaunchPath::Session0);
+    if session0 {
+        return via_service(user, runner_exe, std, job, request);
+    }
+    in_owner_session(user, runner_exe, std, job, request)
+}
+
+/// Start the runner in the owner's own session with
+/// `CreateProcessWithLogonW`, on the window station and desktop this process
+/// made for this sandbox user, which this function names in the request (any
+/// `desktop` the caller set is replaced).
+fn in_owner_session(
     user: &Credential<'_>,
     runner_exe: &Path,
     std: [HANDLE; 3],
@@ -654,9 +1066,7 @@ pub(crate) fn start(
         thread.as_raw_handle(),
         user.sid,
     );
-    let note = protected.as_ref().err().map(|e| {
-        format!("also, the runner's access lists could not be written before it ran: {e}")
-    });
+    let note = note_for_protection(&protected);
     let end_job = |e: SandboxError| {
         // SAFETY: a valid job handle; ends the runner and anything it started.
         unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
@@ -675,13 +1085,59 @@ pub(crate) fn start(
         return Err(end_job(last_error("resume the runner")));
     }
     drop(thread);
+    handshake(
+        server,
+        &args.pipe,
+        runner,
+        pi.dwProcessId,
+        frame,
+        job,
+        protected,
+    )
+}
 
+/// The note a failed write of the runner's access lists adds to any later
+/// launch error.
+fn note_for_protection(protected: &Result<(), String>) -> Option<String> {
+    protected
+        .as_ref()
+        .err()
+        .map(|e| format!("also, the runner's access lists could not be written before it ran: {e}"))
+}
+
+/// Wait for the runner of process `runner_pid` to connect to `server`, send
+/// it `frame` and read its reply. The same for both launch paths: the runner
+/// speaks to the owner's process, never to the launcher. On any failure the
+/// job is ended, so neither the runner nor the command keeps running.
+fn handshake(
+    server: OwnedHandle,
+    pipe_name: &str,
+    runner: OwnedHandle,
+    runner_pid: u32,
+    frame: Vec<u8>,
+    job: &OwnedHandle,
+    protected: Result<(), String>,
+) -> Result<Started, SandboxError> {
+    let note = note_for_protection(&protected);
+    let end_job = |e: SandboxError| {
+        // SAFETY: a valid job handle; ends the runner and anything it started.
+        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        match (&note, e) {
+            (Some(note), SandboxError::PlatformSetup { step, source }) => {
+                SandboxError::PlatformSetup {
+                    step,
+                    source: std::io::Error::new(source.kind(), format!("{source}; {note}")),
+                }
+            }
+            (_, e) => e,
+        }
+    };
     let deadline = kgraf_core::waits::deadline_after(HANDSHAKE_TIMEOUT);
     pipe::wait_for_client(
         &server,
-        &args.pipe,
+        pipe_name,
         &runner,
-        pi.dwProcessId,
+        runner_pid,
         "wait for the runner",
         "the runner ended before it connected",
         Some(deadline),

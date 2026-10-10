@@ -18,9 +18,10 @@ use std::sync::{Arc, OnceLock};
 use super::super::names::{OwnerNames, Role};
 use super::super::password::Password;
 use super::super::runner::RUNNER_NAME;
+use super::super::session0::Active;
 use super::super::slots::{Lease, Leases, Pool};
 use super::super::store::{
-    credentials_path, grants_path, load_slot_users, missing_store, slots_dir,
+    credentials_path, grants_path, launch_path_file, load_slot_users, missing_store, slots_dir,
 };
 use super::{accounts, dpapi::Dpapi, setup::stored_user};
 use crate::error::SandboxError;
@@ -65,6 +66,15 @@ pub(crate) struct Users {
     /// The list of the owner's folders granted to the sandbox users
     /// ([`grants_path`]).
     pub grants: PathBuf,
+    /// Which launch path setup proved on this machine
+    /// ([`super::super::session0`]), read from the record beside the store.
+    /// A missing record is the owner's session with no grant: the path every
+    /// setup before the launcher service made.
+    pub launch: Active,
+    /// kGraf's launcher service and the pipe it is asked on, for the
+    /// session-0 path.
+    pub service: String,
+    pub service_pipe: String,
 }
 
 impl Users {
@@ -263,6 +273,16 @@ fn load() -> Result<Option<Users>, SandboxError> {
         leases: Leases::new(slots_dir(&store), count),
         runner,
         grants: grants_path(&store),
+        // A record that cannot be read is the same as none: the owner's
+        // session with no grant, which gives a command no named object and
+        // says so in the note a failed cargo gets. Nothing is refused here,
+        // because this path is the one every setup before the launcher
+        // service made.
+        launch: std::fs::read_to_string(launch_path_file(&store))
+            .map(|text| Active::decode(&text))
+            .unwrap_or_else(|_| Active::decode("")),
+        service: names.service(),
+        service_pipe: names.service_pipe(),
     }))
 }
 

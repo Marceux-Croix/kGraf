@@ -24,18 +24,27 @@
 //! semaphore by name, and create none. The semaphore lives as long as the
 //! command: the started child holds it.
 //!
-//! **Measured: this is not enough.** The open was expected to need no right
-//! on the session's directory beyond traversal, which every token's
-//! `SeChangeNotifyPrivilege` gives. A hosted Windows self-test refused it
-//! ("cannot open path or name kgraf-jobserver-... Access is denied"):
-//! `kernelbase.dll` opens the session's directory itself, with explicit
-//! rights, before it looks up any name, and the directory refuses the
-//! command. rustc also makes a named mutex of its own to print any
-//! diagnostic, so a jobserver alone cannot make a build run. The cause, and
-//! the note a failed command's output gets, are in
-//! [`super::named_objects`]. The semaphore is still made: it costs one
-//! handle, and where the directory admits the command it saves cargo from
-//! making its own.
+//! **What each launch path gives.** The open depends on where the command
+//! starts ([`LaunchPath`]).
+//!
+//! - *Session 0* (kGraf's launcher service). The command resolves an
+//!   unprefixed name in the machine-wide `\BaseNamedObjects`, which carries no
+//!   session logon SID, so the open works, and so do the named objects cargo
+//!   and rustc make for themselves. The semaphore's name carries `Global\`,
+//!   because the process that makes it is kGraf's own, in the owner's
+//!   session (see [`semaphore_name`]).
+//! - *Owner session* (`CreateProcessWithLogonW`). A hosted Windows self-test
+//!   refused the open ("cannot open path or name kgraf-jobserver-... Access is
+//!   denied"): `kernelbase.dll` opens the session's object directory itself,
+//!   with explicit rights, before it looks up any name, and that directory
+//!   refuses the command. The open is still refused on this path unless the
+//!   fallback grant of the session directory is in place. rustc also makes a
+//!   named mutex of its own to print any diagnostic, so a jobserver alone
+//!   cannot make a build run here. The cause, and the note a failed command's
+//!   output gets, are in [`super::named_objects`].
+//!
+//! The semaphore is made on both paths: it costs one handle, and where the
+//! command can open it, cargo does not make its own.
 //!
 //! The command can do nothing with the semaphore but take and give back its
 //! tokens, and no other program is admitted to it. The self-test measures
@@ -48,6 +57,8 @@
 //! token count are tested on every host. The Windows call is in
 //! `windows::jobserver`.
 
+use super::session0::LaunchPath;
+
 /// The variable cargo and rustc read first for a jobserver to join.
 pub const JOBSERVER_VAR: &str = "CARGO_MAKEFLAGS";
 
@@ -56,12 +67,24 @@ pub const JOBSERVER_VAR: &str = "CARGO_MAKEFLAGS";
 /// admitted to.
 pub const USER_SEMAPHORE_ACCESS: u32 = 0x0010_0000 | 0x0002;
 
-/// The semaphore's name for `nonce`: `kgraf-jobserver-` and sixteen hex
-/// digits. No `Global\` or `Local\` prefix: the session's own namespace,
-/// where the command, started in the owner's session, looks it up.
-pub fn semaphore_name(nonce: [u8; 8]) -> String {
+/// The semaphore's name for `nonce` on `path`: `kgraf-jobserver-` and sixteen
+/// hex digits, with the `Global\` prefix on [`LaunchPath::Session0`] and none
+/// on [`LaunchPath::OwnerSession`].
+///
+/// The process that makes the semaphore is kGraf's own, in the owner's
+/// session. An unprefixed name it makes lands in the owner's session
+/// directory, which a command in session 0 never looks in. Only `Global\`
+/// names the machine-wide directory from every session, so only it is the same
+/// object for both ends. In session 0 an unprefixed name would resolve to the
+/// global directory as well, so the prefix is what makes the two ends agree.
+/// On the owner-session path both ends are in one session, and the unprefixed
+/// name is the session's own.
+pub fn semaphore_name(path: LaunchPath, nonce: [u8; 8]) -> String {
     let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-    format!("kgraf-jobserver-{hex}")
+    match path {
+        LaunchPath::Session0 => format!("Global\\kgraf-jobserver-{hex}"),
+        LaunchPath::OwnerSession => format!("kgraf-jobserver-{hex}"),
+    }
 }
 
 /// The value of [`JOBSERVER_VAR`] that names the semaphore `name`, in the
@@ -90,11 +113,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_name_has_no_namespace_prefix_and_carries_the_nonce() {
-        let name = semaphore_name([0, 1, 2, 0xab, 0xcd, 0xef, 0x10, 0xff]);
+    fn the_owner_session_name_has_no_namespace_prefix_and_carries_the_nonce() {
+        let name = semaphore_name(
+            LaunchPath::OwnerSession,
+            [0, 1, 2, 0xab, 0xcd, 0xef, 0x10, 0xff],
+        );
         assert_eq!(name, "kgraf-jobserver-000102abcdef10ff");
         assert!(!name.contains('\\'), "no Global\\ or Local\\ prefix");
-        assert_ne!(name, semaphore_name([0; 8]));
+        assert_ne!(name, semaphore_name(LaunchPath::OwnerSession, [0; 8]));
+    }
+
+    /// The semaphore is made in the owner's session and opened in session 0,
+    /// so only the global prefix names one object for both ends.
+    #[test]
+    fn the_session_0_name_carries_the_global_prefix_and_the_same_nonce() {
+        let nonce = [0, 1, 2, 0xab, 0xcd, 0xef, 0x10, 0xff];
+        let name = semaphore_name(LaunchPath::Session0, nonce);
+        assert_eq!(name, "Global\\kgraf-jobserver-000102abcdef10ff");
+        assert_eq!(
+            name.strip_prefix("Global\\"),
+            Some(semaphore_name(LaunchPath::OwnerSession, nonce).as_str())
+        );
+        assert_ne!(name, semaphore_name(LaunchPath::Session0, [0; 8]));
     }
 
     /// The value names the semaphore the way the `jobserver` crate finds it:

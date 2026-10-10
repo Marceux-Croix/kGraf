@@ -29,6 +29,7 @@ async fn a_check_on_a_backend_that_cannot_deny_the_network_runs_and_says_so() {
     let run = |net: CheckNetwork, command: &str, secs: u64| {
         crate::gates::run_confined_on(
             net,
+            false,
             &live,
             &r.root,
             &[],
@@ -71,6 +72,7 @@ async fn the_open_network_decision_changes_what_the_check_can_reach() {
     let run = |net: CheckNetwork| {
         crate::gates::run_confined_on(
             net,
+            false,
             &live,
             &r.root,
             &[],
@@ -99,6 +101,7 @@ async fn a_failing_check_that_built_cold_says_so_and_a_passing_one_does_not() {
     let run = |command: &str| {
         crate::gates::run_confined_on(
             CheckNetwork::deny(),
+            false,
             &live,
             &r.root,
             &[],
@@ -116,4 +119,39 @@ async fn a_failing_check_that_built_cold_says_so_and_a_passing_one_does_not() {
     assert!(!ok, "{text}");
     assert!(text.contains("[build] the check built cold"), "{text}");
     assert!(text.contains("no-such-warm-folder"), "{text}");
+}
+
+/// A check that prints rustc's named-mutex abort and fails gets the sandbox
+/// line that says why, unless the active launch path makes named objects work
+/// (`Active::cargo_runs`): then the failure has another cause and the line
+/// would name the wrong one. The check only prints the text rustc prints on
+/// Windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_check_gets_the_named_object_line_only_where_cargo_cannot_run() {
+    let r = repo();
+    let c = named("b.txt", "w-named-gate");
+    let ws_path = prepared(&r, &c, "w-named-gate").await;
+    let live = r.workspaces.get(&ws_path).expect("live");
+    let command = "echo 'failed to create global mutex named `rustc_errors`' >&2; exit 101";
+    let run = |cargo_runs: bool| {
+        crate::gates::run_confined_on(
+            CheckNetwork::deny(),
+            cargo_runs,
+            &live,
+            &r.root,
+            &[],
+            command,
+            Duration::from_secs(30),
+            2_000,
+            None,
+        )
+        .expect("the check ran")
+    };
+    let (ok, text) = run(false);
+    assert!(!ok, "{text}");
+    assert!(text.contains("[sandbox] rustc could not make"), "{text}");
+    let (ok, text) = run(true);
+    assert!(!ok, "{text}");
+    assert!(!text.contains("rustc could not make"), "{text}");
+    assert!(text.contains("rustc_errors"), "the output stays: {text}");
 }

@@ -1755,6 +1755,8 @@ What `setup` creates, for the Windows user who runs it:
   cache filter (Windows Server 2025 answers `FWP_E_OUT_OF_BOUNDS`). Setup then goes on
   without it, names each refused filter with Windows' error, and ends with a notice
   that DNS is not confined on this machine;
+- a launcher service, `kgraf-launcher-<hash>`, set to start on demand, so that cargo and
+  rustc work (below);
 - an undo record under `%ProgramData%\kGraf\sandbox\`.
 
 The users' passwords are random, 40 characters long, and stored only for your
@@ -1779,13 +1781,37 @@ After `setup`, every sandboxed command runs as the sandbox user, through the
 commands run as the offline user. Dependency installs reach the network through kGraf's
 proxy. A command can write only where kGraf allows. It cannot read your Windows profile, apart
 from the toolchain and program folders kGraf grants it inside that profile. cargo and rustc
-do not run as the sandbox user on Windows: they need a named kernel object in the Windows
-session (cargo a jobserver, rustc a named mutex to print any warning or error), and the
-sandbox user's command can neither make nor open one there, because the session admits its
-logon SID, which kGraf denies the command so that it cannot open your own processes. A
-failed command whose output shows this ends with a `[sandbox]` line that says so; the
-program did not fail on its own, and `-j1` does not help. Each command still gets a
-jobserver kGraf makes for it, named in `CARGO_MAKEFLAGS`. A git command in the sandbox
+need a named kernel object (cargo a jobserver, rustc a named mutex to print any warning or
+error). In your own Windows session a sandboxed command can make or open none, because that
+session admits its logon SID, which kGraf denies the command so that it cannot open your own
+processes. So `setup` installs a launcher service, `kgraf-launcher-<hash>`. It starts a
+sandboxed command in session 0, the session Windows gives its services. There a name with no
+prefix resolves below the machine-wide object directory, and cargo and rustc can make the
+named objects they need. The service starts when a command needs it, runs only kGraf's own
+runner program, and accepts requests from your Windows account alone. Nothing runs as SYSTEM.
+Setup then proves the path: it runs a probe as a sandbox user that makes a named semaphore
+and an unprefixed mutex. `kgraf sandbox status`, `kgraf sandbox selfcheck` and the end of
+`setup` print one line that starts with `named objects:`. It says which path is active, why,
+and what the probe found.
+
+If the service cannot be set up, or the probe is refused, kGraf asks for administrator
+rights once more, for a fallback. It admits the sandbox group to the object directory of your
+Windows session with four rights (look a name up in it, list it, make an object in it and
+make a subdirectory in it) and the right to read the directory's own access list. The grant
+cannot rewrite the access list, take its ownership or delete it. The risk: a sandboxed
+command can then put a named object in the directory your own programs read, so a program of
+yours can be made to open an object a sandboxed command made instead of its own. Windows
+makes the directory again at every logon, so the grant is gone at your next sign-out whether
+or not `kgraf sandbox remove` ran. Remove takes it off as well. The same risk line is in
+`setup`, `status` and `selfcheck`.
+
+Where neither path works, a sandboxed command starts in your session and cannot make or open
+a named object there, so cargo and rustc cannot run as a sandbox user. A failed command whose
+output shows this ends with a `[sandbox]` line that says why; the program did not fail on its
+own, and `-j1` does not help. Each command still gets a jobserver kGraf makes for it, named in
+`CARGO_MAKEFLAGS` (under a `Global\` name when the service starts the command).
+
+A git command in the sandbox
 that writes a ref in a repository inside your profile fails with "unable to create
 directory for ...": before it writes a ref, git reads the attributes of each folder above
 the repository, and your profile's folders are not readable to the sandbox user. This was
@@ -1797,6 +1823,7 @@ for a toolchain setting in each folder above the command's folder, and your prof
 is not readable to the sandbox user. The warning changes nothing.
 Without `setup`, the token sandbox described below stays in use. If the users exist but
 the runner is missing, every sandboxed command stops with an error. `kgraf sandbox remove`
+stops and deletes the launcher service, takes off the fallback grant where setup made one, and
 also revokes the folder permissions that kGraf added for the users, and deletes the DNS
 and loopback filters, their sublayer and their provider by the keys the undo record lists.
 It does not touch other WFP filters.

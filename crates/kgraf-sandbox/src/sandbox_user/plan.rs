@@ -77,6 +77,17 @@ pub struct Observed {
     /// Why the WFP objects could not be read, when they could not (reading
     /// them can need administrator rights).
     pub wfp_unreadable: Option<String>,
+    /// The launcher service's description, if a service of kGraf's name is
+    /// installed. `None` when no service of that name exists.
+    pub service: Option<String>,
+    /// Whether the installed service is running. `None` when no service of
+    /// kGraf's name exists or its state could not be read.
+    pub service_running: Option<bool>,
+    /// The access mask of the sandbox group's allow entry on the owner's
+    /// session object directory. `None` when the group has no entry there or
+    /// the directory's list could not be read: the two read the same, as an
+    /// unreadable list reads as no entry in the fields above.
+    pub named_objects_grant: Option<u32>,
 }
 
 /// One setup step.
@@ -104,6 +115,13 @@ pub enum StepId {
     /// proxy ([`super::wfp`]). The key stays `dns-filter`, the step's name
     /// before the loopback filters joined it.
     DnsFilter,
+    /// Install or refresh the launcher service that starts a sandboxed
+    /// command in session 0 ([`super::session0`]).
+    Service,
+    /// Grant the sandbox group the least rights that let a command make a
+    /// named object in the owner's session object directory. The fallback for
+    /// a launcher service that cannot be installed or does not prove itself.
+    NamedObjects,
     /// Write the undo record.
     Record,
 }
@@ -121,6 +139,8 @@ impl StepId {
             StepId::Rule(p) => format!("rule-{}", p.key()),
             StepId::CloseFolders => "close-folders".into(),
             StepId::DnsFilter => "dns-filter".into(),
+            StepId::Service => "service".into(),
+            StepId::NamedObjects => "named-objects".into(),
             StepId::Record => "record".into(),
         }
     }
@@ -133,6 +153,8 @@ impl StepId {
             "record" => StepId::Record,
             "close-folders" => StepId::CloseFolders,
             "dns-filter" => StepId::DnsFilter,
+            "service" => StepId::Service,
+            "named-objects" => StepId::NamedObjects,
             _ => {
                 if let Some(r) = key.strip_prefix("user-") {
                     StepId::User(role(r)?)
@@ -175,6 +197,16 @@ impl StepId {
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
+            StepId::Service => format!(
+                "launcher service {} starts sandboxed commands in session 0, where cargo and \
+                 rustc can make the named objects they need",
+                names.service()
+            ),
+            StepId::NamedObjects => format!(
+                "fallback, used only where the launcher service does not work: group {} may \
+                 make named objects in the owner's session object directory",
+                names.group()
+            ),
             StepId::Record => "undo record".into(),
         }
     }
@@ -203,6 +235,13 @@ pub fn failure_leaves(id: StepId) -> &'static str {
              reached; run `kgraf sandbox status` for the filter lines, \
              `kgraf sandbox selfcheck` for the effect, and `kgraf sandbox remove` to take the \
              users off the machine"
+        }
+        StepId::Service => {
+            "kGraf's launcher service is not on this machine, so a sandboxed command starts in \
+             the owner's own Windows session, where it can make no named kernel object: cargo \
+             and rustc cannot run as a sandbox user unless setup made the fallback grant. The \
+             undo record names any service that was created, so `kgraf sandbox remove` takes \
+             it off; run `kgraf sandbox status` for the launch path this machine uses"
         }
         _ => "",
     }
@@ -375,6 +414,10 @@ pub enum PlanError {
     )]
     ForeignGroup(String),
     #[error(
+        "a service named {0} exists and kGraf did not make it for this account; remove or rename it, then run setup again"
+    )]
+    ForeignService(String),
+    #[error(
         "the sandbox user {0} is in the Administrators group; a sandbox user must not be an administrator. Remove it from the group, then run setup again"
     )]
     UserIsAdministrator(String),
@@ -402,17 +445,16 @@ pub enum PlanError {
 /// the owner's process asked for slot users.
 pub fn elevated_params(
     names: &OwnerNames,
-    setup: bool,
+    action: &str,
     pipe: &str,
     nonce: &str,
     owner_pid: u32,
 ) -> String {
     let mut params = format!(
-        "--action {} --pipe {pipe} --nonce {nonce} --owner-pid {owner_pid} --owner-sid {}",
-        if setup { "setup" } else { "remove" },
+        "--action {action} --pipe {pipe} --nonce {nonce} --owner-pid {owner_pid} --owner-sid {}",
         names.owner_sid()
     );
-    if setup {
+    if action == "setup" {
         params.push_str(&format!(" --slots {}", names.slots()));
     }
     if let Some(tag) = names.tag() {
@@ -559,6 +601,38 @@ pub fn plan_setup(names: &OwnerNames, observed: &Observed) -> Result<Vec<Step>, 
             .map(|(object, key)| UndoEntry::Wfp { object, key })
             .collect(),
     });
+    // The plan lists what setup may do; `session0::select` decides what it
+    // did. Both launch paths are planned every time, because only the
+    // executing side can tell, at run time, whether the service installs and
+    // proves itself or the fallback grant is needed.
+    //
+    // After the users: the service starts the runner as a slot user.
+    let service = names.service();
+    let action = match &observed.service {
+        Some(d) if !names.owns_service_comment(d) => {
+            return Err(PlanError::ForeignService(service));
+        }
+        Some(_) => Action::Update,
+        None => Action::Create,
+    };
+    steps.push(Step {
+        id: StepId::Service,
+        action,
+        undo: vec![UndoEntry::Service(service)],
+    });
+    // After the group: the entry names its SID. The undo list is empty here
+    // for the reason `CloseFolders`' is: the SID is known only once the group
+    // step has run, and the mask only once the entry is written, so the step
+    // records its own `NamedObjectsGrant` entry when it writes one.
+    steps.push(Step {
+        id: StepId::NamedObjects,
+        action: if observed.named_objects_grant.is_some() {
+            Action::Update
+        } else {
+            Action::Create
+        },
+        undo: Vec::new(),
+    });
     Ok(steps)
 }
 
@@ -614,6 +688,18 @@ fn closed_entry_refusal(
             "{path} is not one of the folders setup closes on this machine"
         ));
     }
+    sandbox_group_sid_refusal(sid, names, observed, resolves)
+}
+
+/// The SID bound of [`closed_entry_refusal`], for any record line that names
+/// the sandbox group by SID: the SID is the group's own, or an account of the
+/// owner's authority, not the owner, that no longer resolves.
+fn sandbox_group_sid_refusal(
+    sid: &str,
+    names: &OwnerNames,
+    observed: &Observed,
+    resolves: &dyn Fn(&str) -> Option<bool>,
+) -> Option<String> {
     if observed
         .group_sid
         .as_deref()
@@ -639,6 +725,35 @@ fn closed_entry_refusal(
         None => Some(format!(
             "whether {sid} still names an account could not be read"
         )),
+    }
+}
+
+/// Why removal may not take the recorded entry off the owner's session object
+/// directory, or `None` when it may. The SID bound is the `closed` entries';
+/// the directory must also have been read and carry exactly the recorded mask,
+/// so removal never takes off an entry wider or narrower than the one setup
+/// wrote. `None` in [`Observed::named_objects_grant`] reads as not read.
+fn named_objects_refusal(
+    sid: &str,
+    mask: u32,
+    names: &OwnerNames,
+    observed: &Observed,
+    resolves: &dyn Fn(&str) -> Option<bool>,
+) -> Option<String> {
+    if let Some(why) = sandbox_group_sid_refusal(sid, names, observed, resolves) {
+        return Some(why);
+    }
+    match observed.named_objects_grant {
+        Some(m) if m == mask => None,
+        Some(m) => Some(format!(
+            "the owner's session object directory carries mask {m:#x} for the sandbox group, \
+             not the recorded {mask:#x}"
+        )),
+        None => Some(
+            "the entry was not read from the owner's session object directory: it is gone with \
+             that session, or its list could not be read"
+                .to_owned(),
+        ),
     }
 }
 
@@ -717,6 +832,8 @@ pub fn undo_key(e: &UndoEntry) -> String {
         UndoEntry::Rule(n) => format!("remove-rule:{n}"),
         UndoEntry::Closed { path, .. } => format!("remove-closed:{path}"),
         UndoEntry::Wfp { object, key } => format!("remove-{}:{}", object.key(), guid_text(*key)),
+        UndoEntry::Service(n) => format!("remove-service:{n}"),
+        UndoEntry::NamedObjectsGrant { sid, .. } => format!("remove-named-objects-grant:{sid}"),
     }
 }
 
@@ -755,6 +872,10 @@ fn entry_text(e: &UndoEntry) -> String {
         UndoEntry::Rule(n) => format!("firewall rule {n}"),
         UndoEntry::Closed { sid, path, .. } => format!("the deny entry for {sid} on {path}"),
         UndoEntry::Wfp { object, key } => format!("{object} {}", guid_text(*key)),
+        UndoEntry::Service(n) => format!("service {n}"),
+        UndoEntry::NamedObjectsGrant { sid, .. } => {
+            format!("the entry for {sid} on the owner's session object directory")
+        }
     }
 }
 
@@ -763,6 +884,15 @@ fn entry_text(e: &UndoEntry) -> String {
 /// and the hidden values, logon rights while the user's SID still resolves,
 /// the group, then the users, and the WFP objects last of all, each filter
 /// before the sublayer and the provider it names.
+///
+/// The service entry goes first and is removed even while a command is still
+/// running: the remove step stops the service with a bounded wait and then
+/// deletes it, so a command in flight never keeps the service, and the service
+/// never keeps a slot user's logon. The Windows side does that, not this plan.
+/// The named-objects entry follows the `closed` entries' rule: it is taken off
+/// only when the directory was read and still carries exactly the recorded
+/// mask for the recorded SID. A directory that was not read, or that holds
+/// another mask, keeps the line ([`RemoveAction::Kept`]) with a note.
 pub fn plan_remove(
     names: &OwnerNames,
     record: &Record,
@@ -789,6 +919,9 @@ pub fn plan_remove(
             UndoEntry::Closed { sid, path, .. } => {
                 closed_entry_refusal(sid, path, names, observed, resolves).map(|why| (e, why))
             }
+            UndoEntry::NamedObjectsGrant { sid, mask } => {
+                named_objects_refusal(sid, *mask, names, observed, resolves).map(|why| (e, why))
+            }
             _ => None,
         })
         .collect();
@@ -801,6 +934,9 @@ pub fn plan_remove(
             // Judged above, with its own reason in the error.
             UndoEntry::Closed { .. } => true,
             UndoEntry::Wfp { object, key } => keys.get(*object) == *key,
+            UndoEntry::Service(n) => *n == names.service(),
+            // Judged above, with its own reason in the note.
+            UndoEntry::NamedObjectsGrant { .. } => true,
         };
         if !ours {
             return Err(PlanError::ForeignEntry(entry_text(e)));
@@ -836,7 +972,9 @@ pub fn plan_remove(
     // user condition is a security descriptor of SIDs, which deletes with or
     // without them.
     let rank = |e: &UndoEntry| match e {
-        UndoEntry::Rule(_) => 0,
+        // The service first: it holds no slot user's logon once it is gone.
+        UndoEntry::Service(_) => 0,
+        UndoEntry::Rule(_) | UndoEntry::NamedObjectsGrant { .. } => 0,
         UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
         UndoEntry::Rights { .. } => 2,
         UndoEntry::Group(_) => 3,
@@ -864,6 +1002,16 @@ pub fn plan_remove(
             // Whether the entry is still on the folder is read when it is
             // taken off: removing an absent entry changes nothing.
             UndoEntry::Closed { .. } => true,
+            // Judged above: unless the directory was read and carries the
+            // recorded mask, the note keeps the line.
+            UndoEntry::NamedObjectsGrant { .. } => true,
+            UndoEntry::Service(n) => match &observed.service {
+                Some(d) if !names.owns_service_comment(d) => {
+                    return Err(PlanError::ForeignService(n.clone()));
+                }
+                Some(_) => true,
+                None => false,
+            },
             UndoEntry::Group(n) => match &observed.group {
                 Some(c) if !names.owns_group_comment(c) => {
                     return Err(PlanError::ForeignGroup(n.clone()));
@@ -1145,6 +1293,55 @@ pub fn status_report(
             state,
         );
     }
+    // The launcher service. It is installed to start on demand: the owner's
+    // side starts it before a launch, so a stopped service is its normal
+    // state between commands and is not a gap.
+    let service_ok = observed
+        .service
+        .as_ref()
+        .is_some_and(|d| names.owns_service_comment(d));
+    let (state, running_words) = match (&observed.service, observed.service_running) {
+        (None, _) => (ItemState::Missing, ""),
+        (Some(d), _) if !names.owns_service_comment(d) => (
+            ItemState::Wrong("not made by kGraf for this account".into()),
+            "",
+        ),
+        (Some(_), Some(true)) => (ItemState::Present, " (installed, running)"),
+        (Some(_), Some(false)) => (
+            ItemState::Present,
+            " (installed, stopped; started when a command needs it)",
+        ),
+        (Some(_), None) => (ItemState::Unknown("its state could not be read".into()), ""),
+    };
+    push(
+        format!("launcher service {}{running_words}", names.service()),
+        state,
+    );
+    // The grant is the fallback. With the service installed it is not
+    // needed, so its absence is no gap; without one, its absence is.
+    match observed.named_objects_grant {
+        Some(mask) => push(
+            format!(
+                "sandbox group may make named objects in the owner's session object \
+                 directory (fallback, mask {mask:#x}; a command can put a named object where \
+                 the owner's own programs read)"
+            ),
+            ItemState::Present,
+        ),
+        None if service_ok => push(
+            "no fallback grant on the owner's session object directory (not needed while the \
+             launcher service is installed)"
+                .into(),
+            ItemState::Present,
+        ),
+        None => push(
+            "sandbox group may make named objects in the owner's session object directory \
+             (fallback, needed because the launcher service is not installed; the entry is absent \
+             or could not be read)"
+                .into(),
+            ItemState::Missing,
+        ),
+    }
     let refused_at_setup = |object: WfpObject| {
         record
             .as_ref()
@@ -1338,6 +1535,11 @@ mod tests {
             o.closed.insert(path.into(), Some(true));
         }
         o.wfp = WfpKeys::derive(n).all().iter().map(|(_, k)| *k).collect();
+        // Both launch paths are planned every time, so a complete machine
+        // holds the service and the fallback grant.
+        o.service = Some(n.service_comment());
+        o.service_running = Some(true);
+        o.named_objects_grant = Some(0x3);
         o
     }
 
@@ -1389,7 +1591,7 @@ mod tests {
         let r = record_from(&steps, &n);
         assert_eq!(
             r.entries.len(),
-            2 + 1 + 2 + 2 + RulePurpose::ALL.len() + WfpObject::ALL.len()
+            2 + 1 + 2 + 2 + RulePurpose::ALL.len() + WfpObject::ALL.len() + 1
         );
         for (object, key) in WfpKeys::derive(&n).all() {
             assert!(
@@ -1523,7 +1725,8 @@ mod tests {
                 WfpObject::Provider => 7,
                 o => panic!("{o:?} has no rank"),
             },
-            UndoEntry::Rule(_) => 0,
+            UndoEntry::Service(_) | UndoEntry::Rule(_) => 0,
+            UndoEntry::NamedObjectsGrant { .. } => 0,
             UndoEntry::Hidden(_) | UndoEntry::Closed { .. } => 1,
             UndoEntry::Rights { .. } => 2,
             UndoEntry::Group(_) => 3,
@@ -1882,16 +2085,16 @@ mod tests {
     #[test]
     fn the_elevated_step_is_told_how_many_slots_to_make() {
         let n = names().with_slots(4);
-        let params = elevated_params(&n, true, "p", "n", 7);
+        let params = elevated_params(&n, "setup", "p", "n", 7);
         assert!(params.contains(" --slots 4"), "{params}");
         assert!(params.starts_with("--action setup "), "{params}");
         let tagged = OwnerNames::derive(OWNER, Some("t1")).unwrap();
-        let params = elevated_params(&tagged, true, "p", "n", 7);
+        let params = elevated_params(&tagged, "setup", "p", "n", 7);
         assert!(
             params.contains(" --slots 0") && params.ends_with(" --tag t1"),
             "{params}"
         );
-        assert!(!elevated_params(&n, false, "p", "n", 7).contains("--slots"));
+        assert!(!elevated_params(&n, "remove", "p", "n", 7).contains("--slots"));
     }
 
     #[test]
@@ -2473,6 +2676,17 @@ mod tests {
         ] {
             assert!(left.contains(needle), "{needle:?} is missing: {left}");
         }
+        // A failed launcher service step says what a command gets instead,
+        // and that a service that was created is still recorded.
+        let service = failure_leaves(StepId::Service);
+        for needle in [
+            "no named kernel object",
+            "the fallback grant",
+            "kgraf sandbox remove",
+            "kgraf sandbox status",
+        ] {
+            assert!(service.contains(needle), "{needle:?} is missing: {service}");
+        }
         // Every other step is covered by its own error; no clause.
         let n = names();
         for step in plan_setup(
@@ -2484,7 +2698,10 @@ mod tests {
         )
         .unwrap()
         {
-            if step.id != StepId::DnsFilter {
+            // The DNS filter step and the launcher service step each leave
+            // something a reader must know about; every other step is
+            // covered by its own error.
+            if !matches!(step.id, StepId::DnsFilter | StepId::Service) {
                 assert_eq!(failure_leaves(step.id), "", "{:?}", step.id);
             }
         }
@@ -2785,5 +3002,276 @@ mod closed_folder_tests {
         assert_eq!(line(r"C:\"), ItemState::Present);
         assert_eq!(line(r"C:\ProgramData"), ItemState::Missing);
         assert!(matches!(line(r"D:\"), ItemState::Unknown(_)));
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    const GROUP_SID: &str = "S-1-5-21-1-2-3-1100";
+
+    fn all_gone(_sid: &str) -> Option<bool> {
+        Some(false)
+    }
+
+    fn names() -> OwnerNames {
+        OwnerNames::derive(OWNER, None).unwrap()
+    }
+
+    fn clean() -> Observed {
+        Observed {
+            firewall: FirewallFacts {
+                enabled_all_profiles: Some(true),
+                local_policy_effective: Some(true),
+            },
+            ..Observed::default()
+        }
+    }
+
+    fn grant(mask: u32) -> UndoEntry {
+        UndoEntry::NamedObjectsGrant {
+            sid: GROUP_SID.into(),
+            mask,
+        }
+    }
+
+    fn status_line<'a>(report: &'a StatusReport, part: &str) -> &'a StatusLine {
+        report
+            .lines
+            .iter()
+            .find(|l| l.item.contains(part))
+            .unwrap_or_else(|| panic!("no status line with {part:?}: {report}"))
+    }
+
+    #[test]
+    fn setup_plans_the_service_and_the_fallback_grant_every_time() {
+        let n = names();
+        let steps = plan_setup(&n, &clean()).unwrap();
+        let ids: Vec<StepId> = steps.iter().map(|s| s.id).collect();
+        let pos = |id| ids.iter().position(|x| *x == id).unwrap();
+        // The service, then the grant, directly after the DNS filter step.
+        assert_eq!(pos(StepId::Service), pos(StepId::DnsFilter) + 1);
+        assert_eq!(pos(StepId::NamedObjects), pos(StepId::DnsFilter) + 2);
+        assert!(pos(StepId::Group) < pos(StepId::NamedObjects));
+        let service = &steps[pos(StepId::Service)];
+        assert_eq!(service.action, Action::Create);
+        assert_eq!(service.undo, vec![UndoEntry::Service(n.service())]);
+        let grant_step = &steps[pos(StepId::NamedObjects)];
+        assert_eq!(grant_step.action, Action::Create);
+        // The SID and the mask are known only when the step runs.
+        assert!(grant_step.undo.is_empty());
+        for id in [StepId::Service, StepId::NamedObjects] {
+            assert_eq!(StepId::from_key(&id.key()), Some(id));
+            assert!(!id.describe(&n).is_empty());
+        }
+        assert_eq!(StepId::Service.key(), "service");
+        assert_eq!(StepId::NamedObjects.key(), "named-objects");
+    }
+
+    #[test]
+    fn an_installed_service_and_an_existing_grant_make_their_steps_updates() {
+        let n = names();
+        let mut o = clean();
+        o.service = Some(n.service_comment());
+        o.named_objects_grant = Some(0x3);
+        let steps = plan_setup(&n, &o).unwrap();
+        for id in [StepId::Service, StepId::NamedObjects] {
+            let step = steps.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(step.action, Action::Update, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn a_service_kgraf_did_not_make_is_refused() {
+        let n = names();
+        let mut o = clean();
+        o.service = Some("someone else's service".into());
+        assert_eq!(
+            plan_setup(&n, &o),
+            Err(PlanError::ForeignService(n.service()))
+        );
+        let text = PlanError::ForeignService(n.service()).to_string();
+        assert!(text.contains(&n.service()) && text.contains("did not make it"));
+        // The same service in a record is not removed either.
+        let mut r = Record::new(OWNER, None);
+        r.add(UndoEntry::Service(n.service()));
+        assert_eq!(
+            plan_remove(&n, &r, &o, &all_gone),
+            Err(PlanError::ForeignService(n.service()))
+        );
+    }
+
+    #[test]
+    fn remove_stops_and_deletes_the_service_before_the_accounts() {
+        let n = names();
+        let mut o = clean();
+        o.service = Some(n.service_comment());
+        o.users.insert(
+            n.user(Role::Offline),
+            UserFacts {
+                sid: "S-1-5-21-1-2-3-1010".into(),
+                comment: n.user_comment(Role::Offline),
+                in_administrators: false,
+            },
+        );
+        let mut r = Record::new(OWNER, None);
+        r.add(UndoEntry::User(n.user(Role::Offline)));
+        r.add(UndoEntry::Service(n.service()));
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
+        assert_eq!(steps[0].entry, UndoEntry::Service(n.service()));
+        assert_eq!(steps[0].action, RemoveAction::Remove);
+        assert_eq!(steps[0].key(), format!("remove-service:{}", n.service()));
+        // A service that is already gone is listed as gone.
+        let steps = plan_remove(&n, &r, &clean(), &all_gone).unwrap();
+        let service = steps
+            .iter()
+            .find(|s| matches!(s.entry, UndoEntry::Service(_)))
+            .unwrap();
+        assert_eq!(service.action, RemoveAction::AlreadyGone);
+    }
+
+    #[test]
+    fn remove_refuses_a_service_name_that_is_not_this_owners() {
+        let n = names();
+        let mut r = Record::new(OWNER, None);
+        r.add(UndoEntry::Service("kgraf-launcher-ffffffff".into()));
+        assert!(matches!(
+            plan_remove(&n, &r, &clean(), &all_gone),
+            Err(PlanError::ForeignEntry(_))
+        ));
+    }
+
+    #[test]
+    fn remove_takes_the_grant_off_only_when_the_directory_carries_that_mask() {
+        let n = names();
+        let mut r = Record::new(OWNER, None);
+        r.add(grant(0x3));
+        let mut o = clean();
+        o.group_sid = Some(GROUP_SID.into());
+        // Read, and exactly the recorded mask: removed.
+        o.named_objects_grant = Some(0x3);
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
+        assert_eq!(steps[0].action, RemoveAction::Remove);
+        assert!(steps[0].note.is_none());
+        assert_eq!(
+            steps[0].key(),
+            format!("remove-named-objects-grant:{GROUP_SID}")
+        );
+        // Another mask: kept, with the two masks in the note.
+        o.named_objects_grant = Some(0xf0003);
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
+        assert_eq!(steps[0].action, RemoveAction::Kept);
+        let note = steps[0].note.as_deref().unwrap();
+        assert!(note.contains("0xf0003") && note.contains("0x3"), "{note}");
+        // Not read from the machine: kept, never dropped from the record.
+        o.named_objects_grant = None;
+        let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
+        assert_eq!(steps[0].action, RemoveAction::Kept);
+        assert!(steps[0].note.as_deref().unwrap().contains("not read"));
+    }
+
+    #[test]
+    fn remove_never_takes_a_grant_off_for_a_sid_that_is_not_the_group() {
+        let n = names();
+        let mut o = clean();
+        o.group_sid = Some(GROUP_SID.into());
+        o.named_objects_grant = Some(0x3);
+        for sid in [OWNER, "S-1-5-32-545", "S-1-5-21-9-9-9-1100"] {
+            let mut r = Record::new(OWNER, None);
+            r.add(UndoEntry::NamedObjectsGrant {
+                sid: sid.into(),
+                mask: 0x3,
+            });
+            let steps = plan_remove(&n, &r, &o, &all_gone).unwrap();
+            assert_eq!(steps[0].action, RemoveAction::Kept, "{sid}");
+            assert!(steps[0].note.is_some(), "{sid}");
+        }
+    }
+
+    #[test]
+    fn status_shows_the_service_installed_stopped_unread_foreign_or_missing() {
+        let n = names();
+        let line = |service: Option<String>, running: Option<bool>| {
+            let mut o = clean();
+            o.service = service;
+            o.service_running = running;
+            let report = status_report(&n, &o, Ok(None), &Credentials::Missing);
+            let l = status_line(&report, "launcher service");
+            (l.state.clone(), l.item.clone())
+        };
+        let ours = Some(n.service_comment());
+        let (state, item) = line(ours.clone(), Some(true));
+        assert_eq!(state, ItemState::Present);
+        assert!(item.contains("installed, running"), "{item}");
+        // The service starts on demand, so a stopped one is normal: present,
+        // with its state in words.
+        let (state, item) = line(ours.clone(), Some(false));
+        assert_eq!(state, ItemState::Present);
+        assert!(
+            item.contains("installed, stopped; started when a command needs it"),
+            "{item}"
+        );
+        let (state, _) = line(ours, None);
+        assert!(matches!(state, ItemState::Unknown(_)));
+        let (state, _) = line(Some("other".into()), Some(true));
+        assert!(matches!(state, ItemState::Wrong(w) if w.contains("not made by kGraf")));
+        assert_eq!(line(None, None).0, ItemState::Missing);
+    }
+
+    #[test]
+    fn a_stopped_service_does_not_make_status_not_ready() {
+        let n = names();
+        let mut o = clean();
+        o.service = Some(n.service_comment());
+        o.service_running = Some(false);
+        let report = status_report(&n, &o, Ok(None), &Credentials::Missing);
+        assert!(
+            report
+                .lines
+                .iter()
+                .filter(|l| {
+                    l.item.contains("launcher service") || l.item.contains("session object")
+                })
+                .all(|l| l.state == ItemState::Present),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_missing_fallback_grant_is_a_gap_only_while_the_service_is_not_installed() {
+        let n = names();
+        let state = |service: Option<String>, running: Option<bool>, grant: Option<u32>| {
+            let mut o = clean();
+            o.service = service;
+            o.service_running = running;
+            o.named_objects_grant = grant;
+            let report = status_report(&n, &o, Ok(None), &Credentials::Missing);
+            status_line(&report, "session object directory")
+                .state
+                .clone()
+        };
+        let ours = Some(n.service_comment());
+        // An installed service needs no grant, running or stopped.
+        assert_eq!(state(ours.clone(), Some(true), None), ItemState::Present);
+        assert_eq!(state(ours.clone(), Some(false), None), ItemState::Present);
+        // No service, or one that is not kGraf's, without the fallback leaves
+        // cargo unable to run.
+        assert_eq!(state(None, None, None), ItemState::Missing);
+        assert_eq!(
+            state(Some("other".into()), Some(true), None),
+            ItemState::Missing
+        );
+        assert_eq!(state(None, None, Some(0x3)), ItemState::Present);
+        // A grant that is there is shown with its mask and its risk.
+        let mut o = clean();
+        o.named_objects_grant = Some(0x3);
+        let report = status_report(&n, &o, Ok(None), &Credentials::Missing);
+        let item = &status_line(&report, "session object directory").item;
+        assert!(
+            item.contains("0x3") && item.contains("owner's own programs"),
+            "{item}"
+        );
     }
 }

@@ -2724,11 +2724,20 @@ async fn a_check_that_fails_on_a_named_object_says_why() {
         .expect("ran")
     {
         Verdict::Fail { reason } => {
-            assert!(
-                reason.contains("[sandbox] rustc could not make its named mutex")
-                    && reason.contains("did not fail on its own"),
-                "{reason}"
-            );
+            // The line is added only where this machine's launch path cannot
+            // make the named objects a build needs. Where it can, the same
+            // output is a failure of the check itself and must not be
+            // explained away (`kgraf_sandbox::sandbox_user::cargo_runs`). The
+            // gate's own test pins both answers.
+            if kgraf_sandbox::sandbox_user::cargo_runs() {
+                assert!(!reason.contains("[sandbox]"), "{reason}");
+            } else {
+                assert!(
+                    reason.contains("[sandbox] rustc could not make its named mutex")
+                        && reason.contains("did not fail on its own"),
+                    "{reason}"
+                );
+            }
         }
         other => panic!("expected a failure, got {other:?}"),
     }

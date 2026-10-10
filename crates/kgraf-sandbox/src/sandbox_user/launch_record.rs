@@ -25,6 +25,10 @@ use std::time::{Duration, SystemTime};
 /// ones dropped.
 const MAX_STATION_LINES: usize = 64;
 
+/// At most this many launcher lines are kept: one per command, so a long run
+/// keeps the first ones, where a failure that repeats says most.
+const MAX_LAUNCH_LINES: usize = 64;
+
 /// Durations of one kind of call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Timings {
@@ -69,6 +73,12 @@ struct Record {
     /// The wait for the spawn lock (and the marking of the standard handles)
     /// before each logon call.
     lock_wait: Timings,
+    /// Each ask of kGraf's launcher service, from the send to the reply.
+    launches: Timings,
+    /// How many of those asks failed.
+    launches_failed: u64,
+    /// What the launcher answered, oldest first.
+    launch_replies: Vec<String>,
 }
 
 static RECORD: Mutex<Record> = Mutex::new(Record {
@@ -78,6 +88,9 @@ static RECORD: Mutex<Record> = Mutex::new(Record {
     logon: Timings::ZERO,
     logon_failed: 0,
     lock_wait: Timings::ZERO,
+    launches: Timings::ZERO,
+    launches_failed: 0,
+    launch_replies: Vec::new(),
 });
 
 fn record() -> std::sync::MutexGuard<'static, Record> {
@@ -134,6 +147,41 @@ pub fn note_logon(lock_wait: Duration, call: Duration, ok: bool) {
     }
 }
 
+/// One launch through kGraf's launcher service: how long the ask took and
+/// what came back. A Windows run reads these lines to see which path started
+/// each command, and the error of a launch that failed
+/// ([`super::session0::LaunchPath`]).
+pub fn note_launch(
+    path: super::session0::LaunchPath,
+    asked: Duration,
+    reply: &Result<super::session0::ServiceReply, crate::error::SandboxError>,
+) {
+    let mut r = record();
+    r.launches.add(asked);
+    let text = match reply {
+        Ok(reply) => reply.to_string(),
+        Err(e) => {
+            r.launches_failed += 1;
+            e.to_string()
+        }
+    };
+    // The newest lines are the ones dropped, as for the stations: a full
+    // record means a defect, and the first failures say most.
+    if r.launch_replies.len() < MAX_LAUNCH_LINES {
+        r.launch_replies.push(format!(
+            "launch: the {} path started a command: {} (at {})",
+            path.key(),
+            one_line(&text),
+            now()
+        ));
+    }
+}
+
+/// `text` as one line, so one launch is one line.
+fn one_line(text: &str) -> String {
+    text.replace(['\r', '\n'], " ").trim().to_owned()
+}
+
 fn station_line(
     at: u64,
     role: &str,
@@ -163,6 +211,19 @@ fn logon_line(logon: &Timings, failed: u64, lock_wait: &Timings) -> Option<Strin
             ms(logon.max),
             ms(lock_wait.mean()),
             ms(lock_wait.max),
+        )
+    })
+}
+
+fn launcher_line(launches: &Timings, failed: u64) -> Option<String> {
+    (launches.count > 0).then(|| {
+        format!(
+            "launch: asks of kGraf's launcher service {} ({failed} failed): last {}, mean {}, \
+             longest {}",
+            launches.count,
+            ms(launches.last),
+            ms(launches.mean()),
+            ms(launches.max),
         )
     })
 }
@@ -200,6 +261,8 @@ pub fn lines() -> Vec<String> {
             ));
         }
         out.extend(logon_line(&r.logon, r.logon_failed, &r.lock_wait));
+        out.extend(r.launch_replies.clone());
+        out.extend(launcher_line(&r.launches, r.launches_failed));
         out
     };
     out.extend(lock_line(&kgraf_core::child_run::spawn_lock_stats()));
@@ -209,6 +272,24 @@ pub fn lines() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows run must be able to read which path started a command and
+    /// why a launch failed, on one line each.
+    #[test]
+    fn a_launcher_line_counts_the_asks_and_the_ones_that_failed() {
+        assert_eq!(launcher_line(&Timings::ZERO, 0), None);
+        let mut asks = Timings::ZERO;
+        asks.add(Duration::from_millis(40));
+        asks.add(Duration::from_millis(60));
+        let line = launcher_line(&asks, 1).expect("a line");
+        assert!(line.starts_with("launch: asks of kGraf's launcher service 2 (1 failed)"));
+        assert!(line.contains("longest"), "{line}");
+        // A Windows message that carries line breaks stays one line.
+        assert_eq!(
+            one_line("Access is denied.\r\nstep two\n"),
+            "Access is denied.  step two"
+        );
+    }
 
     #[test]
     fn a_station_line_names_the_station_the_desktop_the_role_and_the_user() {

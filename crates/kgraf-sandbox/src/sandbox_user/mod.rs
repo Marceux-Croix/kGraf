@@ -44,14 +44,20 @@ pub mod firewall;
 pub mod handshake;
 pub mod jobserver;
 pub mod launch_record;
+pub mod named_object_grant;
 pub mod named_objects;
 pub mod names;
 pub mod password;
 pub mod plan;
+pub mod probe;
 pub mod record;
 pub mod runner;
+pub mod service_args;
+pub mod service_dacl;
+pub mod session0;
 pub mod slots;
 pub mod store;
+pub mod trusted_path;
 pub mod wfp;
 #[cfg(windows)]
 pub mod windows;
@@ -73,6 +79,33 @@ pub use store::{
     slots_dir,
 };
 pub use wfp::{DNS_RESOLVER_INTERFACE, WfpKeys, WfpObject};
+
+/// Whether cargo and rustc are expected to run in a sandboxed command on
+/// this machine.
+///
+/// Only Windows can answer no: a sandboxed command there needs a named
+/// kernel object for cargo's jobserver and for the lock rustc takes to print
+/// any diagnostic, and whether it can make one follows the launch path setup
+/// proved ([`session0`]). The answer is yes only where a probe made those
+/// objects, so a caller that adds a note to a failed command says why
+/// whenever kGraf cannot promise them (fail loud). Other platforms confine a
+/// command without taking its object namespace away.
+pub fn cargo_runs() -> bool {
+    #[cfg(windows)]
+    {
+        // No stored users means the token sandbox of decision 0011, whose
+        // restricted token is refused in the session's object directory as
+        // well.
+        windows::state::users()
+            .ok()
+            .flatten()
+            .is_some_and(|users| users.launch.cargo_runs())
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 /// What `kgraf sandbox setup` prints on a platform that needs no setup.
 pub fn no_setup_needed_notice() -> String {

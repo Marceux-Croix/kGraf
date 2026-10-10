@@ -618,6 +618,9 @@ pub(crate) fn run_confined(
 ) -> std::result::Result<(bool, String), String> {
     run_confined_on(
         kgraf_sandbox::CheckNetwork::current(),
+        // The launch path this machine proved decides whether a check that
+        // fails on a named object gets the line that says why.
+        kgraf_sandbox::sandbox_user::cargo_runs(),
         ws,
         checkout,
         denies,
@@ -629,10 +632,14 @@ pub(crate) fn run_confined(
 }
 
 /// [`run_confined`] with the network decision given, so a test can stand in
-/// for a backend that cannot deny it.
+/// for a backend that cannot deny it, and with `cargo_runs` given
+/// (`Active::cargo_runs` of the sandbox user's launch path). Where it is
+/// true, a failure that shows a named-object marker gets no sandbox note.
+/// [`run_confined`] passes `false`, which keeps the note.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_confined_on(
     network: kgraf_sandbox::CheckNetwork,
+    cargo_runs: bool,
     ws: &Workspace,
     checkout: &Path,
     denies: &[PathBuf],
@@ -788,7 +795,7 @@ pub(crate) fn run_confined_on(
     let open = network.notice().map_or_else(String::new, open_network_note);
     match status {
         Some(s) => {
-            let named = named_object_note(&text);
+            let named = named_object_note(&text, cargo_runs);
             text = format!("$ {command}\n{text}\n[{s}]");
             if !s.success() {
                 text.push_str(&refused);
@@ -966,8 +973,10 @@ pub(crate) fn refused_note(refused: &[String]) -> String {
 /// rustc could not make or open a named kernel object in the Windows
 /// session (`kgraf_sandbox::sandbox_user::named_objects`), or nothing.
 /// Without it the gate's failure reads as rustc's own crash (0xC0000409).
-fn named_object_note(log: &str) -> String {
-    kgraf_sandbox::sandbox_user::named_objects::note_for(log)
+/// Nothing too where `cargo_runs` says the active launch path makes named
+/// objects work: the failure then has another cause.
+fn named_object_note(log: &str, cargo_runs: bool) -> String {
+    kgraf_sandbox::sandbox_user::named_objects::note_for(log, cargo_runs)
         .map(|n| format!("\n[sandbox] {n}"))
         .unwrap_or_default()
 }
@@ -1370,13 +1379,26 @@ mod tests {
         let log = "[1549 bytes cut]\n[the error lines of the cut part:]\nerror: failed to run \
                    `rustc` to learn about target-specific information\n  failed to create \
                    global mutex named `rustc_errors`\n";
-        let note = super::named_object_note(log);
+        let note = super::named_object_note(log, false);
         assert!(
             note.starts_with("\n[sandbox] rustc could not make"),
             "{note}"
         );
         assert_eq!(note.matches("[sandbox]").count(), 1, "{note}");
-        assert_eq!(super::named_object_note("error[E0425]: cannot find"), "");
+        assert_eq!(
+            super::named_object_note("error[E0425]: cannot find", false),
+            ""
+        );
+    }
+
+    /// Where the active launch path makes named objects work, the same log
+    /// gets no sandbox line: the failure has another cause.
+    #[test]
+    fn no_sandbox_line_is_added_where_the_active_path_makes_named_objects_work() {
+        let log = "error: failed to run `rustc`\n  failed to create global mutex named \
+                   `rustc_errors`\n";
+        assert!(!super::named_object_note(log, false).is_empty());
+        assert_eq!(super::named_object_note(log, true), "");
     }
 
     /// The count of cut bytes is exact: the file's size less what is kept,

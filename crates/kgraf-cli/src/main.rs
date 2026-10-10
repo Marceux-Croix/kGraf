@@ -627,6 +627,18 @@ enum Command {
         #[command(subcommand)]
         action: SandboxAction,
     },
+    /// Make the named kernel objects cargo and rustc need, and say whether
+    /// they could be made. `kgraf sandbox setup` and `kgraf sandbox
+    /// selfcheck` run it as a sandbox user to measure the launch path. Its
+    /// name is `kgraf_sandbox::sandbox_user::probe::SUBCOMMAND`; a test below
+    /// holds the two equal.
+    #[command(hide = true)]
+    SandboxNamedObjectProbe {
+        /// Start the probe as a sandbox user through the recorded launch
+        /// path, and relay what it printed and the status it exited with.
+        #[arg(long)]
+        launch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -948,6 +960,9 @@ fn feature_name(command: &Command) -> &'static str {
         Command::Diag { .. } => "diag",
         Command::Deps { .. } => "deps",
         Command::Sandbox { .. } => "sandbox",
+        // The probe is part of the sandbox setup it measures, and is counted
+        // with it: one more name here would say nothing a reader wants.
+        Command::SandboxNamedObjectProbe { .. } => "sandbox",
     }
 }
 
@@ -1550,6 +1565,7 @@ fn run_cli() -> Result<()> {
             } => sandbox_cmd::elevated(&action, pipe, nonce, owner_pid, owner_sid, tag, slots),
             SandboxAction::Selfcheck => sandbox_cmd::selfcheck(),
         },
+        Command::SandboxNamedObjectProbe { launch } => sandbox_cmd::named_object_probe(launch),
         Command::Deps { action } => match action {
             DepsAction::Status => deps_cmd::status(&root),
             DepsAction::Allow { package_manager } => deps_cmd::set(
@@ -2524,6 +2540,32 @@ fn ledger_redact(root: &Path, call_id: &str, reason: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hidden probe command is reached by the word the sandbox crate
+    /// gives it, so setup can start it with that one argument, and
+    /// `--launch` is what tells the owner's side from the probe itself.
+    #[test]
+    fn the_named_object_probe_is_reached_by_its_own_word() {
+        use kgraf_sandbox::sandbox_user::probe;
+
+        let plain = Cli::try_parse_from(["kgraf", probe::SUBCOMMAND]).expect("parse");
+        match plain.command {
+            Command::SandboxNamedObjectProbe { launch } => assert!(!launch),
+            other => panic!("{}", feature_name(&other)),
+        }
+        let launched =
+            Cli::try_parse_from(["kgraf", probe::SUBCOMMAND, probe::LAUNCH_FLAG]).expect("parse");
+        match launched.command {
+            Command::SandboxNamedObjectProbe { launch } => assert!(launch),
+            other => panic!("{}", feature_name(&other)),
+        }
+        // Hidden, and not a second interface: it is counted with the sandbox
+        // setup it measures.
+        assert_eq!(
+            feature_name(&Command::SandboxNamedObjectProbe { launch: false }),
+            "sandbox"
+        );
+    }
 
     /// A price file that names only a bare model, and a ledger with one call on
     /// the Azure route to a deployment named like that model.

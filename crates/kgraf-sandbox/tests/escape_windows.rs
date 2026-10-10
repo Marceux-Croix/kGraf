@@ -38,6 +38,9 @@ use std::process::Output;
 use std::time::{Duration, Instant};
 
 use common::{fixture, sandbox_user_mode};
+use kgraf_sandbox::sandbox_user::jobserver;
+use kgraf_sandbox::sandbox_user::session0::{Active, LaunchPath};
+use kgraf_sandbox::sandbox_user::store::{credentials_path, launch_path_file};
 use kgraf_sandbox::{
     Backend, Network, ReadConfinement, Redirect, SandboxError, SandboxPolicy, WorkerSlot,
     Workspace, WorkspaceManager, WorkspaceSpec, link_dependency_trees, platform_isolation,
@@ -46,6 +49,18 @@ use kgraf_sandbox::{
 
 const DENIED: i32 = 5;
 const OTHER_ERR: i32 = 3;
+
+/// Which launch path this machine's setup proved, read from the record
+/// beside the credential store, as every sandboxed command reads it. A
+/// machine with no record takes the owner's session.
+fn active_launch_path() -> LaunchPath {
+    let tag = std::env::var("KGRAF_SANDBOX_TAG")
+        .ok()
+        .filter(|t| !t.is_empty());
+    credentials_path(tag.as_deref())
+        .and_then(|store| std::fs::read_to_string(launch_path_file(&store)).ok())
+        .map_or(LaunchPath::OwnerSession, |text| Active::decode(&text).path)
+}
 
 // ---- probe side -------------------------------------------------------------
 
@@ -261,8 +276,9 @@ fn named_semaphore(prefix: &str) -> std::io::Result<String> {
 /// DIRECTORY_CREATE_SUBDIRECTORY`.
 const DIRECTORY_AS_KERNELBASE: u32 = 0x000f;
 /// `DIRECTORY_TRAVERSE` alone: what it asks for when that open fails, before
-/// it tries the directory's `Restricted` subdirectory.
-const DIRECTORY_TRAVERSE: u32 = 0x0001;
+/// it tries the directory's `Restricted` subdirectory. Traverse is the second
+/// bit; the first is `DIRECTORY_QUERY`.
+const DIRECTORY_TRAVERSE: u32 = 0x0002;
 
 /// This process's session's object directory: `\Sessions\<n>\BaseNamedObjects`,
 /// or `\BaseNamedObjects` in session 0.
@@ -2799,7 +2815,16 @@ fn the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured() {
              sandbox user",
             kind.word()
         );
-        assert!(line.starts_with("opened kgraf-jobserver-"), "{line}");
+        // The name carries `Global\` on the session-0 path and no prefix on
+        // the owner-session path
+        // (`sandbox_user::jobserver::semaphore_name`), so the one this
+        // machine's recorded path asks for is the one the command must have
+        // opened: a name of the other path would mean the two ends do not
+        // agree.
+        let name = line.strip_prefix("opened ").unwrap_or(&line);
+        let want = jobserver::semaphore_name(active_launch_path(), [0; 8]);
+        let prefix = want.trim_end_matches(|c: char| c.is_ascii_hexdigit());
+        assert!(name.starts_with(prefix), "{line}; expected {prefix}...");
     }
 }
 

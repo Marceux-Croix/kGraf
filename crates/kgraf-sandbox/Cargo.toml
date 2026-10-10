@@ -89,6 +89,11 @@ junction = { version = "2.1.0", default-features = false }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
+    # `Wdk_System_SystemServices`: the access rights of an object directory
+    # (`DIRECTORY_QUERY` and the three beside it), held equal to the values the
+    # fallback grant's policy file repeats
+    # (`sandbox_user/named_object_grant.rs`).
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_Dns",
@@ -102,11 +107,25 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    # The launcher service builds the started process's environment from the
+    # logged-on sandbox user, never from its own
+    # (`CreateEnvironmentBlock`, `sandbox_user/windows/service_main.rs`).
+    "Win32_System_Environment",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    # `Win32_System_RemoteDesktop`: which Windows session this process runs in
+    # (`ProcessIdToSessionId`). A process in session 0 names the machine-wide
+    # object directory on both launch paths, so a Windows run reports its own
+    # session before it reads any measurement
+    # (`sandbox_user/windows/named_object_dir.rs`).
+    "Win32_System_RemoteDesktop",
     "Win32_System_Rpc",
+    # `Win32_System_Services`: kGraf's launcher service in the service control
+    # manager (`sandbox_user/windows/service.rs`), which starts a sandboxed
+    # command in session 0.
+    "Win32_System_Services",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",

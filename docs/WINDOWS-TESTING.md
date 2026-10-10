@@ -139,8 +139,9 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and seven WFP filters (three DNS filters and four loopback filters), with no tag. The output lists a received password for every one of these users. A filter Windows refuses does not stop setup: a `refused` line names it with Windows' error and a `probe:` reading, the WFP step's line says `partial`, and setup exits 0 with a closing notice that DNS, loopback connections, or both are not confined on this machine. |
 | (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines and the four loopback filter lines included, except a filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" (or "loopback connections are", or both) and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
 | (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. If selfcheck failed on the sandbox user and printed no result lines (its error names that backend and stops at the probe), step (e) still runs so its tests show which programs start as the sandbox user, and the summary says `GATE FAILED: selfcheck failed on the sandbox user and printed no result lines`. The report then says which of two cases the error line shows: the probe ran and failed the step the line names (an earlier run: "a direct connection to the origin worked"), or the probe did not finish its steps (the line gives only an exit status, for example because Git Bash did not start as that user). Any other failure stops the phase: step (e) does not run. |
+| (b2) to (b4) | the fallback grant, `kgraf sandbox-named-object-probe --launch`, `kgraf sandbox status` | Only where the probe in (b) was refused (`session0::Proof::Refused`) and the window is elevated. The phase runs the fallback's elevated action itself, probes again through the fallback and reads the status. See "Named objects" below. |
 | (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
-| (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING. |
+| (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING, the launcher service line and the fallback grant line included. A service or a grant that is still there is a failure. |
 
 Rules of the phase:
 
@@ -238,8 +239,8 @@ in the report (each came from the first self-test run whose re-run ran as the sa
   its named semaphore in the session. kGraf now makes one per command and names it in
   `CARGO_MAKEFLAGS`. Expect in (d) a launch line `made jobserver semaphore kgraf-jobserver-...
   with N tokens for a command of sandbox user ...`. The next run refused the open of that
-  semaphore too, so cargo builds as the sandbox user still fail; see "Named objects" below
-  for what (e) shows now. The cargo test prints cargo's own lines. A line
+  semaphore too; see "Named objects" below for the launcher service that is meant to fix
+  this, and for what (e) must show now. The cargo test prints cargo's own lines. A line
   `warn: could not canonicalize path C:\Users\<user>` from rustup is expected: rustup looks for
   a toolchain override in each folder above the command's folder, and the owner's profile
   folder is not readable to the sandbox user. It is a warning, not a failure.
@@ -262,35 +263,78 @@ What the phase collects about named objects, git's ref writes, the junction test
 and what to read in the report (each came from the second self-test run whose re-run ran as
 the sandbox user; none of the changes has run on Windows since):
 
-- Named objects. That run proved that a sandbox user's command can neither make nor open a
-  named object in the session: "measurement: a named semaphore in the session as the slot
-  user without the network: exit 5, denied", and cargo's "cannot open path or name
-  kgraf-jobserver-... Access is denied (os error 5)" for the semaphore kGraf made for it.
-  rustc then aborted with "failed to create global mutex named `rustc_errors`" and exit
-  0xC0000409: rustc makes that mutex, with no prefix, to print any warning or error. About
-  forty cargo tests failed this way (bench-briefs, contract checks, contract flow, four
+- Named objects. The second self-test run proved that a sandbox user's command in the
+  owner's session can neither make nor open a named object: "measurement: a named semaphore
+  in the session as the slot user without the network: exit 5, denied", and cargo's "cannot
+  open path or name kgraf-jobserver-... Access is denied (os error 5)". rustc then aborted
+  with "failed to create global mutex named `rustc_errors`" and exit 0xC0000409. About forty
+  cargo tests failed this way (bench-briefs, contract checks, contract flow, four
   kgraf_host tests, the cargo escape test). The cause, as far as the evidence goes:
   `kernelbase.dll` opens the session's object directory itself, with explicit rights,
   before it looks up any name, and that directory admits the session's logon SID, which the
-  command holds deny-only. kGraf does not change either (see decision 0097), so these tests
-  still fail. Expect in (e): `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured`
-  failing on the jobserver open, with a message that names the cause, and these lines, each
-  to be sent whole:
-  - `measurement: the session's object directory \Sessions\<n>\BaseNamedObjects as the owner
-    reads it: O:...G:...D:...S:...`, and the same for its `Restricted` subdirectory. The
-    access list says which SIDs Windows admits there and whether the account that runs
-    kGraf may change it.
-  - `measurement: a named semaphore in the session ...` and `... in the global namespace
-    (Global\) ...`, one per kind. Exit 5 in the global line confirms that a `Global\` name
-    is refused the same way; exit 0 means a global name works and a later fix can use it
-    for the jobserver (rustc's mutex still has no prefix).
-  - `measurement: the session's object directory opened with the rights kernelbase asks for
-    first ...` and `... for traversal alone ...`. Exit 5 in both is the cause above. Exit 0
-    for traversal alone means `kernelbase.dll` goes on to the `Restricted` subdirectory,
-    whose access list then decides.
-  A failed cargo command's output, in the shell tool and in a gate's result, now ends with
-  a `[sandbox]` line that names the cause ("rustc could not make its named mutex to print a
-  diagnostic: the program stopped because ..."). Expect that line in the failures' tails.
+  command holds deny-only. kGraf now starts a sandboxed command in session 0 through a
+  launcher service that setup installs, and keeps a recorded grant on the owner's session
+  object directory as the fallback (decision 0097, the last amendment). The probe decides
+  which path is active. Nothing of this has run on Windows. The next run must show the
+  following, in this order. Send each line whole.
+  1. The Windows session of the process that runs kGraf. It is the first line of the sandbox
+     user phase in the report, before any verdict, and it is read with
+     `ProcessIdToSessionId`. On a hosted machine that process may be in session 0. Then both
+     paths name the same machine-wide object directory, and every result below must be read
+     that way: a named object made there does not show that a command works from an
+     interactive session.
+  2. The launcher service. Setup (b) installs it. Status (c) has a line `present  launcher
+     service kgraf-launcher-<hash> (installed, stopped; started when a command needs it)`,
+     and the description of the service reads back as kGraf's. A stopped service between
+     commands is normal: it starts on demand and is not a gap.
+  3. The `launch:` lines. Each ask of the service gives a line `launch: the session0 path
+     started a command: ... (at ...)` that names the path that started the command and, for
+     a logon that failed, its logon type and Win32 error. The report lists these lines, and
+     the `named objects:` lines, in the "Launch path" section.
+  4. The `named objects:` line in (b), (c) and (d). It names the active path, why that path
+     is the active one, and what the probe found. A probe that made a named semaphore and an
+     unprefixed mutex says "Proved". A probe that ran and was refused says "The proof
+     failed, a named object was refused". A probe that could not run says so, and that it
+     says nothing about named objects.
+  5. The `measurement:` lines for a named semaphore and for an unprefixed mutex, each made
+     by a sandbox user through the active path, and the jobserver opened under its `Global\`
+     name (`Global\kgraf-jobserver-<hex>` on the session-0 path). The test
+     `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` must pass, or fail
+     with a message that names the cause.
+  6. cargo and rustc running as a sandbox user. The tests that failed on the named object
+     (the cargo tests listed above) must pass now, or fail for a reason that is named. The
+     environment of a command comes from `CreateEnvironmentBlock` and the user profile is not
+     loaded, so what a build reads from `HKEY_CURRENT_USER` is not available. The run shows
+     whether cargo, rustc or a toolchain lookup needs it. A failed cargo command's output
+     still ends with a `[sandbox]` line that names the cause where cargo cannot run.
+  7. No change in what the launcher touches: standard input and output, the exit status, the
+     kill when the command is dropped, the time limits, the job, the egress proxy and the
+     network filters (the WFP filters match by user SID). The tests for these must pass as
+     they did before.
+  8. A clean remove (f). The service is stopped and deleted, the fallback grant is taken off
+     where it was made, and nothing of kGraf's is left. The status after the removal has the
+     line `MISSING  launcher service ...` and a `MISSING` line for the fallback grant. The
+     report says "Launcher service after the removal: gone. Fallback grant after the
+     removal: gone." A service or a grant that is still there, or a status that prints
+     neither line, makes the removal check fail.
+  9. If the probe in (b) was refused, the phase exercises the fallback by itself, with no
+     person at the keyboard. After setup it runs the elevated action
+     `kgraf sandbox elevated --action grant-named-objects` (step (b2), started from the
+     runner the way setup starts its own elevated step), probes again through the fallback
+     (step (b3), `kgraf sandbox-named-object-probe --launch`) and reads the status (b4). The
+     report section "Named objects: the fallback and the path chosen" prints, in this order:
+     the Windows session the elevated step ran in; the access list of that session's object
+     directory before the grant and after it; the path chosen (session 0, the fallback grant,
+     or neither); and the probe outcome for each path tried, in the words of
+     `session0::Proof` (`Made`, `Refused`, `CouldNotRun`). Where the fallback is the active
+     path, the whole list above must hold through it, and the risk line must be in setup,
+     status, selfcheck and the report: a sandboxed command can then put a named object in
+     the directory the owner's own programs read. The grant is gone at the next sign-out in
+     any case, and remove takes it off as well. If the first probe was not refused, the
+     report says the fallback did not run.
+  If the process that runs kGraf is in session 0, items 4, 5 and 9 describe one machine-wide
+  directory and prove less than they do from an interactive session. Say so when you send the
+  report.
 - Git's ref writes. That run's `everything_a_check_creates_is_removed_and_nothing_outside`
   failed in a check that ran `git init` in a tree in the owner's profile: "cannot lock ref
   'HEAD': unable to create directory for .../nested/.git/HEAD". Git stats each folder of

@@ -1383,6 +1383,73 @@ impl Exec for PhaseExec<'_> {
         e2e::run_all(&ctx, cfg!(windows))
     }
 
+    fn grant_named_objects(&mut self) -> StepRun {
+        let label = "(b2) fallback grant (elevated action grant-named-objects)";
+        let command = "kgraf sandbox elevated --action grant-named-objects".to_owned();
+        self.console.log(&format!("  sandbox user {label}"));
+        let started = Instant::now();
+        #[cfg(windows)]
+        let (code, start_error, output) = {
+            use kgraf_sandbox::sandbox_user::OwnerNames;
+            use kgraf_sandbox::sandbox_user::windows::{accounts, setup};
+            let mut out = Vec::new();
+            let exe = self.kgraf().to_string_lossy().into_owned();
+            let result: Result<(), String> = (|| {
+                let sid = accounts::current_user_sid().map_err(|e| e.to_string())?;
+                let names = OwnerNames::derive(&sid, None).map_err(|e| e.to_string())?;
+                setup::grant_named_objects(
+                    &names,
+                    &setup::Launch {
+                        exe: &exe,
+                        subcommand: "sandbox elevated",
+                    },
+                    &mut |e| out.push(format!("{e:?}")),
+                )
+                .map_err(|e| e.to_string())
+            })();
+            match result {
+                Ok(()) => (Some(0), None, out.join("\n")),
+                Err(e) => (Some(1), None, format!("{}\n{e}", out.join("\n"))),
+            }
+        };
+        #[cfg(not(windows))]
+        let (code, start_error, output) = (
+            None,
+            Some("the fallback grant exists only on Windows".to_owned()),
+            String::new(),
+        );
+        StepRun {
+            label: label.to_owned(),
+            command,
+            code,
+            start_error,
+            secs: started.elapsed().as_secs_f64(),
+            output,
+            ..StepRun::default()
+        }
+    }
+
+    fn object_directory(&mut self) -> sandbox_phase::DirectoryRead {
+        #[cfg(windows)]
+        {
+            use kgraf_sandbox::sandbox_user::windows::named_object_dir as dir;
+            let session = dir::session_of_current_process().map_err(|e| e.to_string());
+            let access_list = match &session {
+                Ok(n) => dir::read_sddl(*n).map_err(|e| e.to_string()),
+                Err(e) => Err(e.clone()),
+            };
+            sandbox_phase::DirectoryRead {
+                session,
+                access_list,
+            }
+        }
+        #[cfg(not(windows))]
+        sandbox_phase::DirectoryRead {
+            session: Err("this is not a Windows host".into()),
+            access_list: Err("this is not a Windows host".into()),
+        }
+    }
+
     fn teardown(&mut self) -> Vec<String> {
         match self.placed.take() {
             Some(p) => {

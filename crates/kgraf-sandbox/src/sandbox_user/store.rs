@@ -66,6 +66,15 @@ pub fn grants_path(store: &Path) -> PathBuf {
     store.with_extension("grants")
 }
 
+/// Where setup records which launch path a sandboxed command takes on this
+/// machine ([`super::session0::Active`]), beside the store at `store`. The
+/// owner's own process writes and reads it, so it needs no administrator
+/// rights; a missing file means the owner's session with no grant, which is
+/// what every setup before the launcher service made.
+pub fn launch_path_file(store: &Path) -> PathBuf {
+    store.with_extension("launch")
+}
+
 /// The folders a grants list names: one absolute path per line, each once,
 /// in the order first written. Blank and relative lines are skipped, so a
 /// damaged line never names a folder relative to where `remove` runs.

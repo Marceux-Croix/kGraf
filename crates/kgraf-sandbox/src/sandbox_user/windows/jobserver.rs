@@ -14,6 +14,7 @@ use windows_sys::Win32::System::Threading::CreateSemaphoreW;
 
 use super::super::jobserver::{makeflags, semaphore_name, semaphore_sddl, tokens};
 use super::super::launch_record;
+use super::super::session0::LaunchPath;
 use super::{last_error, wide};
 use crate::error::SandboxError;
 
@@ -58,6 +59,12 @@ pub(crate) fn create(owner_sid: &str, user_sid: &str) -> Result<Jobserver, Sandb
         bInheritHandle: 0,
     };
     let count = tokens(std::thread::available_parallelism().map_or(1, usize::from));
+    // The name must be the one the command looks up, so it follows the path
+    // that starts the command: in session 0 the owner's process and the
+    // command are in different sessions, and only a `Global\` name is the
+    // same object for both. A machine with no record takes the owner's
+    // session, as every setup before the launcher service made.
+    let path = super::state::users()?.map_or(LaunchPath::OwnerSession, |users| users.launch.path);
     let made = (|| {
         for _ in 0..NAME_TRIES {
             let mut nonce = [0u8; 8];
@@ -65,7 +72,7 @@ pub(crate) fn create(owner_sid: &str, user_sid: &str) -> Result<Jobserver, Sandb
                 step: "name the jobserver semaphore (getrandom)",
                 source: std::io::Error::other(e.to_string()),
             })?;
-            let name = semaphore_name(nonce);
+            let name = semaphore_name(path, nonce);
             let w = wide(&name);
             // SAFETY: `sa` and `w` live across the call; the result is a
             // handle or null.

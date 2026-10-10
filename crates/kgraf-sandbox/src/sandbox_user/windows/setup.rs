@@ -7,11 +7,13 @@
 //! the undo record after every step, so a run cut short can still be undone.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::super::acl::{CLOSED_FOLDER_DENY, CLOSED_FOLDER_FLAGS};
 use super::super::blob::{StoredUser, decode_credentials, decode_users, encode_credentials};
 use super::super::firewall::{offline_rules, rule_users};
 use super::super::handshake::{Event, Message, Receiver, StepOutcome, new_nonce, pipe_name};
+use super::super::named_object_grant;
 use super::super::names::{MAX_SLOTS, OwnerNames, Role};
 use super::super::password::Password;
 use super::super::plan::{
@@ -20,10 +22,15 @@ use super::super::plan::{
     plan_remove, plan_setup, removal_outcome, stale_closed_entries, status_report, undo_key,
 };
 use super::super::record::{DENIED_LOGON_RIGHTS, Record, UndoEntry};
+use super::super::runner::RUNNER_NAME;
+use super::super::service_args;
 use super::super::slots::roots_in_text;
 use super::super::store::{grants_path, load_user, parse_grants, slots_dir};
+use super::super::trusted_path;
 use super::super::wfp::{WfpKeys, WfpObject, filter_users};
-use super::{accounts, dpapi::Dpapi, elevate, firewall, pipe, secure, wfp};
+use super::{
+    accounts, dpapi::Dpapi, elevate, firewall, named_object_dir, pipe, secure, service, wfp,
+};
 use crate::error::SandboxError;
 
 fn setup_error(step: &'static str, why: impl std::fmt::Display) -> SandboxError {
@@ -201,6 +208,33 @@ fn close_folders(
 pub enum ElevatedAction {
     Setup,
     Remove,
+    /// The fallback alone: grant the sandbox group the smallest rights that
+    /// let a command look up and make a name in the owner's session object
+    /// directory ([`super::named_object_dir`]). Its own action, so the
+    /// administrator rights it needs are asked for only on a machine where
+    /// the launcher service did not prove itself, and never on a machine
+    /// where the session-0 path works.
+    GrantNamedObjects,
+}
+
+impl ElevatedAction {
+    /// The word the elevated step is started with.
+    pub fn key(self) -> &'static str {
+        match self {
+            ElevatedAction::Setup => "setup",
+            ElevatedAction::Remove => "remove",
+            ElevatedAction::GrantNamedObjects => "grant-named-objects",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "setup" => Some(ElevatedAction::Setup),
+            "remove" => Some(ElevatedAction::Remove),
+            "grant-named-objects" => Some(ElevatedAction::GrantNamedObjects),
+            _ => None,
+        }
+    }
 }
 
 /// The elevated step's arguments, as the user's process passed them.
@@ -248,10 +282,15 @@ pub fn elevated_main(args: &ElevatedArgs) -> i32 {
             // two fixed users once reported every slot user's sign-in screen
             // entry as already gone while it was still there.
             (ElevatedAction::Remove, _) => Ok(names.with_slots(MAX_SLOTS)),
+            // The grant acts on the sandbox group alone, so the slot count
+            // changes nothing; it reads every slot there can be, as a
+            // removal does.
+            (ElevatedAction::GrantNamedObjects, _) => Ok(names.with_slots(MAX_SLOTS)),
         })
         .and_then(|names| match args.action {
             ElevatedAction::Setup => run_setup(&names, &mut send),
             ElevatedAction::Remove => run_remove(&names, &mut send),
+            ElevatedAction::GrantNamedObjects => run_grant(&names, &mut send),
         });
     match result {
         Ok(()) => {
@@ -308,6 +347,25 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
         };
         // What the DNS filter step did with each filter, once it ran.
         let mut dns: Option<DnsStepReport> = None;
+        // A measurement a step read for the owner to collect, with no change
+        // of its own.
+        let mut measured: Option<String> = None;
+        // The launcher service goes into the record before it is installed,
+        // not after. `CreateServiceW` can succeed and the write of the
+        // service's description or of its access list then fail, which would
+        // leave a service that runs as LocalSystem behind with no record of
+        // it, so `kgraf sandbox remove` would walk past it. The record is on
+        // disk by the time the install is attempted, and a removal treats an
+        // entry whose object is not there as a removal that finished, so an
+        // entry for a service that was never created costs nothing. Every
+        // other step's objects are named by the undo entries the loop adds
+        // after it, which no partial failure can leave behind.
+        if step.id == StepId::Service {
+            for entry in &step.undo {
+                record.add(entry.clone());
+            }
+            write_record(&path, &record).map_err(|e| fail("record", &e))?;
+        }
         let done: Result<(), SandboxError> = match step.id {
             StepId::CheckFirewall => Ok(()),
             StepId::User(role) => {
@@ -370,6 +428,32 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
                 });
                 dns = Some(dns_step_report(step.action, &results));
             }),
+            // kGraf's launcher service, which starts a sandboxed command in
+            // session 0 so it can make the named kernel objects cargo and
+            // rustc need (`super::super::session0`). It starts nothing but
+            // the runner beside this executable, and only for the owner.
+            StepId::Service => install_service(names),
+            // The fallback is not made here: this step only measures. A
+            // grant on the owner's session object directory is a weaker
+            // boundary, so it is made by its own elevated action
+            // (`ElevatedAction::GrantNamedObjects`), and only on a machine
+            // where a probe showed the launcher service refused a named
+            // object. The measurement goes to the owner as a note, so a
+            // Windows run reads which session the owner is in and what that
+            // directory admits.
+            StepId::NamedObjects => match named_object_dir::session_of_current_process() {
+                Ok(session) => {
+                    let sddl = named_object_dir::read_sddl(session)
+                        .unwrap_or_else(|e| format!("could not be read: {e}"));
+                    measured = Some(format!(
+                        "the elevated step runs in session {session}; its object directory {} \
+                         admits {sddl}",
+                        named_object_grant::directory_path(session)
+                    ));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             StepId::Record => Ok(()),
         };
         done.map_err(|e| {
@@ -385,6 +469,14 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
         })?;
         for entry in &step.undo {
             record.add(entry.clone());
+        }
+        if let Some(message) = measured
+            && !send(Message::Note {
+                key: key.clone(),
+                message,
+            })
+        {
+            return Err(fail("pipe", &"the user's process stopped listening"));
         }
         if let Some(report) = dns {
             // Every key is still in the undo list: removal treats a key
@@ -409,6 +501,199 @@ fn run_setup(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resul
         if !send(Message::Password { role, password }) {
             return Err(fail("pipe", &"the user's process stopped listening"));
         }
+    }
+    Ok(())
+}
+
+/// The step that reads who may write kGraf's own program files, named in
+/// every refusal it raises.
+const IMAGE_CHECK_STEP: &str = "check that only administrators may write kGraf's program files";
+
+/// One object on the path to a program the launcher service starts, read as
+/// the rule in [`super::super::trusted_path`] reads it: one open that follows
+/// no link, for the attributes, the owner and the access list.
+///
+/// `Err` is a reason the object could not be judged, which refuses the
+/// install exactly as a bad access list does: the check fails closed.
+fn path_object(path: &Path) -> Result<trusted_path::Object, String> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    let attrs = meta.file_attributes();
+    // `symlink_metadata` reports a junction as neither file nor folder, so the
+    // attributes decide; a link is refused by the rule in any case.
+    let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let kind = match (is_dir, path.parent()) {
+        (true, None) => trusted_path::Kind::VolumeRoot,
+        (true, Some(_)) => trusted_path::Kind::Folder,
+        (false, _) => trusted_path::Kind::File,
+    };
+    Ok(trusted_path::Object {
+        path: path.display().to_string(),
+        kind,
+        owner: secure::owner_of(path),
+        link: attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        dacl: secure::dacl_of(path).map_err(|e| {
+            format!(
+                "the access list of {} could not be read: {e}",
+                path.display()
+            )
+        })?,
+    })
+}
+
+/// Refuse the install unless no principal other than an administrator
+/// principal can put other bytes behind any of `paths`: each file, and every
+/// folder above it up to the volume root.
+///
+/// The rule, the trusted principals and the disqualifying rights are in
+/// [`super::super::trusted_path`], so the policy is reviewable without
+/// Windows. This function only reads the machine and reports the first object
+/// that fails.
+pub(crate) fn only_administrators_may_write(paths: &[&Path]) -> Result<(), SandboxError> {
+    let refuse = |why: String| setup_error(IMAGE_CHECK_STEP, trusted_path::refusal_message(&why));
+    for path in paths {
+        if let Some(why) = trusted_path::shape_refusal(&path.to_string_lossy()) {
+            return Err(refuse(why));
+        }
+        // The volume root first, so the first refusal names the outermost
+        // object that has to be put right. Two paths in one folder read that
+        // folder twice, which costs one open and keeps the walk plain.
+        let mut up: Vec<&Path> = path.ancestors().collect();
+        up.reverse();
+        let chain: Vec<trusted_path::Object> = up
+            .into_iter()
+            .map(path_object)
+            .collect::<Result<_, String>>()
+            .map_err(refuse)?;
+        if let Some(why) = trusted_path::first_refusal(&chain) {
+            return Err(refuse(why));
+        }
+    }
+    Ok(())
+}
+
+/// How long a removal waits for the launcher service to stop before it
+/// deletes it. A command that is still running keeps its own process and job,
+/// so the wait is for the service alone, and a removal must finish.
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Install or refresh kGraf's launcher service: this executable, with the
+/// launcher subcommand, the owner's SID, the pipe name and the runner beside
+/// this executable. The runner path is pinned at install time, so the service
+/// starts nothing else.
+fn install_service(names: &OwnerNames) -> Result<(), SandboxError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| setup_error("find kGraf's own program for the launcher service", e))?;
+    let runner = super::state::find_runner(&exe).ok_or_else(|| {
+        setup_error(
+            "find the runner for the launcher service",
+            format!(
+                "{}.exe is not installed beside {}",
+                RUNNER_NAME,
+                exe.display()
+            ),
+        )
+    })?;
+    // Both files and every folder above them, before anything is installed:
+    // the service runs as LocalSystem and the owner's own account may start
+    // it, so a principal that can replace either file runs code as
+    // LocalSystem (`super::super::trusted_path`).
+    only_administrators_may_write(&[&exe, &runner])?;
+    let args = service_args::ServiceArgs {
+        owner_sid: names.owner_sid().to_owned(),
+        pipe: names.service_pipe(),
+        runner: runner.to_string_lossy().into_owned(),
+    };
+    // Checked here, so an argument the service would refuse never reaches an
+    // installed image path.
+    service_args::ServiceArgs::parse(args.to_args())
+        .map_err(|e| setup_error("build the launcher service's arguments", e.0))?;
+    let args = args.to_args();
+    service::install(
+        &names.service(),
+        &names.service_display(),
+        &names.service_comment(),
+        &exe,
+        &args,
+        names.owner_sid(),
+    )
+}
+
+/// The fallback alone, as its own elevated action: grant the sandbox group
+/// the smallest rights that let a command look up and make a name in the
+/// owner's session object directory, record the grant, and report what the
+/// directory admits.
+///
+/// The owner's process asks for this only where a probe showed the launcher
+/// service refused a named object, so a machine on which session 0 works
+/// never gets the weaker boundary.
+fn run_grant(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Result<(), Failure> {
+    let fail = |key: &str, e: &dyn std::fmt::Display| (key.to_owned(), e.to_string());
+    let key = StepId::NamedObjects.key();
+    // `_hold` keeps the record's folder open until this step ends, as a
+    // setup does, so none of them can be renamed away between the check and
+    // the write.
+    let (path, _hold) = trusted_record_path(names, true)
+        .map_err(|e| fail("record", &e))?
+        .ok_or_else(|| fail("record", &"the undo record folder is missing"))?;
+    let mut record = match read_record(&path) {
+        Ok(Some(r)) if r.owner_sid == names.owner_sid() => r,
+        Ok(Some(r)) => {
+            return Err(fail(
+                "record",
+                &format!(
+                    "the undo record belongs to {}, not to {}",
+                    r.owner_sid,
+                    names.owner_sid()
+                ),
+            ));
+        }
+        Ok(None) => Record::new(names.owner_sid(), names.tag()),
+        Err(e) => return Err(fail("record", &e)),
+    };
+    let session =
+        named_object_dir::session_of_current_process().map_err(|e| fail(&key, &e.to_string()))?;
+    let group = accounts::sid_of(&names.group())
+        .map_err(|e| fail(&key, &e.to_string()))?
+        .ok_or_else(|| {
+            fail(
+                &key,
+                &format!(
+                    "the sandbox group {} does not exist; run `kgraf sandbox setup` first",
+                    names.group()
+                ),
+            )
+        })?;
+    let mask = named_object_dir::grant(session, &group).map_err(|e| fail(&key, &e.to_string()))?;
+    record.add(UndoEntry::NamedObjectsGrant {
+        sid: group.clone(),
+        mask,
+    });
+    write_record(&path, &record).map_err(|e| fail("record", &e))?;
+    let sddl = named_object_dir::read_sddl(session)
+        .unwrap_or_else(|e| format!("could not be read after the grant: {e}"));
+    if !send(Message::Note {
+        key: key.clone(),
+        message: format!(
+            "the sandbox group {group} may now look up and make a name in the object directory \
+             {} of session {session}, with the access mask {mask:#x}. {} Its access list is now \
+             {sddl}",
+            named_object_grant::directory_path(session),
+            named_object_grant::EXPLANATION
+        ),
+    }) {
+        return Err(fail("pipe", &"the user's process stopped listening"));
+    }
+    if !send(Message::Step {
+        key,
+        outcome: StepOutcome::Created,
+    }) {
+        return Err(fail("pipe", &"the user's process stopped listening"));
     }
     Ok(())
 }
@@ -477,6 +762,21 @@ fn run_remove(names: &OwnerNames, send: &mut dyn FnMut(Message) -> bool) -> Resu
                     flags,
                 } => secure::reopen_folder(Path::new(path), sid, *mask, *flags),
                 UndoEntry::Wfp { object, key } => wfp::remove(*object, *key).map(drop),
+                // Stopped with a bounded wait, then deleted, even while a
+                // command still runs: the command has its own process and
+                // the owner's job, so it does not need the service any more,
+                // and a removal must finish.
+                UndoEntry::Service(name) => service::delete(name, SERVICE_STOP_TIMEOUT),
+                // Exactly the entry the record names, on the directory of
+                // the session this removal runs in. An entry that is already
+                // gone is a success: Windows makes that directory again at
+                // every logon, so a grant of an earlier session is gone with
+                // it.
+                UndoEntry::NamedObjectsGrant { sid, mask } => {
+                    named_object_dir::session_of_current_process()
+                        .and_then(|session| named_object_dir::revoke(session, sid, *mask))
+                        .map(drop)
+                }
             };
             if let Err(e) = done {
                 let message = format!(
@@ -536,7 +836,7 @@ fn drive(
     let params = format!(
         "{} {}",
         launch.subcommand,
-        elevated_params(names, action == ElevatedAction::Setup, &name, &nonce, pid)
+        elevated_params(names, action.key(), &name, &nonce, pid)
     );
     let child = elevate::run_elevated(launch.exe, &params)?;
     let lines = server.accept(&child.process, child.pid)?;
@@ -660,6 +960,22 @@ pub fn setup(
     std::fs::write(&tmp, bytes).map_err(|e| setup_error("store the passwords", e))?;
     std::fs::rename(&tmp, store).map_err(|e| setup_error("store the passwords", e))?;
     Ok(gaps)
+}
+
+/// The fallback for named objects, asked for on its own: grant the sandbox
+/// group the smallest rights that let a command look up and make a name in
+/// the owner's session object directory.
+///
+/// The caller asks for this only where a probe showed that the launcher
+/// service refused a named object, and says what the fallback costs before
+/// the administrator prompt. One more prompt is the price of a machine on
+/// which session 0 does not work; a machine on which it works never sees it.
+pub fn grant_named_objects(
+    names: &OwnerNames,
+    launch: &Launch<'_>,
+    on_event: &mut dyn FnMut(&Event),
+) -> Result<(), SandboxError> {
+    drive(names, launch, ElevatedAction::GrantNamedObjects, on_event).map(drop)
 }
 
 /// `kgraf sandbox remove`: undo what the record lists, then delete the stored

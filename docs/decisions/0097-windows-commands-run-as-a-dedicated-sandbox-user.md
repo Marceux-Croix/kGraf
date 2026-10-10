@@ -1848,3 +1848,213 @@ What the next Windows run must show:
   is the recorded gap".
 - A later fix for named objects is chosen on those lines: whether a `Global\` name works,
   whether the directory admits traversal, and who may change its access list.
+
+---
+
+## Amendment (2026-10-09): a launcher service starts a sandboxed command in session 0, so cargo and rustc run
+
+The gap the amendment above recorded, that cargo and rustc cannot run as a sandbox user, is
+not acceptable: Rust work is what kGraf is for. This amendment is what was built to close it.
+Nothing in it has run on Windows yet; every line says what is proved on the host, what is
+documented and what a Windows run must show.
+
+### Why a separate session is the fix
+
+Every Win32 call for a named mutex, semaphore, event or section resolves the name below one
+object directory that `kernelbase.dll` opens once per process, with explicit rights, before
+it looks up any name. In the owner's session that directory is
+`\Sessions\<n>\BaseNamedObjects`, Windows admits the session's logon SID there, and a
+sandboxed command holds that SID deny-only, so every such call is refused. In session 0, the
+session Windows gives its services, an unprefixed name resolves below the machine-wide
+`\BaseNamedObjects` instead (Microsoft, "Kernel Object Namespaces": a service application
+uses the global namespace by default). So a command that runs in session 0 reaches a
+directory that carries no session logon SID, with the sandbox user's rights unchanged.
+
+Rejected, with the reason:
+
+- **Give the command the owner's logon SID.** It would admit the command to the objects the
+  owner's own processes make, which is what the runner's deny-only SID exists to prevent.
+- **Change the access list of the owner's session object directory, for every command.**
+  Windows makes that directory again at every logon, and a command could then plant a named
+  object the owner's own programs open. Kept only as the fallback below, recorded and
+  removed.
+- **A private namespace** (`CreatePrivateNamespace`). The `jobserver` crate and rustc open
+  fixed names, not boundaries, so a namespace of kGraf's own is not the one they look in.
+- **BNO isolation** (`ProcThreadAttributeBnoIsolation`). Undocumented, and it is not
+  inherited by the child processes a build starts.
+- **A scheduled task** instead of a service. A task registered to run whether the user is
+  logged on or not does land in session 0, but it takes no handles, so the command's standard
+  input and output, its job and its exit status would all have to be rebuilt around files;
+  registration is per run and slow.
+- **`CreateProcessWithLogonW` with the session changed.** Moving a token to another session
+  needs `SeTcbPrivilege`, which the account that runs kGraf has not got, and that call cannot
+  run from a service at all: the LocalSystem token has no logon SID (Microsoft names
+  `LogonUser` with `CreateProcessAsUser` as the way to do this from a service).
+
+### What was built
+
+- **One service per owner**, `kgraf-launcher-<hash>`, installed by the elevated
+  `kgraf sandbox setup` and deleted by `kgraf sandbox remove`, recorded in the undo record
+  like every other object setup makes. LocalSystem, demand start: it does not run until the
+  first sandboxed command starts it, and it then stays running until it is stopped or
+  removed. Its own access list gives the owner's SID exactly `SERVICE_START`,
+  `SERVICE_STOP`, `SERVICE_QUERY_STATUS`, `SERVICE_QUERY_CONFIG` and `READ_CONTROL`: it may
+  start and stop the service and read its state, and may not change what the service runs.
+- **It starts nothing but kGraf's runner.** The service refuses any request whose runner path
+  is not the one the administrator installed it with, and the command itself still comes over
+  the owner-to-runner pipe and still runs with the token the runner builds. Nothing runs as
+  SYSTEM.
+- **Owner-only requests.** The service's pipe is created as the first instance
+  (`FILE_FLAG_FIRST_PIPE_INSTANCE`), rejects remote clients, and its access list admits
+  SYSTEM and the owner's SID alone, without `FILE_CREATE_PIPE_INSTANCE`, so not even the
+  owner's SID can create a second instance of the name. For each request the service reads
+  the whole frame first, then impersonates the client, reads the client token's user SID and
+  refuses every SID but the owner's; a failed impersonation is a refusal, never a request
+  handled as the service's own. The client's process ID is checked against the request as a
+  second, weaker test, because Windows reuses process IDs.
+- **The owner's handles, and nothing else.** The service opens the owner's process for
+  `PROCESS_DUP_HANDLE` and duplicates four handles out of it: the three standard handles and
+  the job. It refuses any handle whose object is not a pipe, a file or a job. So the sandbox
+  gets the owner's own standard input and output and the owner's job, and the launcher adds
+  nothing of its own.
+- **The job, the kill and the timeouts are unchanged.** The created process is put in the
+  owner's job while it is still suspended, and the runner's protected access lists are
+  written before it runs, as on the owner-session path. A job assignment that fails ends the
+  suspended process: a command outside the owner's job could outlive the owner.
+- **The window station.** The service passes an empty `lpDesktop`, so Windows forms a window
+  station name from the new logon session's ID and creates that station and its default
+  desktop (Microsoft, "Process Connection to a Window Station"). Each command therefore gets
+  a window station of its own in session 0, and no access list of the owner's session is
+  touched. On the owner-session path the two stations kGraf makes are unchanged.
+- **The logon.** `LogonUserW` with `LOGON32_LOGON_INTERACTIVE`, domain `.`, and the password
+  the owner's process unsealed and sent in the request. The password is sealed for the
+  owner's account with DPAPI, which LocalSystem cannot open, so the service cannot hold it;
+  it travels over the owner-only pipe, is never written to disk, and both ends clear it from
+  memory. The interactive type is used because setup denies each sandbox user the batch,
+  service, network and remote-interactive logon rights on purpose, and that is not loosened.
+  `CreateProcessAsUser` runs the process in the token's session, and a token from `LogonUser`
+  carries the session of the process that called it, so the command lands in the service's
+  session 0 with no privilege to move it.
+- **The logon SID, per path.** The runner's option `--logon-sid` says what to do, and the
+  runner checks the token it built against what was asked (fail loud either way). On the
+  owner-session path it stays `deny`, as before. On the session-0 path it is `keep`: the token
+  comes from `LogonUser` for the sandbox user alone, so its logon SID names a logon session
+  nothing else shares, nothing of the owner's admits it, and the object directory of session 0
+  is reached through it.
+- **The jobserver semaphore** is named `Global\kgraf-jobserver-<hex>` on the session-0 path,
+  so the owner's process, which creates it in the owner's session, and the command, which
+  opens it in session 0, name the same object. Its access list is unchanged: SYSTEM and the
+  owner fully, the command's user to wait and release only. On the owner-session path the
+  name stays unprefixed.
+- **The profile is not loaded.** `LoadUserProfile` needs the backup and restore privileges
+  and leaves a loaded hive behind, so the service does not call it. The environment comes from
+  `CreateEnvironmentBlock`, never from the service's own LocalSystem environment. What a
+  build reads from `HKEY_CURRENT_USER` is therefore not available; a Windows run must show
+  whether cargo, rustc or a toolchain lookup needs it.
+
+### What the session-0 path costs
+
+The fallback's weaker boundary is said out loud, so this path's cost is said in the same
+place and the same words (`session0::Active::line`), and a reader is not left with the
+impression that session 0 costs nothing:
+
+- A command can make a name in the machine-wide object directory, which this machine's
+  services also use. So it can take a name a service has not made yet, and a later
+  create-or-open by that service then opens the command's object or fails. An object the
+  command makes carries its own access list, which admits that command's user alone, so no
+  other user reaches through it; the name is the reach, not the object.
+- Two commands of one sandbox user can reach each other's named objects there. Before this
+  path neither could make such an object at all. One sandbox user is one boundary in this
+  design, so this is inside a boundary and not across one, but it is new.
+- What does not change: named pipes and the ports of the remote procedure call were never
+  per session, so the service control manager and those endpoints were reachable before.
+  The folder access lists, the firewall rules and the network filters all match by user
+  SID, so they hold in session 0 unchanged. Session 0 has no interactive desktop, and each
+  command gets the window station of its own logon session.
+
+### The fallback, and how the path is chosen
+
+Where the service cannot be installed or started, or where its proof fails, setup grants the
+sandbox group the smallest rights that let a command look up and make a name in the owner's
+session object directory, records the grant and takes it off at remove. It is a weaker
+boundary, and setup, status, selfcheck and the Windows self-test report all say so in the same
+words: a sandboxed command can then put a named object in the directory the owner's own
+programs read. The grant is gone at the owner's next sign-out in any case.
+
+The choice is made from measurements, not from intent. Setup installs the service and then
+proves it: it runs a probe as a sandbox user through the new path, and the probe makes a named
+semaphore and an unprefixed mutex. Only a probe that ran and failed moves setup to the
+fallback, which is then proved the same way. Where neither path proves itself, commands run as
+before and a failed cargo or rustc keeps its `[sandbox]` line. The active path, why it is the
+active one, and what a probe found are one line in `kgraf sandbox status`, in `selfcheck`, at
+the end of setup and in the Windows self-test report. A probe that could not run at all, for a
+reason that is not a refused named object, leaves the path unproved and says that: it does not
+pick the fallback on an unrelated failure.
+
+### What a review of the launcher changed, and what it left open
+
+An adversarial review of the launcher, before any Windows run, found two defects that could
+have made the machine less safe than it was. Both are fixed:
+
+- **The service made the owner's standard handles inheritable in its own process and started
+  the runner with handle inheritance on.** Requests are answered on one thread each, so a
+  command of one sandbox user could inherit the standard handles of another, and a standard
+  output redirected to a file is a file handle that carries the owner's own access. The
+  start now names exactly the three handles it passes, and the job with them, so inheritance
+  cannot reach anything else and a command can no longer be left outside the job by a
+  service that ends between the two calls.
+- **Nothing checked where kGraf's own program and its runner live.** The owner may start the
+  service, and the service runs as the local system account, so a program file that a
+  non-administrator may write is a way to run code as that account. kGraf's own tests run its
+  program from a folder inside the repository under test, and a sandbox user may hold a grant
+  over such a tree. Setup now checks the program, the runner and every folder above each of
+  them, and refuses to install the service when anything but the system, the administrators
+  or the trusted installer may write there. The refusal is a step failure that names the
+  first path and the entry that failed, so the selection falls to the fallback and says why.
+
+Also fixed from the same review: the launcher's reply is read with a deadline; every failure
+after the job is made ends the job; the password is built in one buffer of its exact size at
+both ends; a pipe that is not there yet is waited out, because the service control manager
+reports the service running before the service has made its first instance; the job a
+request names is refused unless it kills its processes when it closes and permits no
+breakaway; the owner's process is verified by its account and not by its process ID alone; a
+service that is installed is recorded before anything else is written, so a setup cut short
+cannot leave one behind; and a request thread that panics no longer holds a client slot for
+good.
+
+Left open, with the reason:
+
+- **A program can take the launcher's pipe name while the service is stopped.** The name is
+  derived from the owner's SID, which every local account can read, and the service is demand
+  start, so the name is free until the first command of a session. kGraf's side cannot be
+  made to talk to such a program (it offers identification alone and refuses any server that
+  does not run as the local system account, before it sends anything), so the cost is that
+  sandboxed commands stop working until the squatter is gone, and not a password or a
+  launch. A probe that fails this way is read as "could not run", which asks for no
+  fallback.
+- **A request may name any handle whose object is a file.** A pipe and a file are one object
+  type on Windows, and kGraf redirects a command's standard streams to files on purpose, so
+  the type check cannot be narrower. Only the owner's own process can send a request, so this
+  is one more layer and not a boundary.
+- **Two commands of one sandbox user can reach each other's named objects in session 0.**
+  Stated above under what the path costs.
+
+### What a Windows run must show
+
+1. **Which session the process that runs kGraf is in**, first of all. On a hosted machine
+   that process may itself be in session 0, and then both paths name the same machine-wide
+   directory and the result must be read that way.
+2. The service installed, its description read back as kGraf's, started on demand, and a
+   `launch:` line for every command saying which path started it and, for the session-0 path,
+   the logon type and the Win32 error of a logon that failed.
+3. `measurement:` lines from a sandbox user through the active path: a named semaphore and an
+   unprefixed mutex, both made; the jobserver opened under its `Global\` name.
+4. cargo and rustc running as a sandbox user: the cargo-dependent tests that failed on the
+   named object now pass, or fail for another reason that is named.
+5. Unchanged behaviour on everything the launcher touches: standard input and output, exit
+   status, kill on drop, the time limits, the job, the egress proxy and the network filters,
+   which match by user SID.
+6. A clean `kgraf sandbox remove`: the service stopped and deleted, the fallback grant taken
+   off where it was made, and nothing of kGraf's left behind.
+7. Where the fallback is the active path, the same proof through it, and the risk line in
+   setup, status, selfcheck and the report.

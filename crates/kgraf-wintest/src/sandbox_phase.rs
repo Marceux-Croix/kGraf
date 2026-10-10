@@ -25,10 +25,14 @@ use serde::Serialize;
 use crate::e2e::{Check, Status};
 use crate::libtest::Outcome;
 use crate::report::BinaryResult;
+use kgraf_sandbox::sandbox_user::probe;
+use kgraf_sandbox::sandbox_user::session0::Proof;
 
 pub const SETUP_LIMIT: Duration = Duration::from_secs(300);
 pub const STATUS_LIMIT: Duration = Duration::from_secs(120);
 pub const SELFCHECK_LIMIT: Duration = Duration::from_secs(300);
+/// One run of the named-object probe through a launch path.
+pub const PROBE_LIMIT: Duration = Duration::from_secs(180);
 
 /// The lines `kgraf sandbox selfcheck` prints for a pass that proved network
 /// confinement, and the backend line of the Windows sandbox user
@@ -119,6 +123,319 @@ fn probe_words(line: &str) -> &'static str {
     } else {
         "The probe did not finish its steps: the line gives its exit status, not a step."
     }
+}
+
+/// The report's first line: the Windows session of the process that runs
+/// kGraf, read with `ProcessIdToSessionId` by the sandbox crate's
+/// `session_of_current_process`. Session 0 is the session Windows gives its
+/// services. If kGraf itself runs there, as it can on a hosted machine, the
+/// launcher service path and the owner-session fallback name the same
+/// machine-wide object directory, and no result below separates the two.
+pub fn session_line(session: Result<u32, String>) -> String {
+    const SOURCE: &str = "Read by the self-test runner with ProcessIdToSessionId \
+                          (`session_of_current_process` in the sandbox crate).";
+    match session {
+        Ok(0) => format!(
+            "**Windows session of the process that runs kGraf: 0.** This is the session Windows \
+             gives its services. Both launch paths then name the same machine-wide object \
+             directory, so read every result below that way: a named object made here does not \
+             show that a command works from an interactive session. {SOURCE}"
+        ),
+        Ok(n) => format!(
+            "**Windows session of the process that runs kGraf: {n}.** Session 0 is the session \
+             of Windows services. The launcher service path reaches the machine-wide object \
+             directory from session 0. The fallback reaches the directory of session {n}. {SOURCE}"
+        ),
+        Err(e) => format!(
+            "**Windows session of the process that runs kGraf: not read** ({e}). If it is \
+             session 0, both launch paths name the same machine-wide object directory and every \
+             result below must be read that way. {SOURCE}"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn read_owner_session() -> Result<u32, String> {
+    kgraf_sandbox::sandbox_user::windows::named_object_dir::session_of_current_process()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn read_owner_session() -> Result<u32, String> {
+    Err("this is not a Windows host".into())
+}
+
+/// The lines of the steps' output that say which launch path is active and
+/// what started each command: `named objects:` (`Active::line`, with what the
+/// probe found) and `launch:` (the sandbox crate's launch record). Each line
+/// is kept once, with the label of the first step that printed it.
+pub fn launch_findings(p: &SandboxPhase) -> Vec<(String, String)> {
+    let steps = [
+        &p.selfcheck_before,
+        &p.setup,
+        &p.status,
+        &p.selfcheck,
+        &p.remove,
+        &p.status_after,
+    ];
+    let mut out: Vec<(String, String)> = Vec::new();
+    for s in steps.into_iter().flatten() {
+        for l in s.output.lines().map(str::trim) {
+            let wanted = l.starts_with("named objects: ") || l.starts_with("launch: ");
+            if wanted && !out.iter().any(|(_, seen)| seen == l) {
+                out.push((s.label.clone(), l.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+fn render_launch_path(p: &SandboxPhase) -> String {
+    let mut md = String::from("### Launch path\n\n");
+    let found = launch_findings(p);
+    let (named, launch): (Vec<_>, Vec<_>) = found
+        .iter()
+        .partition(|(_, l)| l.starts_with("named objects: "));
+    let block = |rows: &[&(String, String)]| {
+        crate::report::fence(
+            "text",
+            &rows
+                .iter()
+                .map(|(label, l)| format!("[{label}] {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    if named.is_empty() {
+        md.push_str(
+            "No step printed a `named objects:` line, so the report does not say which launch \
+             path is active or what the probe found.\n\n",
+        );
+    } else {
+        md.push_str(
+            "The active launch path and what the probe found (`named objects:` lines):\n\n",
+        );
+        md.push_str(&block(&named));
+        md.push('\n');
+    }
+    if launch.is_empty() {
+        md.push_str("No step printed a `launch:` line.\n\n");
+    } else {
+        md.push_str("The launch lines the sandbox crate collects (`launch:` lines):\n\n");
+        md.push_str(&block(&launch));
+        md.push('\n');
+    }
+    md
+}
+
+/// The session of the owner's process and the access list (SDDL) of that
+/// session's object directory, or why either could not be read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DirectoryRead {
+    pub session: Result<u32, String>,
+    pub access_list: Result<String, String>,
+}
+
+/// The sandbox crate's words for a probe outcome (`session0::Proof`).
+pub fn proof_words(proof: &Proof) -> String {
+    match proof {
+        Proof::Made => "session0::Proof::Made (the command made both objects)".into(),
+        Proof::Refused(why) => format!(
+            "session0::Proof::Refused (the command ran and Windows refused a named object): {why}"
+        ),
+        Proof::CouldNotRun(why) => format!(
+            "session0::Proof::CouldNotRun (the probe could not run, for a reason that is not a \
+             refused named object): {why}"
+        ),
+    }
+}
+
+/// Which path a `named objects:` line names, as `Active::line` words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum PathWord {
+    Session0,
+    Fallback,
+    Neither,
+}
+
+impl PathWord {
+    pub fn words(self) -> &'static str {
+        match self {
+            PathWord::Session0 => "session 0 (the launcher service)",
+            PathWord::Fallback => "the fallback grant",
+            PathWord::Neither => "neither (the owner's session, no grant)",
+        }
+    }
+}
+
+/// What a `named objects:` line (`session0::Active::line`) says: the path,
+/// and the probe outcome. The outcome is `None` where no probe has run.
+pub fn read_named_line(line: &str) -> (PathWord, Option<Proof>) {
+    let path = if line.contains("start in session 0 through kGraf's launcher service") {
+        PathWord::Session0
+    } else if line.contains("which admits the sandbox group to its object directory") {
+        PathWord::Fallback
+    } else {
+        PathWord::Neither
+    };
+    let proof = if line.contains(". Proved: a sandbox user made a named semaphore") {
+        Some(Proof::Made)
+    } else if let Some((_, why)) =
+        line.split_once(". The proof failed, a named object was refused: ")
+    {
+        Some(Proof::Refused(why.to_owned()))
+    } else if let Some((_, why)) = line.split_once("says nothing about named objects. ") {
+        Some(Proof::CouldNotRun(why.to_owned()))
+    } else {
+        None
+    };
+    (path, proof)
+}
+
+/// The last `named objects:` line of a step's output.
+fn named_line_of(step: &Option<StepRun>) -> Option<String> {
+    step.as_ref()?
+        .output
+        .lines()
+        .map(str::trim)
+        .rfind(|l| l.starts_with("named objects: "))
+        .map(str::to_owned)
+}
+
+/// The `named objects:` line the first probe left: setup's, else status's.
+pub fn first_named_line(p: &SandboxPhase) -> Option<String> {
+    named_line_of(&p.setup).or_else(|| named_line_of(&p.status))
+}
+
+fn serialize_proof<S: serde::Serializer>(p: &Proof, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&proof_words(p))
+}
+
+/// The fallback the phase ran itself because the first probe was refused.
+#[derive(Clone, Debug, Serialize)]
+pub struct Fallback {
+    pub before: DirectoryRead,
+    pub grant: StepRun,
+    pub after: DirectoryRead,
+    /// `kgraf sandbox-named-object-probe --launch` after the grant.
+    pub probe: StepRun,
+    /// What the probe proved, from its exit status and output
+    /// (`probe::proof_of_relay`, the rule setup uses too).
+    #[serde(serialize_with = "serialize_proof")]
+    pub proof: Proof,
+    pub status: StepRun,
+}
+
+fn run_fallback(ex: &mut dyn Exec) -> Fallback {
+    let before = ex.object_directory();
+    let grant = ex.grant_named_objects();
+    let after = ex.object_directory();
+    let probe = ex.cli(
+        "(b3) probe through the fallback",
+        &[probe::SUBCOMMAND, probe::LAUNCH_FLAG],
+        PROBE_LIMIT,
+        true,
+    );
+    let proof = kgraf_sandbox::sandbox_user::probe::proof_of_relay(probe.code, &probe.output);
+    let status = ex.cli(
+        "(b4) status after the fallback",
+        &["sandbox", "status"],
+        STATUS_LIMIT,
+        true,
+    );
+    Fallback {
+        before,
+        grant,
+        after,
+        probe,
+        proof,
+        status,
+    }
+}
+
+/// Which path is in force at the end of setup and the fallback: session 0 or
+/// the grant where a probe made the objects, else neither.
+pub fn chosen_path(p: &SandboxPhase) -> String {
+    let Some(line) = first_named_line(p) else {
+        return "not known: no step printed a `named objects:` line".into();
+    };
+    let (path, proof) = read_named_line(&line);
+    if proof == Some(Proof::Made) && path != PathWord::Neither {
+        return path.words().into();
+    }
+    match &p.fallback {
+        Some(f) if f.proof == Proof::Made => PathWord::Fallback.words().into(),
+        _ => PathWord::Neither.words().into(),
+    }
+}
+
+fn render_named_objects(p: &SandboxPhase) -> String {
+    let mut md = String::from("### Named objects: the fallback and the path chosen\n\n");
+    let acl = |r: &Result<String, String>| match r {
+        Ok(s) => format!("`{s}`"),
+        Err(e) => format!("not read ({e})"),
+    };
+    if let Some(f) = &p.fallback {
+        md.push_str(
+            "The first probe was refused (`session0::Proof::Refused`), so the phase ran the \
+             fallback's elevated action itself: `kgraf sandbox elevated --action \
+             grant-named-objects`, started from the runner the way setup starts its own \
+             elevated step.\n\n",
+        );
+        md.push_str(&match &f.before.session {
+            Ok(n) => format!(
+                "1. Windows session the elevated step ran in: {n}. The step starts as the \
+                 same user from the runner, so this is the runner's session.\n"
+            ),
+            Err(e) => format!("1. Windows session the elevated step ran in: not read ({e}).\n"),
+        });
+        md.push_str(&format!(
+            "2. Access list of that session's object directory before the grant: {}\n",
+            acl(&f.before.access_list)
+        ));
+        md.push_str(&format!(
+            "3. Access list after the grant: {}\n",
+            acl(&f.after.access_list)
+        ));
+    } else {
+        md.push_str(
+            "The fallback grant did not run: the first probe was not refused, or setup or \
+             elevation was missing.\n\n",
+        );
+    }
+    let step = if p.fallback.is_some() { 4 } else { 1 };
+    md.push_str(&format!("{step}. Path chosen: {}\n", chosen_path(p)));
+    md.push_str(&format!(
+        "{}. Probe outcome for each path tried:\n",
+        step + 1
+    ));
+    match first_named_line(p).map(|l| read_named_line(&l)) {
+        Some((path, Some(proof))) => md.push_str(&format!(
+            "   - {} (setup's probe): {}\n",
+            path.words(),
+            proof_words(&proof)
+        )),
+        Some((path, None)) => md.push_str(&format!(
+            "   - {} (setup's probe): no probe has run\n",
+            path.words()
+        )),
+        None => md.push_str("   - setup's probe: no `named objects:` line was printed\n"),
+    }
+    if let Some(f) = &p.fallback {
+        md.push_str(&format!(
+            "   - {} (probe after the grant): {}\n",
+            PathWord::Fallback.words(),
+            proof_words(&f.proof)
+        ));
+    }
+    md.push('\n');
+    if let Some(f) = &p.fallback {
+        md.push_str("The grant step:\n\n");
+        md.push_str(&step_block(&Some(f.grant.clone())));
+        md.push_str(&step_block(&Some(f.probe.clone())));
+        md.push_str(&step_block(&Some(f.status.clone())));
+    }
+    md
 }
 
 pub const REMOVE_LIMIT: Duration = Duration::from_secs(300);
@@ -214,6 +531,15 @@ pub trait Exec {
     /// Runs one test binary of the suite again, by manifest id.
     fn rerun(&mut self, id: &str) -> BinaryResult;
     fn e2e(&mut self) -> Vec<Check>;
+    /// The fallback's elevated action, `kgraf sandbox elevated --action
+    /// grant-named-objects`, started from the owner's side the way setup
+    /// starts its own (`setup::grant_named_objects`): the output is the events
+    /// the elevated step sent back.
+    fn grant_named_objects(&mut self) -> StepRun;
+    /// The Windows session of the owner's process and the access list of that
+    /// session's object directory. The elevated step starts as the same user
+    /// from this process, so it runs in this session.
+    fn object_directory(&mut self) -> DirectoryRead;
     /// Undoes what `preflight` placed; returns notes.
     fn teardown(&mut self) -> Vec<String>;
 }
@@ -304,6 +630,11 @@ pub fn check_ready(out: &str, code: Option<i32>) -> StatusCheck {
 pub struct GoneCheck {
     pub ok: bool,
     pub left: Vec<String>,
+    /// The status after removal printed the launcher service as MISSING.
+    pub service_gone: bool,
+    /// The status after removal shows no fallback grant on the owner's
+    /// session object directory.
+    pub grant_gone: bool,
 }
 
 /// (f): after the removal every line about kGraf's own items is MISSING.
@@ -318,6 +649,33 @@ pub fn check_gone(out: &str) -> GoneCheck {
         if l.word != "MISSING" && !MACHINE_ITEMS.contains(&l.item.as_str()) {
             g.left.push(format!("{} {}", l.word, l.item));
         }
+    }
+    // A service or a grant left behind is a defect, and a status that does
+    // not print the line cannot confirm it is gone (fail loud).
+    match lines
+        .iter()
+        .find(|l| l.item.starts_with("launcher service "))
+    {
+        Some(l) => g.service_gone = l.word == "MISSING",
+        None => g.left.push(
+            "the status after removal printed no launcher service line, so the service is \
+             not confirmed gone"
+                .into(),
+        ),
+    }
+    match lines.iter().find(|l| {
+        l.item
+            .contains("named objects in the owner's session object directory")
+            || l.item.starts_with("no fallback grant")
+    }) {
+        Some(l) => {
+            g.grant_gone = l.word == "MISSING" || l.item.starts_with("no fallback grant");
+        }
+        None => g.left.push(
+            "the status after removal printed no fallback grant line, so the grant is not \
+             confirmed gone"
+                .into(),
+        ),
     }
     g.ok = g.left.is_empty();
     g
@@ -402,6 +760,11 @@ pub struct SandboxPhase {
     /// error line, [`failure_under_user`]); (e) ran anyway.
     pub failed_under_user: Option<String>,
     pub cancelled: bool,
+    /// Which Windows session the process that runs kGraf is in
+    /// ([`session_line`]). The report says it before any verdict.
+    pub owner_session: Option<String>,
+    /// The fallback grant the phase ran because the first probe was refused.
+    pub fallback: Option<Fallback>,
     pub reruns: Vec<Rerun>,
     pub e2e: Vec<Check>,
     pub remove: Option<StepRun>,
@@ -455,7 +818,10 @@ pub fn run_phase(
     elevated: Option<bool>,
     cancelled: &dyn Fn() -> bool,
 ) -> SandboxPhase {
-    let mut p = SandboxPhase::default();
+    let mut p = SandboxPhase {
+        owner_session: Some(session_line(read_owner_session())),
+        ..SandboxPhase::default()
+    };
     if elevated == Some(false) {
         p.notes.push(NEEDS_ELEVATION.into());
     }
@@ -485,6 +851,13 @@ pub fn run_phase(
     let status = ex.cli("(c) status", &["sandbox", "status"], STATUS_LIMIT, true);
     p.status_check = Some(check_ready(&status.output, status.code));
     p.status = Some(status);
+
+    // The first probe was refused: exercise the fallback here, unattended.
+    let refused = first_named_line(&p)
+        .is_some_and(|l| matches!(read_named_line(&l).1, Some(Proof::Refused(_))));
+    if refused && elevated != Some(false) {
+        p.fallback = Some(run_fallback(ex));
+    }
 
     let gate = ex.cli(
         "(d) selfcheck (gate)",
@@ -668,6 +1041,12 @@ pub fn render_measurements(reruns: &[Rerun]) -> String {
 /// The report part for the phase: baseline and sandbox user side by side.
 pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> String {
     let mut md = String::from("\n## Sandbox user phase\n\n");
+    // First, before any verdict: both launch paths read one directory when
+    // kGraf itself runs in session 0.
+    if let Some(line) = &p.owner_session {
+        md.push_str(line);
+        md.push_str("\n\n");
+    }
     md.push_str(&format!("**{}**\n\n", p.summary()));
     for n in &p.notes {
         md.push_str(&format!("- {n}\n"));
@@ -699,6 +1078,7 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
             }
         ));
     }
+    md.push_str(&render_named_objects(p));
     md.push_str("### (d) selfcheck (gate)\n\n");
     md.push_str(&step_block(&p.selfcheck));
     if p.stopped_at_gate {
@@ -723,6 +1103,8 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
             probe_words(line)
         ));
     }
+
+    md.push_str(&render_launch_path(p));
 
     if !p.stopped_at_gate {
         md.push_str("### (e) baseline and sandbox user, side by side\n\n");
@@ -803,6 +1185,19 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
     md.push_str("Status after the removal:\n\n");
     md.push_str(&step_block(&p.status_after));
     if let Some(g) = &p.gone {
+        md.push_str(&format!(
+            "Launcher service after the removal: {}. Fallback grant after the removal: {}.\n\n",
+            if g.service_gone {
+                "gone"
+            } else {
+                "STILL THERE or not confirmed"
+            },
+            if g.grant_gone {
+                "gone"
+            } else {
+                "STILL THERE or not confirmed"
+            },
+        ));
         md.push_str(&if g.ok {
             "Confirmed: nothing of the sandbox user is left (every kGraf line is MISSING).\n"
                 .to_owned()
@@ -862,8 +1257,11 @@ mod tests {
         "sandbox selfcheck: ok\n  backend: Windows sandbox user\n  network: confined";
     const SELFCHECK_TOKEN: &str = "sandbox selfcheck: network not confined\n  backend: Windows restricted token (token sandbox)";
 
+    const ACL_BEFORE: &str = "O:SYG:SYD:(A;;0xf0003;;;SY)";
+    const ACL_AFTER: &str = "O:SYG:SYD:(A;;0xf0003;;;SY)(A;;0x2000f;;;S-1-5-21-1-2-3-1001)";
+
     const STATUS_OK: &str = "  present  Windows Firewall on for every profile\n  present  local firewall rules take effect\n  present  offline sandbox user kgraf-a\n  present  online sandbox user kgraf-b\n  present  stored password of kgraf-a\n  present  stored password of kgraf-b\nThe Windows sandbox user is set up.";
-    const STATUS_GONE: &str = "  present  Windows Firewall on for every profile\n  present  local firewall rules take effect\n  MISSING  offline sandbox user kgraf-a\n  MISSING  online sandbox user kgraf-b\n  MISSING  stored passwords\nThe Windows sandbox user is not fully set up: run `kgraf sandbox setup`.";
+    const STATUS_GONE: &str = "  present  Windows Firewall on for every profile\n  present  local firewall rules take effect\n  MISSING  offline sandbox user kgraf-a\n  MISSING  online sandbox user kgraf-b\n  MISSING  stored passwords\n  MISSING  launcher service kgraf-launcher-00ff\n  MISSING  sandbox group may make named objects in the owner's session object directory (fallback, needed because the launcher service is not installed; the entry is absent or could not be read)\nThe Windows sandbox user is not fully set up: run `kgraf sandbox setup`.";
 
     /// Records the calls; each `kgraf` command answers from `script`.
     #[derive(Default)]
@@ -877,6 +1275,11 @@ mod tests {
         preflight: Option<String>,
         /// Tests that pass in every re-run.
         passing: Vec<String>,
+        /// What setup prints; `None`: "setup output".
+        setup_out: Option<String>,
+        /// What the probe after the grant prints, and its exit status.
+        probe_out: String,
+        probe_code: i32,
     }
 
     impl Exec for Fake {
@@ -888,7 +1291,11 @@ mod tests {
             self.calls
                 .push(format!("{} cancel={honor}", args.join(" ")));
             let (code, out) = match args[1] {
-                "setup" => (self.setup_code, "setup output"),
+                _ if args[0] == probe::SUBCOMMAND => (self.probe_code, self.probe_out.as_str()),
+                "setup" => (
+                    self.setup_code,
+                    self.setup_out.as_deref().unwrap_or("setup output"),
+                ),
                 "remove" => {
                     self.removed = true;
                     (0, "removed")
@@ -924,6 +1331,28 @@ mod tests {
         fn e2e(&mut self) -> Vec<Check> {
             self.calls.push("e2e".into());
             vec![]
+        }
+        fn grant_named_objects(&mut self) -> StepRun {
+            self.calls.push("grant-named-objects".into());
+            StepRun {
+                label: "(b2) fallback grant".into(),
+                command: "kgraf sandbox elevated --action grant-named-objects".into(),
+                code: Some(0),
+                output: "granted".into(),
+                ..StepRun::default()
+            }
+        }
+        fn object_directory(&mut self) -> DirectoryRead {
+            let n = self
+                .calls
+                .iter()
+                .filter(|c| *c == "grant-named-objects")
+                .count();
+            self.calls.push("object-directory".into());
+            DirectoryRead {
+                session: Ok(2),
+                access_list: Ok(if n == 0 { ACL_BEFORE } else { ACL_AFTER }.into()),
+            }
         }
         fn teardown(&mut self) -> Vec<String> {
             self.calls.push("teardown".into());
@@ -1412,5 +1841,224 @@ mod tests {
         ] {
             assert!(md.contains(want), "missing {want:?} in\n{md}");
         }
+    }
+
+    const NAMED_LINE: &str = "named objects: sandboxed commands start in session 0 through kGraf's launcher service, so cargo and rustc can make the named objects they need. Proved: a sandbox user made a named semaphore and an unprefixed mutex through this path";
+    const LAUNCH_LINE: &str =
+        "launch: the session0 path started a command: started (at 1700000000)";
+
+    /// The report says which Windows session kGraf runs in before any
+    /// verdict, and a session 0 is read as "both paths name one directory".
+    #[test]
+    fn the_report_names_the_owner_session_before_the_verdict() {
+        let zero = session_line(Ok(0));
+        assert!(zero.contains("kGraf: 0."), "{zero}");
+        assert!(
+            zero.contains("same machine-wide object directory"),
+            "{zero}"
+        );
+        assert!(session_line(Ok(2)).contains("kGraf: 2."));
+        let unread = session_line(Err("boom".into()));
+        assert!(unread.contains("not read"), "{unread}");
+        assert!(unread.contains("boom"), "{unread}");
+
+        let p = SandboxPhase {
+            owner_session: Some(zero),
+            ..SandboxPhase::default()
+        };
+        let md = render(&baseline(), &[], &p);
+        let at = |t: &str| {
+            md.find(t)
+                .unwrap_or_else(|| panic!("missing {t:?} in\n{md}"))
+        };
+        assert!(
+            at("Windows session of the process that runs kGraf") < at("ran to the end"),
+            "{md}"
+        );
+    }
+
+    /// The `named objects:` and `launch:` lines of the steps' output reach
+    /// the report in a section of their own, each once.
+    #[test]
+    fn the_report_lists_the_launch_path_and_the_launch_lines() {
+        let step = |label: &str, out: String| {
+            Some(StepRun {
+                label: label.into(),
+                command: format!("kgraf {label}"),
+                code: Some(0),
+                output: out,
+                ..StepRun::default()
+            })
+        };
+        let p = SandboxPhase {
+            setup: step("(b) setup", format!("setup output\n  {NAMED_LINE}")),
+            status: step("(c) status", format!("  {NAMED_LINE}")),
+            selfcheck: step(
+                "(d) selfcheck (gate)",
+                format!("  {LAUNCH_LINE}\n  {NAMED_LINE}"),
+            ),
+            ..SandboxPhase::default()
+        };
+        let found = launch_findings(&p);
+        assert_eq!(found.len(), 2, "each line once: {found:?}");
+        assert_eq!(found[0], ("(b) setup".to_owned(), NAMED_LINE.to_owned()));
+        let md = render(&baseline(), &[], &p);
+        assert!(md.contains("### Launch path"), "{md}");
+        assert!(md.contains(&format!("[(b) setup] {NAMED_LINE}")), "{md}");
+        assert!(
+            md.contains(&format!("[(d) selfcheck (gate)] {LAUNCH_LINE}")),
+            "{md}"
+        );
+
+        let none = render(&baseline(), &[], &SandboxPhase::default());
+        assert!(
+            none.contains("No step printed a `named objects:` line"),
+            "{none}"
+        );
+        assert!(none.contains("No step printed a `launch:` line"), "{none}");
+    }
+
+    fn named_line(
+        path: kgraf_sandbox::sandbox_user::session0::LaunchPath,
+        proof: Option<Proof>,
+    ) -> String {
+        use kgraf_sandbox::sandbox_user::session0::Active;
+        Active {
+            path,
+            granted: path == kgraf_sandbox::sandbox_user::session0::LaunchPath::OwnerSession
+                && proof == Some(Proof::Made),
+            proved: proof,
+            because: String::new(),
+        }
+        .line()
+    }
+
+    /// The phase reads the path and the probe outcome back from the words
+    /// `Active::line` prints, for each outcome the sandbox crate has.
+    #[test]
+    fn a_named_objects_line_is_read_back_into_a_path_and_a_probe_outcome() {
+        use kgraf_sandbox::sandbox_user::session0::LaunchPath::{OwnerSession, Session0};
+        for (path, proof, want) in [
+            (Session0, Some(Proof::Made), PathWord::Session0),
+            (
+                Session0,
+                Some(Proof::Refused("denied".into())),
+                PathWord::Session0,
+            ),
+            (
+                Session0,
+                Some(Proof::CouldNotRun("no exe".into())),
+                PathWord::Session0,
+            ),
+            (OwnerSession, Some(Proof::Made), PathWord::Fallback),
+            (OwnerSession, None, PathWord::Neither),
+        ] {
+            let line = named_line(path, proof.clone());
+            let (got_path, got) = read_named_line(&line);
+            assert_eq!(got_path, want, "{line}");
+            assert_eq!(got, proof, "{line}");
+        }
+    }
+
+    fn refused_setup() -> Fake {
+        use kgraf_sandbox::sandbox_user::session0::LaunchPath::Session0;
+        Fake {
+            setup_out: Some(format!(
+                "  {}",
+                named_line(Session0, Some(Proof::Refused("Access is denied".into())))
+            )),
+            probe_out: "probe made semaphore\nprobe made mutex".into(),
+            ..Fake::default()
+        }
+    }
+
+    /// A refused first probe makes the phase run the fallback itself, in
+    /// order: read the directory, grant, read it again, probe again.
+    #[test]
+    fn a_refused_probe_makes_the_phase_run_the_fallback_and_probe_again() {
+        let mut ex = refused_setup();
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        let at = |c: &str| ex.calls.iter().position(|x| x.starts_with(c)).unwrap();
+        assert!(
+            at("object-directory") < at("grant-named-objects"),
+            "{:?}",
+            ex.calls
+        );
+        assert!(at("grant-named-objects") < at("sandbox-named-object-probe --launch"));
+        assert!(p.fallback.as_ref().unwrap().proof == Proof::Made, "{p:?}");
+
+        // A probe that made both objects never runs the fallback, and an
+        // unelevated window never starts one.
+        let mut ok = Fake::default();
+        run_phase(&mut ok, &baseline(), Some(true), &|| false);
+        assert!(!ok.calls.contains(&"grant-named-objects".to_owned()));
+        let mut plain = refused_setup();
+        let q = run_phase(&mut plain, &baseline(), Some(false), &|| false);
+        assert!(q.fallback.is_none());
+    }
+
+    /// The report prints, in this order, the session, the access list before
+    /// and after the grant, the path chosen and each probe outcome.
+    #[test]
+    fn the_report_prints_the_fallback_in_its_order() {
+        let mut ex = refused_setup();
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        let md = render(&baseline(), &[], &p);
+        let order = [
+            "Windows session the elevated step ran in: 2",
+            "before the grant: `O:SYG:SYD:(A;;0xf0003;;;SY)`",
+            "after the grant: `O:SYG:SYD:(A;;0xf0003;;;SY)(A;;0x2000f;;;S-1-5-21-1-2-3-1001)`",
+            "Path chosen: the fallback grant",
+            "(setup's probe): session0::Proof::Refused",
+            "(probe after the grant): session0::Proof::Made",
+        ];
+        let mut last = 0;
+        for want in order {
+            let at = md
+                .find(want)
+                .unwrap_or_else(|| panic!("missing {want:?} in\n{md}"));
+            assert!(at >= last, "{want:?} is out of order in\n{md}");
+            last = at;
+        }
+    }
+
+    /// A fallback whose probe is refused again leaves the path as neither.
+    #[test]
+    fn a_fallback_that_is_refused_too_chooses_neither() {
+        let mut ex = Fake {
+            probe_code: 1,
+            probe_out: "Access is denied (os error 5)".into(),
+            ..refused_setup()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(
+            chosen_path(&p).starts_with("neither"),
+            "{}",
+            chosen_path(&p)
+        );
+        assert!(chosen_path(&SandboxPhase::default()).starts_with("not known"));
+    }
+
+    /// A removal that leaves the service or the grant behind is a failure,
+    /// and a status that does not print the lines cannot confirm either.
+    #[test]
+    fn a_service_or_a_grant_left_after_removal_is_a_failure() {
+        let g = check_gone(STATUS_GONE);
+        assert!(g.ok && g.service_gone && g.grant_gone, "{g:?}");
+        let service = STATUS_GONE.replace(
+            "MISSING  launcher service kgraf-launcher-00ff",
+            "present  launcher service kgraf-launcher-00ff (installed, stopped)",
+        );
+        let g = check_gone(&service);
+        assert!(!g.ok && !g.service_gone && g.grant_gone, "{g:?}");
+        let grant = STATUS_GONE.replace(
+            "MISSING  sandbox group may make named objects",
+            "present  sandbox group may make named objects",
+        );
+        let g = check_gone(&grant);
+        assert!(!g.ok && g.service_gone && !g.grant_gone, "{g:?}");
+        let silent = "  MISSING  offline sandbox user kgraf-a";
+        let g = check_gone(silent);
+        assert!(!g.ok && g.left.len() == 2, "{g:?}");
     }
 }
