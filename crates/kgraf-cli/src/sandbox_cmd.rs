@@ -745,6 +745,11 @@ fn launch_probe_as_sandbox_user() -> std::result::Result<(Option<i32>, String), 
     ))
 }
 
+/// Time the relaying process gets beyond the probe's own bound, to start,
+/// report and exit.
+#[cfg(windows)]
+const PROBE_RELAY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Run the probe through the recorded launch path, in a process of its own.
 ///
 /// A process of its own because the launch path is read once per process:
@@ -758,7 +763,11 @@ fn probe_in_a_new_process(exe: &str, tag: Option<&str>) -> Proof {
     if let Some(tag) = tag {
         cmd.env(probe::TAG_ENV, tag);
     }
-    match cmd.output() {
+    // Bounded, under the spawn lock: the child waits on its own probe for at
+    // most `probe::WAIT`, so a child still running well past that is stuck,
+    // and a stuck probe proves nothing either way.
+    let limits = kgraf_core::child_run::Limits::new(probe::WAIT + PROBE_RELAY_MARGIN);
+    match kgraf_core::child_run::run(cmd, "the launch probe", None, limits) {
         Ok(out) => {
             let text = format!(
                 "{}{}",
@@ -767,7 +776,7 @@ fn probe_in_a_new_process(exe: &str, tag: Option<&str>) -> Proof {
             );
             probe::proof_of_relay(out.status.code(), &text)
         }
-        Err(e) => Proof::CouldNotRun(format!("the probe could not be started: {e}")),
+        Err(e) => Proof::CouldNotRun(format!("the probe did not finish: {e}")),
     }
 }
 
