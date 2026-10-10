@@ -104,13 +104,16 @@ enum Act {
     Ui,
     Console,
     NamedSemaphore,
+    NamedSemaphoreGlobal,
+    OpenSessionDirectory,
+    StatAncestors,
     OpenJobserver,
 }
 
 impl Act {
     /// Every action, so a name coming back from the environment finds its
     /// value. A variant left out here fails loudly in the probe.
-    const ALL: [Act; 25] = [
+    const ALL: [Act; 28] = [
         Act::Write,
         Act::Delete,
         Act::Rename,
@@ -135,6 +138,9 @@ impl Act {
         Act::Ui,
         Act::Console,
         Act::NamedSemaphore,
+        Act::NamedSemaphoreGlobal,
+        Act::OpenSessionDirectory,
+        Act::StatAncestors,
         Act::OpenJobserver,
     ];
 
@@ -164,6 +170,9 @@ impl Act {
             Act::Ui => "ui",
             Act::Console => "console",
             Act::NamedSemaphore => "named_semaphore",
+            Act::NamedSemaphoreGlobal => "named_semaphore_global",
+            Act::OpenSessionDirectory => "open_session_directory",
+            Act::StatAncestors => "stat_ancestors",
             Act::OpenJobserver => "open_jobserver",
         }
     }
@@ -219,18 +228,23 @@ fn probe_entry() {
         Act::Ui => ui_objects(),
         Act::SendInputHere => send_input_here(),
         Act::Console => Ok(console_window().to_string()),
-        Act::NamedSemaphore => named_semaphore(),
+        Act::NamedSemaphore => named_semaphore(""),
+        Act::NamedSemaphoreGlobal => named_semaphore("Global\\"),
+        Act::OpenSessionDirectory => open_session_directory(&arg),
+        Act::StatAncestors => stat_ancestors(&arg),
         Act::OpenJobserver => open_jobserver(),
     };
     exit_with(result)
 }
 
-/// Create a named semaphore with no namespace prefix, in the session's
-/// `BaseNamedObjects`, as the `jobserver` crate does when cargo or rustc
-/// finds no jobserver to join.
-fn named_semaphore() -> std::io::Result<String> {
+/// Create a named semaphore whose name starts with `prefix`: with no prefix
+/// in the session's `BaseNamedObjects`, as the `jobserver` crate does when
+/// cargo or rustc finds no jobserver to join; with `Global\` in the global
+/// namespace, which creating a semaphore needs no privilege for (only a
+/// file mapping or a symbolic link there needs `SeCreateGlobalPrivilege`).
+fn named_semaphore(prefix: &str) -> std::io::Result<String> {
     use windows_sys::Win32::System::Threading::CreateSemaphoreW;
-    let name = format!("kgraf-escape-probe-{}", std::process::id());
+    let name = format!("{prefix}kgraf-escape-probe-{}", std::process::id());
     let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: a NUL-terminated name and no security attributes.
     let h = unsafe { CreateSemaphoreW(std::ptr::null(), 1, 1, wide.as_ptr()) };
@@ -240,6 +254,166 @@ fn named_semaphore() -> std::io::Result<String> {
     // SAFETY: a fresh handle, closed once.
     unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
     Ok(format!("created {name}"))
+}
+
+/// The rights `kernelbase.dll` first opens the session's object directory
+/// with: `DIRECTORY_QUERY | DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT |
+/// DIRECTORY_CREATE_SUBDIRECTORY`.
+const DIRECTORY_AS_KERNELBASE: u32 = 0x000f;
+/// `DIRECTORY_TRAVERSE` alone: what it asks for when that open fails, before
+/// it tries the directory's `Restricted` subdirectory.
+const DIRECTORY_TRAVERSE: u32 = 0x0001;
+
+/// This process's session's object directory: `\Sessions\<n>\BaseNamedObjects`,
+/// or `\BaseNamedObjects` in session 0.
+fn session_directory() -> String {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
+    }
+    let mut id = 0u32;
+    // SAFETY: an out pointer to a local.
+    let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut id) };
+    if ok == 0 || id == 0 {
+        r"\BaseNamedObjects".to_owned()
+    } else {
+        format!(r"\Sessions\{id}\BaseNamedObjects")
+    }
+}
+
+/// Open the object directory `path` with `access` (`NtOpenDirectoryObject`).
+/// The handle on success; the `NTSTATUS` otherwise, STATUS_ACCESS_DENIED as
+/// the Win32 error 5, so the probe reports it as denied.
+fn open_directory(path: &str, access: u32) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::NtOpenDirectoryObject;
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
+    let mut wide: Vec<u16> = path.encode_utf16().collect();
+    let bytes = u16::try_from(wide.len() * 2).map_err(std::io::Error::other)?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        ObjectName: &name,
+        // OBJ_CASE_INSENSITIVE, as kernelbase opens it.
+        Attributes: 0x40,
+        ..Default::default()
+    };
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: `name` and `wide` outlive the call; the handle is an out
+    // pointer, owned below on success.
+    let status = unsafe { NtOpenDirectoryObject(&mut handle, access, &attributes) };
+    if status >= 0 {
+        // SAFETY: a fresh handle this code now owns.
+        return Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) });
+    }
+    if status as u32 == 0xC000_0022 {
+        return Err(std::io::Error::from_raw_os_error(5));
+    }
+    Err(std::io::Error::other(format!(
+        "NTSTATUS 0x{:08x}",
+        status as u32
+    )))
+}
+
+/// Open the session's object directory with the rights in `access`, a hex
+/// number, as `kernelbase.dll` does before it looks up any object name.
+fn open_session_directory(access: &str) -> std::io::Result<String> {
+    let mask = u32::from_str_radix(access.trim_start_matches("0x"), 16)
+        .map_err(|e| std::io::Error::other(format!("{access}: {e}")))?;
+    let path = session_directory();
+    open_directory(&path, mask).map(|_| format!("opened {path} for 0x{mask:x}"))
+}
+
+/// Read the attributes of every folder above `path`, from the drive root
+/// down, as git does before it writes a ref (`safe_create_leading_directories`
+/// stats each folder of the absolute path, then makes the ones it cannot
+/// stat). The first folder whose attributes cannot be read is the error.
+fn stat_ancestors(path: &str) -> std::io::Result<String> {
+    let path = Path::new(path);
+    let mut above: Vec<&Path> = path.ancestors().skip(1).collect();
+    above.reverse();
+    // The drive root itself is never made, so git does not stat it.
+    for folder in above.into_iter().skip(1) {
+        if let Err(e) = std::fs::metadata(folder) {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", folder.display()),
+            ));
+        }
+    }
+    Ok(format!("every folder above {} was read", path.display()))
+}
+
+/// The owner's reading of an object directory's owner, access list and
+/// label, in SDDL, or why it could not be read.
+fn directory_sddl(path: &str) -> String {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::GetKernelObjectSecurity;
+    // READ_CONTROL.
+    let handle = match open_directory(path, 0x0002_0000) {
+        Ok(h) => h,
+        Err(e) => return format!("not read: {e}"),
+    };
+    // OWNER, GROUP, DACL and LABEL.
+    let what = 0x1 | 0x2 | 0x4 | 0x10;
+    let mut needed = 0u32;
+    // SAFETY: a size query with no buffer; the call fills `needed`.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle.as_raw_handle(),
+            what,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    let mut sd = vec![0u8; needed as usize];
+    // SAFETY: a buffer of the size the query above asked for.
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle.as_raw_handle(),
+            what,
+            sd.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return format!("not read: {}", std::io::Error::last_os_error());
+    }
+    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let mut len = 0u32;
+    // SAFETY: `sd` holds the descriptor read above; the call allocates
+    // `text`, freed below.
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd.as_mut_ptr().cast(),
+            SDDL_REVISION_1,
+            what,
+            &mut text,
+            &mut len,
+        )
+    } == 0
+    {
+        return format!("not converted: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: `text` holds `len` UTF-16 units, the terminator included.
+    let units = unsafe { std::slice::from_raw_parts(text, len as usize) };
+    let sddl = String::from_utf16_lossy(units)
+        .trim_end_matches('\0')
+        .to_owned();
+    // SAFETY: frees the string the conversion allocated, once.
+    unsafe { LocalFree(text as HLOCAL) };
+    sddl
 }
 
 /// Open the jobserver `CARGO_MAKEFLAGS` names, with the rights the
@@ -1381,30 +1555,77 @@ fn a_junction_inside_the_root_cannot_escape() {
     std::fs::create_dir_all(&outside).unwrap();
     for &kind in kinds() {
         let link = e.ws.root().join(format!("jn-{}", kinds_tag(kind)));
+        let acl_before = icacls_listing(&outside);
         let (code, line) = probe2(&e.ws, kind, Act::JunctionWrite, &link, &outside);
         assert_ne!(code, 0, "junction write succeeded {}: {line}", kind.word());
         assert!(!outside.join("planted.txt").exists(), "{line}");
-        // The junction the probe planted stays in the tree, and the next
-        // command there is refused before any access entry is written: the
-        // grant would reach through the link. A hosted Windows self-test met
-        // this refusal as the second kind's probe failing to start. The link
-        // is then taken out, so the next kind measures its own write.
+        // The junction the probe planted stays in the tree. The probe's own
+        // user already has its entry on the tree, so the next command of the
+        // same user writes no entry and walks no link: the grant returns
+        // before any write when the entry is present. With nothing written,
+        // nothing can be carried through the link, and that command starts.
+        // The junction's target must keep its access list. The refusal of a
+        // grant that would write is proved below, on a tree no user has an
+        // entry on. The link is then taken out, so the next kind measures
+        // its own write.
         if std::fs::symlink_metadata(&link).is_ok() {
-            let refused = sandboxed_command(&policy_as(&e.ws, kind), self_exe(), e.ws.root())
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default();
+            let next = sandboxed_command(&policy_as(&e.ws, kind), self_exe(), e.ws.root())
+                .map(|_| ())
+                .map_err(|e| e.to_string());
             if sandbox_user_mode() {
                 assert!(
-                    refused.contains("holds the link") && refused.contains("nothing was written"),
-                    "a tree holding a junction out of it was granted on {}: {refused:?}",
+                    next.is_ok(),
+                    "the next command of the user whose entry is already on the tree did not \
+                     start beside the junction {}: {next:?}",
                     kind.word()
                 );
             } else {
-                println!("measurement: the next command beside the planted junction: {refused:?}");
+                println!("measurement: the next command beside the planted junction: {next:?}");
             }
+            assert_eq!(
+                icacls_listing(&outside),
+                acl_before,
+                "the access list of the junction's target changed {}",
+                kind.word()
+            );
             std::fs::remove_dir(&link).expect("remove the planted junction");
         }
+    }
+    // A tree that holds a junction out of it, where no sandbox user has an
+    // entry yet: the first grant for each user must be refused before any
+    // entry is written, and the target's access list must not change.
+    if sandbox_user_mode() {
+        let planted = e.other.root().join("jn-planted");
+        let status = std::process::Command::new("cmd.exe")
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                planted.to_string_lossy().as_ref(),
+                outside.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not plant the junction");
+        let acl_before = icacls_listing(&outside);
+        for &kind in kinds() {
+            let refused = sandboxed_command(&policy_as(&e.other, kind), self_exe(), e.other.root())
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                refused.contains("holds the link") && refused.contains("nothing was written"),
+                "a tree holding a junction out of it was granted on {}: {refused:?}",
+                kind.word()
+            );
+        }
+        assert_eq!(
+            icacls_listing(&outside),
+            acl_before,
+            "the access list of the junction's target changed"
+        );
+        std::fs::remove_dir(&planted).expect("remove the planted junction");
     }
     // As in the hard-link test: a target whose own access list decides, so
     // the junction itself is what the result measures.
@@ -2506,21 +2727,65 @@ fn a_real_cargo_build_runs_inside_the_sandbox() {
 
 /// A command that runs as the sandbox user opens the jobserver kGraf made
 /// for it, by the name `CARGO_MAKEFLAGS` gives, with the rights cargo and
-/// rustc ask for (`sandbox_user::jobserver`): without it rustc stopped at its
-/// start in a hosted Windows self-test ("failed to create jobserver ...
-/// Access is denied"). Whether the session also lets the sandbox user create
-/// a named object of its own, which the runner's deny-only logon SID is
-/// expected to refuse, is a measurement, so a run shows what other programs
-/// that create one meet.
+/// rustc ask for (`sandbox_user::jobserver`). A hosted Windows self-test
+/// refused that open ("Access is denied"), and refused a named semaphore of
+/// the command's own in the session too: `kernelbase.dll` opens the
+/// session's object directory itself before it looks up any name, and that
+/// directory admits the session's logon SID, which the command holds
+/// deny-only (`sandbox_user::named_objects`). Until a fix lets the command
+/// open that directory, this test fails on the jobserver open, and cargo and
+/// rustc cannot run as the sandbox user.
+///
+/// Each part of that cause is printed as a `measurement:` line, so a run
+/// shows what a fix must change: the owner's reading of the session's
+/// directory and of its `Restricted` subdirectory (their owner, access list,
+/// label), and as each sandbox user, a named semaphore in the session and in
+/// the global namespace, and the directory opened with the rights
+/// `kernelbase.dll` asks for first and with traversal alone.
 #[test]
 fn the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured() {
     let e = env();
+    let directory = session_directory();
+    println!(
+        "measurement: the session's object directory {directory} as the owner reads it: {}",
+        directory_sddl(&directory)
+    );
+    let restricted = format!(r"{directory}\Restricted");
+    println!(
+        "measurement: the object directory {restricted} as the owner reads it: {}",
+        directory_sddl(&restricted)
+    );
     for &kind in kinds() {
         let (code, line) = probe(&e.ws, kind, Act::NamedSemaphore, Path::new(""));
         println!(
             "measurement: a named semaphore in the session {}: exit {code}, {line}",
             kind.word()
         );
+        let (code, line) = probe(&e.ws, kind, Act::NamedSemaphoreGlobal, Path::new(""));
+        println!(
+            "measurement: a named semaphore in the global namespace (Global\\) {}: exit \
+             {code}, {line}",
+            kind.word()
+        );
+        for (what, access) in [
+            (
+                "with the rights kernelbase asks for first",
+                DIRECTORY_AS_KERNELBASE,
+            ),
+            ("for traversal alone", DIRECTORY_TRAVERSE),
+        ] {
+            let (code, line) = probe(
+                &e.ws,
+                kind,
+                Act::OpenSessionDirectory,
+                Path::new(&format!("{access:x}")),
+            );
+            println!(
+                "measurement: the session's object directory opened {what} {}: exit {code}, \
+                 {line}",
+                kind.word()
+            );
+        }
         if !sandbox_user_mode() {
             continue;
         }
@@ -2528,10 +2793,36 @@ fn the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured() {
         assert_eq!(
             code,
             0,
-            "the command could not open the jobserver kGraf made for it {}: {line}",
+            "the command could not open the jobserver kGraf made for it {}: {line}. While \
+             the session's object directory refuses the command (the measurement lines \
+             above), no named object can be opened, and cargo and rustc cannot run as the \
+             sandbox user",
             kind.word()
         );
         assert!(line.starts_with("opened kgraf-jobserver-"), "{line}");
+    }
+}
+
+/// Whether a sandbox user can read the attributes of each folder above its
+/// tree. Git reads them before it writes any ref (`git init`, `git commit`,
+/// a branch): it stats each folder of the repository's absolute path from
+/// the drive root down and makes the ones it cannot stat
+/// (`safe_create_leading_directories`). The traverse privilege lets a
+/// command open a path below a folder it cannot list, but not read that
+/// folder's own attributes, and a folder in the owner's profile admits only
+/// the owner, SYSTEM and administrators. A hosted Windows self-test met it as
+/// "cannot lock ref 'HEAD': unable to create directory for
+/// .../nested/.git/HEAD" in a check that ran `git init` in a tree in the
+/// owner's profile. A measurement, so a run shows which folder refuses.
+#[test]
+fn the_attributes_of_each_folder_above_the_tree_are_measured() {
+    let e = env();
+    for &kind in kinds() {
+        let (code, line) = probe(&e.ws, kind, Act::StatAncestors, e.ws.root());
+        println!(
+            "measurement: the attributes of each folder above the tree {}: exit {code}, {line}",
+            kind.word()
+        );
     }
 }
 

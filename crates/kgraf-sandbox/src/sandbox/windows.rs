@@ -264,10 +264,12 @@ pub(super) const USER_STRENGTH: IsolationStrength = IsolationStrength {
            a local server and connects to it fails there; where Windows refuses a loopback \
            filter at setup, loopback is not confined on this machine and \
            `kgraf sandbox status` shows the filter as FAILED; \
-           a program that creates a named object in the session is refused, because the \
-           session admits its logon SID, which the command holds deny-only: cargo and \
-           rustc get a jobserver kGraf makes for each command instead, other programs \
-           get nothing; \
+           a program that makes or opens a named object in the session is refused, a \
+           `Global\\` name included, because the session's object directory admits its \
+           logon SID, which the command holds deny-only: so cargo and rustc cannot run as \
+           the sandbox user (cargo needs a jobserver, rustc a named mutex to print any \
+           warning or error, and the jobserver kGraf makes for each command cannot be \
+           opened either), and a failed command's output says so; \
            traffic Windows sends on the user's behalf \
            is not proved blocked: a UNC path (\\\\host\\share) makes the kernel's SMB \
            client connect, the WebClient service carries WebDAV, and ICMP \
@@ -331,6 +333,9 @@ mod user_gaps_tests {
             "a listener it started itself included",
             "loopback is not confined on this machine",
             "named object in the session is refused",
+            "name included",
+            "cargo and rustc cannot run as the sandbox user",
+            "a failed command's output says so",
             "jobserver",
             "UNC path",
             "WebDAV",

@@ -44,6 +44,7 @@ pub mod firewall;
 pub mod handshake;
 pub mod jobserver;
 pub mod launch_record;
+pub mod named_objects;
 pub mod names;
 pub mod password;
 pub mod plan;

@@ -2205,6 +2205,7 @@ async fn run_sandboxed(
             let (stderr_bytes, stderr_trunc) =
                 drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
             let status = status.map_err(|e| internal(format!("wait failed: {e}")))?;
+            let named = named_object_note(&stdout_bytes, &stderr_bytes);
             let mut output = render_output(
                 status.success(),
                 status.code(),
@@ -2214,11 +2215,8 @@ async fn run_sandboxed(
                 stderr_trunc,
                 output_cap,
             );
-            if !status.success() && !refused.is_empty() {
-                let lines: Vec<String> = refused.iter().map(|r| format!("[sandbox] {r}")).collect();
-                output.parts.push(OutputPart::Text {
-                    text: UntrustedText::new(lines.join("\n")),
-                });
+            if !status.success() {
+                push_sandbox_lines(&mut output, &refused, named);
             }
             Ok(output)
         }
@@ -2637,6 +2635,7 @@ async fn run_sandboxed(
                 drain_with_cap(&mut stdout_task, &stdout_buf, DRAIN_GRACE).await;
             let (stderr_bytes, stderr_trunc) =
                 drain_with_cap(&mut stderr_task, &stderr_buf, DRAIN_GRACE).await;
+            let named = named_object_note(&stdout_bytes, &stderr_bytes);
             let mut output = render_output(
                 status.success(),
                 status.code(),
@@ -2646,11 +2645,8 @@ async fn run_sandboxed(
                 stderr_trunc,
                 output_cap,
             );
-            if !status.success() && !refused.is_empty() {
-                let lines: Vec<String> = refused.iter().map(|r| format!("[sandbox] {r}")).collect();
-                output.parts.push(OutputPart::Text {
-                    text: UntrustedText::new(lines.join("\n")),
-                });
+            if !status.success() {
+                push_sandbox_lines(&mut output, &refused, named);
             }
             Ok(output)
         }
@@ -2920,6 +2916,38 @@ async fn drain_with_cap(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (std::mem::take(&mut kept.bytes), kept.truncated)
         }
+    }
+}
+
+/// The sandbox's note for a failed command whose output shows that it could
+/// not make or open a named kernel object in the Windows session (cargo's
+/// jobserver, rustc's diagnostic lock): without it the result is a bare
+/// 0xC0000409 that reads as the program's own crash
+/// (`kgraf_sandbox::sandbox_user::named_objects`). Read before the output is
+/// cut to the cap, so a marker in the cut part still counts.
+#[cfg(any(unix, windows))]
+fn named_object_note(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stderr),
+        String::from_utf8_lossy(stdout)
+    );
+    kgraf_sandbox::sandbox_user::named_objects::note_for(&text)
+}
+
+/// Add the sandbox's lines to a failed command's output: the reads it
+/// refused, then the named-object note, each as one `[sandbox]` line.
+#[cfg(any(unix, windows))]
+fn push_sandbox_lines(output: &mut ToolOutput, refused: &[String], named: Option<String>) {
+    let lines: Vec<String> = refused
+        .iter()
+        .chain(named.iter())
+        .map(|r| format!("[sandbox] {r}"))
+        .collect();
+    if !lines.is_empty() {
+        output.parts.push(OutputPart::Text {
+            text: UntrustedText::new(lines.join("\n")),
+        });
     }
 }
 
@@ -3282,6 +3310,52 @@ mod tests {
             .expect("call");
         assert!(!out.is_error);
         assert!(out.render().contains("hello-from-sandbox"));
+    }
+
+    /// A failed command whose output shows rustc's abort for its diagnostic
+    /// lock gets the sandbox's line that says why
+    /// (`kgraf_sandbox::sandbox_user::named_objects`); a failure without it,
+    /// and a success with it, get none. The program here only prints the
+    /// text rustc prints on Windows; the mechanism under test is the shell
+    /// tool reading a failed command's output.
+    #[tokio::test]
+    async fn a_named_object_failure_in_the_output_gets_the_sandbox_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = ctx(dir.path().to_path_buf());
+        let (tool, _hook) = ShellTool::new(policy());
+        let marker = "failed to create global mutex named `rustc_errors`";
+        let run = |script: String| {
+            let tool = &tool;
+            let c = &c;
+            async move {
+                tool.call(
+                    json!({"command": ["/bin/sh", "-c", script]}),
+                    c,
+                    &CallPermit::new(),
+                )
+                .await
+                .expect("call")
+            }
+        };
+        let line = format!(
+            "[sandbox] {}",
+            kgraf_sandbox::sandbox_user::named_objects::Cause::DiagnosticLock.seen()
+        );
+        let failed = run(format!("echo '{marker}' >&2; exit 101")).await;
+        assert!(failed.is_error);
+        let text = failed.render();
+        assert!(text.contains(&line), "{text}");
+        assert!(text.contains("did not fail on its own"), "{text}");
+
+        let other = run("echo 'error: mismatched types' >&2; exit 101".to_owned())
+            .await
+            .render();
+        assert!(!other.contains("[sandbox]"), "{other}");
+
+        let passed = run(format!("echo '{marker}' >&2; exit 0")).await;
+        assert!(!passed.is_error);
+        let passed = passed.render();
+        assert!(!passed.contains(&line), "{passed}");
     }
 
     /// Decision 0011, amended 2026-10-07: where the backend cannot deny the

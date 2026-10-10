@@ -1749,3 +1749,102 @@ What the next Windows run must show:
 - A failure of any of these carries its evidence: a `refused` loopback line with its probe
   reading, cargo's own lines, the parent's view of the fence refusal, a note naming the
   failing step.
+
+## Amendment (2026-10-09): what the second re-run as the sandbox user found
+
+A hosted Windows Server 2025 run (Datacenter 24H2, build 26100.33438).
+It ran the self-test's re-run (e) as the sandbox user for the second time. Proved: the four
+WFP loopback filters are present and selfcheck says "network: only the egress proxy was
+reachable"; as the sandbox user every shell, startup, TLS, stdio and kgraf_tools test
+passes; 0 binaries hung. Nothing below has run on Windows since; each bullet says what is
+proved on the host, what is inferred, and what a run must show.
+
+- **Named objects are refused, the jobserver kGraf makes included; cargo and rustc do not
+  run as the sandbox user.** Measured: "a named semaphore in the session as the slot user
+  without the network: exit 5, denied Access is denied", and cargo's "cannot open path or
+  name kgraf-jobserver-<hex> from the jobserver environment variable value: Access is
+  denied. (os error 5)" for the semaphore kGraf made for the command, whose own access list
+  admits the command's user. rustc then aborted with "failed to create global mutex named
+  `rustc_errors`" and 0xC0000409. The earlier amendment's premise, that opening an existing
+  object needs no right on the directory beyond traversal, is false for the Win32 calls:
+  `kernelbase.dll` opens the session's object directory itself, with explicit rights
+  (`DIRECTORY_QUERY | DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT |
+  DIRECTORY_CREATE_SUBDIRECTORY`, then `DIRECTORY_TRAVERSE` alone and the `Restricted`
+  subdirectory), before it looks up any name, and an explicit open is an access check that
+  the traverse privilege does not bypass. Microsoft does not document this; ReactOS and Wine
+  implement the calls so after Windows, and the self-test now measures both opens. That
+  directory admits the session's logon SID,
+  which the runner makes deny-only. `Global` and `Local` are symbolic links inside the same
+  directory, so a `Global\` name is expected to be refused the same way; that is inferred,
+  and the self-test now measures it. rustc makes the named mutex `rustc_errors`, with no
+  prefix, in `emit_to_destination` for every diagnostic it prints
+  (`compiler/rustc_errors/src/lock.rs`, rust-lang/rust master), so no jobserver in any
+  namespace can make a build that prints a warning or an error run. cargo makes a jobserver
+  for any job count (`jobserver::Client::new`), so `-j1` is no fallback. Not done, and why:
+  giving the command the logon SID would admit it to the owner's processes and objects,
+  which is what the runner's deny-only SID exists to prevent; adding the sandbox users to
+  the session directory's access list changes a system object that Windows makes again at
+  every logon, needs rights the account that runs kGraf may not have, and would let a
+  command make objects in the namespace the owner's programs open. A private namespace is
+  no answer: the `jobserver` crate and rustc open names, not boundaries. What is done: a
+  failed command whose output shows rustc's lock abort or a refused jobserver gets one
+  `[sandbox]` line naming the cause, in the shell tool's result and in a gate's result
+  (`sandbox_user::named_objects`; host tests `each_windows_failure_text_names_its_cause`,
+  `other_failures_get_no_note`, `a_named_object_failure_in_the_output_gets_the_sandbox_note`,
+  `a_check_that_fails_on_a_named_object_says_why`, the last two failing with the note left
+  out). The jobserver stays: it costs one handle and helps wherever the directory admits
+  the command. The gaps text says that cargo and rustc cannot run as the sandbox user. The
+  escape test now prints the owner's reading of the session's directory and of its
+  `Restricted` subdirectory in SDDL, and as each sandbox user a named semaphore in the
+  session and in the global namespace and the directory opened with each of the two rights
+  sets; those lines decide whether a later fix can give the command a namespace of its own.
+- **The junction test asked the wrong user.** The earlier amendment said the test pins the
+  link walk's refusal of the next command beside the probe's junction. This run showed that
+  command starting ("a tree holding a junction out of it was granted on as the slot user
+  without the network: \"\""). It was the probe's own user, whose entry was already on the
+  tree: `grant_writable_root` returns before any write when the entry is present
+  (`if present(&read_dacl(root)?) { return Ok(...) }`), and the link walk runs only in
+  front of a write (`apply_inheritable` through `guarded_inheritable_write`). With nothing
+  written, nothing is carried through the link; what the command reaches through it is what
+  the target's own access list gives that user. The refusal guards writes, not starts, so
+  this is not an escape. In the run before, the second kind's user had no entry yet, which
+  is why it met the refusal. The test now checks both halves: beside the probe's junction
+  the same user's next command starts and the target's access list is unchanged; on a fresh
+  tree holding a junction out of it, the first grant for each user is refused with "holds
+  the link ... nothing was written" and the target's access list is unchanged.
+- **Git cannot write a ref in a repository inside the owner's profile.** A check that ran
+  `git init` in a tree in the owner's profile failed with "cannot lock ref 'HEAD': unable to
+  create directory for .../nested/.git/HEAD". Git stats each folder of the repository's
+  absolute path from the drive root before it writes a ref, and makes each folder it cannot
+  stat (`safe_create_leading_directories`, `path.c`; `lock_raw_ref` calls it for every
+  ref; Git for Windows' `mingw_stat` opens the folder for its attributes). The traverse
+  privilege lets the command open a path below a folder it cannot list, but not read that
+  folder's attributes, and the profile admits only the owner, SYSTEM and administrators.
+  Inferred from the code and the error; the escape test
+  `the_attributes_of_each_folder_above_the_tree_are_measured` now names the first folder
+  that refuses. Not done: granting the sandbox users the right to read the attributes of
+  each such folder would change the access lists of the owner's profile folders, and
+  keeping worktrees outside the profile changes where kGraf puts them; either needs a
+  Windows run to prove. USAGE says what fails.
+- **The denied read's text follows the OS.** The worker end-to-end test expected EPERM's
+  "Operation not permitted" on every OS but Linux; Git Bash reports the access list's
+  ERROR_ACCESS_DENIED as EACCES, "Permission denied", and the sandbox had refused the read
+  correctly. The expected text is now chosen per OS, the denied read must be an error, and
+  the no-leak check is unchanged. Host test
+  `the_denied_read_text_follows_the_errno_of_each_os`, which fails with the Windows case
+  left on EPERM.
+- **The DNS test says which leak it saw.** `an_offline_lookup_does_not_reach_the_dns_client_service`
+  still fails while Windows refuses the name resolution cache filters, as it must. Its
+  message now says that the leak is the recorded gap when one of those filters is absent or
+  disabled, and a defect of the filters when every one is present and running.
+
+What the next Windows run must show:
+
+- Re-run (e): the junction test and the worker end-to-end test pass. The jobserver test
+  fails on the open with a message naming the cause, and prints the session directory's
+  SDDL lines, the global-namespace semaphore line and the two directory-open lines; the
+  ancestor measurement names a folder in the owner's profile. Every failing cargo command's
+  tail ends with the `[sandbox]` line for named objects. The DNS test's failure says "This
+  is the recorded gap".
+- A later fix for named objects is chosen on those lines: whether a `Global\` name works,
+  whether the directory admits traversal, and who may change its access list.

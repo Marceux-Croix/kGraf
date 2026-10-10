@@ -2707,6 +2707,33 @@ async fn a_check_that_changes_a_committed_file_fails_naming_it() {
     );
 }
 
+/// A check whose output shows rustc's abort for its diagnostic lock, the
+/// failure of every cargo build a Windows sandboxed command runs, fails with
+/// the sandbox's line that says why, so the reason does not read as rustc's
+/// own crash. The check only prints the text rustc prints on Windows.
+#[tokio::test]
+async fn a_check_that_fails_on_a_named_object_says_why() {
+    let r = repo();
+    let c = named("b.txt", "w-named");
+    let ws = prepared(&r, &c, "w-named").await;
+    std::fs::write(ws.join("b.txt"), "worker\n").expect("write");
+    let check = "echo 'failed to create global mutex named `rustc_errors`' >&2; exit 101";
+    match verifier(&r, check)
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran")
+    {
+        Verdict::Fail { reason } => {
+            assert!(
+                reason.contains("[sandbox] rustc could not make its named mutex")
+                    && reason.contains("did not fail on its own"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
 /// What a check creates goes, whatever its shape, and nothing outside the
 /// worktree is touched: files in new directories, a link to a file outside
 /// (the link goes, not its target), a nested repository (git lists it as

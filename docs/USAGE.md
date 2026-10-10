@@ -1778,9 +1778,18 @@ After `setup`, every sandboxed command runs as the sandbox user, through the
 `kgraf-sandbox-runner` program installed beside `kgraf`. Checks and ordinary shell
 commands run as the offline user. Dependency installs reach the network through kGraf's
 proxy. A command can write only where kGraf allows. It cannot read your Windows profile, apart
-from the toolchain and program folders kGraf grants it inside that profile. Each command
-also gets a jobserver kGraf makes for it, named in `CARGO_MAKEFLAGS`, which its cargo and
-rustc use: the sandbox user cannot create the one they would otherwise make. Git in the
+from the toolchain and program folders kGraf grants it inside that profile. cargo and rustc
+do not run as the sandbox user on Windows: they need a named kernel object in the Windows
+session (cargo a jobserver, rustc a named mutex to print any warning or error), and the
+sandbox user's command can neither make nor open one there, because the session admits its
+logon SID, which kGraf denies the command so that it cannot open your own processes. A
+failed command whose output shows this ends with a `[sandbox]` line that says so; the
+program did not fail on its own, and `-j1` does not help. Each command still gets a
+jobserver kGraf makes for it, named in `CARGO_MAKEFLAGS`. A git command in the sandbox
+that writes a ref in a repository inside your profile fails with "unable to create
+directory for ...": before it writes a ref, git reads the attributes of each folder above
+the repository, and your profile's folders are not readable to the sandbox user. This was
+seen for `git init`; `git commit` and a new branch write refs the same way. Git in the
 command trusts the command's own folders (`safe.directory`, given through
 `GIT_CONFIG_COUNT`): they belong to your account, and git refuses a repository another
 user owns. rustup may print `warn: could not canonicalize path C:\Users\<you>`: it looks

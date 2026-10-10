@@ -21,17 +21,28 @@
 //! `OpenSemaphoreA` asks for), and names it in `CARGO_MAKEFLAGS` the way
 //! cargo names its own to the processes it starts. cargo, rustc and the `cc`
 //! crate read that variable first (`jobserver::Client::from_env`), open the
-//! semaphore by name, and create none. Opening an existing object needs no
-//! right on the directory beyond traversal, which every token's
-//! `SeChangeNotifyPrivilege` gives. The semaphore lives as long as the
+//! semaphore by name, and create none. The semaphore lives as long as the
 //! command: the started child holds it.
 //!
+//! **Measured: this is not enough.** The open was expected to need no right
+//! on the session's directory beyond traversal, which every token's
+//! `SeChangeNotifyPrivilege` gives. A hosted Windows self-test refused it
+//! ("cannot open path or name kgraf-jobserver-... Access is denied"):
+//! `kernelbase.dll` opens the session's directory itself, with explicit
+//! rights, before it looks up any name, and the directory refuses the
+//! command. rustc also makes a named mutex of its own to print any
+//! diagnostic, so a jobserver alone cannot make a build run. The cause, and
+//! the note a failed command's output gets, are in
+//! [`super::named_objects`]. The semaphore is still made: it costs one
+//! handle, and where the directory admits the command it saves cargo from
+//! making its own.
+//!
 //! The command can do nothing with the semaphore but take and give back its
-//! tokens, and no other program is admitted to it. A program that creates a
-//! named object of its own in the session (a named mutex of an installer,
-//! for one) is still refused; the self-test measures whether the session's
-//! directory refuses the sandbox user (`a_named_object_in_the_session_is_measured`
-//! in `tests/escape_windows.rs`).
+//! tokens, and no other program is admitted to it. The self-test measures
+//! the open, a named object of the command's own in the session and in the
+//! global namespace, and the session's directory
+//! (`the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` in
+//! `tests/escape_windows.rs`).
 //!
 //! Platform-neutral: the name, the variable's value, the access list and the
 //! token count are tested on every host. The Windows call is in

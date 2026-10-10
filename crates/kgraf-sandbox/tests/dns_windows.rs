@@ -27,7 +27,7 @@ use std::net::ToSocketAddrs;
 
 use kgraf_sandbox::sandbox_user::dns_check::{is_probe_name, is_server_answer, probe_name};
 use kgraf_sandbox::sandbox_user::windows::{accounts, dns, wfp};
-use kgraf_sandbox::sandbox_user::{OwnerNames, WfpKeys};
+use kgraf_sandbox::sandbox_user::{OwnerNames, WfpKeys, WfpObject};
 use kgraf_sandbox::{Backend, Network, SandboxPolicy, platform_isolation, sandboxed_command};
 
 /// A name with real addresses, for the lookups that must still work.
@@ -163,8 +163,11 @@ fn baseline() {
 /// cache filters with `FWP_E_OUT_OF_BOUNDS`, a gap setup records and
 /// `kgraf sandbox status` shows as FAILED), the filter is absent and the
 /// lookup leaves the machine, and this test fails on the lookup: the gap is
-/// real, and the failure says what leaks. Each DNS filter's state is printed
-/// first as a `measurement:` line, so the report shows which were in place.
+/// real, and the failure says what leaks and that it is the recorded gap
+/// ([`leak_message`]). A leak with every name resolution cache filter in
+/// place is named as a defect of the filters instead. Each DNS filter's state
+/// is printed first as a `measurement:` line, so the report shows which were
+/// in place.
 #[test]
 fn an_offline_lookup_does_not_reach_the_dns_client_service() {
     if !sandbox_user_mode() {
@@ -172,29 +175,41 @@ fn an_offline_lookup_does_not_reach_the_dns_client_service() {
         return;
     }
     let keys = WfpKeys::derive(&owner_names());
-    match wfp::existing(&keys) {
+    // Whether a name resolution cache filter is absent or disabled: the gap
+    // setup records. `None` when the filters could not be read.
+    let gap = match wfp::existing(&keys) {
         Ok(state) => {
+            let mut gap = false;
             for (object, key) in keys.filters() {
                 if !object.is_dns_filter() {
                     continue;
                 }
                 // Present is not effective: a filter the Base Filtering
                 // Engine has disabled is read like any other.
-                let how = if !state.present.contains(&key) {
+                let missing = !state.present.contains(&key);
+                let disabled = state.disabled.contains(&key);
+                let how = if missing {
                     "absent (refused at setup, or removed)"
-                } else if state.disabled.contains(&key) {
+                } else if disabled {
                     "present, but FWPM_FILTER_FLAG_DISABLED: it does not run"
                 } else {
                     "present"
                 };
+                if object != WfpObject::RpcFilter && (missing || disabled) {
+                    gap = true;
+                }
                 println!(
                     "measurement: the DNS filter on {}: {how}",
                     object.layer_words()
                 );
             }
+            Some(gap)
         }
-        Err(why) => println!("measurement: the WFP filters were not read: {why}"),
-    }
+        Err(why) => {
+            println!("measurement: the WFP filters were not read: {why}");
+            None
+        }
+    };
     if !clear_cache() {
         eprintln!(
             "note: Clear-DnsClientCache failed (it needs administrator rights); the probe \
@@ -208,12 +223,20 @@ fn an_offline_lookup_does_not_reach_the_dns_client_service() {
     let status: u32 = code.parse().unwrap_or_else(|_| panic!("probe said {code}"));
     assert!(
         !is_server_answer(status),
-        "the offline user's DnsQuery got a DNS server's answer (status {status}): lookups \
-         leave the machine"
+        "{}",
+        leak_message(
+            gap,
+            &format!("the offline user's DnsQuery got a DNS server's answer (status {status})")
+        )
     );
     let resolved = probe_name().unwrap();
     let line = probe(Network::Deny, "getaddrinfo", &resolved);
-    assert_ne!(line, "ok", "the offline user resolved {resolved}");
+    assert_ne!(
+        line,
+        "ok",
+        "{}",
+        leak_message(gap, &format!("the offline user resolved {resolved}"))
+    );
     // The status the offline user's lookups got is the evidence the run
     // must report: it says how the filter's refusal looks to a program.
     eprintln!("offline user: DnsQuery status {status}, getaddrinfo {line}");
@@ -221,9 +244,36 @@ fn an_offline_lookup_does_not_reach_the_dns_client_service() {
     for name in [&queried, &resolved] {
         assert!(
             !cache_lists(name),
-            "the DNS Client service looked {name} up for the offline user: lookups leave the \
-             machine"
+            "{}",
+            leak_message(
+                gap,
+                &format!("the DNS Client service looked {name} up for the offline user")
+            )
         );
+    }
+}
+
+/// The failure text for a lookup that left the machine: `what` it was, then
+/// whether the filters' state read before the probe explains it. While a
+/// name resolution cache filter is absent or disabled, the leak is the gap
+/// setup recorded, and this test fails on purpose until it is closed; with
+/// every filter present and running, the leak is a defect of the filters.
+fn leak_message(gap: Option<bool>, what: &str) -> String {
+    match gap {
+        Some(true) => format!(
+            "{what}: lookups leave the machine. This is the recorded gap: a name resolution \
+             cache filter is absent or disabled (Windows Server 2025 refuses them at setup \
+             with FWP_E_OUT_OF_BOUNDS; `kgraf sandbox status` shows them as FAILED), so DNS is \
+             not confined on this machine. This test fails while the gap stands"
+        ),
+        Some(false) => format!(
+            "{what}: lookups leave the machine although every name resolution cache filter is \
+             present and running. That is a defect of the filters, not the recorded gap"
+        ),
+        None => format!(
+            "{what}: lookups leave the machine. The WFP filters could not be read, so whether \
+             this is the recorded gap of an absent filter is not known"
+        ),
     }
 }
 

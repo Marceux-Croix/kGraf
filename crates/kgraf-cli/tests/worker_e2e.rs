@@ -766,12 +766,12 @@ async fn a_worker_runs_end_to_end_on_the_real_tools_transcript_masking_mcp_and_l
         "{:?}",
         out["c2-4"]
     );
-    // Seatbelt denies with EPERM; Landlock's read allowlist with EACCES.
-    let denial = if cfg!(target_os = "linux") {
-        "Permission denied"
-    } else {
-        "Operation not permitted"
-    };
+    assert!(
+        out["c2-5"].1,
+        "the denied read is an error: {:?}",
+        out["c2-5"]
+    );
+    let denial = denial_text(std::env::consts::OS);
     assert!(out["c2-5"].0.contains(denial), "{:?}", out["c2-5"]);
     for (id, (text, _)) in &out {
         assert!(
@@ -2068,4 +2068,22 @@ async fn a_hosted_mcp_call_is_denied_without_a_rule_and_runs_after_kgraf_allow()
         assembled.close().await;
     }
     end_segment(&repo, segment, &mut opened, "w12").await;
+}
+
+/// What `head` prints when the sandbox refuses its read, on `os`
+/// (`std::env::consts::OS`). Seatbelt refuses with EPERM. Landlock's read
+/// allowlist refuses with EACCES. On Windows the access list refuses the
+/// open with ERROR_ACCESS_DENIED, which the Git Bash runtime maps to EACCES.
+fn denial_text(os: &str) -> &'static str {
+    match os {
+        "linux" | "windows" => "Permission denied",
+        _ => "Operation not permitted",
+    }
+}
+
+#[test]
+fn the_denied_read_text_follows_the_errno_of_each_os() {
+    assert_eq!(denial_text("windows"), "Permission denied");
+    assert_eq!(denial_text("linux"), "Permission denied");
+    assert_eq!(denial_text("macos"), "Operation not permitted");
 }

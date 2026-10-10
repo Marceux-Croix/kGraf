@@ -788,9 +788,11 @@ pub(crate) fn run_confined_on(
     let open = network.notice().map_or_else(String::new, open_network_note);
     match status {
         Some(s) => {
+            let named = named_object_note(&text);
             text = format!("$ {command}\n{text}\n[{s}]");
             if !s.success() {
                 text.push_str(&refused);
+                text.push_str(&named);
                 text.push_str(&build_note);
                 text.push_str(&missing_installs_note(checkout));
             }
@@ -958,6 +960,16 @@ fn missing_installs_note(checkout: &Path) -> String {
 /// say why), or nothing.
 pub(crate) fn refused_note(refused: &[String]) -> String {
     refused.iter().map(|r| format!("\n[sandbox] {r}")).collect()
+}
+
+/// The sandbox's line for a failing command whose log shows that cargo or
+/// rustc could not make or open a named kernel object in the Windows
+/// session (`kgraf_sandbox::sandbox_user::named_objects`), or nothing.
+/// Without it the gate's failure reads as rustc's own crash (0xC0000409).
+fn named_object_note(log: &str) -> String {
+    kgraf_sandbox::sandbox_user::named_objects::note_for(log)
+        .map(|n| format!("\n[sandbox] {n}"))
+        .unwrap_or_default()
 }
 
 #[async_trait::async_trait]
@@ -1348,6 +1360,23 @@ mod tests {
             super::refused_note(&["a".to_owned(), "b".to_owned()]),
             "\n[sandbox] a\n[sandbox] b"
         );
+    }
+
+    /// A gate log that shows rustc's abort for its diagnostic lock, as the
+    /// cut log keeps it among the error lines of the cut part, gets one
+    /// sandbox line naming the cause; another failure gets nothing.
+    #[test]
+    fn a_named_object_failure_in_the_log_gets_one_sandbox_line() {
+        let log = "[1549 bytes cut]\n[the error lines of the cut part:]\nerror: failed to run \
+                   `rustc` to learn about target-specific information\n  failed to create \
+                   global mutex named `rustc_errors`\n";
+        let note = super::named_object_note(log);
+        assert!(
+            note.starts_with("\n[sandbox] rustc could not make"),
+            "{note}"
+        );
+        assert_eq!(note.matches("[sandbox]").count(), 1, "{note}");
+        assert_eq!(super::named_object_note("error[E0425]: cannot find"), "");
     }
 
     /// The count of cut bytes is exact: the file's size less what is kept,

@@ -237,12 +237,9 @@ in the report (each came from the first self-test run whose re-run ran as the sa
   ("failed to create jobserver: Os { code: 5 }", exit 0xC0000409): rustc could not create
   its named semaphore in the session. kGraf now makes one per command and names it in
   `CARGO_MAKEFLAGS`. Expect in (d) a launch line `made jobserver semaphore kgraf-jobserver-...
-  with N tokens for a command of sandbox user ...`; in (e)
-  `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` passing, with one
-  `measurement: a named semaphore in the session ...` line per kind (exit 5 there means the
-  session refuses the sandbox user's own named objects, as expected; exit 0 means it does
-  not); and `a_real_cargo_build_runs_inside_the_sandbox`, the bench-briefs checks and the
-  contract checks passing. The cargo test now prints cargo's own lines. A line
+  with N tokens for a command of sandbox user ...`. The next run refused the open of that
+  semaphore too, so cargo builds as the sandbox user still fail; see "Named objects" below
+  for what (e) shows now. The cargo test prints cargo's own lines. A line
   `warn: could not canonicalize path C:\Users\<user>` from rustup is expected: rustup looks for
   a toolchain override in each folder above the command's folder, and the owner's profile
   folder is not readable to the sandbox user. It is a warning, not a failure.
@@ -260,6 +257,62 @@ in the report (each came from the first self-test run whose re-run ran as the sa
 - The worktree hold. `a_worktree_the_worker_still_writes_is_not_snapshotted` must fail the
   verification with "still runs": kGraf now lists each command it started in a worktree by
   its job, and quiesce is busy while one still holds a process.
+
+What the phase collects about named objects, git's ref writes, the junction test and DNS,
+and what to read in the report (each came from the second self-test run whose re-run ran as
+the sandbox user; none of the changes has run on Windows since):
+
+- Named objects. That run proved that a sandbox user's command can neither make nor open a
+  named object in the session: "measurement: a named semaphore in the session as the slot
+  user without the network: exit 5, denied", and cargo's "cannot open path or name
+  kgraf-jobserver-... Access is denied (os error 5)" for the semaphore kGraf made for it.
+  rustc then aborted with "failed to create global mutex named `rustc_errors`" and exit
+  0xC0000409: rustc makes that mutex, with no prefix, to print any warning or error. About
+  forty cargo tests failed this way (bench-briefs, contract checks, contract flow, four
+  kgraf_host tests, the cargo escape test). The cause, as far as the evidence goes:
+  `kernelbase.dll` opens the session's object directory itself, with explicit rights,
+  before it looks up any name, and that directory admits the session's logon SID, which the
+  command holds deny-only. kGraf does not change either (see decision 0097), so these tests
+  still fail. Expect in (e): `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured`
+  failing on the jobserver open, with a message that names the cause, and these lines, each
+  to be sent whole:
+  - `measurement: the session's object directory \Sessions\<n>\BaseNamedObjects as the owner
+    reads it: O:...G:...D:...S:...`, and the same for its `Restricted` subdirectory. The
+    access list says which SIDs Windows admits there and whether the account that runs
+    kGraf may change it.
+  - `measurement: a named semaphore in the session ...` and `... in the global namespace
+    (Global\) ...`, one per kind. Exit 5 in the global line confirms that a `Global\` name
+    is refused the same way; exit 0 means a global name works and a later fix can use it
+    for the jobserver (rustc's mutex still has no prefix).
+  - `measurement: the session's object directory opened with the rights kernelbase asks for
+    first ...` and `... for traversal alone ...`. Exit 5 in both is the cause above. Exit 0
+    for traversal alone means `kernelbase.dll` goes on to the `Restricted` subdirectory,
+    whose access list then decides.
+  A failed cargo command's output, in the shell tool and in a gate's result, now ends with
+  a `[sandbox]` line that names the cause ("rustc could not make its named mutex to print a
+  diagnostic: the program stopped because ..."). Expect that line in the failures' tails.
+- Git's ref writes. That run's `everything_a_check_creates_is_removed_and_nothing_outside`
+  failed in a check that ran `git init` in a tree in the owner's profile: "cannot lock ref
+  'HEAD': unable to create directory for .../nested/.git/HEAD". Git stats each folder of
+  the repository's absolute path from the drive root before it writes a ref, and the sandbox
+  user cannot read the attributes of a folder in the owner's profile. Expect the test to
+  fail the same way, and in (e) the line `measurement: the attributes of each folder above
+  the tree ...: exit 5, denied ...<the first folder that refuses>` from
+  `the_attributes_of_each_folder_above_the_tree_are_measured`. Exit 0 there with the test
+  still failing means the cause is another one: send the test's tail whole.
+- The junction test. It now checks both halves of the link walk: beside the junction its
+  probe planted, the next command of the same user starts (that user's entry is already on
+  the tree, so nothing is written and nothing can be carried through the link) and the
+  target's access list is unchanged; on a fresh tree holding a junction out of it, the first
+  grant for each user is refused with "holds the link ... nothing was written". Expect
+  `a_junction_inside_the_root_cannot_escape` to pass.
+- The worker end-to-end test now expects Git Bash's "Permission denied" for the denied read
+  on Windows. Expect
+  `a_worker_runs_end_to_end_on_the_real_tools_transcript_masking_mcp_and_ledger` to pass.
+- DNS. `an_offline_lookup_does_not_reach_the_dns_client_service` still fails while Windows
+  refuses the name resolution cache filters. Its message now says "This is the recorded
+  gap" when a name resolution cache filter is absent or disabled, and calls the leak a
+  defect of the filters when every one is present and running.
 
 What the phase collects about the DNS filter, and what to read in the report:
 
@@ -539,12 +592,19 @@ process environment.
      `the_owner_cannot_rewrite_the_dacl_of_an_outside_file`: each runs a second phase
      against an Everyone-writable folder under ProgramData, where the target's own access
      list decides and not the owner's profile, and prints a `measurement:` line. The
-     junction test also checks, as a sandbox user, that the next command in a worktree
-     holding the planted junction is refused before any access entry is written ("holds
-     the link ... nothing was written"), then removes the junction before the next kind.
+     junction test also checks, as a sandbox user, that the next command of the same user
+     beside the planted junction starts with the target's access list unchanged, and that
+     on a fresh tree holding a junction the first grant for each user is refused before any
+     access entry is written ("holds the link ... nothing was written").
    - `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured`: a sandbox user
-     opens the jobserver kGraf made for its command, and a `measurement:` line per kind
-     says whether it may create a named semaphore of its own in the session.
+     opens the jobserver kGraf made for its command; `measurement:` lines give the owner's
+     reading of the session's object directory and of its `Restricted` subdirectory, and
+     per kind whether a named semaphore of the command's own may be made in the session and
+     in the global namespace, and whether the directory opens with the rights
+     `kernelbase.dll` asks for and for traversal alone.
+   - `the_attributes_of_each_folder_above_the_tree_are_measured`: a `measurement:` line per
+     kind naming the first folder above the tree whose attributes the sandbox user cannot
+     read, which git needs before it writes a ref.
 
    In a manual run, add `--show-output` to the command above (libtest prints the output of
    a passing test only then) and copy every line that starts with `measurement:` into the
