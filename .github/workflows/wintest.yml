@@ -115,8 +115,10 @@ jobs:
           Write-Output "access list of the copy's tests folder:"
           icacls (Join-Path $dest 'tests')
           Write-Output "owner of the copy and of its program, which the launcher service checks:"
+          # Diagnostics only: a missing file is reported, never a job failure.
           (Get-Acl $dest).Owner
-          (Get-Acl (Join-Path $dest 'kgraf.exe')).Owner
+          $program = Join-Path $dest 'programs\kgraf.exe'
+          if (Test-Path $program) { (Get-Acl $program).Owner } else { Write-Output "not found: $program" }
           Write-Output "access list of the volume root, which the same check reads:"
           icacls C:\
 
