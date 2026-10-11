@@ -208,6 +208,11 @@ impl CallCapability {
         &self.programs
     }
 
+    /// The call's rule subjects: for a shell call, its command lines.
+    pub(crate) fn subjects(&self) -> &[String] {
+        &self.subjects
+    }
+
     /// The record of this call refused by `by` with `output`. Only a
     /// command-level match (a user rule, the deletion limit, the mode's
     /// command policy) names another program than the call's own
@@ -426,6 +431,139 @@ impl RefusalDirectory {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(worker);
+    }
+}
+
+/// Opens the `why` of a report that kGraf filed for a worker. The trace of
+/// the run and the worker log carry it, so a reader can tell this report from
+/// one the model wrote.
+pub const KGRAF_FILED_LEAD: &str =
+    "Filed by kGraf on the worker's behalf; the model did not call report_shortfall: ";
+
+/// The most command lines kept per refused program in a report kGraf files.
+const MAX_REPORTED_LINES: usize = 3;
+
+/// The most characters of one refused command line a report quotes.
+const MAX_REPORTED_LINE_CHARS: usize = 160;
+
+/// A permission report that kGraf filed for a worker that was refused the
+/// same program twice and never reported it. At most one per attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KgrafShortfall {
+    /// The program the report asks for: the one refused twice.
+    pub need: String,
+    /// The report's reason, which names every refused program and its
+    /// command lines. Begins with [`KGRAF_FILED_LEAD`].
+    pub why: String,
+    /// What the report tool answered, if it was called and answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+}
+
+/// How many refusals of one program, with no run of it in between, make kGraf
+/// file the report. Two, as the no-change guard gives two notices: a first
+/// refusal can be a slip the model corrects, a second names a program it
+/// needs and will not report.
+pub const REFUSALS_BEFORE_KGRAF_FILES: usize = 2;
+
+/// Refusals of shell programs in one attempt, and whether a report was made
+/// (by the model) or filed (by kGraf). The rule, kept here so it is one
+/// readable function:
+///
+/// - Only a shell program refused by a command policy or the unattended ask
+///   counts. A whole-tool refusal (a skill), a path refusal (a write scope)
+///   and a user deny rule do not: a grant cannot lift them, or the report is
+///   a different kind, so the model's own report is the right one.
+/// - A later run of the program without error clears its count.
+/// - Two different programs refused once each do not count.
+/// - Any `report_shortfall` call by the model ends the guard for the attempt.
+/// - It fires once per attempt.
+#[derive(Debug, Default)]
+pub(crate) struct RepeatedRefusals {
+    /// Per program, in order of first refusal: the command lines refused.
+    by_program: Vec<(String, Vec<String>)>,
+    model_reported: bool,
+    filed: bool,
+}
+
+impl RepeatedRefusals {
+    /// The model called the report tool: kGraf files nothing for it.
+    pub(crate) fn model_reported(&mut self) {
+        self.model_reported = true;
+    }
+
+    /// A call that ran `programs` finished without error.
+    pub(crate) fn ran(&mut self, programs: &[String]) {
+        self.by_program.retain(|(p, _)| !programs.contains(p));
+    }
+
+    /// A call of `tool` was refused: `call` is its record and `lines` its
+    /// command lines.
+    pub(crate) fn refused(&mut self, tool: &str, call: &RefusedCall, lines: &[String]) {
+        let counts = tool == "shell"
+            && !call.whole_tool
+            && call.path.is_none()
+            && call.by != kgraf_tools::permissions::PERMISSION_RULES_HOOK
+            && !call.capability.is_empty();
+        if !counts {
+            return;
+        }
+        let entry = match self
+            .by_program
+            .iter()
+            .position(|(p, _)| *p == call.capability)
+        {
+            Some(i) => &mut self.by_program[i].1,
+            None => {
+                self.by_program.push((call.capability.clone(), Vec::new()));
+                &mut self.by_program.last_mut().expect("just pushed").1
+            }
+        };
+        let line = lines.join(" ; ");
+        let line: String = line.chars().take(MAX_REPORTED_LINE_CHARS).collect();
+        entry.push(line);
+    }
+
+    /// The report to file now, if the rule says so and none was filed.
+    pub(crate) fn due(&self) -> Option<KgrafShortfall> {
+        if self.model_reported || self.filed {
+            return None;
+        }
+        let (need, _) = self
+            .by_program
+            .iter()
+            .find(|(_, lines)| lines.len() >= REFUSALS_BEFORE_KGRAF_FILES)?;
+        let named: Vec<String> = self
+            .by_program
+            .iter()
+            .map(|(program, lines)| {
+                let shown: Vec<String> = lines
+                    .iter()
+                    .take(MAX_REPORTED_LINES)
+                    .map(|l| format!("`{l}`"))
+                    .collect();
+                format!(
+                    "`{program}` refused {} time(s): {}",
+                    lines.len(),
+                    shown.join(", ")
+                )
+            })
+            .collect();
+        Some(KgrafShortfall {
+            need: need.clone(),
+            why: format!(
+                "{KGRAF_FILED_LEAD}the worker was refused {} and the instruction cannot be done \
+                 without it. Refused: {}.",
+                format_args!("`{need}`"),
+                named.join("; ")
+            ),
+            reply: None,
+        })
+    }
+
+    /// The report is filed or tried; none is filed again.
+    pub(crate) fn mark_filed(&mut self) {
+        self.filed = true;
     }
 }
 

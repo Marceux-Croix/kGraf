@@ -2260,6 +2260,79 @@ fn stated_in_prose(claim: &str, text: &str) -> bool {
         .any(|w| w == claim)
 }
 
+/// Kind labels the interface schema uses for a surface symbol, with the prose
+/// words and signature form by which a provider states that kind. A model
+/// that echoes the label ("I assume you provide `dotproduct` as a
+/// `callable_symbol`") restates the symbol's kind, not a property the
+/// provider must repeat.
+const KIND_LABELS: &[(&str, &[&str])] = &[
+    (
+        "callable_symbol",
+        &[
+            "function",
+            "callable",
+            "method",
+            "def",
+            "fn",
+            "func",
+            "procedure",
+        ],
+    ),
+    (
+        "function_symbol",
+        &[
+            "function",
+            "callable",
+            "method",
+            "def",
+            "fn",
+            "func",
+            "procedure",
+        ],
+    ),
+    (
+        "method_symbol",
+        &["method", "function", "callable", "def", "fn", "func"],
+    ),
+    (
+        "type_symbol",
+        &[
+            "type",
+            "class",
+            "struct",
+            "enum",
+            "trait",
+            "interface",
+            "record",
+        ],
+    ),
+    (
+        "class_symbol",
+        &["class", "type", "struct", "enum", "record"],
+    ),
+    (
+        "constant_symbol",
+        &["constant", "const", "static", "value", "variable"],
+    ),
+    ("module_symbol", &["module", "package", "namespace"]),
+];
+
+/// Whether `claim` is a kind label that the provision matches: the provider
+/// gives the symbol a signature (for a callable kind) or says a word of that
+/// kind in its prose or anchors. Any other claim is not a kind label and is
+/// compared as before.
+fn kind_label_satisfied(claim: &str, text: &str, theirs: &BTreeSet<String>) -> bool {
+    let Some((_, words)) = KIND_LABELS.iter().find(|(l, _)| *l == claim) else {
+        return false;
+    };
+    let callable = words.contains(&"function");
+    (callable && theirs.iter().any(|c| c.starts_with("fn(")))
+        || prose_words(text)
+            .iter()
+            .any(|w| words.contains(&w.as_str()))
+        || theirs.iter().any(|c| words.contains(&c.as_str()))
+}
+
 /// One provision: (party, sentence, the sentence's claims).
 type Provision<'a> = (&'a str, &'a str, BTreeSet<String>);
 
@@ -2765,6 +2838,7 @@ pub fn compare_handshake_ordered(
                     mine.iter().all(|c| {
                         theirs.contains(c)
                             || stated_in_prose(c, t)
+                            || kind_label_satisfied(c, t, theirs)
                             || (silent_ok && artifact.states(sym, c))
                     })
                 })

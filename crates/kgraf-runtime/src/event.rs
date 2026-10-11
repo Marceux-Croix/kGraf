@@ -262,6 +262,13 @@ pub enum NoticeKind {
     /// turn had ended. The round was dropped and the model was told what was
     /// missing. Sent on each of the bounded retries of an attempt.
     LostOutput,
+    /// The worker was refused the same command program twice and did not call
+    /// `report_shortfall`; kGraf filed the permission report for it. Sent once,
+    /// when the report is filed.
+    KgrafShortfall,
+    /// What the orchestrator answered to the report kGraf filed. Counted
+    /// apart from [`NoticeKind::KgrafShortfall`] so one filing is one count.
+    KgrafShortfallAnswer,
 }
 
 impl WorkerEvent {

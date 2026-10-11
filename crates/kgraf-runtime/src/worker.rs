@@ -846,6 +846,8 @@ async fn prepare(
         done,
         denied: 0,
         refused,
+        repeated: crate::shortfall::RepeatedRefusals::default(),
+        kgraf_shortfall: None,
         capabilities: std::collections::HashMap::new(),
         patch_rejections: 0,
         fence: options.fence,
@@ -1285,6 +1287,11 @@ struct Worker {
     denied: u32,
     /// Calls a policy refused, for the result (decision 0093).
     refused: crate::shortfall::RefusedCalls,
+    /// Refusals of one program that the model did not report, for the
+    /// report kGraf files for it (at most one per attempt).
+    repeated: crate::shortfall::RepeatedRefusals,
+    /// The report kGraf filed in this attempt, for the result.
+    kgraf_shortfall: Option<crate::shortfall::KgrafShortfall>,
     /// Each call of the current round by id: what it exercises, to name what
     /// a refusal refused and to match a refusal to a retry.
     capabilities: std::collections::HashMap<String, crate::shortfall::CallCapability>,
@@ -1512,6 +1519,7 @@ impl Worker {
             route_fault: self.route_fault.take(),
             rationale,
             refused: self.refused.take(),
+            kgraf_shortfall: self.kgraf_shortfall.take(),
             compaction: self.compactions.first().cloned(),
             later_compactions: self.compactions.iter().skip(1).cloned().collect(),
             round_blocks: self.progress.report(),
@@ -2194,7 +2202,7 @@ impl Worker {
                         String::new(),
                     ));
                 }
-                Ok(None) => {}
+                Ok(None) => self.file_shortfall_if_due(ep).await?,
                 Err(Halt::Abandoned { phase, partial, .. }) => {
                     // Reached only from `dispatch`'s own `Halt::Abandoned` (below),
                     // which always fires after the round's model call already ran;
@@ -2205,6 +2213,107 @@ impl Worker {
                 Err(halt) => return Err(halt),
             }
         }
+    }
+
+    /// File the permission report for a worker that was refused one program
+    /// twice and did not report it (see [`crate::shortfall::RepeatedRefusals`]).
+    /// The report goes through the approval chain and the registered
+    /// `report_shortfall` tool, so the orchestrator decides as it does for a
+    /// report the model wrote: it grants, asks, or holds, and cancels the
+    /// attempt when it does. When it answers without a decision, the answer
+    /// is given to the model in a notice. At most once per attempt, and a
+    /// failure to file is kept on the result, not retried.
+    async fn file_shortfall_if_due(&mut self, ep: &WorkerEndpoint) -> Result<(), Halt> {
+        let Some(mut report) = self.repeated.due() else {
+            return Ok(());
+        };
+        let registry = self.env.tools.clone();
+        if registry.get(crate::shortfall::SHORTFALL_TOOL).is_none() {
+            return Ok(());
+        }
+        self.repeated.mark_filed();
+        self.emit(
+            ep,
+            WorkerEvent::Notice {
+                kind: crate::event::NoticeKind::KgrafShortfall,
+                text: format!(
+                    "You were refused `{}` again and did not call report_shortfall, so kGraf \
+                     reported it for you: {}",
+                    report.need, report.why
+                ),
+            },
+        )
+        .await?;
+        let discovered = DiscoveredTools::new();
+        let view = ToolView {
+            registry: &registry,
+            discovered: &discovered,
+        };
+        let pending = PendingCall {
+            call_id: "kgraf-shortfall".to_owned(),
+            tool: crate::shortfall::SHORTFALL_TOOL.to_owned(),
+            input: serde_json::json!({
+                "kind": "permission",
+                "scope": "command",
+                "need": report.need,
+                "why": report.why,
+            }),
+            worker: self.brief.worker.clone(),
+            task: self.brief.task.clone(),
+        };
+        let chain = self.approval.clone();
+        let verdict = {
+            let mut log = RecordingLog {
+                ep,
+                seq: &mut self.seq,
+            };
+            chain
+                .review(view, pending, &mut log)
+                .await
+                .map_err(approval_halt)?
+        };
+        let Verdict::Run(call) = verdict else {
+            self.trace_failures.push(
+                "kGraf could not file the permission report: the approval chain did not clear \
+                 report_shortfall"
+                    .to_owned(),
+            );
+            self.kgraf_shortfall = Some(report);
+            return Ok(());
+        };
+        let ctx = ToolContext {
+            worker: self.brief.worker.clone(),
+            task: self.brief.task.clone(),
+            workspace_root: self.brief.workspace_root.clone(),
+            cancel: ep.cancellation_token().child_token(),
+            progress: ProgressSink::default(),
+        };
+        match registry.execute(call, &ctx).await {
+            Ok(output) if !output.is_error => report.reply = Some(output.render()),
+            Ok(output) => self.trace_failures.push(format!(
+                "kGraf filed the permission report and it was refused: {}",
+                output.render()
+            )),
+            // The orchestrator cancels the attempt as it decides; a cancel
+            // that wins the race with the reply is the report taking effect.
+            Err(ToolError::Cancelled { .. }) => {}
+            Err(e) => self
+                .trace_failures
+                .push(format!("kGraf could not file the permission report: {e}")),
+        }
+        let reply = report.reply.clone();
+        self.kgraf_shortfall = Some(report);
+        if let Some(reply) = reply {
+            self.emit(
+                ep,
+                WorkerEvent::Notice {
+                    kind: crate::event::NoticeKind::KgrafShortfallAnswer,
+                    text: format!("The orchestrator answered the report: {reply}"),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Digests of every path the progress gate tracks (dirty ones included), and
@@ -3832,8 +3941,12 @@ impl Worker {
             return;
         };
         let tool = call.tool.clone();
+        if tool == crate::shortfall::SHORTFALL_TOOL {
+            self.repeated.model_reported();
+        }
         if !*is_error {
             self.refused.ran_ok(&tool, call.programs());
+            self.repeated.ran(call.programs());
             return;
         }
         if output.starts_with(INVALID_CALL_PREFIX)
@@ -3852,7 +3965,9 @@ impl Worker {
         let Some(by) = policy else {
             return;
         };
-        self.refused.refused(call.refusal(&by, output, path));
+        let recorded = call.refusal(&by, output, path);
+        self.repeated.refused(&tool, &recorded, call.subjects());
+        self.refused.refused(recorded);
         let can_report = self
             .env
             .tools

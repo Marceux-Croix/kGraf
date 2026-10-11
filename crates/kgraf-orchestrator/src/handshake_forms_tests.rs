@@ -451,3 +451,49 @@ fn a_default_is_dropped_from_the_parameter_type() {
     assert_eq!(param("k=1.0", true), Param::Untyped);
     assert_eq!(param("cls", true), Param::Receiver);
 }
+
+const KIND_PROVIDES: &str = "I will provide `dotproduct` function that takes two `list`s of numbers (`int` or `float`) and returns their dot product as a number.";
+
+/// A consumer that echoes the schema's kind label for the symbol states the
+/// symbol's kind, not a property the provider must repeat.
+#[test]
+fn a_kind_label_the_provider_matches_is_not_a_disagreement() {
+    let f = compare_handshake(
+        &ic(&["dotproduct"], vec![]),
+        &[
+            statement("p", &[KIND_PROVIDES], &[]),
+            statement(
+                "c",
+                &[],
+                &[
+                    "I assume you provide `dotproduct` as a `callable_symbol` within the package namespace.",
+                ],
+            ),
+        ],
+        &BTreeMap::new(),
+    );
+    assert_eq!(holding(&f), vec![], "{f:#?}");
+}
+
+/// A kind label does not excuse a wrong claim beside it, and a kind the
+/// provider contradicts is still a disagreement.
+#[test]
+fn a_kind_label_beside_a_wrong_claim_still_disagrees() {
+    for expects in [
+        "I assume you provide `dotproduct` as a `callable_symbol` that returns a `str`.",
+        "I assume you provide `dotproduct` as a `type_symbol`.",
+    ] {
+        let f = compare_handshake(
+            &ic(&["dotproduct"], vec![]),
+            &[
+                statement("p", &[KIND_PROVIDES], &[]),
+                statement("c", &[], &[expects]),
+            ],
+            &BTreeMap::new(),
+        );
+        assert!(
+            matches!(&f[..], [HandshakeFinding::Disagree { symbol, .. }] if symbol == "dotproduct"),
+            "{expects}: {f:#?}"
+        );
+    }
+}

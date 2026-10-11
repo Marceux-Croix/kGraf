@@ -262,3 +262,29 @@ grouped names (`a, b string` for `a string, b string`) disagreed.
   arguments hold spaces.
 
 Test: `kgraf-orchestrator` `checks.rs` `a_signature_in_every_language_is_compared_by_its_types`.
+
+## Amendment (2026-10-11): a kind label the consumer echoes is not a claim the provider must restate
+
+A consumer that wrote "I assume you provide `dotproduct` as a `callable_symbol` within the
+package namespace" was held as `Disagree` against a provider that said "I will provide
+`dotproduct` function that takes two `list`s ... and returns their dot product". The
+backticked `callable_symbol` is the schema's word for a function. It states the symbol's kind.
+The comparison required it among the provider's claims or prose, so a model that echoed the
+schema's vocabulary held the run twice.
+
+- **Rule.** A consumer claim that is a kind label counts as consistent when the provision of
+  that symbol states a matching kind: a signature (for a callable kind), or a word of that kind
+  in its prose or anchors. Labels and kind words: `callable_symbol`, `function_symbol`
+  (function, callable, method, def, fn, func, procedure); `method_symbol` (method, function,
+  callable, def, fn, func); `type_symbol` (type, class, struct, enum, trait, interface,
+  record); `class_symbol` (class, type, struct, enum, record); `constant_symbol` (constant,
+  const, static, value, variable); `module_symbol` (module, package, namespace).
+- **Still found.** A kind the provider contradicts (`type_symbol` against a function), and
+  any other claim beside the label (a type, arity or return type the provider omits or
+  changes). The "returns an `int`" case is unchanged.
+- **Not done.** A generic placement phrase outside backticks ("within the package namespace")
+  is prose, not a claim, and needed no change.
+
+Tests: `kgraf-orchestrator` `handshake_forms_tests.rs`
+`a_kind_label_the_provider_matches_is_not_a_disagreement`,
+`a_kind_label_beside_a_wrong_claim_still_disagrees`.

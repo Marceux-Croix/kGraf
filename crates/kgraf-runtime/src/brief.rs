@@ -368,6 +368,11 @@ pub struct WorkerResult {
     /// reached a check and in a record from before the field.
     #[serde(default)]
     pub peak_context_tokens: u64,
+    /// The permission report kGraf filed for this worker after two refusals
+    /// of one program with no report from the model, if it did. Set by the
+    /// loop alone, never from model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kgraf_shortfall: Option<crate::shortfall::KgrafShortfall>,
 }
 
 impl WorkerResult {
@@ -401,6 +406,7 @@ impl WorkerResult {
             route_fault: None,
             round_blocks: None,
             peak_context_tokens: 0,
+            kgraf_shortfall: None,
         }
     }
 }

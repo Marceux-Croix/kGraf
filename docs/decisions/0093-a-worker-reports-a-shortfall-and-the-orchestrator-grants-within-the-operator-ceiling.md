@@ -381,3 +381,40 @@ Tests: `kgraf-orchestrator` `shortfall.rs`
 `bypass_answers_a_sibling_contracts_file_and_never_grants_it` and
 `an_instructions_report_about_a_sibling_contracts_file_is_answered_not_amended`. With the old
 answer text, or with the verifier saying nothing, they fail.
+
+## Amendment (2026-10-11): kGraf files the report for a worker that is refused one program twice
+
+A model often ignores "call `report_shortfall`". In a recorded unattended run in Manual mode on a
+local model, the worker was refused `mkdir` once and `python3` four times, never reported, worked
+around the refusals, and ran to the time limit. A refusal that only asks the model to report
+leaves the outcome to the model. This follows the no-change guard (`MAX_NO_CHANGE_NOTICES`):
+a notice that quotes the facts, then kGraf acts, bounded.
+
+- **The rule** (`RepeatedRefusals`, `kgraf-runtime` `shortfall.rs`). When one shell program has
+  been refused twice in an attempt, with no run of it without error in between, and the model has
+  not called `report_shortfall` in the attempt, kGraf files a permission report (`scope` command,
+  `need` the program refused twice). Counted refusals are those of a command policy or the
+  unattended ask. Not counted: a refusal of a whole tool (a skill's `allowed-tools`), a refusal
+  naming a path (a write scope: a file report is a different report), and a user deny rule (a
+  grant cannot lift it). Two different programs refused once each do not trigger it. Any call of
+  `report_shortfall` by the model ends the guard for the attempt.
+- **It goes the model's way.** kGraf sends the report through the approval chain and the
+  registered `report_shortfall` tool, so the grounding in the refusal record, the grant, ask or
+  hold decision, and the cancel of the attempt are the ones a report by the model gets. When the
+  orchestrator answers without a decision, the answer reaches the model in a notice.
+- **At most one per attempt.** There is no loop: the guard is spent when it fires, also when the
+  chain does not clear the tool (kept on `trace_failures`).
+- **It is shown as kGraf's.** The report's `why` opens with `KGRAF_FILED_LEAD` and names every
+  refused program with its command lines, so the run trace carries it. The worker log has a
+  `NoticeKind::KgrafShortfall` notice when it is filed and a `KgrafShortfallAnswer` notice for
+  the answer. `WorkerResult::kgraf_shortfall` holds the report and the tool's answer. The
+  permissions scenarios count it as a fact (`kgraf_filed_shortfalls`) and label the evidence.
+- An `ask_user_question` whose text names a refused program does not count toward the rule.
+
+Tests: `kgraf-runtime` `tests/kgraf_files_shortfall.rs`
+`two_refusals_of_one_program_without_a_report_are_filed_by_kgraf`,
+`one_refusal_then_a_report_by_the_model_files_nothing`,
+`a_report_by_the_model_before_the_second_refusal_ends_the_guard`,
+`two_different_programs_refused_once_each_file_nothing`,
+`a_program_that_later_ran_does_not_count_its_earlier_refusal`. With the call to the guard
+removed, the first fails and the others pass; restored, all pass.
