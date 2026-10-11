@@ -2362,8 +2362,8 @@ What the probe does not prove. It ran as the runner account (an administrator), 
 sandbox user and not through the launcher service. It made one profile for the probe, and
 the sandbox uses no AppContainer. The tools needed grants and still did not all run. A
 decision to move the sandbox to an AppContainer, or to add one for DNS, would need a stable
-packet attribution (a capture filtered to the container's process or package) and a way to
-run git and rustc in it. Neither exists, so 0097 keeps the dedicated sandbox user and the
+packet attribution and a way to run git and rustc in it. The probe-only run below gives the
+attribution; the tool access does not exist, so 0097 keeps the dedicated sandbox user and the
 recorded DNS gap.
 
 Probe-only run (2026-10-11, GitHub run 38179466993). With per-packet names and the DNS Client
