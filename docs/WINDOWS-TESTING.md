@@ -460,7 +460,64 @@ capabilities, captures ports 53 and 853 with `pktmon` in each phase, flushes the
 cache before each phase, and tries three things. Phase A looks up a name inside the container.
 Phase B looks it up outside, as a control. Phase C runs git and cargo inside the container,
 with read and execute granted on the cargo home, the rustup home and Git for Windows. It
-never fails the job, and writes `appcontainer-dns.md` to the artifact. The verdicts:
+never fails the job, and writes `appcontainer-dns.md` to the artifact. Runs 16 to 22 used
+the first version of the probe, which gave a verdict from packet counts. The table below
+is from that version.
+
+The probe now saves raw data and decides by name. It differs from that version in four
+ways:
+
+- **Probe-only mode.** Dispatch the workflow with `probe_only=true` to run only the probe
+  and the upload. The job installs no Rust and builds nothing, and it skips the bundle, the
+  tests, the sandbox user phase and the firewall test. It checks out only the `scripts`
+  folder. The upload step still runs after a failure or a cancel. The command is:
+
+  ```
+  gh workflow run wintest.yml -f probe_only=true
+  ```
+
+  The probe alone took 1.4 to 2.3 minutes in runs 16 to 22. Job set-up and the checkout
+  add to that. Expect a few minutes in all. This mode has not been timed yet.
+- **Two real lookups.** The probe looks up `example.com` with getaddrinfo
+  (`Dns.GetHostAddresses`) and with `DnsQuery_W`, called through `Add-Type` C# in Windows
+  PowerShell inside the container. `DnsQuery_W` is the DNS Client service API that
+  `Resolve-DnsName -DnsOnly` uses. `Resolve-DnsName` itself cannot run in the container:
+  the DnsClient module is built on CIM, which needs WMI. The same two lookups run in the
+  control phase. If `Add-Type` cannot compile in the container, the line reads `NOT-RUN`,
+  not `REFUSED`, and the verdict is INCONCLUSIVE unless a packet or an answer decides it.
+  The probe name is `example.com`. A name made up for each run does not resolve, so a
+  leaked lookup would return "no such host" and look the same as a refused one. The
+  packets are matched on the exact name instead, and the DNS Client log names the process.
+- **Raw files.** The artifact folder `appcontainer-dns-raw/` holds, per phase, the pktmon
+  `.etl`, its text form (`.txt`) and a `.pcapng` from `pktmon etl2pcap` (`cap-A.*` is the
+  container phase, `cap-B.*` the control). It also holds `dns-client-operational.evtx`, an
+  export of the `Microsoft-Windows-DNS-Client/Operational` log for the probe window. The
+  probe enables that log if it is off and restores its state at the end. Open the
+  `.pcapng` in Wireshark and the `.evtx` in Event Viewer to check the markdown.
+- **Detail in `appcontainer-dns.md`.** Each phase lists every DNS packet with its time,
+  direction, frame size in bytes, protocol, addresses, kind (query or response), type and
+  decoded name. One packet is logged at several points of the network stack, so copies
+  with the same DNS ID, kind, name, type and ports within 100 ms count as one; the line
+  above the table gives how many were removed. A packet that does not decode, and any
+  packet on port 853 (DNS over TLS), is listed as `(not decoded)`. A table of DNS Client
+  events follows, with time, phase, event ID, query name, process ID and status. The
+  report also gives the process IDs of the in-container processes the probe started (phase
+  A lookups, and the tools in phase C).
+
+The verdict rule, in this order:
+
+| Verdict | Condition |
+|---|---|
+| LEAK-SERVICE | a lookup inside the container returned an address |
+| FALLBACK-SENT | a phase A packet carries the name `example.com` (exact match, no count) |
+| CONFINED | no phase A packet carries the name; every phase A packet decoded; both lookups ran; the control sent the name; the event log was read; and no event for the name has status 0 from an in-container process ID |
+| INCONCLUSIVE | anything else; the line names the reason (packet list missing, a packet that did not decode, a lookup that did not start or build, a control that sent nothing, an event log that could not be read, or an event that disagrees with the lookups) |
+
+The capture sees the whole machine, so a phase A packet with the name may come from
+another process. The event table gives the process ID. The log may report the DNS Client
+service's process ID in its header, not the caller's; if no event process ID matches an
+in-container process ID, attribution rests on the timing and the packets. The earlier
+verdicts follow:
 
 | Run | Verdict | Packets on 53 or 853 in phase A | Control packets (phase B) |
 |---|---|---|---|

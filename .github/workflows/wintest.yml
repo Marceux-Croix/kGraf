@@ -17,6 +17,11 @@
 #   4. Runs the Windows Firewall network test (scripts/wintest-firewall.ps1).
 #   5. Uploads the report and the firewall output as one artifact.
 #
+# Probe-only mode (probe_only=true): runs only the AppContainer DNS probe and
+# the upload. It checks out the scripts folder, installs no Rust and builds
+# nothing; every other step is skipped. The artifact holds
+# appcontainer-dns.md and the raw capture files in appcontainer-dns-raw/.
+#
 # Cost: this bills Windows minutes, at twice the Linux rate on a private
 # repository. The job stops after 165 minutes.
 #
@@ -68,6 +73,10 @@ on:
         description: "Also run the AppContainer DNS probe (scripts/wintest-appcontainer-dns.ps1)"
         type: boolean
         default: true
+      probe_only:
+        description: "Run only the AppContainer DNS probe and the upload: no build, bundle, tests or sandbox user steps"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -93,6 +102,7 @@ jobs:
       # The budget counts from here. The job's own set-up before this step
       # takes a few seconds, which the minute taken off the budget covers.
       - name: Note the job start
+        if: ${{ !inputs.probe_only }}
         shell: bash
         run: echo "WINTEST_JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       # Some tracked benchmark logs have paths longer than 260 characters;
@@ -100,17 +110,24 @@ jobs:
       - name: Allow long paths in Git
         run: git config --system core.longpaths true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The probe needs only the scripts folder; the full checkout is for
+          # the build. An empty value checks out everything.
+          sparse-checkout: ${{ inputs.probe_only && 'scripts' || '' }}
       # The same moving `stable` alias that ci.yml uses; see the comment there.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, as of 2026-09-26
+        if: ${{ !inputs.probe_only }}
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ !inputs.probe_only }}
         with:
           # The package script builds in its own target folder.
           workspaces: ". -> target/wintest"
 
       - name: Build the self-test bundle
         id: build
+        if: ${{ !inputs.probe_only }}
         shell: bash
         env:
           KGRAF_WINTEST_NATIVE: "1"
@@ -127,6 +144,7 @@ jobs:
       # and names the sandbox group if it cannot read the binaries. The
       # baseline runs from the same copy, so both halves run the same files.
       - name: Place the bundle outside the profile
+        if: ${{ !inputs.probe_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -167,6 +185,7 @@ jobs:
       # loudly: a missing piece would turn a test into a skip or a failure
       # that measures nothing.
       - name: Start the OpenSSH agent and check Git for Windows
+        if: ${{ !inputs.probe_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -183,6 +202,7 @@ jobs:
           git --version
 
       - name: Run the bundle
+        if: ${{ !inputs.probe_only }}
         shell: bash
         env:
           # The runner is elevated and throwaway, so the sandbox user setup
@@ -220,7 +240,7 @@ jobs:
 
       - name: Run the firewall network test
         # It runs the sandbox from the bundle, so it needs the build.
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && !inputs.probe_only && steps.build.outcome == 'success' }}
         shell: pwsh
         run: |
           $stage = (Get-ChildItem target/wintest/bundle -Directory -Filter 'kgraf-wintest-*' | Select-Object -First 1).FullName
@@ -231,7 +251,7 @@ jobs:
           exit 0
 
       - name: Run the AppContainer DNS probe
-        if: ${{ !cancelled() && inputs.appcontainer_dns }}
+        if: ${{ !cancelled() && (inputs.appcontainer_dns || inputs.probe_only) }}
         continue-on-error: true
         shell: pwsh
         run: |
@@ -240,7 +260,7 @@ jobs:
           exit 0
 
       # Also after a cancel or a timeout: a partial report is a result.
-      - name: Upload the report and the firewall output
+      - name: Upload the report, the firewall output and the probe files
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
