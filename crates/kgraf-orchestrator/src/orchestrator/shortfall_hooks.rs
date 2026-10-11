@@ -244,6 +244,7 @@ impl RunLoop {
             &contract,
             &self.authority(),
             Some(&self.record.open_contracts),
+            &self.record.coordination.closed,
         );
         let decision = match plan_shape_hold {
             Some(reason) => ShortfallDecision::Hold { reason },

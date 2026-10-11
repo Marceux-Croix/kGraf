@@ -52,6 +52,7 @@
 
 use crate::challenge::{ContractControl, ContractReply};
 use crate::challenge_tool::ContractLine;
+use crate::coordination::{ClosedContract, Closure};
 use crate::run_state::OpenContract;
 use kgraf_runtime::{RefusalDirectory, RefusalRecord, RefusedCall, WorkerResult};
 use kgraf_session::skills::SkillDirectory;
@@ -696,7 +697,7 @@ pub fn decide(
     contract: &OpenContract,
     authority: &Authority,
 ) -> ShortfallDecision {
-    decide_in_plan(kind, scope, need, &[], why, contract, authority, None)
+    decide_in_plan(kind, scope, need, &[], why, contract, authority, None, &[])
 }
 
 /// [`decide`] with the run's open contracts, when they are known. A file a
@@ -705,6 +706,12 @@ pub fn decide(
 /// for a re-plan, instead of pointing at `--allow-path`, which would let one
 /// attempt write a file the plan never assigned. With `plan` as `None` the
 /// hold keeps the permission wording.
+///
+/// `finished`: the run's closed contracts. An unattended run that needs a
+/// file no open contract writes, but a verified and integrated contract of
+/// the run listed in its writes, is granted the path: the file's only planned
+/// writer is done, so it has no concurrent writer, and the asking contract's
+/// result is verified as usual. A path no contract listed keeps the hold.
 ///
 /// `with`: for a command report, the other programs the refused command
 /// runs ([`Grounding::Refused`]); the grant names each of them that the
@@ -720,6 +727,7 @@ pub fn decide_in_plan(
     contract: &OpenContract,
     authority: &Authority,
     plan: Option<&[OpenContract]>,
+    finished: &[ClosedContract],
 ) -> ShortfallDecision {
     let hold = |reason: String| ShortfallDecision::Hold { reason };
     if contract.shortfall_redispatches >= MAX_SHORTFALL_REDISPATCHES {
@@ -858,8 +866,23 @@ pub fn decide_in_plan(
         .then_some(p),
         _ => None,
     };
+    let finished_writer = unowned_file.and_then(|p| {
+        finished
+            .iter()
+            .filter(|c| c.closure == Closure::Verified)
+            .find(|c| c.writes.iter().any(|w| w.trim_start_matches("./") == p))
+    });
     if authority.attended {
         ShortfallDecision::AskUser { grant, question }
+    } else if let (Some(path), Some(writer)) = (unowned_file, finished_writer) {
+        ShortfallDecision::Grant {
+            by: format!(
+                "`{path}` was written by finished contract `{}` and no open contract writes \
+                 it, so it was handed to this contract",
+                writer.contract
+            ),
+            grant,
+        }
     } else if let Some(path) = unowned_file {
         hold(format!(
             "a worker needs to write `{path}` ({why}), and no open contract of this plan writes \
@@ -2579,6 +2602,7 @@ mod tests {
                 &mine,
                 &a,
                 plan,
+                &[],
             )
         };
         let ShortfallDecision::Hold { reason } = ask("docs/new.md", Some(&plan)) else {
@@ -2607,7 +2631,105 @@ mod tests {
             &mine,
             &attended,
             Some(&plan),
+            &[],
         );
         assert!(matches!(d, ShortfallDecision::AskUser { .. }), "{d:?}");
+    }
+
+    /// The shared manifest case: the one contract that listed the root
+    /// manifest finished and was integrated, no open contract writes it, and
+    /// a later contract needs it. Nobody attends, so the path is granted
+    /// (loudly, naming the finished writer). A path no contract ever listed
+    /// is still held, a finished contract that was only superseded does not
+    /// count, an attended run is still asked, and a user rule still wins.
+    #[test]
+    fn a_file_only_a_finished_contract_wrote_is_handed_to_the_asking_contract() {
+        let a = authority(PermissionMode::Manual, false);
+        let asking = contract_writing("c2", &["wcl/Cargo.toml", "wcl/src/main.rs"]);
+        let plan = [asking.clone()];
+        let done = ClosedContract::of(
+            &contract_writing("c1", &["Cargo.toml", "wcl-core/src/lib.rs"]),
+            Closure::Verified,
+        );
+        let ask = |need: &str, a: &Authority, finished: &[ClosedContract]| {
+            decide_in_plan(
+                ShortfallKind::Permission,
+                RequestScope::File,
+                need,
+                &[],
+                "the acceptance needs the member",
+                &asking,
+                a,
+                Some(&plan),
+                finished,
+            )
+        };
+        let finished = [done.clone()];
+        let ShortfallDecision::Grant { grant, by } = ask("Cargo.toml", &a, &finished) else {
+            panic!("expected a grant");
+        };
+        assert_eq!(grant, Grant::Path("Cargo.toml".into()));
+        assert!(by.contains("finished contract `c1`"), "{by}");
+        assert!(by.contains("no open contract writes it"), "{by}");
+        // A path no contract listed keeps the plan-shape hold.
+        let d = ask("docs/new.md", &a, &finished);
+        assert!(
+            matches!(&d, ShortfallDecision::Hold { reason } if reason.contains("re-plan")),
+            "{d:?}"
+        );
+        // A contract that was split into children did not integrate its own writes.
+        let superseded = [ClosedContract::of(
+            &contract_writing("c1", &["Cargo.toml"]),
+            Closure::Superseded,
+        )];
+        let d = ask("Cargo.toml", &a, &superseded);
+        assert!(matches!(d, ShortfallDecision::Hold { .. }), "{d:?}");
+        // Attended: the user is asked, as before.
+        let attended = authority(PermissionMode::Manual, true);
+        let d = ask("Cargo.toml", &attended, &finished);
+        assert!(matches!(d, ShortfallDecision::AskUser { .. }), "{d:?}");
+    }
+
+    /// A user deny or ask rule on the path comes before the handover.
+    #[test]
+    fn a_user_rule_wins_over_the_handover_of_a_finished_contracts_file() {
+        let asking = contract_writing("c2", &["wcl/Cargo.toml"]);
+        let plan = [asking.clone()];
+        let finished = [ClosedContract::of(
+            &contract_writing("c1", &["Cargo.toml"]),
+            Closure::Verified,
+        )];
+        for (deny, ask) in [
+            (
+                vec![Rule::parse("apply_patch(Cargo.toml)").expect("rule")],
+                vec![],
+            ),
+            (
+                vec![],
+                vec![Rule::parse("apply_patch(Cargo.toml)").expect("rule")],
+            ),
+        ] {
+            let a = Authority {
+                mode: PermissionMode::Manual,
+                allow: AllowSet::default(),
+                rules: UserRules { deny, ask },
+                attended: false,
+            };
+            let d = decide_in_plan(
+                ShortfallKind::Permission,
+                RequestScope::File,
+                "Cargo.toml",
+                &[],
+                "x",
+                &asking,
+                &a,
+                Some(&plan),
+                &finished,
+            );
+            assert!(
+                matches!(&d, ShortfallDecision::Hold { reason } if reason.contains("rule")),
+                "{d:?}"
+            );
+        }
     }
 }

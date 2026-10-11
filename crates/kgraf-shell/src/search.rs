@@ -1018,6 +1018,7 @@ mod tests {
                 workers: vec![],
                 worker_routes: vec![],
                 rationale: None,
+                writes: vec![],
             },
             ClosedContract {
                 contract: "old".into(),
@@ -1027,6 +1028,7 @@ mod tests {
                 workers: vec![],
                 worker_routes: vec![],
                 rationale: None,
+                writes: vec![],
             },
         ];
         let runs = vec![kgraf_orchestrator::StoredRun {

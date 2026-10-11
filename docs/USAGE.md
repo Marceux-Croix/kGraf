@@ -935,7 +935,7 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   you. A contract is re-dispatched at most twice for shortfalls; a grant that did not help
   holds. Every grant, hold and answer is in the run's trace (`shortfall` and `permission`
   events), and each grant is kept on the contract with who asked, why, and who granted it.
-- A shortfall that would hold the contract (a plan-shape error for a file no open contract writes,
+- A shortfall that would hold the contract (a plan-shape error for a file no contract of the run listed,
   a denial nobody attends to answer, a deny rule, a skill) is a claim that the contract cannot
   be done in its scope, and the verifier judges it first (decision 0093). When the worker had
   changed files, its attempt is verified as a completed one would be. If the check passes, the
@@ -2269,6 +2269,9 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   each member it lists, or the root lists only the members that exist and each later member's
   contract adds itself. A worker that still asks for such a file, written only by a contract
   that runs later, holds its contract as a plan-shape error that asks for a re-plan (0030).
+  A file that only a finished, integrated contract listed, and no open contract writes, is
+  handed to the asking contract in an unattended run, with a notice naming the finished
+  contract (0030, amended 2026-10-11).
   The member list is read from a `members = [...]` list in the root contract's instruction,
   and also from prose such as "the workspace root Cargo.toml with members wcl-core and wcl":
   after the word `member` or `members` to the end of the sentence, a word counts when the plan

@@ -428,6 +428,7 @@ impl RunLoop {
                 &snapshot,
                 &authority,
                 Some(&self.record.open_contracts),
+                &self.record.coordination.closed,
             );
             match decision {
                 ShortfallDecision::Grant { grant, by } => {

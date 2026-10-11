@@ -1070,3 +1070,34 @@ only where nothing else can follow.
 
 Tests: `kgraf-orchestrator` `incomplete_answer_tests.rs`, built from recorded answers
 (`tests/fixtures/incomplete-answers/`); `malformed_answer_retry.rs`; `intake.rs`.
+
+## Amendment (2026-10-11): a file only a finished contract wrote is handed to the contract that needs it
+
+A greenfield canary run (round 17d, `qwen3.6:35b`) planned `c1`, which wrote the root `Cargo.toml`
+(a workspace with member `wcl-core`) and `wcl-core`, and `c2`, which wrote `wcl/Cargo.toml` and
+`wcl/src/main.rs`. `c1` finished and was integrated. The worker of `c2` correctly reported that
+`wcl` must be a root member for `cargo test -p wcl --offline` to pass. No open contract wrote the
+root `Cargo.toml`, because the writes of `c1` closed when it finished, so the unattended run held
+`c2` as a plan-shape error and ended Blocked. A planner that leaves a shared manifest with an
+earlier contract is a common model deficiency; the run now recovers from it.
+
+An unattended shortfall for a path is now granted to the asking contract when all of these hold:
+no open contract writes the path; a contract of the run that closed as verified and integrated
+listed the path in its writes; and no user deny or ask rule applies (those checks run first and
+still win). Disjoint writes forbids concurrent writers. The file's only planned writer is done and
+no open contract writes it, so it has no concurrent writer, and the asking contract's result is
+verified as usual. The grant is loud: its `by` text reads "`<path>` was written by finished
+contract `<id>` and no open contract writes it, so it was handed to this contract", and it reaches
+the trace and the contract's grant record like every other grant.
+
+A path that no contract of the run ever listed keeps the plan-shape hold and its re-plan advice.
+An attended run is still asked. The re-plan stays what it was: it runs once, before work starts.
+
+The closed-contract record now keeps the paths the contract listed in its writes (`writes`, empty
+for a record from before this change). `decide_in_plan` takes the run's closed contracts.
+
+Tests: `kgraf-orchestrator` `shortfall.rs`:
+`a_file_only_a_finished_contract_wrote_is_handed_to_the_asking_contract` (grant with the finished
+writer named; unlisted path still held; a superseded contract does not count; attended still
+asks) and `a_user_rule_wins_over_the_handover_of_a_finished_contracts_file`. The first was seen to
+fail with the finished-writer lookup disabled.

@@ -173,6 +173,12 @@ pub struct ClosedContract {
     /// block, and for every record from before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<ProducerRationale>,
+    /// The paths the contract listed in its writes when it closed. A verified
+    /// contract's file has no concurrent writer; a later shortfall for it can
+    /// be handed to a contract that needs it. Empty for a record from before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
 }
 
 impl ClosedContract {
@@ -185,6 +191,7 @@ impl ClosedContract {
             workers: c.workers.iter().map(ToString::to_string).collect(),
             worker_routes: c.worker_routes.clone(),
             rationale: None,
+            writes: c.writes.iter().map(|w| w.path.clone()).collect(),
         }
     }
 
