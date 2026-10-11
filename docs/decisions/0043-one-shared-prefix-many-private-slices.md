@@ -128,3 +128,15 @@ system's reason was not part of the message.
 4. **Sizing.** A hand-back child's slice cap counts a slice it cannot render from here at the
    per-slice bound and keeps it, so the spawn, not the sizing, is where a left-out slice is
    named.
+
+## Amendment (2026-10-11): no graph for the worker is left out too, not refused
+
+Item 2 said a brief that names slices with no graph configured is still refused. That is
+replaced. A worker with no graph (`NoSlices`) leaves every node its brief names out, with the
+reason "no graph is configured for this worker", and starts; its opening, the `Context` event,
+its result and the orchestrator's notices say so, as for any left-out slice, and it reads the
+files with its tools. Seen live: a re-planned contract named a node from the run's graph while
+its attempts were assembled with no graph, and both died at spawn before any model call. The
+source of that mismatch is also closed: when the build found nothing to index, an attempt now
+opens the graph at assembly if it holds nodes by then, since the run indexes its own writes as
+contracts finish.

@@ -107,15 +107,25 @@ impl AttemptAssembler {
             .routes
             .get(route)
             .ok_or_else(|| Error::Invalid(format!("route `{route}` is not configured")))?;
-        let graph = if self.indexed {
-            Some(GraphParts {
+        let open_parts = || -> Result<GraphParts> {
+            Ok(GraphParts {
                 // The run's own indexing pass is the writer that may rebuild;
                 // an attempt only opens what it left.
                 slices: GraphStore::open_existing_for_facts(&self.graph_path, &self.root).lift()?,
                 tool: GraphStore::open_existing_for_facts(&self.graph_path, &self.root).lift()?,
             })
+        };
+        let graph = if self.indexed {
+            Some(open_parts()?)
         } else {
-            None
+            // The build found nothing to index, but the run's own writes are
+            // indexed as contracts finish. A later contract's brief can then
+            // name nodes, so an attempt opens the graph once it holds any.
+            // A graph that cannot be opened here leaves the worker without
+            // one, as the build reported.
+            open_parts()
+                .ok()
+                .filter(|parts| parts.slices.node_count().is_ok_and(|nodes| nodes > 0))
         };
         let (allow_store, _) = PersistedAllowStore::open(allow_store_path(&self.state), ws.root())
             .step("cannot open the project's allow rules")?;

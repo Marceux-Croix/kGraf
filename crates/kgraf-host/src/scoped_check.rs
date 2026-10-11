@@ -290,6 +290,9 @@ pub(crate) fn scope(command: &str, root: &Path, writes: &[&str]) -> Scope {
 /// cargo, when the file is the target root (`src/lib.rs`, `src/main.rs`) of a
 /// package whose manifest the tree holds: cargo cannot load a workspace with
 /// a member that has no target, so no `cargo test -p` of any member runs.
+/// For the same reason it needs the manifest (`<dir>/Cargo.toml`) and the
+/// target roots of a member the root manifest lists ([`listed_member`]):
+/// cargo reads every member's manifest before it runs any `-p` command.
 /// The caller checks that the file is absent; this reads only the rule.
 pub(crate) fn needs_absent(command: &str, root: &Path, selected: &[String], write: &str) -> bool {
     let write = write.trim_start_matches("./");
@@ -303,6 +306,12 @@ pub(crate) fn needs_absent(command: &str, root: &Path, selected: &[String], writ
     if !matches!(runner(command, root), Ok(Runner::Cargo { .. })) {
         return false;
     }
+    if write
+        .strip_suffix("/Cargo.toml")
+        .is_some_and(|dir| listed_member(root, dir))
+    {
+        return true;
+    }
     let dir = ["src/lib.rs", "src/main.rs"].iter().find_map(|target| {
         if write == *target {
             Some("")
@@ -310,7 +319,54 @@ pub(crate) fn needs_absent(command: &str, root: &Path, selected: &[String], writ
             write.strip_suffix(&format!("/{target}"))
         }
     });
-    dir.is_some_and(|dir| package_name(&root.join(dir)).is_some())
+    dir.is_some_and(|dir| package_name(&root.join(dir)).is_some() || listed_member(root, dir))
+}
+
+/// Whether the workspace manifest at `root` lists `dir` as a member, so cargo
+/// loads `dir/Cargo.toml` before any command: an explicit entry of
+/// `[workspace] members`, or a `<prefix>/*` entry when `dir` exists (a glob
+/// matches only directories that are there). An entry of `exclude` is not a
+/// member. Other glob forms are not read: an unread member is not waited on,
+/// and the attempt is judged as before.
+fn listed_member(root: &Path, dir: &str) -> bool {
+    let dir = dir.trim_start_matches("./").trim_end_matches('/');
+    if dir.is_empty() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(ws) = doc.get("workspace") else {
+        return false;
+    };
+    let entries = |key: &str| -> Vec<String> {
+        ws.get(key)
+            .and_then(|v| v.as_array())
+            .map(|v| {
+                v.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|x| x.trim_start_matches("./").trim_end_matches('/').to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if entries("exclude").iter().any(|e| e == dir) {
+        return false;
+    }
+    let in_glob = |prefix: &str| {
+        !prefix.contains(['*', '?', '['])
+            && dir
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            && root.join(dir).is_dir()
+    };
+    entries("members")
+        .iter()
+        .any(|m| m == dir || m.strip_suffix("/*").is_some_and(in_glob))
 }
 
 /// Every single-part command [`scope`] can produce for `command` in the tree at
@@ -1373,6 +1429,50 @@ mod tests {
         assert!(needs_absent(pycmd, py.path(), &own, "textkit/slug.py"));
         assert!(!needs_absent(pycmd, py.path(), &own, "textkit/counts.py"));
         assert!(!needs_absent(pycmd, py.path(), &own, "src/lib.rs"));
+    }
+
+    /// Cargo reads the manifest of every listed member before any `-p`
+    /// command, so a narrowed check needs the absent manifest of a member the
+    /// root manifest lists, under a `crates/` prefix or a `<prefix>/*` glob
+    /// whose directory exists, and that member's target roots. An excluded
+    /// directory, an unlisted one, or a glob directory that is not there is
+    /// not needed.
+    #[test]
+    fn a_narrowed_check_needs_the_absent_manifest_of_a_listed_member() {
+        let t = tree(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/wcl-core\", \"crates/wcl\", \"tools/*\"]\n\
+                 exclude = [\"tools/old\"]\n",
+            ),
+            (
+                "crates/wcl-core/Cargo.toml",
+                "[package]\nname = \"wcl-core\"\n",
+            ),
+            ("crates/wcl-core/src/lib.rs", "pub fn f() {}\n"),
+            ("tools/gen/README", "gen\n"),
+            ("tools/old/README", "old\n"),
+        ]);
+        let cmd = "cargo test --workspace --offline";
+        let s = scope(cmd, t.path(), &["crates/wcl-core/src/lib.rs"]);
+        let (_, selected) = narrowed(&s);
+        assert_eq!(selected, ["package wcl-core"]);
+        let needs = |w: &str| needs_absent(cmd, t.path(), &selected, w);
+        assert!(needs("crates/wcl/Cargo.toml"));
+        assert!(needs("./crates/wcl/Cargo.toml"));
+        assert!(needs("crates/wcl/src/main.rs"));
+        assert!(needs("tools/gen/Cargo.toml"));
+        assert!(!needs("tools/old/Cargo.toml"));
+        assert!(!needs("tools/new/Cargo.toml"));
+        assert!(!needs("crates/other/Cargo.toml"));
+        assert!(!needs("crates/wcl/README.md"));
+        // Not cargo: nothing is read from the manifest.
+        assert!(!needs_absent(
+            "python3 -m unittest discover -s tests",
+            t.path(),
+            &selected,
+            "crates/wcl/Cargo.toml"
+        ));
     }
 
     #[test]

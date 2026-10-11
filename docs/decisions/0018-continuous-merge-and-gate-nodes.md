@@ -611,3 +611,31 @@ another contract's file, or one that reads the same at the base, is deferred as 
 Tests: `kgraf-host` `a_failure_naming_a_file_the_contract_wrote_is_not_deferred`,
 `a_failure_naming_only_another_contracts_file_is_still_deferred`,
 `own_file_failure_matches_whole_paths_in_each_spelling`.
+
+## Amendment (2026-10-11, second): a narrowed cargo check needs the absent manifest of a listed member
+
+A contract wrote only the root `Cargo.toml`, listing `crates/wcl-core` and `crates/wcl`. The next
+contract wrote the `wcl-core` crate while a later one, still open, writes `crates/wcl/Cargo.toml`.
+The run's check `cargo test --workspace --offline` narrowed to `cargo test -p wcl-core --offline`,
+which cargo cannot load without the other member's manifest ("failed to load manifest for
+workspace member"). Only a target root of a package whose manifest the tree holds counted as
+needed, so nothing was deferred, and the contract failed for a file it may not write.
+
+The plan check of decision 0030 reads each contract's own acceptance, and this contract's
+acceptance ran no cargo command. The verifier judges a contract by the run's check, narrowed, and
+its open-contract failures are this decision's deferral.
+
+- **Rule.** Under cargo, a narrowed check also needs an open contract's absent file that is the
+  manifest (`<dir>/Cargo.toml`) or a target root (`src/lib.rs`, `src/main.rs`) of a member the
+  root manifest lists: an explicit `[workspace] members` entry, at any depth, or a `<prefix>/*`
+  entry whose directory exists, since a glob matches only directories that are there. An
+  `exclude` entry is not a member. Other glob forms are not read, and the attempt is judged as
+  before.
+- **Unchanged.** The deferral still needs a committed attempt, a failure on the attempt and at the
+  dispatch base, and a root gate. The own-file rule still runs first. A check that waits on
+  nothing gets no base run. Without a root gate the attempt fails and the reason names the
+  manifest waited on.
+
+Tests: `kgraf-host`
+`a_narrowed_check_that_needs_an_open_members_manifest_is_deferred_to_the_root_gate`,
+`a_narrowed_check_needs_the_absent_manifest_of_a_listed_member`.

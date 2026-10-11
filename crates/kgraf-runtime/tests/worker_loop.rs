@@ -2147,13 +2147,17 @@ async fn silent_degradations_are_refused() {
         Err(WorkerError::SkillsUnsupported { .. })
     ));
 
-    // A slice named with no graph configured.
+    // A slice named with no graph configured is left out by name, loudly;
+    // the spawn does not fail (see tests/slice_without_graph.rs).
     let mut b = brief("w1", "x", dir.path(), 3);
     b.slices = vec![NodeId::new("n1")];
-    assert!(matches!(
-        spawn_worker(env, b, SpawnOptions::default()).await,
-        Err(WorkerError::Slice(_))
-    ));
+    let mut handle = spawn_worker(env, b, SpawnOptions::default())
+        .await
+        .expect("a slice that cannot be rendered does not fail the spawn");
+    while handle.next_event().await.is_some() {}
+    let left_out = handle.result().await.expect("result").slices_left_out;
+    assert_eq!(left_out.len(), 1);
+    assert_eq!(left_out[0].node, NodeId::new("n1"));
 
     // A tool-use stop whose response carries no tool call (the shape of a stream
     // parser that drops tool blocks) fails the run instead of ending it empty.

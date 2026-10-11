@@ -1339,6 +1339,101 @@ async fn an_attempts_slices_are_read_from_its_own_worktree() {
     }
 }
 
+/// The build found nothing to index (`indexed: false`), but the run's own
+/// writes were indexed since, so a later brief names nodes. The attempt opens
+/// the graph that now holds them and renders the slice; before, it got no
+/// graph and the spawn failed with "no graph is configured for this worker".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempt_opens_a_graph_indexed_after_the_build_found_none() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[(
+            "iface/src/lib.rs",
+            "pub fn order_total() -> i64 {\n    42\n}\n",
+        )],
+    );
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let graph_path = state.join("graph.db");
+    let node = {
+        let g = GraphStore::open(&graph_path, &r.root).expect("graph");
+        kgraf_graph::Indexer::new(&g).index().expect("index");
+        kgraf_core::NodeId::new(
+            g.resolve_symbol("order_total").expect("resolve")[0]
+                .id
+                .clone(),
+        )
+    };
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path,
+        indexed: false,
+        ledger: ledger.clone(),
+        config: WorkerConfig::with_servers(vec![]).expect("config"),
+        max_output_tokens: 1_000,
+        max_checkpoints: 3,
+        reasoning: Default::default(),
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
+        skill_directory: Default::default(),
+        refusal_directory: Default::default(),
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
+    };
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(ShellCaller),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: ContextConfig::for_model(200_000).expect("context"),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    let ws = worktree(&r, "w-late").await;
+    let built = assembler
+        .build(&route, &ws, &"w-late".into(), &"r9/c-late".into())
+        .await
+        .expect("built");
+    let rendering = built
+        .env
+        .slices
+        .render(std::slice::from_ref(&node))
+        .expect("renders");
+    assert_eq!(rendering.slices.len(), 1, "{rendering:?}");
+    assert!(rendering.left_out.is_empty(), "{rendering:?}");
+    if let Some(closer) = built.closer {
+        closer.close().await;
+    }
+}
+
 /// Item 2: each attempt's environment is assembled in its own worktree.
 /// The shell runs in that worktree (two attempts see their own files),
 /// its approval hook denies an unapproved write (a delegate never asks),
@@ -3699,6 +3794,108 @@ async fn a_narrowed_check_that_needs_open_contracts_sources_is_deferred_to_the_r
             && notice.contains("`wcl/src/main.rs` of c2"),
         "{notice}"
     );
+}
+
+/// A contract writing `paths`, named `id`.
+fn writing(id: &str, paths: &[&str]) -> OpenContract {
+    let mut c = named(paths[0], id);
+    c.writes = paths
+        .iter()
+        .map(|p| kgraf_orchestrator::WriteTarget {
+            path: (*p).into(),
+            node: None,
+        })
+        .collect();
+    c
+}
+
+/// A greenfield plan whose first contract wrote only the workspace manifest,
+/// listing `crates/wcl-core` and `crates/wcl`. `c2` writes the library crate;
+/// `c4`, still open, writes `crates/wcl/Cargo.toml`. The run's check narrows
+/// to `cargo test -p wcl-core --offline` on `c2`'s tree, and cargo cannot
+/// load the workspace without the other member's manifest ("failed to load
+/// manifest for workspace member `<worktree>/crates/wcl`"). The check needs
+/// that absent manifest, so the failure is deferred to the root gate.
+#[tokio::test]
+async fn a_narrowed_check_that_needs_an_open_members_manifest_is_deferred_to_the_root_gate() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let files = [
+        (".gitignore", "target/\n"),
+        ("README", "wcl\n"),
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\n    \"crates/wcl-core\",\n    \"crates/wcl\",\n]\n\
+             resolver = \"2\"\n",
+        ),
+    ];
+    let r = repo_in(dir, root.clone(), &base, &files);
+    owner_only_modes(&root, &files);
+    let c2 = writing(
+        "c2",
+        &["crates/wcl-core/Cargo.toml", "crates/wcl-core/src/lib.rs"],
+    );
+    let open = [
+        writing("c3", &["crates/wcl-core/src/lib.rs"]),
+        writing("c4", &["crates/wcl/Cargo.toml", "crates/wcl/src/main.rs"]),
+    ];
+    let ws = prepared(&r, &c2, "w-member").await;
+    std::fs::create_dir_all(ws.join("crates/wcl-core/src")).expect("mkdir");
+    std::fs::write(
+        ws.join("crates/wcl-core/Cargo.toml"),
+        "[package]\nname = \"wcl-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        ws.join("crates/wcl-core/src/lib.rs"),
+        "pub struct Counts {\n    pub lines: usize,\n    pub words: usize,\n    pub bytes: \
+         usize,\n}\n\npub fn count(text: &str) -> Counts {\n    Counts { lines: \
+         text.matches('\\n').count(), words: text.split_whitespace().count(), bytes: \
+         text.len() }\n}\n",
+    )
+    .expect("lib");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v
+        .verify_among(&c2, &ws, &result(), &open)
+        .await
+        .expect("ran");
+    let Verdict::Pass { by, notices, .. } = &verdict else {
+        panic!("deferred while c4 is open: {verdict:?}");
+    };
+    assert_eq!(
+        by,
+        "cargo test -p wcl-core --offline (deferred to the root gate)"
+    );
+    let notice = notices
+        .iter()
+        .find(|n| n.contains("is deferred to the root gate"))
+        .unwrap_or_else(|| panic!("said in a notice: {notices:?}"));
+    assert!(notice.contains("`crates/wcl/Cargo.toml` of c4"), "{notice}");
+    assert!(
+        notice.contains("failed to load manifest for workspace member"),
+        "{notice}"
+    );
+    // Without a root gate it fails, and says it waits on that manifest.
+    let ws = prepared(&r, &c2, "w-member-ungated").await;
+    std::fs::create_dir_all(ws.join("crates/wcl-core/src")).expect("mkdir");
+    std::fs::write(
+        ws.join("crates/wcl-core/Cargo.toml"),
+        "[package]\nname = \"wcl-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(ws.join("crates/wcl-core/src/lib.rs"), "pub fn f() {}\n").expect("lib");
+    let verdict = verifier(&r, GREENFIELD_CHECK)
+        .verify_among(&c2, &ws, &result(), &open)
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("no root gate would run it: {verdict:?}");
+    };
+    assert!(reason.contains("`crates/wcl/Cargo.toml` of c4"), "{reason}");
 }
 
 /// The worker hears the same rule before it finishes: the answer to its

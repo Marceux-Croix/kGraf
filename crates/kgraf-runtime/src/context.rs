@@ -501,21 +501,27 @@ pub trait SliceSource: Send + Sync {
     fn render(&self, nodes: &[NodeId]) -> Result<SliceRendering, SliceError>;
 }
 
-/// No graph: refuses any slice. For a brief that names none. A brief that
-/// names slices with no graph configured is a wrong configuration, not a stale
-/// node, so it stays an error.
+/// No graph: every node a brief names is left out, by name, with the reason.
+/// The worker starts without the slice, its opening says so, and it reads the
+/// files with its tools. An absent graph is not a reason to refuse a worker:
+/// a brief's nodes can come from a graph indexed after this worker's
+/// environment was built.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoSlices;
 
 impl SliceSource for NoSlices {
     fn render(&self, nodes: &[NodeId]) -> Result<SliceRendering, SliceError> {
-        match nodes.first() {
-            None => Ok(SliceRendering::default()),
-            Some(node) => Err(SliceError {
-                node: node.to_string(),
-                reason: "no graph is configured for this worker".into(),
-            }),
-        }
+        Ok(SliceRendering {
+            slices: Vec::new(),
+            left_out: nodes
+                .iter()
+                .map(|node| SliceLeftOut {
+                    node: node.clone(),
+                    path: String::new(),
+                    reason: "no graph is configured for this worker".into(),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -927,9 +933,16 @@ mod tests {
     }
 
     #[test]
-    fn no_slices_refuses_a_named_node_and_accepts_none() {
-        assert!(NoSlices.render(&[]).expect("none").slices.is_empty());
-        assert!(NoSlices.render(&[NodeId::new("n1")]).is_err());
+    fn no_slices_leaves_a_named_node_out_and_accepts_none() {
+        let none = NoSlices.render(&[]).expect("none");
+        assert!(none.slices.is_empty() && none.left_out.is_empty());
+        let named = NoSlices.render(&[NodeId::new("n1")]).expect("starts");
+        assert!(named.slices.is_empty());
+        assert_eq!(named.left_out.len(), 1);
+        assert_eq!(named.left_out[0].node, NodeId::new("n1"));
+        assert!(named.left_out[0].reason.contains("no graph"));
+        let notice = left_out_notice(&named.left_out).expect("notice");
+        assert!(notice.contains("n1") && notice.contains("no graph"));
     }
 
     #[test]
