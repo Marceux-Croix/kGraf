@@ -119,7 +119,8 @@ public static class AcProbe {
     static IntPtr EnvBlock(Hashtable over) {
         var env = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (DictionaryEntry e in Environment.GetEnvironmentVariables()) env[(string)e.Key] = (string)e.Value;
-        foreach (DictionaryEntry e in over) env[(string)e.Key] = (string)e.Value;
+        // Values from PowerShell can arrive wrapped (PSObject); ToString gives the string they hold.
+        foreach (DictionaryEntry e in over) env[Convert.ToString(e.Key)] = Convert.ToString(e.Value);
         var sb = new StringBuilder();
         foreach (var kv in env) sb.Append(kv.Key).Append('=').Append(kv.Value).Append('\0');
         sb.Append('\0');
