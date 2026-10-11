@@ -278,6 +278,10 @@ pub struct ContractCounters {
     /// ([`ContractEvent::Unchecked`]), one per edge. Each is also counted in
     /// `checks_not_run`: a check the run asked for did not run.
     pub unchecked_edges: u64,
+    /// Interfaces whose pre-dispatch checks were skipped because the check
+    /// program is not installed ([`ContractEvent::ChecksSkipped`]); their
+    /// parties ran without contract checks.
+    pub interface_checks_skipped: u64,
 }
 
 impl ContractCounters {
@@ -361,6 +365,18 @@ pub enum ContractEvent {
         /// Every party's route and model, held ones included (0078).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parties: Vec<PartyModel>,
+    },
+    /// The interface's checks were skipped because the check program is not
+    /// installed on this machine (`CheckError::ProgramMissing`, and only that
+    /// cause). Nothing is held: the interface's parties dispatch as if it had
+    /// no pre-dispatch checks, and the run's verify gate still judges the
+    /// work. Counted in `interface_checks_skipped`, not in `checks_not_run`
+    /// (no party was held and no verdict is pending).
+    ChecksSkipped {
+        interface: String,
+        version: u32,
+        program: String,
+        detail: String,
     },
     Inadequate {
         interface: String,
@@ -471,6 +487,11 @@ struct Entry {
     /// `false`, so a revised stub lands again under its own version; the
     /// prior version's landed commit stays reachable, never rewritten.
     stub_landed: bool,
+    /// The missing check program that made the current version's checks be
+    /// skipped (`ContractEvent::ChecksSkipped`). While set, the interface
+    /// takes the path of a run with contract checks off: no stub landing, no
+    /// consumer tests, no hold.
+    checks_skipped: Option<String>,
     /// Every stub path any version of this interface has landed. Kept across
     /// revisions (never reset), so a revised stub may replace the file an
     /// earlier version's stub put at the tip without declaring it in
@@ -516,6 +537,7 @@ impl ContractBook {
                 checked: false,
                 supersessions: 0,
                 stub_landed: false,
+                checks_skipped: None,
                 landed_paths: BTreeSet::new(),
             };
             if entries.insert(id.clone(), entry).is_some() {
@@ -548,6 +570,14 @@ impl ContractBook {
 
     pub fn checked(&self, id: &str) -> bool {
         self.entries.get(id).is_some_and(|e| e.checked)
+    }
+
+    /// The missing check program that made `id`'s checks be skipped, if they
+    /// were (`ContractEvent::ChecksSkipped`).
+    pub fn checks_skipped(&self, id: &str) -> Option<&str> {
+        self.entries
+            .get(id)
+            .and_then(|e| e.checks_skipped.as_deref())
     }
 
     /// Whether the current version's stub is already committed onto the
@@ -663,6 +693,7 @@ impl ContractBook {
                             checked: false,
                             supersessions: 0,
                             stub_landed: false,
+                            checks_skipped: None,
                             landed_paths: BTreeSet::new(),
                         },
                     );
@@ -719,6 +750,20 @@ impl ContractBook {
                     };
                 }
                 self.hold(interface, held);
+            }
+            ContractEvent::ChecksSkipped {
+                interface,
+                version,
+                program,
+                ..
+            } => {
+                if let Some(e) = self.entries.get_mut(interface)
+                    && e.current.version == *version
+                    && e.checks_skipped.is_none()
+                {
+                    e.checks_skipped = Some(program.clone());
+                    c.interface_checks_skipped += 1;
+                }
             }
             ContractEvent::Inadequate {
                 interface,
@@ -1923,6 +1968,31 @@ mod tests {
         assert_eq!(book.counters().unchecked_edges, 3, "only c5 <- c3 is new");
         let json = serde_json::to_value(&event).expect("json");
         assert_eq!(json["kind"], "unchecked");
+    }
+
+    /// A skipped check (missing program) is event-sourced: replaying the same
+    /// events rebuilds it, counts it once, and leaves the interface active
+    /// and unheld, so a resumed run does not hold again.
+    #[test]
+    fn skipped_checks_replay_without_a_hold_and_count_once() {
+        let skipped = ContractEvent::ChecksSkipped {
+            interface: "config".into(),
+            version: 1,
+            program: "pytest".into(),
+            detail: "not found on PATH".into(),
+        };
+        let mut book = ContractBook::new(Vec::new(), DEFAULT_MAX_SUPERSESSIONS).expect("book");
+        book.apply(&ContractEvent::Registered {
+            interface: Box::new(ic()),
+        });
+        book.apply(&skipped);
+        book.apply(&skipped);
+        assert_eq!(book.checks_skipped("config"), Some("pytest"));
+        assert_eq!(book.state("config"), Some(&InterfaceState::Active));
+        assert!(!book.checked("config"));
+        assert_eq!(book.blocked("p"), None);
+        let c = book.counters();
+        assert_eq!((c.interface_checks_skipped, c.checks_not_run), (1, 0));
     }
 
     /// Registration is the live path's way in: applied once, so a plan step

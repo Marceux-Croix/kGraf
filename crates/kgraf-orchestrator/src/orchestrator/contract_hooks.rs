@@ -41,9 +41,9 @@ use crate::challenge::{
     excerpt_in_contract, resolve_by_lookup, resolve_by_recompute, vendors,
 };
 use crate::checks::{
-    CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding, HandshakeRequest,
-    HandshakeStatement, Handshaker, InterfaceContract, PartyModel, SandboxRunner, check_mechanical,
-    compare_handshake_ordered, ordered_pairs,
+    CheckError, CheckFailure, CheckRun, CheckStage, FileOverlay, HandshakeFinding,
+    HandshakeRequest, HandshakeStatement, Handshaker, InterfaceContract, PartyModel, SandboxRunner,
+    check_mechanical, compare_handshake_ordered, ordered_pairs,
 };
 use crate::consumer_tests::{self, ConsumerTestKey, ConsumerTestOutcome};
 use crate::plan::PlanError;
@@ -80,7 +80,7 @@ pub(super) enum WorkDone {
         /// The start it answers ([`RunningCheck::seq`]): a result of a start the
         /// desk no longer tracks is stale and ignored.
         seq: u64,
-        result: Result<Result<Vec<CheckRun>, CheckFailure>, String>,
+        result: Result<Result<Vec<CheckRun>, CheckFailure>, CheckError>,
     },
     Recompute {
         challenge: Challenge,
@@ -600,16 +600,22 @@ impl RunLoop {
             .map(|d| d.book.interfaces_of(&contract.contract))
             .unwrap_or_default();
         for id in interfaces {
-            let Some((ic, state, checked)) = self.contracts.as_ref().and_then(|d| {
+            let Some((ic, state, checked, skipped)) = self.contracts.as_ref().and_then(|d| {
                 Some((
                     d.book.get(&id)?.clone(),
                     d.book.state(&id)?.clone(),
                     d.book.checked(&id),
+                    d.book.checks_skipped(&id).is_some(),
                 ))
             }) else {
                 continue;
             };
             let blocked = match &state {
+                // The check program is not installed here: the interface
+                // takes the path of a run with contract checks off. No
+                // mechanical check, handshake, stub landing or consumer
+                // test, and no hold; the run's verify gate judges the work.
+                InterfaceState::Active if skipped => continue,
                 InterfaceState::Active if checked => {
                     // `ChecksPassed` is persisted before
                     // the land, so a resume inside that window finds the
@@ -953,9 +959,7 @@ impl RunLoop {
         let runner = desk.runner.clone();
         let ic2 = ic.clone();
         let task = tokio::spawn(async move {
-            let result = check_mechanical(&runner, &ic2)
-                .await
-                .map_err(|e| e.to_string());
+            let result = check_mechanical(&runner, &ic2).await;
             let _ = tx
                 .send(LoopMsg::ContractWork(Box::new(WorkDone::Mechanical {
                     interface: ic2.id.clone(),
@@ -1340,7 +1344,27 @@ impl RunLoop {
                     return Ok(());
                 }
                 match result {
+                    // Only a missing check program degrades; any other cause
+                    // keeps the hold below.
+                    Err(CheckError::ProgramMissing { program, detail }) => {
+                        let text = format!(
+                            "{} its checks were not run because `{program}` is not installed; \
+                             its parties run without contract checks, and the run's verify gate \
+                             still judges the work",
+                            hold_prefix(&ic)
+                        );
+                        self.contract_event(ContractEvent::ChecksSkipped {
+                            interface,
+                            version,
+                            program,
+                            detail,
+                        })
+                        .await?;
+                        self.session_notice("", "", text);
+                        self.save()?;
+                    }
                     Err(error) => {
+                        let error = error.to_string();
                         let held =
                             self.hold_parties(&ic, &format!("checks could not run: {error}"));
                         let parties = self.party_models(&ic);

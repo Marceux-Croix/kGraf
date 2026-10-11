@@ -5196,3 +5196,100 @@ async fn an_answer_refused_again_for_the_same_reason_is_not_asked_a_third_time()
     // No call is added elsewhere: the contracts ask and two interface asks.
     assert_eq!(rig.parts.planner.prompts().len(), 3);
 }
+
+// ---------------------------- a missing check program degrades, other causes hold
+
+/// `py_ic` with check programs that are not installed on this machine.
+fn missing_program_ic() -> InterfaceContract {
+    let mut ic = py_ic();
+    ic.compile = s(&["kgraf-no-such-compiler", "--compile"]);
+    ic.test = s(&["kgraf-no-such-compiler", "--test"]);
+    ic
+}
+
+/// An interface whose check program is not installed does not hold its
+/// parties. They dispatch as in a run with contract checks off (no stub
+/// landing, no consumer tests), one notice names the program, the trace holds
+/// the event, and the fact is counted apart from `checks_not_run`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interface_whose_check_program_is_missing_does_not_hold_its_parties() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&missing_program_ic()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert!(report.held.is_empty(), "{:?}", report.held);
+    assert!(
+        !worker_requests(&rig.parts).is_empty(),
+        "the parties were dispatched"
+    );
+    assert_eq!(report.contracts.interface_checks_skipped, 1, "{report:?}");
+    assert_eq!(report.contracts.checks_not_run, 0, "{report:?}");
+    assert_eq!(report.contracts.stubs_landed, 0, "no stub landed");
+    let notices: Vec<&String> = report
+        .notices
+        .iter()
+        .filter(|n| n.contains("kgraf-no-such-compiler"))
+        .collect();
+    assert_eq!(notices.len(), 1, "one notice: {:?}", report.notices);
+    assert!(
+        notices[0]
+            .contains("its checks were not run because `kgraf-no-such-compiler` is not installed")
+            && notices[0].contains("verify gate still judges the work"),
+        "{}",
+        notices[0]
+    );
+    let events = rig.contract_events().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ContractEvent::ChecksSkipped { program, .. } if program == "kgraf-no-such-compiler"))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            ContractEvent::CheckNotRun { .. } | ContractEvent::CheckFailed { .. }
+        )),
+        "{events:?}"
+    );
+}
+
+/// A check that could not run for any other cause keeps the hold: here the
+/// handshake call fails, so both parties stay held and nothing is skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_that_cannot_run_for_another_cause_still_holds_its_parties() {
+    let dir = tempfile::tempdir().expect("dir");
+    let slow = SlowHandshake::new(
+        Duration::from_millis(20),
+        3,
+        vec![("cons", Duration::from_millis(30))],
+    );
+    let (rig, report) = run_slow_handshake(dir.path(), slow).await;
+    let report = report.expect("run");
+    assert_ne!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.checks_not_run, 1, "{report:?}");
+    assert_eq!(report.contracts.interface_checks_skipped, 0, "{report:?}");
+    assert!(!report.held.is_empty(), "{report:?}");
+    assert!(
+        worker_requests(&rig.parts).is_empty(),
+        "no worker was spent"
+    );
+    assert!(
+        !rig.contract_events()
+            .await
+            .iter()
+            .any(|e| matches!(e, ContractEvent::ChecksSkipped { .. })),
+    );
+}

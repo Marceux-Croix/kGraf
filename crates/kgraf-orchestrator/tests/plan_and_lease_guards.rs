@@ -137,7 +137,8 @@ async fn after_losing_the_run_lease_the_old_owner_writes_nothing() {
     record.updated_ms = 42;
     store.save(&record).expect("save");
 
-    let report = tokio::time::timeout(Duration::from_secs(10), run)
+    // A hang guard, not a speed check (see the lease-lost test).
+    let report = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .expect("in time")
         .expect("join")
@@ -202,7 +203,10 @@ async fn a_lease_lost_just_before_acceptance_voids_the_result() {
             .expect("acquire");
         assert!(matches!(got, Acquisition::Granted(_)));
     }
-    let report = tokio::time::timeout(Duration::from_secs(10), run)
+    // A hang guard, not a speed check. The run prepares two worktrees and
+    // verifies twice; on a loaded Windows runner the same file took six times
+    // its usual time, and a 10 s bound failed a run that was only slow.
+    let report = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .expect("in time")
         .expect("join")
@@ -273,7 +277,8 @@ async fn a_loss_of_another_holder_found_before_acceptance_cancels_its_workers() 
     p.beta.hang.store(false, Ordering::SeqCst);
     gate.add_permits(8);
 
-    let report = tokio::time::timeout(Duration::from_secs(10), run)
+    // A hang guard, not a speed check (see the lease-lost test).
+    let report = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .expect("a's parked worker was cancelled in time")
         .expect("join")
@@ -329,7 +334,8 @@ async fn a_run_lease_loss_found_before_acceptance_stops_the_run() {
     steal(&p, "run:r1", "new-owner", 60_000);
     gate.add_permits(8);
 
-    let report = tokio::time::timeout(Duration::from_secs(10), run)
+    // A hang guard, not a speed check (see the lease-lost test).
+    let report = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .expect("in time")
         .expect("join")
@@ -386,7 +392,8 @@ async fn a_run_lease_loss_found_before_a_resolver_merges_stops_the_run() {
     steal(&p, "run:r1", "new-owner", 60_000);
     gate.add_permits(8);
 
-    let report = tokio::time::timeout(Duration::from_secs(10), run)
+    // A hang guard, not a speed check (see the lease-lost test).
+    let report = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .expect("in time")
         .expect("join")

@@ -1151,3 +1151,42 @@ and `repaired_plans_pass_with_cargo` (each repaired plan's contracts pass a real
 `plan_repaired` events and notices, and a member no contract writes is still refused and asked
 again. With the repair call disabled the repair tests failed; with the cycle and concurrent-writer
 guards disabled their two tests failed.
+
+## Amendment (2026-10-11, third): a missing check program skips an interface's checks; it no longer holds its parties
+
+A canary run of `benchmark-terminal-bench-c` on a local model ended Blocked. Every interface had a
+`pytest` test command, `pytest` was not installed on the machine, and the check runner returned
+`CheckError::ProgramMissing`. Each interface became `InterfaceState::NotRun`, and the dispatch gate held
+every party of it, so no work was done. A machine without a language's test runner is a normal
+environment. The interface checks are an extra layer before dispatch; the run's verify gate and
+acceptance checks still judge the work. The earlier text of this decision, that a contract whose program
+is not installed is held, is replaced for that one cause.
+
+The rule: when the mechanical check of an interface fails with `ProgramMissing`, and only that cause,
+no party is held.
+- The loop records `ContractEvent::ChecksSkipped` (interface, version, program, detail). The book keeps the
+  program on the interface's entry for that version. The state stays `Active` and `checked` stays false.
+- One notice per interface and version names the program and what was skipped: "interface i1@v1: its
+  checks were not run because `pytest` is not installed; its parties run without contract checks, and the
+  run's verify gate still judges the work". The event is in the trace, and the run report adds an
+  `interface checks skipped` line.
+- The fact is counted in `ContractCounters::interface_checks_skipped`. It is not added to
+  `checks_not_run`, because no party is held and no verdict is pending; the canary's `not run`
+  comparison is unchanged. The canary reads the events (`checks_skipped_programs`) and, when the notice
+  is present, reports the skip with the program named.
+- The dispatch gate treats such an interface as a run with contract checks off: it runs no mechanical
+  check, handshake, stub landing (`ensure_stub_landed`) or consumer test (`run_consumer_tests`) for it,
+  and holds nothing. Parties of an interface that has other, checked interfaces are still gated by those.
+- The skip is event-sourced like every interface fact. A replay or a resume rebuilds it from the same
+  event, counts it once, and does not hold. A revised version starts with no skip, so its checks are tried
+  again. A run persisted before this rule keeps the holds it recorded.
+
+Every other cause stays a hold: a handshake call that fails, `InputMissing`, a compile that timed out
+twice, an I/O or configuration error of the runner.
+
+Tests: `an_interface_whose_check_program_is_missing_does_not_hold_its_parties` (parties dispatch, one
+notice, the trace event, the count, no stub landed), `a_check_that_cannot_run_for_another_cause_still_holds_its_parties`,
+`skipped_checks_replay_without_a_hold_and_count_once`, the host test
+`a_contract_in_a_language_this_machine_cannot_check_skips_its_checks_and_runs`, and the canary test
+`test_skipped_interface_checks_are_read_as_a_fact_with_the_program_named`. With the skip arm disabled the
+first test failed.

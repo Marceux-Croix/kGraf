@@ -1395,7 +1395,8 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   whose interface fails at that point is held, with the file that failed named. Each
   handshake and each check names every party's route and model, and the run record keeps
   each hold with them, so you can see which models disagreed. A contract whose compiler or
-  test runner is not installed is held too, with the program named. A check command that names a
+  test runner is not installed is not held: its interface checks are skipped, a notice names the
+  program, and the run's verify gate still judges the work. A check command that names a
   script or source file nobody supplies (not in the interface, not in the repository) is asked
   for again with the file named, and a check that finds such a file missing says "file", not
   "program not installed". The report's `not run` counts consumed edges left unchecked and

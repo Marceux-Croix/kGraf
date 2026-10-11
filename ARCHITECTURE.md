@@ -781,7 +781,10 @@ report's `not run`) and in `unchecked_edges`; the book counts an edge once howev
 applied, so a replay and a resume agree. A notice says "contract checks did not run for ...". Each
 interface ask is a `ContractEvent::InterfaceAsked` (calls, milliseconds, output tokens), so the
 report states `interfaces  planner N calls S s T tokens; accepted C compile-only, B behavior`. The run
-is not held for an interface the planner could not write.
+is not held for an interface the planner could not write. An interface whose check program is
+not installed on the machine (`ProgramMissing`, and no other cause) is not held either: its checks are
+skipped with a notice and a `ChecksSkipped` event, counted in `interface_checks_skipped`, and its parties
+dispatch as in a run with contract checks off (decision 0030).
 
 When the gate holds a plan that nothing has acted on yet (no dispatch, no merge, no stub
 landed, no interface the run was given), and the run would end on that hold, the whole plan

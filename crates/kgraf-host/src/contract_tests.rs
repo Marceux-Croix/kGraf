@@ -617,10 +617,11 @@ async fn check_scratch_is_private_removed_on_drop_and_swept_when_its_owner_is_de
 }
 
 /// A contract whose compile program is not installed is a check that could
-/// not run, not a stub-compile failure of the contract: its parties are held,
-/// no worker is spent on them, and the reason names the program.
+/// not run, not a stub-compile failure of the contract. Its parties are not
+/// held: the interface's checks are skipped, loudly, the parties dispatch as
+/// in a run with contract checks off, and the event and the count name it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_contract_in_a_language_this_machine_cannot_check_holds_its_parties() {
+async fn a_contract_in_a_language_this_machine_cannot_check_skips_its_checks_and_runs() {
     let (_dir, root, config) = project("fake-nolang");
     let model = fake(&["kgraf-no-such-compiler", "--check"]);
     let host = host(config, "fake-nolang", model.clone());
@@ -632,34 +633,36 @@ async fn a_contract_in_a_language_this_machine_cannot_check_holds_its_parties() 
         .await
         .expect("run");
     let report = outcome.report;
-    assert!(report.verified.is_empty(), "{report:?}");
-    let mut held: Vec<&str> = report.held.iter().map(|(c, _)| c.as_str()).collect();
-    held.sort();
-    assert_eq!(held, vec!["cons", "prod"], "{report:?}");
     assert!(
-        report
+        !report
             .held
             .iter()
-            .all(|(_, why)| why.contains("kgraf-no-such-compiler")),
-        "{:?}",
+            .any(|(_, why)| why.contains("kgraf-no-such-compiler")),
+        "no party is held for the missing program: {:?}",
         report.held
     );
     let events = contract_events(&root, "nolang").await;
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ContractEvent::CheckNotRun { error, .. } if error.contains("not installed"))),
+        events.iter().any(|e| matches!(e, ContractEvent::ChecksSkipped { program, .. } if program == "kgraf-no-such-compiler")),
         "{events:?}"
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, ContractEvent::CheckFailed { .. })),
-        "a missing toolchain is no verdict on the contract"
+        !events.iter().any(|e| matches!(
+            e,
+            ContractEvent::CheckFailed { .. } | ContractEvent::CheckNotRun { .. }
+        )),
+        "a missing toolchain is no verdict on the contract and no hold"
     );
-    let seen = model.snapshot();
-    assert!(seen.briefs.is_empty(), "no worker was spent");
-    assert_eq!(report.contracts.checks_not_run, 1);
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("`kgraf-no-such-compiler` is not installed")),
+        "{:?}",
+        report.notices
+    );
+    assert_eq!(report.contracts.interface_checks_skipped, 1);
+    assert_eq!(report.contracts.checks_not_run, 0);
 }
 
 /// Turned off, the run asks for no interface, offers no challenge tool, and

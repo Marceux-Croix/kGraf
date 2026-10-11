@@ -4574,10 +4574,21 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
 
 /// A stand-in for cargo on a manifest: no manifest fails one way, a manifest
 /// with a package table and no target fails another, and a workspace passes.
-const MANIFEST_CHECK: &str = "if [ ! -f Cargo.toml ]; then echo \"error: could not find \
-     \\`Cargo.toml\\` in \\`$PWD\\` or any parent directory\"; exit 1; fi; \
+///
+/// It is short on purpose. A deferred check's notice quotes only the first
+/// `DEFERRED_OUTPUT_CHARS` characters of the check's output, and the output
+/// starts with the command itself. Where the check cannot start at all (the
+/// Windows token sandbox ends every child with status 0xc0000142), the status
+/// follows the command, and a long command pushes it out of the quote. The
+/// test's failure text then would not say why the shell never ran.
+const MANIFEST_CHECK: &str = "[ -f Cargo.toml ] || { echo \"error: could not find \
+     \\`Cargo.toml\\` in \\`$PWD\\`\"; exit 1; }; \
      if grep -q '^\\[package\\]' Cargo.toml; then echo \"error: failed to parse manifest at \
-     \\`$PWD/Cargo.toml\\`\"; echo \"Caused by: no targets specified in the manifest\"; exit 1; fi";
+     \\`$PWD/Cargo.toml\\`\"; echo \"Caused by: no targets specified\"; exit 1; fi";
+
+// The echoed command (`$ ` and the command), its line break and the text
+// `[exit code: 0xc0000142]` must fit in the 300 characters of the quote.
+const _: () = assert!(MANIFEST_CHECK.len() <= 265);
 
 /// The canary failure: the contract writes a root manifest cargo refuses.
 /// The check fails at the dispatch base too (no manifest, a different

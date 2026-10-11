@@ -896,6 +896,13 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
             c.escalations
         ));
         out.push(format!("interfaces  {}", c.interface_economy()));
+        if c.interface_checks_skipped > 0 {
+            out.push(format!(
+                "interface checks skipped  {} (check program not installed; those parties ran \
+                 without contract checks)",
+                c.interface_checks_skipped
+            ));
+        }
     } else {
         out.push("contracts  off: no interface contract was written or checked".to_owned());
     }
