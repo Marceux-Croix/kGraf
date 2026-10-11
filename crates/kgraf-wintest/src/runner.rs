@@ -1438,6 +1438,23 @@ impl PhaseExec<'_> {
     fn kgraf(&self) -> PathBuf {
         self.bundle.join("programs").join("kgraf.exe")
     }
+
+    /// The time limit of a re-run of `tests` of the binary `id`: the limit
+    /// of the whole binary ([`limit_for`] of its expected time), also when
+    /// only some of its tests run. A subset of a binary's tests takes no
+    /// longer than the whole binary, so the whole binary's limit holds for
+    /// any subset. Their share of the expected time ([`rerun_secs`]) does
+    /// not: it assumes the binary's average rate, and the tests a re-run
+    /// selects are the ones the token sandbox stopped at their first child
+    /// process, so they failed fast in the baseline and are the slow ones
+    /// when they run to the end. 89 such tests of `kgraf_host#rest` had a
+    /// share of 125 s, so a limit of 625 s; as the sandbox user they took
+    /// 526 s and 538 s on two hosted runners, and on a slower one 80 of 89
+    /// passed before that limit cut the run off.
+    fn rerun_limit(&self, id: &str, tests: Option<&[String]>) -> Duration {
+        let (whole, _) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        limit_for(whole.max(self.rerun_expected(id, tests).as_secs_f64()))
+    }
 }
 
 impl Exec for PhaseExec<'_> {
@@ -1556,9 +1573,10 @@ impl Exec for PhaseExec<'_> {
             }
             None => (*run, listed),
         };
+        let limit = self.rerun_limit(id, tests);
         // The progress line names the binary that runs, not only the phase.
         self.console.with(|p, _| p.set_item(format!("re-run {id}")));
-        let result = run_binary(
+        let result = run_binary_limits(
             self.console,
             run,
             self.bundle,
@@ -1566,6 +1584,8 @@ impl Exec for PhaseExec<'_> {
             &self.rerun_env,
             expected,
             listed,
+            limit,
+            solo_limit_for(run.secs_per_test),
             &self.time_budget,
         );
         self.console.with(|p, _| p.set_item(String::new()));
@@ -2263,6 +2283,50 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         assert_eq!(rerun_secs(100.0, None, Some(1)), 100.0);
         assert_eq!(rerun_secs(100.0, Some(10), None), 100.0);
         assert_eq!(rerun_secs(100.0, Some(10), Some(10)), 100.0);
+    }
+
+    /// A sandbox user re-run of some tests of a binary gets the whole
+    /// binary's limit, not one from their share of its expected time. The
+    /// numbers are `kgraf_host#rest`'s: 450 tests at 1.4 s expected, and 89
+    /// failed-only tests that took 538 s as the sandbox user on one hosted
+    /// runner and more than the 625 s their share gave on a slower one.
+    #[test]
+    fn a_rerun_of_some_tests_gets_the_whole_binarys_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let console = Console::new(crate::progress::Progress::default());
+        let layout = workdir::layout(dir.path(), "phase");
+        let machine = MachineFacts::default();
+        let base = Env {
+            vars: vec![],
+            show_output: false,
+        };
+        let run = run_of("fake-tests", "p/lib/p");
+        let runs = [&run];
+        let whole = SECS_BINARY_BASE + 450.0 * 1.4;
+        let ex = PhaseExec {
+            console: &console,
+            bundle: dir.path(),
+            layout: &layout,
+            env: &base,
+            rerun_env: phase_rerun_env(&base),
+            machine: &machine,
+            runs: &runs,
+            by_id: [("p/lib/p", (whole, Some(450)))].into_iter().collect(),
+            cwd_root: dir.path(),
+            placed: None,
+            e2e_choice: crate::only::E2eChoice::All,
+            every_binary_named: false,
+            time_budget: Budget::unlimited(),
+        };
+        let names: Vec<String> = (0..89).map(|i| format!("t::{i}")).collect();
+        let limit = ex.rerun_limit("p/lib/p", Some(&names));
+        assert_eq!(limit, limit_for(whole));
+        assert!(limit >= Duration::from_secs(2 * 538), "{limit:?}");
+        // The expected time stays the share: the time budget plans with it.
+        assert!(ex.rerun_expected("p/lib/p", Some(&names)) < Duration::from_secs(130));
+        // A whole re-run, and a binary with no counts, keep their own limit.
+        assert_eq!(ex.rerun_limit("p/lib/p", None), limit_for(whole));
+        assert_eq!(ex.rerun_limit("other", Some(&names)), limit_for(30.0));
     }
 
     /// The binaries a sandbox user run measured as slow get limits that
