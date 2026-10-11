@@ -183,6 +183,18 @@ fn run_at(
     command: &str,
     timeout: Duration,
 ) -> Result<(bool, String), String> {
+    run_at_rooted(manager, base, denies, command, timeout).map(|(passed, out, _)| (passed, out))
+}
+
+/// [`run_at`], also with the root of the throwaway worktree, so the output's
+/// paths can be compared with another run's ([`own_file_failure`]).
+fn run_at_rooted(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    base: &str,
+    denies: &[PathBuf],
+    command: &str,
+    timeout: Duration,
+) -> Result<(bool, String, PathBuf), String> {
     let name = crate::workspaces::harness_worktree_name(crate::workspaces::PROBE_PREFIX);
     let ws = manager
         .create(&kgraf_sandbox::WorkspaceSpec {
@@ -200,10 +212,142 @@ fn run_at(
         CHECK_OUTPUT_CAP,
         None,
     );
+    let root = ws.root().to_path_buf();
     let removed = manager.remove(ws);
     let ran = ran?;
     removed.map_err(|e| format!("cannot remove the worktree at {base}: {e}"))?;
-    Ok(ran)
+    Ok((ran.0, ran.1, root))
+}
+
+/// The most lines of a failing output the own-file test reads.
+const OWN_FILE_LINES: usize = 400;
+
+/// `text` with each spelling of a worktree `root` (as given, and with or
+/// without the macOS `/private` prefix) replaced by `<worktree>`, so the
+/// outputs of two runs in different worktrees compare line by line.
+fn with_roots_named(text: &str, roots: &[&Path]) -> String {
+    let mut spellings: Vec<String> = Vec::new();
+    for root in roots {
+        let r = root.to_string_lossy().trim_end_matches('/').to_owned();
+        if r.is_empty() {
+            continue;
+        }
+        match r.strip_prefix("/private").filter(|b| b.starts_with('/')) {
+            Some(bare) => spellings.push(bare.to_owned()),
+            None => spellings.push(format!("/private{r}")),
+        }
+        spellings.push(r);
+    }
+    // Longest first: `/private/x` before `/x`, so no prefix is left behind.
+    spellings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    spellings.dedup();
+    let mut out = text.to_owned();
+    for s in &spellings {
+        out = out.replace(s.as_str(), "<worktree>");
+    }
+    out
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')
+}
+
+/// Whether `line` names `file` (a path relative to the worktree) as a whole
+/// path: `<worktree>/file`, `file` or `./file`, and not the tail of another
+/// path (`member/file`) or the head of one (`file.bak`).
+fn names_file(line: &str, file: &str) -> bool {
+    let file = file.trim_start_matches("./");
+    if file.is_empty() {
+        return false;
+    }
+    let absolute = format!("<worktree>/{file}");
+    for (needle, is_absolute) in [(absolute.as_str(), true), (file, false)] {
+        for (at, _) in line.match_indices(needle) {
+            let mut after = line[at + needle.len()..].chars();
+            let (next, then) = (after.next(), after.next());
+            // A dot ends a sentence unless a name continues after it.
+            let continues = next
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
+                || (next == Some('.') && then.is_some_and(char::is_alphanumeric));
+            if continues {
+                continue;
+            }
+            let before = &line[..at];
+            let before = before.strip_suffix("./").unwrap_or(before);
+            if is_absolute || !before.chars().next_back().is_some_and(is_path_char) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether another open contract's file `other` could be what a failure in
+/// the contract's own file `own` waits on: it lies in the package `own`
+/// opens. For a manifest in a directory that is the directory's subtree; for
+/// one at the root, the root's own files and `src/` (the members are other
+/// packages, so their files are not it).
+fn could_complete(own: &str, other: &str) -> bool {
+    let own = own.trim_start_matches("./");
+    let other = other.trim_start_matches("./");
+    if own == other {
+        return false;
+    }
+    match own.rsplit_once('/') {
+        Some((dir, _)) => other.starts_with(&format!("{dir}/")),
+        None => !other.contains('/') || other.starts_with("src/"),
+    }
+}
+
+/// A failure of the attempt's check that is the attempt's own, though the
+/// check also fails at the dispatch base: a line of the failing output names
+/// a file the contract itself writes, and that line does not occur in the
+/// output at the dispatch base. A broken manifest the contract wrote is the
+/// case: it is not another contract's missing work, and only the worker that
+/// wrote it can repair it. Returns the first such line.
+///
+/// The failure stays ambiguous, and is left to the deferral, when a new line
+/// also names a file of an open contract (`others`), or an own file that one
+/// of them could complete ([`could_complete`]): the output may then be only
+/// their missing work.
+pub(crate) fn own_file_failure(
+    attempt_output: &str,
+    attempt_roots: &[&Path],
+    base_output: &str,
+    base_root: &Path,
+    writes: &[&str],
+    others: &[&str],
+) -> Option<String> {
+    let attempt = with_roots_named(attempt_output, attempt_roots);
+    let base = with_roots_named(base_output, &[base_root]);
+    let at_base: std::collections::HashSet<&str> = base.lines().map(str::trim).collect();
+    let fresh: Vec<&str> = attempt
+        .lines()
+        .take(OWN_FILE_LINES)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !at_base.contains(line))
+        .collect();
+    let named_own = |line: &str| {
+        writes
+            .iter()
+            .copied()
+            .filter(|w| names_file(line, w))
+            .count()
+            > 0
+    };
+    let waits_on_others = fresh.iter().any(|line| {
+        others.iter().any(|o| names_file(line, o))
+            || writes
+                .iter()
+                .any(|w| names_file(line, w) && others.iter().any(|o| could_complete(w, o)))
+    });
+    if waits_on_others {
+        return None;
+    }
+    fresh
+        .into_iter()
+        .find(|line| named_own(line))
+        .map(str::to_owned)
 }
 
 /// What the verdict of an attempt says when its whole check also fails at
@@ -1120,7 +1264,34 @@ impl Verifier for CommandVerifier {
                 && contract.gate_commands.is_empty()
                 && (matches!(scope, crate::scoped_check::Scope::Whole { .. }) || !waits.is_empty());
             if at_base {
-                match passes_at(&manager, ws.head(), &denies, &command, timeout) {
+                let writes: Vec<&str> = contract.writes.iter().map(|w| w.path.as_str()).collect();
+                let others: Vec<&str> = unmerged
+                    .iter()
+                    .flat_map(|o| o.writes.iter().map(|w| w.path.as_str()))
+                    .collect();
+                let ran = run_at_rooted(&manager, ws.head(), &denies, &command, timeout);
+                // Amended 2026-10-11: a failure that names a file this
+                // contract wrote, and that the dispatch base did not show,
+                // is this contract's own defect. It is never deferred: the
+                // worker gets the error while it can still fix it.
+                let own = match &ran {
+                    Ok((false, base_out, base_root)) if !waits.is_empty() => own_file_failure(
+                        &output,
+                        &[ws.root(), attempt_root.as_path()],
+                        base_out,
+                        base_root,
+                        &writes,
+                        &others,
+                    ),
+                    _ => None,
+                };
+                match ran.map(|(passed, _, _)| passed) {
+                    Ok(false) if own.is_some() => output.push_str(&format!(
+                        "\n(it also fails at the dispatch base, but not with this error: the \
+                         line `{}` names a file this contract writes, so the failure is in \
+                         this contract's own work and it is not deferred)",
+                        clean(own.as_deref().unwrap_or_default())
+                    )),
                     Ok(false) if root_gate && !waits.is_empty() => {
                         deferred = Some(clean_lines(&output));
                         passed = true;

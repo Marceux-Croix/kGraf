@@ -4529,6 +4529,133 @@ fn a_tooling_pyproject_in_a_rust_project_adds_no_pytest_gate() {
     assert!(discover_py(bare.path(), true).0.is_empty());
 }
 
+/// A stand-in for cargo on a manifest: no manifest fails one way, a manifest
+/// with a package table and no target fails another, and a workspace passes.
+const MANIFEST_CHECK: &str = "if [ ! -f Cargo.toml ]; then echo \"error: could not find \
+     \\`Cargo.toml\\` in \\`$PWD\\` or any parent directory\"; exit 1; fi; \
+     if grep -q '^\\[package\\]' Cargo.toml; then echo \"error: failed to parse manifest at \
+     \\`$PWD/Cargo.toml\\`\"; echo \"Caused by: no targets specified in the manifest\"; exit 1; fi";
+
+/// The canary failure: the contract writes a root manifest cargo refuses.
+/// The check fails at the dispatch base too (no manifest, a different
+/// error) and the other contracts write the members, but the error names the
+/// contract's own file, so the attempt is judged failed and the worker gets
+/// the error instead of the check being deferred.
+#[tokio::test]
+async fn a_failure_naming_a_file_the_contract_wrote_is_not_deferred() {
+    let r = repo();
+    let c = named("Cargo.toml", "c1");
+    let ws = prepared(&r, &c, "w-manifest").await;
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"wcl\"\n\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n",
+    )
+    .expect("write");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, MANIFEST_CHECK)
+    };
+    let verdict = v
+        .verify_among(
+            &c,
+            &ws,
+            &result(),
+            &[
+                named("wcl-core/Cargo.toml", "c2"),
+                named("wcl/Cargo.toml", "c3"),
+            ],
+        )
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("the contract's own broken manifest is a failure: {verdict:?}");
+    };
+    assert!(reason.contains("failed to parse manifest at"), "{reason}");
+    assert!(reason.contains("no targets specified"), "{reason}");
+    assert!(!reason.contains("deferred to the root gate"), "{reason}");
+}
+
+/// A failure that names only a file another contract writes is still the
+/// deferral's case: it needs their unmerged work.
+#[tokio::test]
+async fn a_failure_naming_only_another_contracts_file_is_still_deferred() {
+    let r = repo();
+    let (c, ws) = greeting_attempt(&r, "w-other-file").await;
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(
+            &r,
+            "test -f out/sha.txt || { echo 'error: missing out/sha.txt'; exit 1; }",
+        )
+    };
+    let verdict = v
+        .verify_among(&c, &ws, &result(), &[named("out/sha.txt", "c2")])
+        .await
+        .expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("another contract's file is deferred: {verdict:?}");
+    };
+    assert!(by.contains("deferred to the root gate"), "{by}");
+}
+
+/// Path matching: whole paths only, the worktree prefix in each spelling,
+/// and `./`.
+#[test]
+fn own_file_failure_matches_whole_paths_in_each_spelling() {
+    use crate::verifier::own_file_failure;
+    let root = Path::new("/private/var/w/attempt");
+    let alt = Path::new("/var/w/attempt");
+    let base = Path::new("/private/var/w/base");
+    let own = ["Cargo.toml"];
+    let hit = |out: &str, base_out: &str| {
+        own_file_failure(
+            out,
+            &[root, alt],
+            base_out,
+            base,
+            &own,
+            &["wcl-core/src/lib.rs"],
+        )
+        .is_some()
+    };
+    assert!(hit("bad manifest at `/var/w/attempt/Cargo.toml`", ""));
+    assert!(hit(
+        "bad manifest at `/private/var/w/attempt/Cargo.toml`",
+        ""
+    ));
+    assert!(hit("bad manifest at ./Cargo.toml", ""));
+    assert!(hit("bad manifest at `Cargo.toml`", ""));
+    // Another file with the same name, or a longer name, is not it.
+    assert!(!hit("bad manifest at `/var/w/attempt/wcl/Cargo.toml`", ""));
+    assert!(!hit("bad manifest at wcl-core/Cargo.toml", ""));
+    assert!(!hit("bad manifest at Cargo.toml.bak", ""));
+    // A line that also names an open contract's file may be only its missing
+    // work, and so may an own manifest whose package that contract completes.
+    assert!(!hit(
+        "bad manifest at `Cargo.toml`: no wcl-core/src/lib.rs",
+        ""
+    ));
+    let nested = ["wcl-core/Cargo.toml"];
+    let others = ["wcl-core/src/lib.rs"];
+    assert!(
+        own_file_failure(
+            "bad wcl-core/Cargo.toml",
+            &[root],
+            "",
+            base,
+            &nested,
+            &others
+        )
+        .is_none()
+    );
+    assert!(own_file_failure("bad wcl-core/Cargo.toml", &[root], "", base, &nested, &[]).is_some());
+    // The same line at the dispatch base is not new.
+    assert!(!hit(
+        "bad manifest at `/var/w/attempt/Cargo.toml`",
+        "bad manifest at `/private/var/w/base/Cargo.toml`"
+    ));
+}
+
 fn verifier(r: &Repo, command: &str) -> CommandVerifier {
     CommandVerifier {
         command: command.into(),

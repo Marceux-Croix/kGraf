@@ -587,3 +587,27 @@ Tests: `kgraf-orchestrator` `tests/retry_unseen_refusal.rs`
 `a_refusal_no_attempt_saw_gets_one_more_attempt_that_carries_it`,
 `a_refusal_an_attempt_already_saw_holds_after_the_retry_budget`. With `refusal_never_shown`
 false, the first fails.
+
+## Amendment (2026-10-11): a failure in a file the contract wrote is not deferred
+
+A contract wrote a root `Cargo.toml` holding both a `[package]` table with no source and a
+`[workspace]`. Cargo refused it ("failed to parse manifest ... no targets specified in the
+manifest"). The check also failed at the dispatch base with a different error (no manifest) while
+other contracts were open, so it was deferred and the broken manifest merged. The next contract
+then failed on the same parse error in a file it may not write. The deferral hid a common model
+mistake from the worker who made it.
+
+Rule: the deferral applies to a failure that only needs other contracts' unmerged files. It does
+not apply when a line of the failing output names a file the contract itself writes and that line
+does not occur in the output at the dispatch base. Paths match as whole paths, as
+`<worktree>/file`, `file` or `./file`, with the attempt's worktree prefix taken in each spelling
+(`/private` on macOS), and `member/file` is not `file`. The failure stays deferred when it is
+ambiguous: a new line also names a file an open contract writes, or an own file that an open
+contract could complete (a manifest in a directory whose subtree an open contract writes into;
+for the root manifest, the root's files and `src/`). Such an attempt is judged failed as an
+ordinary failed check: the worker gets the error and the retry path runs. A failure naming only
+another contract's file, or one that reads the same at the base, is deferred as before.
+
+Tests: `kgraf-host` `a_failure_naming_a_file_the_contract_wrote_is_not_deferred`,
+`a_failure_naming_only_another_contracts_file_is_still_deferred`,
+`own_file_failure_matches_whole_paths_in_each_spelling`.
