@@ -103,8 +103,11 @@ gh run watch
 gh run download <run id> -n kgraf-windows-selftest
 ```
 
-The artifact holds `report\kgraf-wintest-report-*.md` and `firewall.txt`. It bills Windows
-minutes (twice the Linux rate on a private repository). A failing test does not fail the
+The artifact holds `report\kgraf-wintest-report-*.md` and `firewall.txt`. The upload step
+runs whatever happened before it (`if: always()`), so a job that is cancelled or reaches its
+limit still uploads the partial results it has. It bills Windows minutes (twice the Linux
+rate on a private repository). The job stops after 150 minutes; the runner stops starting
+work earlier than that (see "The time budget" below). A failing test does not fail the
 job; a missing report file does. Two things differ from a standard user's machine: the
 runner account is an administrator, so the sandbox and firewall checks run elevated, and
 the runner has Git for Windows, so the worker shell finds `sh`. A result from the runner
@@ -227,6 +230,50 @@ When selfcheck (d) failed on its `dns:` line, a line `Known gap: DNS is not conf
 machine ...` follows the verdict, with selfcheck's words. It is not a pass: the DNS test of
 the re-run (`an_offline_lookup_does_not_reach_the_dns_client_service`) fails while the gap
 stands, and that failure counts.
+
+#### The time budget (`--budget-mins`)
+
+A job that a host kills at a fixed limit leaves no report. `kgraf-wintest.exe --budget-mins
+<N>` gives the run N minutes of wall-clock time, counted from the start of the runner, for
+everything: the baseline, the sandbox user phase, the removal of the sandbox user, the cleanup
+and the report. Without the option there is no budget.
+
+How the runner keeps to it:
+
+- Before it starts an item, in the baseline, in the sandbox user phase and in the re-runs, it
+  compares the item's expected seconds (the manifest's measured rate, the same number the
+  progress estimate uses) with the time left. An item that does not fit is not started. The
+  report lists it under "Not run" as `not run: budget (expected about N s, M s left)`. The
+  end-to-end checks and the whole sandbox user phase are items too. The phase needs 300 s
+  (`PHASE_START_SECS`) for setup and the gate; with less left it does not start, and nothing
+  is changed on the machine.
+- The time limit of a running item is cut to the time left. When the budget ends the item,
+  the existing kill path ends its process tree, and the report records it as `stopped at the
+  budget` (JSON: `budget_stopped`; it is not `timed_out`, because the item's own limit was not
+  the cause). No solo re-run follows a stop. A solo re-run that the budget ends reads
+  `stopped at the budget`, not `hung`.
+- A reserve is kept free at the end: 540 s with a sandbox user phase (the removal's limit of
+  300 s, the status check's 120 s, and 120 s for the cleanup and the report), 120 s without.
+  Work never uses it. The removal, the cleanup and the report run after the budget is spent,
+  and the removal runs even when the budget ended the phase early.
+- The verdict reads `INCOMPLETE: the time budget of N min ran out; ...` as soon as one item did
+  not run or was stopped. It never reads `ALL PASSED`; the failures that did happen are still
+  counted in the same line. The summary has a "Time budget" row, and the runner exits 1.
+
+The workflow computes the budget from the job: the job limit (150 minutes), less the minutes
+used when the bundle step starts, less 12 minutes for the steps after it, less 1. The steps
+before the bundle took 20 to 22.5 minutes and the steps after it about 9 (the cache save alone
+7 minutes), so the runner gets about 116 minutes, and the budget line is printed in the step's
+log.
+
+#### Reading the progress line
+
+A step that runs a named item shows the item in place of the step name, without the bar and
+the estimate: `<percent> <done>/<total> <clock> | re-run <binary id> test 3 of 12 | ...`.
+Each re-run in the sandbox user phase shows `re-run <binary id>`, and a solo re-run shows
+`solo <binary id>::<test name>` (in the baseline and in the phase). The log also gets a line
+`sandbox user: running <binary id> again` when a re-run starts and `solo re-run
+<binary id>::<test name>` for a solo re-run, so a stall is attributable from the log alone.
 
 #### Running only some tests (`--only`)
 

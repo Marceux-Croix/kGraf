@@ -18,7 +18,21 @@
 #   5. Uploads the report and the firewall output as one artifact.
 #
 # Cost: this bills Windows minutes, at twice the Linux rate on a private
-# repository. The job stops after 120 minutes.
+# repository. The job stops after 150 minutes.
+#
+# Time: the runner gets a wall-clock budget (--budget-mins) so that it stops
+# starting work early enough to remove the sandbox user and write the report
+# before the job limit. The budget is the job limit, less the minutes the job
+# already used when the bundle starts, less the minutes the steps after the
+# bundle need. Measured (runs of 2026-10-10 and 2026-10-11): the steps before
+# the bundle took 20 to 22.5 minutes (cache restore, native build, copy); the
+# steps after it took about 9 minutes (the firewall test 5 s, the AppContainer
+# DNS probe 86 s, the upload 3 s, the cache save 7 minutes 10 s). A complete
+# bundle run took 78 minutes in the faster of two measured runs. The slower
+# one was at 78 minutes with one re-run of the sandbox user phase still
+# running and two to go (baseline 48 minutes), which projects to about 113
+# minutes. With the steps before and after, a complete run needs about 143
+# minutes of the job. The limit is 150.
 #
 # Two things differ from a standard user's machine, so read the results with
 # them in mind:
@@ -55,13 +69,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep equal to `timeout-minutes` below: the job limit cannot read this
+  # value, and the budget is computed from it.
+  WINTEST_JOB_MINUTES: "150"
+  # Minutes the steps after the bundle need: about 9 measured, plus 3.
+  WINTEST_AFTER_BUNDLE_MINUTES: "12"
 
 jobs:
   wintest:
     name: Windows self-test
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
+      # The budget counts from here. The job's own set-up before this step
+      # takes a few seconds, which the minute taken off the budget covers.
+      - name: Note the job start
+        shell: bash
+        run: echo "WINTEST_JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       # Some tracked benchmark logs have paths longer than 260 characters;
       # without long paths, Git cannot check them out on Windows.
       - name: Allow long paths in Git
@@ -160,6 +184,13 @@ jobs:
           ONLY: ${{ inputs.only }}
         run: |
           set -u
+          # The runner's budget: the job limit, less the whole minutes used
+          # so far, less the steps after this one, less one minute for the
+          # part minute dropped and the job set-up. Never under 10.
+          used=$(( ( $(date +%s) - WINTEST_JOB_START ) / 60 ))
+          budget=$(( WINTEST_JOB_MINUTES - used - WINTEST_AFTER_BUNDLE_MINUTES - 1 ))
+          if (( budget < 10 )); then budget=10; fi
+          echo "job minutes $WINTEST_JOB_MINUTES, used $used, budget for the runner $budget"
           stage="/c/kgraf-wintest"
           report_dir="$GITHUB_WORKSPACE/wintest-out/report"
           mkdir -p "$report_dir"
@@ -168,6 +199,7 @@ jobs:
           extra=()
           if [[ "$SANDBOX_USER" == "true" ]]; then extra+=(--sandbox-user); fi
           if [[ -n "$ONLY" ]]; then extra+=(--only "$ONLY"); fi
+          extra+=(--budget-mins "$budget")
           ./kgraf-wintest.exe --all --no-wait "${extra[@]}" --report-dir "$(cygpath -w "$report_dir")" || echo "kgraf-wintest.exe exited with $?"
           # The report file is the result: no file, no result.
           if ! ls "$report_dir"/kgraf-wintest-report-*.md >/dev/null 2>&1; then
@@ -198,8 +230,9 @@ jobs:
           & scripts/wintest-appcontainer-dns.ps1 -Out "$env:GITHUB_WORKSPACE\wintest-out\appcontainer-dns.md"
           exit 0
 
+      # Also after a cancel or a timeout: a partial report is a result.
       - name: Upload the report and the firewall output
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kgraf-windows-selftest

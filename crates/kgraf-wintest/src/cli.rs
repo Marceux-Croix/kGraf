@@ -19,6 +19,9 @@ pub struct RunOptions {
     /// Run only the named binaries, tests and end-to-end checks
     /// ([`crate::only`]).
     pub only: Option<crate::only::Only>,
+    /// Wall-clock minutes the whole run may take, from its start to the
+    /// report ([`crate::budget`]). `None`: no budget.
+    pub budget_mins: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +68,8 @@ kgraf-wintest: runs kGraf's Windows tests and writes one report to the Desktop.
                                      comma-separated `binary-id` or `binary-id::test-name` items
                                      (run ids as in the report); `e2e` or `e2e::<check-id>` adds
                                      end-to-end checks, which otherwise do not run
+      --budget-mins <N>              stop starting work so the run, its sandbox user removal and its
+                                     report end within N minutes; what did not run is in the report
   kgraf-wintest sandbox-run -- <program> [args...]
                                      run one program inside kGraf's sandbox (for manual tests)
 ";
@@ -146,6 +151,16 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "--no-wait" => o.no_wait = true,
                     "--sandbox-user" => o.sandbox_user = true,
                     "--report-dir" => o.report_dir = Some(PathBuf::from(value(&mut it, a)?)),
+                    "--budget-mins" => {
+                        let text = value(&mut it, a)?;
+                        let mins: u64 = text.trim().parse().map_err(|_| {
+                            format!("--budget-mins needs a whole number of minutes, not {text:?}")
+                        })?;
+                        if mins == 0 {
+                            return Err("--budget-mins needs at least 1 minute".into());
+                        }
+                        o.budget_mins = Some(mins);
+                    }
                     "--only" => {
                         let text = value(&mut it, a)?;
                         // An empty value is the full run, so a workflow can
@@ -260,5 +275,18 @@ mod tests {
         assert_eq!(o.only, None);
         assert!(p(&["--only"]).is_err());
         assert!(p(&["--only", "a,,b"]).is_err());
+    }
+
+    #[test]
+    fn budget_mins_takes_a_positive_whole_number() {
+        let Command::Run(o) = p(&["--all", "--budget-mins", "85"]).expect("parses") else {
+            panic!("a run");
+        };
+        assert_eq!(o.budget_mins, Some(85));
+        assert_eq!(RunOptions::default().budget_mins, None);
+        assert!(p(&["--budget-mins"]).is_err());
+        assert!(p(&["--budget-mins", "0"]).is_err());
+        assert!(p(&["--budget-mins", "soon"]).is_err());
+        assert!(p(&["--budget-mins", "-3"]).is_err());
     }
 }

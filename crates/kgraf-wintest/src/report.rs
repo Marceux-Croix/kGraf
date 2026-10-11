@@ -30,6 +30,9 @@ pub struct BinaryResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// The run's time budget ended while this binary ran, and it was
+    /// stopped. `timed_out` stays false: its own limit was not the cause.
+    pub budget_stopped: bool,
     pub start_error: Option<String>,
     pub secs: f64,
     pub expected_secs: f64,
@@ -69,6 +72,7 @@ impl BinaryResult {
         self.failed == 0
             && !self.timed_out
             && !self.cancelled
+            && !self.budget_stopped
             && self.start_error.is_none()
             && self.exit_code == Some(0)
     }
@@ -111,6 +115,8 @@ pub struct Report {
     pub sandbox_user: Option<crate::sandbox_phase::SandboxPhase>,
     /// The `--only` filter the run had, if any: only what it named ran.
     pub only: Option<String>,
+    /// What the time budget did to the baseline, when the run had one.
+    pub budget: Option<crate::budget::BudgetReport>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -181,7 +187,7 @@ fn tally(b: &BinaryResult) -> (u64, u64, bool) {
     let needs = needs.min(b.failed);
     let hung = b.timed_out
         || b.start_error.is_some()
-        || (b.exit_code != Some(0) && b.failed == 0 && !b.cancelled);
+        || (b.exit_code != Some(0) && b.failed == 0 && !b.cancelled && !b.budget_stopped);
     (b.failed - needs, needs, hung)
 }
 
@@ -259,6 +265,30 @@ pub fn headline(r: &Report) -> Headline {
     h
 }
 
+/// What the time budget cut, over both halves of a run: the items that did
+/// not start and the items it stopped.
+pub fn budget_cuts(r: &Report) -> (Vec<crate::budget::NotRun>, Vec<String>) {
+    let mut not_run = Vec::new();
+    let mut stopped = Vec::new();
+    if let Some(b) = &r.budget {
+        not_run.extend(b.not_run.iter().cloned());
+        stopped.extend(b.stopped.iter().cloned());
+    }
+    if let Some(p) = &r.sandbox_user {
+        not_run.extend(p.not_run.iter().cloned());
+        stopped.extend(p.stopped_at_budget.iter().cloned());
+        if let Some(why) = &p.skipped
+            && why.starts_with("budget")
+        {
+            not_run.push(crate::budget::NotRun {
+                what: "sandbox user phase".into(),
+                why: format!("not run: {why}"),
+            });
+        }
+    }
+    (not_run, stopped)
+}
+
 /// The verdict line: what the reader should look at first.
 pub fn verdict(r: &Report) -> String {
     let h = headline(r);
@@ -270,8 +300,22 @@ pub fn verdict(r: &Report) -> String {
     } else {
         String::new()
     };
+    let (not_run, stopped) = budget_cuts(r);
     if r.interrupted {
         "INTERRUPTED: the run was stopped before the end; results below are partial".into()
+    } else if !not_run.is_empty() || !stopped.is_empty() {
+        // Never ALL PASSED: what did not run proves nothing.
+        format!(
+            "INCOMPLETE: the time budget of {} min ran out; {} item(s) did not run and {} \
+             item(s) were stopped at the budget. Of what ran: {} test(s) failed, {} binary \
+             run(s) hung or crashed, {} end-to-end check(s) failed{apart}",
+            r.budget.as_ref().map_or(0, |b| b.mins),
+            not_run.len(),
+            stopped.len(),
+            h.failed,
+            h.hung_or_crashed,
+            h.e2e_fail
+        )
     } else if h.failed == 0 && h.hung_or_crashed == 0 && h.e2e_fail == 0 {
         format!("ALL PASSED (failures that need a missing tool are listed apart{apart})")
     } else {
@@ -383,6 +427,22 @@ pub fn render(r: &Report) -> String {
     if let Some(p) = &r.sandbox_user {
         rows.insert(7, ("Sandbox user phase", p.summary()));
     }
+    if let Some(b) = &r.budget {
+        let (not_run, stopped) = budget_cuts(r);
+        rows.push((
+            "Time budget",
+            if not_run.is_empty() && stopped.is_empty() {
+                format!("{} min, not reached", b.mins)
+            } else {
+                format!(
+                    "{} min, REACHED: {} item(s) not run, {} stopped (see Not run)",
+                    b.mins,
+                    not_run.len(),
+                    stopped.len()
+                )
+            },
+        ));
+    }
     for (k, v) in rows {
         md.push_str(&format!("| {k} | {} |\n", md_escape(&v)));
     }
@@ -438,8 +498,9 @@ pub fn render(r: &Report) -> String {
         if !b.clean() && b.failures.is_empty() {
             any = true;
             md.push_str(&format!(
-                "### {} (exit {:?}, timed out {}, start error {:?}, running test {:?})\n\n",
-                b.id, b.exit_code, b.timed_out, b.start_error, b.open_test
+                "### {} (exit {:?}, timed out {}, stopped at the budget {}, start error {:?}, \
+                 running test {:?})\n\n",
+                b.id, b.exit_code, b.timed_out, b.budget_stopped, b.start_error, b.open_test
             ));
             md.push_str(&fence("text", b.tail.as_deref().unwrap_or("")));
             md.push('\n');
@@ -473,9 +534,9 @@ pub fn render(r: &Report) -> String {
             if tally(b).2 {
                 any = true;
                 md.push_str(&format!(
-                    "### sandbox user: {} (exit {:?}, timed out {}, start error {:?}, running \
-                     test {:?})\n\n",
-                    b.id, b.exit_code, b.timed_out, b.start_error, b.open_test
+                    "### sandbox user: {} (exit {:?}, timed out {}, stopped at the budget {}, \
+                     start error {:?}, running test {:?})\n\n",
+                    b.id, b.exit_code, b.timed_out, b.budget_stopped, b.start_error, b.open_test
                 ));
                 let tail = b
                     .open_test_solo
@@ -537,7 +598,9 @@ pub fn render(r: &Report) -> String {
             b.passed,
             b.failed,
             b.ignored,
-            if b.timed_out {
+            if b.budget_stopped {
+                "stopped at the budget".to_owned()
+            } else if b.timed_out {
                 "timed out".to_owned()
             } else {
                 format!("{:?}", b.exit_code)
@@ -588,6 +651,13 @@ pub fn render(r: &Report) -> String {
     ));
 
     md.push_str("\n## Not run\n\n");
+    let (cut_not_run, cut_stopped) = budget_cuts(r);
+    for n in &cut_not_run {
+        md.push_str(&format!("- {}: {}\n", n.what, n.why));
+    }
+    for what in &cut_stopped {
+        md.push_str(&format!("- {what}: stopped at the budget\n"));
+    }
     for n in &r.not_shipped {
         md.push_str(&format!("- {}: {}\n", n.what, n.reason));
     }
@@ -678,6 +748,7 @@ mod tests {
             exit_code: Some(if failed.is_empty() { 0 } else { 101 }),
             timed_out: false,
             cancelled: false,
+            budget_stopped: false,
             start_error: None,
             secs: 3.0,
             expected_secs: 2.0,
@@ -743,6 +814,83 @@ mod tests {
         hung.exit_code = None;
         r.binaries.push(hung);
         assert_eq!(totals(&r).hung_or_crashed, 1);
+    }
+
+    /// A run the budget cut is never ALL PASSED, whatever else it found,
+    /// and the report says what did not run.
+    #[test]
+    fn a_run_the_budget_cut_is_incomplete_and_never_all_passed() {
+        let mut r = Report::default();
+        r.binaries.push(bin("a", &[]));
+        assert!(verdict(&r).starts_with("ALL PASSED"));
+        r.budget = Some(crate::budget::BudgetReport {
+            mins: 85,
+            not_run: vec![crate::budget::NotRun {
+                what: "k/test/late".into(),
+                why: "not run: budget (expected about 90 s, 12 s left)".into(),
+            }],
+            stopped: vec!["k/test/slow".into()],
+        });
+        let v = verdict(&r);
+        assert!(v.starts_with("INCOMPLETE"), "{v}");
+        assert!(!v.contains("ALL PASSED"), "{v}");
+        assert!(v.contains("85 min"), "{v}");
+        let md = render(&r);
+        assert!(md.contains("k/test/late: not run: budget"), "{md}");
+        assert!(md.contains("k/test/slow: stopped at the budget"), "{md}");
+        assert!(md.contains("| Time budget | 85 min, REACHED"), "{md}");
+        // Failures that did happen stay in the line.
+        r.binaries.push(bin("f", &[("t", "boom")]));
+        let v = verdict(&r);
+        assert!(
+            v.starts_with("INCOMPLETE") && v.contains("1 test(s) failed"),
+            "{v}"
+        );
+    }
+
+    /// Cuts in the sandbox user half alone make the run incomplete too, and
+    /// a phase that did not start for lack of time counts.
+    #[test]
+    fn a_cut_in_the_sandbox_user_half_makes_the_run_incomplete() {
+        let mut r = Report::default();
+        r.binaries.push(bin("a", &[]));
+        r.budget = Some(crate::budget::BudgetReport {
+            mins: 60,
+            ..Default::default()
+        });
+        assert!(verdict(&r).starts_with("ALL PASSED"));
+        assert!(render(&r).contains("| Time budget | 60 min, not reached"));
+        let mut p = crate::sandbox_phase::SandboxPhase::default();
+        p.stopped_at_budget.push("sandbox user re-run of x".into());
+        r.sandbox_user = Some(p);
+        assert!(verdict(&r).starts_with("INCOMPLETE"), "{}", verdict(&r));
+        let p = crate::sandbox_phase::SandboxPhase {
+            skipped: Some("budget: setup and the gate need about 300 s, 12 s left".into()),
+            ..Default::default()
+        };
+        r.sandbox_user = Some(p);
+        assert!(verdict(&r).starts_with("INCOMPLETE"), "{}", verdict(&r));
+        assert!(render(&r).contains("sandbox user phase: not run: budget"));
+    }
+
+    /// A binary the budget stopped is neither clean nor hung or crashed: the
+    /// verdict is about the budget, not a hang.
+    #[test]
+    fn a_binary_stopped_at_the_budget_is_not_counted_as_hung() {
+        let mut r = Report::default();
+        let mut b = bin("s", &[]);
+        b.budget_stopped = true;
+        b.exit_code = None;
+        assert!(!b.clean());
+        r.binaries.push(b);
+        assert_eq!(totals(&r).hung_or_crashed, 0);
+        r.budget = Some(crate::budget::BudgetReport {
+            mins: 5,
+            not_run: vec![],
+            stopped: vec!["s".into()],
+        });
+        assert!(verdict(&r).starts_with("INCOMPLETE"));
+        assert!(render(&r).contains("| s | Core | 3 | 0 | 0 | stopped at the budget |"));
     }
 
     const MSYS: &str = "bash.exe: *** fatal error - \

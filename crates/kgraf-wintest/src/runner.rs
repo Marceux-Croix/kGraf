@@ -17,6 +17,7 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::budget::{Budget, BudgetReport, NotRun};
 use crate::cli::RunOptions;
 use crate::console::Console;
 use crate::e2e;
@@ -525,26 +526,34 @@ fn full_run_args(run: &TestRun, env: &Env) -> Vec<String> {
 /// summary at the end, which a killed binary never reaches. Run `name` alone
 /// to get that output. The first run's outcome is not changed.
 fn solo_rerun(
+    console: &Console,
     run: &TestRun,
     bundle: &Path,
     cwd: &Path,
     env: &Env,
     name: &str,
-    limit: Duration,
+    limit: crate::budget::Capped,
 ) -> Failure {
+    // The line names the binary and the test: a solo re-run that stalls must
+    // be attributable from the log alone.
+    console.log(&format!("  solo re-run {}::{name}", run.id));
+    console.with(|p, _| p.set_solo(&run.id, name));
     let args = ["--exact", name, "--test-threads=1"].map(String::from);
     let f = crate::proc::run(
         binary_command(run, bundle, cwd, env, &args),
-        limit,
+        limit.limit,
         &CANCEL,
         |_| {},
     );
+    let by_budget = limit.by_budget && f.timed_out;
     let mut parser = Parser::default();
     for l in &f.tail {
         parser.feed(l);
     }
     parser.finish();
-    let solo = if f.timed_out {
+    let solo = if by_budget {
+        "stopped at the budget"
+    } else if f.timed_out {
         "hung"
     } else if f.start_error.is_none()
         && f.code == Some(0)
@@ -566,6 +575,7 @@ fn solo_rerun(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_binary(
     console: &Console,
     run: &TestRun,
@@ -574,6 +584,7 @@ fn run_binary(
     env: &Env,
     expected: f64,
     listed: Option<u64>,
+    time_budget: &Budget,
 ) -> BinaryResult {
     run_binary_limits(
         console,
@@ -585,6 +596,7 @@ fn run_binary(
         listed,
         limit_for(expected),
         solo_limit_for(run.secs_per_test),
+        time_budget,
     )
 }
 
@@ -599,6 +611,7 @@ fn run_binary_limits(
     listed: Option<u64>,
     limit: Duration,
     solo_limit: Duration,
+    time_budget: &Budget,
 ) -> BinaryResult {
     let cmd = binary_command(run, bundle, cwd, env, &full_run_args(run, env));
     let mut parser = Parser::default();
@@ -611,7 +624,10 @@ fn run_binary_limits(
     // arrives, restarts it.
     let mut mark = Instant::now();
     let mut test_secs: Vec<(String, f64)> = Vec::new();
-    let f = crate::proc::run(cmd, limit, &CANCEL, |line| {
+    // The run's own limit, cut to the time the budget leaves. A binary that
+    // ends by timeout under the cut was stopped by the budget, not hung.
+    let capped = time_budget.cap(limit);
+    let f = crate::proc::run(cmd, capped.limit, &CANCEL, |line| {
         let ev = parser.feed(line);
         match &ev {
             Event::Started(_) => mark = Instant::now(),
@@ -637,6 +653,7 @@ fn run_binary_limits(
         });
     });
     parser.finish();
+    let budget_stopped = capped.by_budget && f.timed_out;
     let mut failures: Vec<Failure> = parser
         .tests
         .iter()
@@ -659,17 +676,29 @@ fn run_binary_limits(
     let ended_cleanly = parser.summary.is_some() && f.code == Some(0);
     let mut open_test_solo = None;
     let mut rerun_skipped = Vec::new();
-    if !ended_cleanly && !f.cancelled && f.start_error.is_none() {
+    if !ended_cleanly && !f.cancelled && !budget_stopped && f.start_error.is_none() {
         // The open test first: it is the likely cause.
         let mut budget = MAX_SOLO_RERUNS;
         let started = std::time::Instant::now();
         let spent = || started.elapsed() >= Duration::from_secs(SOLO_RERUN_BUDGET_SECS);
         if let Some(name) = &parser.open {
-            open_test_solo = Some(solo_rerun(run, bundle, cwd, env, name, solo_limit));
+            if time_budget.spent() {
+                rerun_skipped.push(name.clone());
+            } else {
+                open_test_solo = Some(solo_rerun(
+                    console,
+                    run,
+                    bundle,
+                    cwd,
+                    env,
+                    name,
+                    time_budget.cap(solo_limit),
+                ));
+            }
             budget -= 1;
         }
         for fail in &mut failures {
-            if budget == 0 || spent() {
+            if budget == 0 || spent() || time_budget.spent() {
                 rerun_skipped.push(fail.test.clone());
                 continue;
             }
@@ -677,7 +706,15 @@ fn run_binary_limits(
                 break;
             }
             budget -= 1;
-            let s = solo_rerun(run, bundle, cwd, env, &fail.test, solo_limit);
+            let s = solo_rerun(
+                console,
+                run,
+                bundle,
+                cwd,
+                env,
+                &fail.test,
+                time_budget.cap(solo_limit),
+            );
             fail.class = s.class;
             fail.tail = s.tail;
             fail.solo = s.solo;
@@ -687,8 +724,9 @@ fn run_binary_limits(
         id: run.id.clone(),
         set: run.set,
         exit_code: f.code,
-        timed_out: f.timed_out,
+        timed_out: f.timed_out && !budget_stopped,
         cancelled: f.cancelled,
+        budget_stopped,
         start_error: f.start_error.clone(),
         secs: f.secs,
         expected_secs: expected,
@@ -810,6 +848,15 @@ pub fn run(o: RunOptions) -> i32 {
     platform::install_ctrl_handler();
     let (started_utc, stamp) = utc_now();
     let t0 = Instant::now();
+    // The reserve is the removal of the sandbox user, the cleanup and the
+    // report: they run after the budget is spent.
+    let time_budget = match o.budget_mins {
+        None => Budget::unlimited(),
+        Some(m) if o.sandbox_user => Budget::new(m, crate::budget::RESERVE_WITH_SANDBOX_USER),
+        Some(m) => Budget::new(m, crate::budget::RESERVE_WITHOUT_SANDBOX_USER),
+    };
+    let mut not_run: Vec<NotRun> = Vec::new();
+    let mut stopped: Vec<String> = Vec::new();
     let base = std::env::temp_dir();
     let id = workdir::run_id(&stamp, std::process::id());
     let layout = workdir::layout(&base, &id);
@@ -1009,7 +1056,9 @@ pub fn run(o: RunOptions) -> i32 {
             break;
         }
         if i == core.len() {
-            e2e_checks = run_e2e_step(
+            e2e_checks = run_e2e_budgeted(
+                &time_budget,
+                &mut not_run,
                 &console,
                 step_e2e,
                 &bundle,
@@ -1027,6 +1076,9 @@ pub fn run(o: RunOptions) -> i32 {
         let expected = console
             .with(|p, _| p.steps()[step].expected_secs)
             .unwrap_or(30.0);
+        if !start_or_refuse(&time_budget, &mut not_run, &r.id, expected) {
+            continue;
+        }
         console.with(|p, now| p.start(step, now));
         let b = run_binary(
             &console,
@@ -1036,8 +1088,13 @@ pub fn run(o: RunOptions) -> i32 {
             &env,
             expected,
             listed.get(i).copied().flatten(),
+            &time_budget,
         );
         console.with(|p, now| p.finish(step, now));
+        if b.budget_stopped {
+            console.log(&format!("  {}: stopped at the time budget", r.id));
+            stopped.push(r.id.clone());
+        }
         if !b.clean() {
             console.log(&format!(
                 "  {}: {} passed, {} failed{}",
@@ -1050,7 +1107,9 @@ pub fn run(o: RunOptions) -> i32 {
         binaries.push(b);
     }
     if chosen.len() <= core.len() && !CANCEL.load(Ordering::Relaxed) {
-        e2e_checks = run_e2e_step(
+        e2e_checks = run_e2e_budgeted(
+            &time_budget,
+            &mut not_run,
             &console,
             step_e2e,
             &bundle,
@@ -1087,6 +1146,7 @@ pub fn run(o: RunOptions) -> i32 {
             placed: None,
             e2e_choice: e2e_choice.clone(),
             every_binary_named: o.only.is_some(),
+            time_budget,
         };
         let phase = sandbox_phase::run_phase(&mut ex, &binaries, machine.elevated, &|| {
             CANCEL.load(Ordering::Relaxed)
@@ -1165,6 +1225,11 @@ pub fn run(o: RunOptions) -> i32 {
         notes,
         sandbox_user,
         only: o.only.as_ref().map(|f| f.text.clone()),
+        budget: time_budget.mins().map(|mins| BudgetReport {
+            mins,
+            not_run,
+            stopped,
+        }),
     };
     if !run_extended {
         r.notes.push(format!(
@@ -1247,7 +1312,44 @@ pub fn run(o: RunOptions) -> i32 {
         wait_for_key();
     }
     let left = r.sandbox_user.as_ref().is_some_and(|p| p.left_behind());
-    i32::from(!(t.failed == 0 && t.hung_or_crashed == 0 && t.e2e_fail == 0) || left)
+    let (cut_not_run, cut_stopped) = report::budget_cuts(&r);
+    let incomplete = !cut_not_run.is_empty() || !cut_stopped.is_empty();
+    i32::from(!(t.failed == 0 && t.hung_or_crashed == 0 && t.e2e_fail == 0) || left || incomplete)
+}
+
+/// Whether an item expected to take `expected_secs` may start. When the
+/// budget refuses it, the item is recorded as not run.
+fn start_or_refuse(
+    time_budget: &Budget,
+    not_run: &mut Vec<NotRun>,
+    what: &str,
+    expected_secs: f64,
+) -> bool {
+    let expected = Duration::from_secs_f64(expected_secs);
+    let ok = time_budget.allows(expected);
+    if !ok {
+        not_run.push(time_budget.refusal(what, expected));
+    }
+    ok
+}
+
+/// The baseline's end-to-end step, when the budget leaves room for it.
+#[allow(clippy::too_many_arguments)]
+fn run_e2e_budgeted(
+    time_budget: &Budget,
+    not_run: &mut Vec<NotRun>,
+    console: &Console,
+    step: usize,
+    bundle: &Path,
+    layout: &Layout,
+    env: &Env,
+    machine: &MachineFacts,
+    choice: &crate::only::E2eChoice,
+) -> Vec<e2e::Check> {
+    if !start_or_refuse(time_budget, not_run, "end-to-end checks", SECS_E2E) {
+        return Vec::new();
+    }
+    run_e2e_step(console, step, bundle, layout, env, machine, choice)
 }
 
 fn run_e2e_step(
@@ -1305,6 +1407,8 @@ struct PhaseExec<'a> {
     e2e_choice: crate::only::E2eChoice,
     /// `--only` named every binary of the baseline, so each runs again.
     every_binary_named: bool,
+    /// The run's time budget: the re-runs are capped by it.
+    time_budget: Budget,
 }
 
 impl PhaseExec<'_> {
@@ -1394,6 +1498,7 @@ impl Exec for PhaseExec<'_> {
                 exit_code: None,
                 timed_out: false,
                 cancelled: false,
+                budget_stopped: false,
                 start_error: Some("not in the manifest".into()),
                 secs: 0.0,
                 expected_secs: 0.0,
@@ -1412,7 +1517,9 @@ impl Exec for PhaseExec<'_> {
             };
         };
         let (expected, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
-        run_binary(
+        // The progress line names the binary that runs, not only the phase.
+        self.console.with(|p, _| p.set_item(format!("re-run {id}")));
+        let result = run_binary(
             self.console,
             run,
             self.bundle,
@@ -1420,7 +1527,19 @@ impl Exec for PhaseExec<'_> {
             &self.rerun_env,
             expected,
             listed,
-        )
+            &self.time_budget,
+        );
+        self.console.with(|p, _| p.set_item(String::new()));
+        result
+    }
+
+    fn time_left(&self) -> Option<Duration> {
+        self.time_budget.left()
+    }
+
+    fn rerun_expected(&self, id: &str) -> Duration {
+        let (expected, _) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        Duration::from_secs_f64(expected)
     }
 
     fn every_binary_named(&self) -> bool {
@@ -1616,6 +1735,7 @@ exec sleep 30
             Some(4),
             Duration::from_millis(1500),
             Duration::from_millis(1500),
+            &Budget::unlimited(),
         );
         // The first run's outcomes stand.
         assert!(b.timed_out);
@@ -1629,6 +1749,212 @@ exec sleep 30
         let open = b.open_test_solo.as_ref().unwrap();
         assert_eq!(open.solo.as_deref(), Some("hung"));
         assert!(b.rerun_skipped.is_empty());
+    }
+
+    /// A fake binary that sleeps far past any limit, for the budget tests.
+    #[cfg(unix)]
+    fn sleeping_binary(dir: &Path) -> (TestRun, Env) {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join("fake-tests");
+        let script = "#!/bin/sh\nif [ \"$1\" = \"--exact\" ]; then exec sleep 30; fi\n\
+                      echo 'running 2 tests'\necho 'test slow::open ... '\nexec sleep 30\n";
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = Env {
+            vars: vec![],
+            show_output: false,
+        };
+        (run_of("fake-tests", "p/test/fake"), env)
+    }
+
+    /// The budget ends while a binary runs: the binary is killed at the
+    /// budget, not at its own 20 s limit; the result says so; it is not
+    /// called hung; no solo re-run follows.
+    #[cfg(unix)]
+    #[test]
+    fn reaching_the_budget_stops_the_running_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, env) = sleeping_binary(dir.path());
+        let console = Console::new(Progress::default());
+        let budget = Budget::with_total(Duration::from_millis(1200), Duration::ZERO);
+        let started = Instant::now();
+        let b = run_binary_limits(
+            &console,
+            &run,
+            dir.path(),
+            dir.path(),
+            &env,
+            1.0,
+            Some(2),
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+            &budget,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stopped at the budget, not at the 20 s limit: {:?}",
+            started.elapsed()
+        );
+        assert!(b.budget_stopped, "{b:?}");
+        assert!(!b.timed_out, "its own limit was not the cause");
+        assert!(!b.clean());
+        assert!(b.open_test_solo.is_none(), "no solo re-run after the stop");
+        assert_eq!(b.open_test.as_deref(), Some("slow::open"));
+    }
+
+    /// A solo re-run gets the time left as its limit; ending under that cut
+    /// is a stop at the budget, not a hang.
+    #[cfg(unix)]
+    #[test]
+    fn a_solo_rerun_is_capped_by_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, env) = sleeping_binary(dir.path());
+        let console = Console::new(Progress::default());
+        let budget = Budget::with_total(Duration::from_millis(2500), Duration::ZERO);
+        let b = run_binary_limits(
+            &console,
+            &run,
+            dir.path(),
+            dir.path(),
+            &env,
+            1.0,
+            Some(2),
+            Duration::from_millis(800),
+            Duration::from_secs(20),
+            &budget,
+        );
+        // The binary's own limit ended it (the budget had time left), so the
+        // open test is re-run alone, capped by the time left.
+        assert!(b.timed_out && !b.budget_stopped, "{b:?}");
+        let solo = b.open_test_solo.expect("a solo re-run under the budget");
+        assert_eq!(solo.solo.as_deref(), Some("stopped at the budget"));
+    }
+
+    /// The progress line names the binary of a solo re-run and its test.
+    #[cfg(unix)]
+    #[test]
+    fn a_solo_rerun_names_the_binary_and_the_test_on_the_progress_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, env) = sleeping_binary(dir.path());
+        let console = Console::new(Progress::new(vec![(
+            "extended 1/1 p/test/fake".into(),
+            5.0,
+        )]));
+        console.with(|p, now| p.start(0, now));
+        let sampler = {
+            let console = console.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                for _ in 0..80 {
+                    if let Some(line) = console.with(|p, now| p.render(now, 0, 120)) {
+                        seen.push(line);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                seen
+            })
+        };
+        let b = run_binary_limits(
+            &console,
+            &run,
+            dir.path(),
+            dir.path(),
+            &env,
+            1.0,
+            Some(2),
+            Duration::from_millis(500),
+            Duration::from_millis(700),
+            &Budget::unlimited(),
+        );
+        assert!(b.open_test_solo.is_some());
+        let seen = sampler.join().unwrap();
+        assert!(
+            seen.iter()
+                .any(|l| l.contains("solo p/test/fake::slow::open")),
+            "{seen:?}"
+        );
+    }
+
+    /// The phase's re-run names its binary on the progress line while it
+    /// runs and clears the name after.
+    #[cfg(unix)]
+    #[test]
+    fn a_sandbox_user_rerun_names_its_binary_on_the_progress_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (run, base) = sleeping_binary(dir.path());
+        // Shorten the fake: it ends by the budget below.
+        let console = Console::new(Progress::new(vec![("sandbox user".into(), 600.0)]));
+        console.with(|p, now| p.start(0, now));
+        let layout = workdir::layout(dir.path(), "phase");
+        let machine = MachineFacts::default();
+        let runs = [&run];
+        let mut ex = PhaseExec {
+            console: &console,
+            bundle: dir.path(),
+            layout: &layout,
+            env: &base,
+            rerun_env: phase_rerun_env(&base),
+            machine: &machine,
+            runs: &runs,
+            by_id: std::collections::HashMap::new(),
+            cwd_root: dir.path(),
+            placed: None,
+            e2e_choice: crate::only::E2eChoice::All,
+            every_binary_named: false,
+            time_budget: Budget::with_total(Duration::from_millis(1500), Duration::ZERO),
+        };
+        let sampler = {
+            let console = console.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                for _ in 0..40 {
+                    if let Some(line) = console.with(|p, now| p.render(now, 0, 80)) {
+                        seen.push(line);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                seen
+            })
+        };
+        let r = ex.rerun("p/test/fake");
+        assert!(r.budget_stopped);
+        let seen = sampler.join().unwrap();
+        assert!(
+            seen.iter().any(|l| l.contains("re-run p/test/fake")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().all(|l| l.chars().count() <= 79),
+            "the line fits 80 columns"
+        );
+        let after = console.with(|p, _| p.item.clone()).unwrap();
+        assert_eq!(after, "");
+        // The budget the phase sees is the budget it was given.
+        assert_eq!(ex.time_left(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn an_item_over_the_time_left_is_not_started_and_is_recorded() {
+        let b = Budget::with_total(Duration::from_secs(100), Duration::from_secs(40));
+        let mut not_run = Vec::new();
+        assert!(start_or_refuse(&b, &mut not_run, "p/test/short", 20.0));
+        assert!(not_run.is_empty());
+        assert!(!start_or_refuse(&b, &mut not_run, "p/test/long", 300.0));
+        assert_eq!(not_run.len(), 1);
+        assert_eq!(not_run[0].what, "p/test/long");
+        assert!(
+            not_run[0].why.starts_with("not run: budget"),
+            "{}",
+            not_run[0].why
+        );
+        // With no budget, everything starts.
+        assert!(start_or_refuse(
+            &Budget::unlimited(),
+            &mut not_run,
+            "x",
+            1e9
+        ));
+        assert_eq!(not_run.len(), 1);
     }
 
     fn run_of(exe: &str, id: &str) -> TestRun {
@@ -1745,6 +2071,7 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
                 Some(1),
                 Duration::from_secs(20),
                 Duration::from_secs(20),
+                &Budget::unlimited(),
             )
         };
         let b = go(&base);
@@ -1786,6 +2113,7 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             placed: None,
             e2e_choice: crate::only::E2eChoice::All,
             every_binary_named: false,
+            time_budget: Budget::unlimited(),
         };
         let r = ex.rerun("p/test/fake");
         assert!(

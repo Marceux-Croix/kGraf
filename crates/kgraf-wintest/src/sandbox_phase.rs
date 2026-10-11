@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::budget::{NotRun, not_run_reason};
 use crate::e2e::{Check, Status};
 use crate::libtest::Outcome;
 use crate::report::BinaryResult;
@@ -547,6 +548,57 @@ pub trait Exec {
     fn object_directory(&mut self) -> DirectoryRead;
     /// Undoes what `preflight` placed; returns notes.
     fn teardown(&mut self) -> Vec<String>;
+    /// Time left under the run's budget, less the reserve for the removal.
+    /// `None`: the run has no budget.
+    fn time_left(&self) -> Option<Duration> {
+        None
+    }
+    /// How long re-running the binary `id` is expected to take.
+    fn rerun_expected(&self, _id: &str) -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+/// Time the setup, the status check and the gate need before the phase may
+/// start: with less left, setup would be cut off half done.
+pub const PHASE_START_SECS: u64 = 300;
+/// Time the end-to-end checks of the re-run are expected to take.
+pub const E2E_EXPECTED_SECS: u64 = 90;
+
+/// Runs one `kgraf` step under the budget. A step that honors cancel is
+/// capped to the time left and is not started when none is left; the
+/// removal steps never are. The flag says the budget cut the step. A cut
+/// step is recorded in `p` ([`SandboxPhase::stopped_at_budget`] or
+/// [`SandboxPhase::not_run`]).
+fn budgeted_cli(
+    ex: &mut dyn Exec,
+    p: &mut SandboxPhase,
+    label: &str,
+    args: &[&str],
+    limit: Duration,
+    honor_cancel: bool,
+) -> (StepRun, bool) {
+    let left = if honor_cancel { ex.time_left() } else { None };
+    if left.is_some_and(|l| l.is_zero()) {
+        p.not_run.push(NotRun {
+            what: label.to_owned(),
+            why: not_run_reason(limit, Duration::ZERO),
+        });
+        let step = StepRun {
+            label: label.to_owned(),
+            command: format!("kgraf {}", args.join(" ")),
+            start_error: Some("not run: budget".into()),
+            ..StepRun::default()
+        };
+        return (step, true);
+    }
+    let capped = left.filter(|l| *l < limit);
+    let step = ex.cli(label, args, capped.unwrap_or(limit), honor_cancel);
+    let cut = capped.is_some() && step.timed_out;
+    if cut {
+        p.stopped_at_budget.push(label.to_owned());
+    }
+    (step, cut)
 }
 
 /// One line of `kgraf sandbox status`.
@@ -774,6 +826,11 @@ pub struct SandboxPhase {
     /// The fallback grant the phase ran because the first probe was refused.
     pub fallback: Option<Fallback>,
     pub reruns: Vec<Rerun>,
+    /// Re-runs and steps the time budget kept from starting.
+    pub not_run: Vec<NotRun>,
+    /// Steps and re-runs that were running when the time budget ended, and
+    /// were stopped.
+    pub stopped_at_budget: Vec<String>,
     pub e2e: Vec<Check>,
     pub remove: Option<StepRun>,
     pub status_after: Option<StepRun>,
@@ -791,7 +848,9 @@ impl SandboxPhase {
         if let Some(s) = &self.skipped {
             return format!("not run: {s}");
         }
-        let gate = if self.stopped_at_gate {
+        let gate = if !self.not_run.is_empty() || !self.stopped_at_budget.is_empty() {
+            "INCOMPLETE: the time budget ran out, so some of the re-run did not run or was stopped"
+        } else if self.stopped_at_gate {
             "stopped at the gate (selfcheck failed), the re-run did not happen"
         } else if self.cancelled {
             "cancelled before the re-run ended"
@@ -833,21 +892,35 @@ pub fn run_phase(
     if elevated == Some(false) {
         p.notes.push(NEEDS_ELEVATION.into());
     }
+    // With too little time for setup and the gate, nothing is started: a
+    // setup cut off half done would need the removal to clean it.
+    if let Some(left) = ex.time_left()
+        && left < Duration::from_secs(PHASE_START_SECS)
+    {
+        p.skipped = Some(format!(
+            "budget: setup and the gate need about {PHASE_START_SECS} s, {} s left",
+            left.as_secs()
+        ));
+        return p;
+    }
     if let Err(why) = ex.preflight() {
         p.skipped = Some(why);
         return p;
     }
 
     // From here on, (f) always runs.
-    p.selfcheck_before = Some(ex.cli(
+    let (before, _) = budgeted_cli(
+        ex,
+        &mut p,
         "(b0) selfcheck before setup",
         &["sandbox", "selfcheck"],
         SELFCHECK_LIMIT,
         true,
-    ));
+    );
+    p.selfcheck_before = Some(before);
     let args = setup_args();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let setup = ex.cli("(b) setup", &args, SETUP_LIMIT, true);
+    let (setup, _) = budgeted_cli(ex, &mut p, "(b) setup", &args, SETUP_LIMIT, true);
     if !setup.ok() {
         p.notes.push(format!("Setup {}.", setup.how()));
         if elevated.is_none() {
@@ -856,7 +929,14 @@ pub fn run_phase(
     }
     p.setup = Some(setup);
 
-    let status = ex.cli("(c) status", &["sandbox", "status"], STATUS_LIMIT, true);
+    let (status, _) = budgeted_cli(
+        ex,
+        &mut p,
+        "(c) status",
+        &["sandbox", "status"],
+        STATUS_LIMIT,
+        true,
+    );
     p.status_check = Some(check_ready(&status.output, status.code));
     p.status = Some(status);
 
@@ -867,7 +947,9 @@ pub fn run_phase(
         p.fallback = Some(run_fallback(ex));
     }
 
-    let gate = ex.cli(
+    let (gate, gate_cut) = budgeted_cli(
+        ex,
+        &mut p,
         "(d) selfcheck (gate)",
         &["sandbox", "selfcheck"],
         SELFCHECK_LIMIT,
@@ -885,7 +967,10 @@ pub fn run_phase(
         failure_under_user(&gate)
     };
     p.selfcheck = Some(gate);
-    if !passed && p.dns_failed.is_none() && p.failed_under_user.is_none() {
+    if gate_cut {
+        // The budget ended in the gate: that is not a failed gate, and the
+        // re-run does not start. (f) still runs.
+    } else if !passed && p.dns_failed.is_none() && p.failed_under_user.is_none() {
         p.stopped_at_gate = true;
     } else {
         for s in select(first, ex.every_binary_named()) {
@@ -893,11 +978,33 @@ pub fn run_phase(
                 p.cancelled = true;
                 break;
             }
+            let expected = ex.rerun_expected(&s.id);
+            if let Some(left) = ex.time_left()
+                && (left.is_zero() || left < expected)
+            {
+                p.not_run.push(NotRun {
+                    what: format!("sandbox user re-run of {}", s.id),
+                    why: not_run_reason(expected, left),
+                });
+                continue;
+            }
             let result = ex.rerun(&s.id);
+            if result.budget_stopped {
+                p.stopped_at_budget
+                    .push(format!("sandbox user re-run of {}", s.id));
+            }
             p.reruns.push(Rerun { why: s.why, result });
         }
+        let e2e_expected = Duration::from_secs(E2E_EXPECTED_SECS);
         if cancelled() {
             p.cancelled = true;
+        } else if let Some(left) = ex.time_left()
+            && (left.is_zero() || left < e2e_expected)
+        {
+            p.not_run.push(NotRun {
+                what: "sandbox user end-to-end checks".into(),
+                why: not_run_reason(e2e_expected, left),
+            });
         } else {
             p.e2e = ex.e2e();
         }
@@ -945,7 +1052,16 @@ fn after_of(test: &str, r: &BinaryResult) -> (String, String) {
             .open_test_solo
             .as_ref()
             .and_then(|f| f.solo.clone())
-            .unwrap_or_else(|| if r.timed_out { "hung" } else { "failed" }.into());
+            .unwrap_or_else(|| {
+                if r.budget_stopped {
+                    "stopped at the budget"
+                } else if r.timed_out {
+                    "hung"
+                } else {
+                    "failed"
+                }
+                .into()
+            });
         return (how, tail);
     }
     match r.tests.iter().find(|t| t.name == test) {
@@ -1200,7 +1316,9 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
                 a.map_or("-".into(), |a| a.failed.to_string()),
                 r.passed,
                 r.failed,
-                if r.timed_out {
+                if r.budget_stopped {
+                    "stopped at the budget".to_owned()
+                } else if r.timed_out {
                     "timed out".to_owned()
                 } else {
                     format!("{:?}", r.exit_code)
@@ -1233,6 +1351,16 @@ pub fn render(first: &[BinaryResult], first_e2e: &[Check], p: &SandboxPhase) -> 
                 ));
                 md.push('\n');
             }
+        }
+        if !p.not_run.is_empty() || !p.stopped_at_budget.is_empty() {
+            md.push_str("#### Cut by the time budget\n\n");
+            for n in &p.not_run {
+                md.push_str(&format!("- {}: {}\n", n.what, n.why));
+            }
+            for what in &p.stopped_at_budget {
+                md.push_str(&format!("- {what}: stopped at the budget\n"));
+            }
+            md.push('\n');
         }
         md.push_str(&render_measurements(&p.reruns));
         md.push_str(
@@ -1299,6 +1427,7 @@ mod tests {
             exit_code: Some(if failures.is_empty() { 0 } else { 101 }),
             timed_out: false,
             cancelled: false,
+            budget_stopped: false,
             start_error: None,
             secs: 1.0,
             expected_secs: 1.0,
@@ -1358,16 +1487,45 @@ mod tests {
         /// What the probe after the grant prints, and its exit status.
         probe_out: String,
         probe_code: i32,
+        /// The time budget left, less the reserve; `None`: no budget.
+        left: Option<Duration>,
+        /// What each `kgraf` step that honors cancel takes from `left`.
+        spend_per_cli: Duration,
+        /// Expected seconds of a re-run, by binary id; 30 when absent.
+        expected: Vec<(&'static str, u64)>,
+        /// The re-run of this binary is stopped at the budget: it returns
+        /// `budget_stopped` and leaves no time.
+        stopped_rerun: Option<&'static str>,
+        /// The gate runs out of time (a timeout under a capped limit).
+        gate_times_out: bool,
+        /// The limit each `kgraf` step was given.
+        limits: Vec<(String, Duration)>,
     }
 
     impl Exec for Fake {
+        fn time_left(&self) -> Option<Duration> {
+            self.left
+        }
+        fn rerun_expected(&self, id: &str) -> Duration {
+            let secs = self
+                .expected
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map_or(30, |(_, s)| *s);
+            Duration::from_secs(secs)
+        }
         fn preflight(&mut self) -> Result<(), String> {
             self.calls.push("preflight".into());
             self.preflight.clone().map_or(Ok(()), Err)
         }
-        fn cli(&mut self, label: &str, args: &[&str], _l: Duration, honor: bool) -> StepRun {
+        fn cli(&mut self, label: &str, args: &[&str], limit: Duration, honor: bool) -> StepRun {
             self.calls
                 .push(format!("{} cancel={honor}", args.join(" ")));
+            self.limits.push((label.to_owned(), limit));
+            if honor {
+                self.left = self.left.map(|l| l.saturating_sub(self.spend_per_cli));
+            }
+            let timed_out = self.gate_times_out && label.contains("(d)");
             let (code, out) = match args[1] {
                 _ if args[0] == probe::SUBCOMMAND => (self.probe_code, self.probe_out.as_str()),
                 "setup" => (
@@ -1389,6 +1547,7 @@ mod tests {
                 label: label.into(),
                 command: format!("kgraf {}", args.join(" ")),
                 code: Some(code),
+                timed_out,
                 output: out.into(),
                 ..StepRun::default()
             }
@@ -1396,6 +1555,11 @@ mod tests {
         fn rerun(&mut self, id: &str) -> BinaryResult {
             self.calls.push(format!("rerun {id}"));
             let mut b = bin(id, &[]);
+            if self.stopped_rerun == Some(id) {
+                b.budget_stopped = true;
+                b.exit_code = None;
+                self.left = Some(Duration::ZERO);
+            }
             b.tests = self
                 .passing
                 .iter()
@@ -1447,6 +1611,134 @@ mod tests {
                 &[("w::cargo", "cargo: jobserver failed"), ("w::x", "plain")],
             ),
         ]
+    }
+
+    /// An item whose expected time does not fit in what is left is not
+    /// started, and the report names it. The item before it, which fits,
+    /// runs.
+    #[test]
+    fn a_rerun_that_would_overrun_the_budget_is_not_started_and_is_reported() {
+        let mut ex = Fake {
+            left: Some(Duration::from_secs(400)),
+            expected: vec![
+                ("kgraf-sandbox/test/escape_windows", 60),
+                ("kgraf-cli/test/worker", 900),
+            ],
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(
+            ex.calls
+                .contains(&"rerun kgraf-sandbox/test/escape_windows".to_owned()),
+            "{:?}",
+            ex.calls
+        );
+        assert!(
+            !ex.calls.contains(&"rerun kgraf-cli/test/worker".to_owned()),
+            "the 900 s item must not start with 400 s left: {:?}",
+            ex.calls
+        );
+        let n = p
+            .not_run
+            .iter()
+            .find(|n| n.what.contains("kgraf-cli/test/worker"))
+            .expect("the item is reported");
+        assert!(n.why.starts_with("not run: budget"), "{}", n.why);
+        assert!(n.why.contains("900"), "{}", n.why);
+        assert_eq!(p.reruns.len(), 1);
+        // Cleanup always runs.
+        assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
+        assert!(p.summary().contains("INCOMPLETE"), "{}", p.summary());
+        let md = render(&baseline(), &[], &p);
+        assert!(md.contains("Cut by the time budget"), "{md}");
+        assert!(md.contains("kgraf-cli/test/worker"), "{md}");
+    }
+
+    /// The budget ends while a re-run is running: that re-run is recorded as
+    /// stopped, nothing after it starts, and the removal still runs.
+    #[test]
+    fn reaching_the_budget_stops_the_running_rerun_and_the_removal_still_runs() {
+        let mut ex = Fake {
+            left: Some(Duration::from_secs(4000)),
+            stopped_rerun: Some("kgraf-sandbox/test/escape_windows"),
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert_eq!(
+            p.stopped_at_budget,
+            vec!["sandbox user re-run of kgraf-sandbox/test/escape_windows".to_owned()]
+        );
+        assert!(p.reruns[0].result.budget_stopped);
+        assert!(
+            !ex.calls.contains(&"rerun kgraf-cli/test/worker".to_owned()),
+            "{:?}",
+            ex.calls
+        );
+        assert!(
+            p.not_run
+                .iter()
+                .any(|n| n.what.contains("kgraf-cli/test/worker")),
+            "{:?}",
+            p.not_run
+        );
+        assert!(
+            p.not_run.iter().any(|n| n.what.contains("end-to-end")),
+            "the end-to-end checks need time too: {:?}",
+            p.not_run
+        );
+        assert!(!ex.calls.contains(&"e2e".to_owned()));
+        // The removal ran, after the stop, with no cancel and no cap.
+        assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
+        assert!(p.gone.as_ref().unwrap().ok);
+        assert!(ex.calls.contains(&"teardown".to_owned()));
+        let remove = ex.limits.iter().find(|(l, _)| l.contains("(f) remove"));
+        assert_eq!(remove.map(|(_, l)| *l), Some(REMOVE_LIMIT));
+    }
+
+    /// A step the budget cuts short gets the time left as its limit, and a
+    /// timeout under that limit is recorded as a stop at the budget, not as
+    /// a failed gate.
+    #[test]
+    fn a_step_gets_the_time_left_as_its_limit_and_a_cut_gate_is_not_a_failed_gate() {
+        let mut ex = Fake {
+            left: Some(Duration::from_secs(400)),
+            spend_per_cli: Duration::from_secs(120),
+            gate_times_out: true,
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        let limit = |label: &str| {
+            ex.limits
+                .iter()
+                .find(|(l, _)| l.contains(label))
+                .map(|(_, l)| *l)
+        };
+        // 400 s left: (b0) keeps its 300 s; 280 s left: setup is capped.
+        assert_eq!(limit("(b0)"), Some(SELFCHECK_LIMIT));
+        assert_eq!(limit("(b) setup"), Some(Duration::from_secs(280)));
+        assert!(
+            p.stopped_at_budget
+                .contains(&"(d) selfcheck (gate)".to_owned()),
+            "{:?}",
+            p.stopped_at_budget
+        );
+        assert!(!p.stopped_at_gate);
+        assert!(p.reruns.is_empty());
+        assert!(ex.calls.contains(&"sandbox remove cancel=false".to_owned()));
+    }
+
+    /// With less time than setup and the gate need, the phase does not
+    /// start and changes nothing.
+    #[test]
+    fn a_phase_with_too_little_time_does_not_start() {
+        let mut ex = Fake {
+            left: Some(Duration::from_secs(PHASE_START_SECS - 1)),
+            ..Fake::default()
+        };
+        let p = run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert!(p.skipped.as_deref().unwrap().starts_with("budget"));
+        assert!(ex.calls.is_empty(), "{:?}", ex.calls);
+        assert!(p.summary().starts_with("not run: budget"));
     }
 
     #[test]

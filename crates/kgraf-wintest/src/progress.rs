@@ -39,6 +39,11 @@ pub struct Progress {
     current: Option<usize>,
     /// What the running step is doing now ("test 3 of 12").
     pub detail: String,
+    /// What the running step runs now, when the step name does not say: a
+    /// test binary's id, or its id and a test name for a solo re-run. It
+    /// stands in for the step name on the line, so a stall is attributable
+    /// from the log alone.
+    pub item: String,
     pub passed: u64,
     pub failed: u64,
 }
@@ -98,7 +103,20 @@ impl Progress {
             s.state = StepState::Running { started: now };
             self.current = Some(index);
             self.detail.clear();
+            self.item.clear();
         }
+    }
+
+    /// Name what the running step runs now ([`Progress::item`]).
+    pub fn set_item(&mut self, label: String) {
+        self.item = label;
+        self.detail.clear();
+    }
+
+    /// Name the solo re-run of `test` of the binary `id`.
+    pub fn set_solo(&mut self, id: &str, test: &str) {
+        self.item = format!("solo {id}::{test}");
+        self.detail.clear();
     }
 
     pub fn finish(&mut self, index: usize, now: f64) {
@@ -238,15 +256,20 @@ impl Progress {
             Eta::Finished => "done".to_owned(),
             Eta::About(secs) => format!("ETA {}", eta_words(secs)),
         };
-        let mut line = format!(
-            "[{bar}] {:>3}% {}/{} {} {} | {}",
-            (frac * 100.0).floor() as u32,
-            self.done_count(),
-            self.steps.len(),
-            clock(now),
-            eta,
-            self.current_name().unwrap_or("-"),
-        );
+        let pct = (frac * 100.0).floor() as u32;
+        let (done, total) = (self.done_count(), self.steps.len());
+        // A named item takes the room of the bar and the estimate: on an
+        // 80-column console they push the item off the line, and the
+        // estimate of a step that runs a stalled item is wrong anyway.
+        let mut line = if self.item.is_empty() {
+            format!(
+                "[{bar}] {pct:>3}% {done}/{total} {} {eta} | {}",
+                clock(now),
+                self.current_name().unwrap_or("-")
+            )
+        } else {
+            format!("{pct:>3}% {done}/{total} {} | {}", clock(now), self.item)
+        };
         if !self.detail.is_empty() {
             line.push(' ');
             line.push_str(&self.detail);
@@ -394,5 +417,35 @@ mod tests {
         assert!(line.contains("/ 12s"), "{line}");
         assert!(line.starts_with("[#-"), "{line}");
         assert!(p.render(12.0, 1, 40).chars().count() <= 39);
+    }
+
+    #[test]
+    fn the_line_names_the_binary_of_a_re_run_even_at_80_columns() {
+        let mut p = Progress::new(vec![("sandbox user".into(), 600.0)]);
+        p.start(0, 0.0);
+        p.detail = "test 3 of 12".into();
+        p.set_item("re-run kgraf-orchestrator/test/contract_checks".into());
+        let line = p.render(3600.0 * 1.6, 0, 80);
+        assert!(
+            line.contains("re-run kgraf-orchestrator/test/contract_checks"),
+            "{line}"
+        );
+        assert!(line.chars().count() <= 79);
+        // Naming an item drops the stale detail of the binary before it.
+        assert!(!line.contains("test 3 of 12"), "{line}");
+    }
+
+    #[test]
+    fn a_solo_re_run_names_the_binary_and_the_test() {
+        let mut p = Progress::new(vec![("extended 1/2 a/test/b".into(), 5.0)]);
+        p.start(0, 0.0);
+        p.set_solo("a/test/b", "t::one");
+        assert!(p.render(1.0, 0, 120).contains("solo a/test/b::t::one"));
+        // The next step starts with no item left over.
+        p.push("next".into(), 1.0);
+        p.start(1, 2.0);
+        let line = p.render(3.0, 0, 120);
+        assert!(!line.contains("solo"), "{line}");
+        assert!(line.contains("| next"), "{line}");
     }
 }

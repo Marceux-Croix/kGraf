@@ -10,6 +10,7 @@
 //! kGraf's own sandbox and secret scrubber, and its parsers and cleanup need
 //! the workspace's tests, clippy and formatting gates.
 
+pub mod budget;
 pub mod cli;
 pub mod console;
 pub mod e2e;
