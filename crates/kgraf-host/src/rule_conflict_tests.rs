@@ -95,7 +95,8 @@ async fn a_denied_verify_program_is_said_and_traced_and_the_run_still_completes(
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "the warning never stops the run: {report:?}"
+        "the warning never stops the run: {report:?}\n{}",
+        super::failed_verdicts(&trace)
     );
     assert_eq!(report.verified, vec!["a".to_owned()], "the command ran");
 }

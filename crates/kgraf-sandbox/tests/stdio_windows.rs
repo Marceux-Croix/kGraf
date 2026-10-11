@@ -41,6 +41,10 @@ const HOLDS: i32 = 0;
 const BROKEN: i32 = 1;
 const OTHER_ERR: i32 = 3;
 
+/// How long the `live` probe runs: a sandboxed process that lives while
+/// other spawns of this process happen.
+const LIVE_FOR: Duration = Duration::from_secs(12);
+
 // ---- probe side -------------------------------------------------------------
 
 /// The command's standard input is not a console: no handle, or one that
@@ -117,6 +121,10 @@ fn probe_entry() {
     let result = match action.as_str() {
         "stdin_not_console" => check_stdin_not_console(),
         "console_stdin_refused" => check_console_stdin_refused(),
+        "live" => {
+            std::thread::sleep(LIVE_FOR);
+            Ok((true, format!("lived {LIVE_FOR:?}")))
+        }
         other => Err(std::io::Error::other(format!("unknown probe {other}"))),
     };
     let (code, line) = match result {
@@ -324,12 +332,18 @@ fn a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start() {
     let e = env();
     let stop = Arc::new(AtomicBool::new(false));
     let spawner = tokio_spawns(stop.clone());
+    // Each long command is this test binary's `live` probe, which only
+    // sleeps. A `ping` to the loopback address served before, but under the
+    // token sandbox it got no reply and exited with status 1 (its output
+    // went to NUL), so the test failed on the command before it judged the
+    // pipes. The sleep needs nothing the sandbox may refuse.
     let mut long = Vec::new();
     for _ in 0..3 {
         long.push(
-            sandboxed_command(&policy(&e.ws), "cmd.exe", e.ws.root())
+            sandboxed_command(&policy(&e.ws), self_exe(), e.ws.root())
                 .unwrap()
-                .args(["/d", "/c", "ping -n 13 127.0.0.1 >NUL"])
+                .args(probe_args())
+                .env("KGRAF_STDIO_PROBE", "live")
                 .stdin(Redirect::Null)
                 .stdout(Redirect::Piped)
                 .stderr(Redirect::Piped)
@@ -343,7 +357,13 @@ fn a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start() {
     let (spawned, slowest) = spawner.join().unwrap();
     for child in long {
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(HOLDS),
+            "{}; stderr: {}",
+            probe_line(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     for line in kgraf_sandbox::sandbox_user::launch_record::lines() {
         println!("{line}");

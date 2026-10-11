@@ -722,8 +722,10 @@ async fn without_contract_checks_no_interface_is_asked_checked_or_offered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_with_different_tool_lists_share_a_route_in_one_process() {
     const ROUTE: &str = "fake-shared";
-    async fn one(checks: bool, run: &str) -> (RunStatus, Vec<crate::Notice>) {
-        let (_dir, _root, mut config) = project(ROUTE);
+    /// The run's status, its notices, and what its failed checks said
+    /// ([`crate::tests::failed_verdicts`]), read before the project is gone.
+    async fn one(checks: bool, run: &str) -> (RunStatus, Vec<crate::Notice>, String) {
+        let (_dir, root, mut config) = project(ROUTE);
         config.contract_checks = checks;
         let host = host(config, ROUTE, fake(COMPILE));
         let mut notices = Vec::new();
@@ -734,18 +736,24 @@ async fn runs_with_different_tool_lists_share_a_route_in_one_process() {
             .run(RunStart::Instruction("Add a config parser.".into()))
             .await
             .expect("run");
-        (outcome.report.status, notices)
+        let trace = std::fs::read_to_string(root.join(".kgraf/runs").join(run).join("trace.jsonl"))
+            .unwrap_or_default();
+        (
+            outcome.report.status,
+            notices,
+            crate::tests::failed_verdicts(&trace),
+        )
     }
     // Each run's future is boxed: unboxed, the test thread (2 MiB) holds
     // both inline, which a debug build's unoptimized state machines overflow
     // on Linux. An optimized build needs under 512 KiB for the same path.
-    let (first, _) = Box::pin(one(true, "seq-on")).await;
-    assert_eq!(first, RunStatus::Completed);
-    let (second, notices) = Box::pin(one(false, "seq-off")).await;
+    let (first, _, why) = Box::pin(one(true, "seq-on")).await;
+    assert_eq!(first, RunStatus::Completed, "{why}");
+    let (second, notices, why) = Box::pin(one(false, "seq-off")).await;
     assert_eq!(
         second,
         RunStatus::Completed,
-        "not refused by the first run's prefix"
+        "not refused by the first run's prefix\n{why}"
     );
     assert!(
         notices.iter().any(|n| matches!(
@@ -758,8 +766,8 @@ async fn runs_with_different_tool_lists_share_a_route_in_one_process() {
         Box::pin(one(true, "con-on")),
         Box::pin(one(false, "con-off"))
     );
-    assert_eq!(a.0, RunStatus::Completed);
-    assert_eq!(b.0, RunStatus::Completed);
+    assert_eq!(a.0, RunStatus::Completed, "{}", a.2);
+    assert_eq!(b.0, RunStatus::Completed, "{}", b.2);
 }
 
 /// A scratch root writable by others, or a symbolic link, is passed over

@@ -89,6 +89,9 @@ pub(super) struct Script {
     last_planner_request: std::sync::Mutex<String>,
     /// The project checkout, for [`Worker::NeedsLaterMember`].
     root: std::sync::Mutex<Option<PathBuf>>,
+    /// The failed tool results the worker requests carried, first lines
+    /// each, once: what the worker's commands said when they failed.
+    failed_results: std::sync::Mutex<Vec<String>>,
 }
 
 impl Script {
@@ -101,7 +104,49 @@ impl Script {
             planner_calls: AtomicUsize::new(0),
             last_planner_request: std::sync::Mutex::new(String::new()),
             root: std::sync::Mutex::new(None),
+            failed_results: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// What the worker's failed tool calls said, for a test that expects the
+    /// run to complete: a guard's or a hold's reason says the worker made no
+    /// change, not that its commands could not start, so this names the
+    /// cause when the platform is it.
+    pub(super) fn failed_tool_results(&self) -> String {
+        let seen = self
+            .failed_results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if seen.is_empty() {
+            "failed tool calls: none".to_owned()
+        } else {
+            format!("failed tool calls:\n{}", seen.join("\n"))
+        }
+    }
+
+    fn note_failed_results(&self, messages: &[kgraf_provider::Message]) {
+        let mut seen = self
+            .failed_results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for content in messages.iter().flat_map(|m| m.content.iter()) {
+            if let Content::ToolResult {
+                content,
+                is_error: true,
+                ..
+            } = content
+            {
+                let head: Vec<&str> = content
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(4)
+                    .collect();
+                let head = head.join(" | ");
+                if !seen.contains(&head) {
+                    seen.push(head);
+                }
+            }
+        }
     }
 }
 
@@ -201,6 +246,7 @@ impl Provider for Script {
                 .iter()
                 .filter(|m| m.role == Role::Assistant)
                 .count();
+            self.note_failed_results(&request.messages);
             let seen = format!("{:?}", request.messages);
             let granted = seen.contains(GRANT_MARK);
             if round == 0 {
@@ -462,6 +508,20 @@ async fn attended(
     }
 }
 
+/// What the attended run `id` under `root` said in its failed checks, and
+/// what its worker's failed tool calls said ([`super::failed_verdicts`],
+/// [`Script::failed_tool_results`]). Takes the fields, not the [`Attended`],
+/// since awaiting its run moves the handle out.
+fn attended_why(root: &Path, script: &Script, id: &str) -> String {
+    let trace = std::fs::read_to_string(root.join(".kgraf/runs").join(id).join("trace.jsonl"))
+        .unwrap_or_default();
+    format!(
+        "{}\n{}",
+        super::failed_verdicts(&trace),
+        script.failed_tool_results()
+    )
+}
+
 async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     for _ in 0..2_000 {
         if let Some(v) = probe() {
@@ -501,7 +561,8 @@ async fn orchestrator_decides_grants_a_shortfall_and_the_next_attempt_runs_it() 
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}\n{trace}"
+        "{report:?}\n{trace}\n{}",
+        script.failed_tool_results()
     );
     assert_eq!(report.verified, vec!["a".to_owned()]);
     assert!(report.unverified.is_empty(), "{:?}", report.unverified);
@@ -545,7 +606,8 @@ async fn a_wrapped_command_is_granted_with_every_program_it_runs() {
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}\n{trace}"
+        "{report:?}\n{trace}\n{}",
+        script.failed_tool_results()
     );
     let lines = shortfall_lines(&trace);
     assert_eq!(lines.len(), 1, "{trace}");
@@ -614,7 +676,8 @@ async fn auto_accept_edits_and_bypass_run_the_command_without_a_shortfall() {
         assert_eq!(
             report.status,
             kgraf_orchestrator::RunStatus::Completed,
-            "{name}: {report:?}\n{trace}"
+            "{name}: {report:?}\n{trace}\n{}",
+            script.failed_tool_results()
         );
         assert!(shortfall_lines(&trace).is_empty(), "{name}: {trace}");
         assert_eq!(script.attempts.load(Ordering::SeqCst), 1, "{name}");
@@ -654,7 +717,8 @@ async fn auto_runs_a_script_of_allowed_programs_and_names_the_one_it_does_not_al
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}\n{trace}"
+        "{report:?}\n{trace}\n{}",
+        script.failed_tool_results()
     );
     assert!(shortfall_lines(&trace).is_empty(), "{trace}");
     assert_eq!(script.attempts.load(Ordering::SeqCst), 1);
@@ -747,7 +811,8 @@ async fn manual_attended_asks_the_user_and_a_grant_releases_the_contract() {
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}"
+        "{report:?}\n{}",
+        attended_why(&a.root, &a.script, "sf-ask")
     );
     assert!(a.script.granted_ran.load(Ordering::SeqCst));
     let trace =
@@ -780,7 +845,8 @@ async fn a_mode_change_releases_a_waiting_request() {
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}"
+        "{report:?}\n{}",
+        attended_why(&a.root, &a.script, "sf-switch")
     );
     assert!(a.desk.pending_permissions().is_empty());
     let trace =
@@ -812,7 +878,8 @@ async fn a_report_nothing_refused_is_answered_and_the_worker_finishes() {
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}\n{trace}"
+        "{report:?}\n{trace}\n{}",
+        script.failed_tool_results()
     );
     let lines = shortfall_lines(&trace);
     assert_eq!(lines.len(), 2, "{trace}");
@@ -1076,8 +1143,14 @@ async fn a_refusal_beside_a_failing_check_is_never_called_verified() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_vacuous_check_is_unverified_and_a_real_one_is_not() {
     let manual = || control(kgraf_tools::PermissionMode::Manual);
-    let (report, _, _) = run(Worker::Writes, manual(), "true", "sf-vacuous").await;
-    assert_eq!(report.status, kgraf_orchestrator::RunStatus::Completed);
+    let (report, trace, script) = run(Worker::Writes, manual(), "true", "sf-vacuous").await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{}\n{}",
+        super::failed_verdicts(&trace),
+        script.failed_tool_results()
+    );
     assert_eq!(report.unverified.len(), 1, "{report:?}");
     assert!(
         report.unverified[0].1.contains("checks nothing"),
@@ -1085,8 +1158,15 @@ async fn a_vacuous_check_is_unverified_and_a_real_one_is_not() {
         report.unverified
     );
 
-    let (report, _, _) = run(Worker::Writes, manual(), "test -f a.txt", "sf-verified").await;
-    assert_eq!(report.status, kgraf_orchestrator::RunStatus::Completed);
+    let (report, trace, script) =
+        run(Worker::Writes, manual(), "test -f a.txt", "sf-verified").await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{}\n{}",
+        super::failed_verdicts(&trace),
+        script.failed_tool_results()
+    );
     assert!(report.unverified.is_empty(), "{report:?}");
 }
 
@@ -1149,7 +1229,8 @@ async fn plan_review_blocks_dispatch_until_the_user_approves() {
     assert_eq!(
         report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "{report:?}"
+        "{report:?}\n{}",
+        attended_why(&a.root, &a.script, "pr-approve")
     );
     assert_eq!(a.script.attempts.load(Ordering::SeqCst), 1);
 }
@@ -1215,6 +1296,7 @@ async fn headless_plan_review_fails_loud_unless_approved_on_the_command_line() {
     let (_dir, mut config) = project();
     config.routes = vec!["mine:llama3".into()];
     config.verify = "test -f a.txt".into();
+    let root = config.root.clone();
     let script = Script::new(Worker::Writes);
     let host = Host::open(config.clone())
         .expect("open")
@@ -1248,9 +1330,15 @@ async fn headless_plan_review_fails_loud_unless_approved_on_the_command_line() {
         .run(RunStart::Instruction("copy README.md to a.txt".into()))
         .await
         .expect("run");
+    let trace =
+        std::fs::read_to_string(root.join(".kgraf/runs/pr-auto/trace.jsonl")).unwrap_or_default();
     assert_eq!(
         outcome.report.status,
-        kgraf_orchestrator::RunStatus::Completed
+        kgraf_orchestrator::RunStatus::Completed,
+        "{:?}\n{}\n{}",
+        outcome.report,
+        super::failed_verdicts(&trace),
+        script.failed_tool_results()
     );
 }
 
@@ -1509,9 +1597,12 @@ fn a_hosted_run_fits_in_half_a_test_threads_stack() {
                         .expect("allow"),
                     false,
                 );
-                let (report, trace, _) =
+                let (report, trace, script) =
                     run(Worker::RunsScript, allowing, "test -f a.txt", "sf-stack").await;
-                (report.status, trace)
+                (
+                    report.status,
+                    format!("{trace}\n{}", script.failed_tool_results()),
+                )
             })
         })
         .expect("spawn")

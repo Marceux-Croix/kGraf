@@ -2177,3 +2177,95 @@ host and cross-compiled checks.
   is a "Known gap" line under the verdict.
 - **`--only <filter>`** runs named binaries or tests in both halves
   (`docs/WINDOWS-TESTING.md`).
+
+## Amendment (2026-10-11): what a full Windows run counted, and a run that fits its budget
+
+A full Windows self-test (Windows Server 2025 Datacenter 24H2, build 26100.33438) read
+INCOMPLETE: its budget of 115 minutes did not admit the re-run of `contract_checks`; of what
+ran, 46 tests and one end-to-end check counted, and 103 baseline failures were listed apart.
+The fixes below stand on code reading and host and cross-compiled checks.
+
+- **A sandboxed `ping` was the long command of a pipe test.**
+  `stdio_windows::a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start`
+  started three sandboxed `cmd /c ping -n 13 127.0.0.1 >NUL` commands to live while
+  unrelated spawns happen. Under the token sandbox `ping` got no reply and exited with
+  status 1, its output gone to NUL, so the test failed on the command (`Output { status: 1,
+  stdout: "", stderr: "" }`) before it judged the pipes; as the sandbox user it passed. The
+  long command is now the test binary's own `live` probe, a 12 s sleep that needs nothing the
+  sandbox may refuse, and a failed probe says its probe line and standard error. The pipe
+  assertions are unchanged. Windows only: it stands on the cross-compiled build.
+- **The setup test ran `kgraf.exe` from a folder its own user may write.** Setup refuses to
+  install the launcher service from a program file, or a folder above one, that anyone but
+  an administrator may write, and the tagged setup test ran the build's `kgraf.exe` from its
+  build or work folder, so setup failed in every run since that check landed. The test now
+  copies `kgraf.exe` and the runner into a new folder on the system drive whose list admits
+  writes by SYSTEM and the Administrators group only (Users read and run), owned by that
+  group, as an installed kGraf is, and removes it at the end. The check itself is unchanged.
+  Its panic messages now end with the step that failed: the report keeps a tail, and the
+  removal's long output had pushed the reason out of it. Windows and elevated only: it
+  stands on the cross-compiled build.
+- **Token sandbox failures whose own output named no limit.** 21 baseline failures of
+  `kgraf_host#rest` and 3 of `kgraf_shell`'s `scheduler_bg` ran a check or a worker command
+  through Git Bash, which ends with `STATUS_DLL_INIT_FAILED` under the token sandbox, but
+  each printed only the run's status, a verdict's `passed()`, a held reason that counts
+  failed attempts, or the worker no-change guard's reason, which says the model wrote nothing
+  (true: its `cp` never started). Each passed as the sandbox user. These tests now
+  print what the run's failed checks said (the details of the failed `verdict` events of its
+  trace), what the worker's failed tool calls said, or the verdict itself, so the limit is in
+  their own output; the semantic speculation test first checks its premise, that the gate
+  passes on the tip, and prints that verdict. The classification rule is unchanged.
+- **A binary whose failures name only `STATUS_DLL_INIT_FAILED` was never re-run.** The
+  re-run selection read the blocker words alone, so `kgraf_shell` stayed out of it and its
+  failures counted. The selection now reads the same markers as the classification.
+- **The own-file rule misread Windows paths, a real defect.** A failure that names a file
+  the contract wrote, and that the dispatch base did not show, is never deferred to the root
+  gate. Cargo on Windows names files with backslashes, and the rule matched whole paths
+  between `/` separators, so in `<root>\wcl-core\Cargo.toml`, a member manifest an open
+  contract's sources complete, it read the tail `Cargo.toml` as the root manifest the contract
+  wrote: `a_narrowed_check_that_needs_open_contracts_sources_is_deferred_to_the_root_gate` and
+  `without_a_root_gate_the_reason_says_the_check_cannot_judge_the_contract_alone` failed in
+  both halves. On Windows the rule now reads the output with `/` for each backslash, and
+  replaces the worktree in its drive form (either case of letter), in the MSYS form Git
+  Bash's programs print (`/c/...`), and in both forms of its canonical path, which spells a
+  short 8.3 folder name long. `a_failure_naming_a_file_the_contract_wrote_is_not_deferred`,
+  whose stand-in for cargo prints `$PWD` through Git Bash, needs the MSYS form. The host test
+  `own_file_failure_reads_windows_paths_in_each_spelling` fails under the old rule.
+- **contract_checks was cut by the budget, not failing.** Each of its 15 baseline failures
+  names the cargo jobserver or `STATUS_DLL_INIT_FAILED`, and its whole re-run passed every one
+  as the sandbox user on an earlier run; the budget left 762 s for an expected 1,242 s.
+- **An end-to-end check is expected under the token sandbox by the rule a test is.** A
+  baseline check leaves the count only when the check with the same id passed as the sandbox
+  user and its own baseline detail or output carries a token sandbox marker. `shell.git_bash`
+  is the case: Git Bash ends with `NtCreateDirectoryObject(...): 0xC0000022` and exit status
+  -1073741502 in the baseline, and passes as the sandbox user. The report lists it beside the
+  tests as `end-to-end check`.
+- **The DNS test's failure is the known gap, not a count, only while the gap is measured.**
+  The re-run's `dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service` fails
+  while the name resolution cache filters are absent. Its failure leaves the count, and is
+  listed under "Known gaps" and named in the known gap line, only when the gate failed on DNS
+  alone and the failure's own output says "This is the recorded gap", which the test prints
+  only when such a filter is absent or disabled. A leak with every filter in place, or any
+  other failure of that binary, still counts.
+- **The list of tests not re-run alone names only counted ones.** A baseline test the cap on
+  solo re-runs left out, and that the sandbox user explained, needs no solo re-run.
+- **A full run fits its budget.** The bundle took 102.5 minutes, 2,668 s of it in the sandbox
+  user phase, where whole re-runs took 2,489 s: `kgraf_host#rest` 933 s to judge 89 failures
+  among 448 tests, the bench-briefs library 677 s for 21 among 70, `contract_flow` 512 s for 1
+  among 72. The re-run of a binary chosen for its baseline failures now runs only those tests
+  and the test it was running when it ended, by full name (libtest `--exact`); a sandbox test
+  binary still runs whole, and so does a binary whose list of names would not fit on one
+  command line. Each failure still gets a first run of its own as the sandbox user, so the
+  rule that classifies it is unchanged. What the phase no longer proves: that a test which
+  passed in the baseline also passes as the sandbox user, outside the sandbox test binaries.
+  Timed per test on a development machine, the failed tests are 66 % of `kgraf_host#rest`'s
+  time, 93 % of the bench-briefs library's, 18 % of `contract_flow`'s and 74 % of
+  `contract_checks`'. Applied to the Windows times, the phase saves about 820 s and the
+  `contract_checks` re-run adds 440 to 1,080 s, so the bundle projects to 97 to 107 minutes
+  and the job to 122 to 139. The job limit goes from 150 to 165 minutes, about 20 minutes of
+  margin in the slower case; a job bills only the minutes it runs. A re-run of some tests is
+  expected to take their share of the binary's expected time.
+
+What the next full run should read: `ALL PASSED`, with the `Known gap: DNS ...` line naming
+the DNS test, which "Known gaps" lists; "Expected under the token sandbox" lists the
+baseline's token sandbox failures and `shell.git_bash`, each `passed` as the sandbox user;
+nothing under "Not run" says `not run: budget`; (f) leaves nothing.

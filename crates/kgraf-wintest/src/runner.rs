@@ -1411,6 +1411,29 @@ struct PhaseExec<'a> {
     time_budget: Budget,
 }
 
+/// The binary `run` limited to the tests `names`, by full name: the
+/// sandbox user re-run of a binary's baseline failures
+/// ([`sandbox_phase::select`]).
+fn rerun_of(run: &TestRun, names: &[String]) -> TestRun {
+    TestRun {
+        filters: names.to_vec(),
+        exact: true,
+        ..run.clone()
+    }
+}
+
+/// The expected seconds of a re-run of `tests` of a binary expected to take
+/// `expected` for its `listed` tests: its share of the whole, at least one
+/// start-up. The whole when the count of either is unknown.
+fn rerun_secs(expected: f64, listed: Option<u64>, tests: Option<usize>) -> f64 {
+    match (listed, tests) {
+        (Some(all), Some(n)) if all > 0 && (n as u64) < all => {
+            (expected * n as f64 / all as f64).max(SECS_BINARY_BASE)
+        }
+        _ => expected,
+    }
+}
+
 impl PhaseExec<'_> {
     fn kgraf(&self) -> PathBuf {
         self.bundle.join("programs").join("kgraf.exe")
@@ -1488,9 +1511,16 @@ impl Exec for PhaseExec<'_> {
         }
     }
 
-    fn rerun(&mut self, id: &str) -> BinaryResult {
-        self.console
-            .log(&format!("  sandbox user: running {id} again"));
+    fn rerun(&mut self, id: &str, tests: Option<&[String]>) -> BinaryResult {
+        match tests {
+            Some(t) => self.console.log(&format!(
+                "  sandbox user: running {} test(s) of {id} again",
+                t.len()
+            )),
+            None => self
+                .console
+                .log(&format!("  sandbox user: running {id} again")),
+        }
         let Some(run) = self.runs.iter().find(|r| r.id == id) else {
             return BinaryResult {
                 id: id.to_owned(),
@@ -1516,7 +1546,16 @@ impl Exec for PhaseExec<'_> {
                 measurements: Vec::new(),
             };
         };
-        let (expected, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        let expected = self.rerun_expected(id, tests).as_secs_f64();
+        let (_, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        let filtered;
+        let (run, listed) = match tests {
+            Some(names) => {
+                filtered = rerun_of(run, names);
+                (&filtered, Some(names.len() as u64))
+            }
+            None => (*run, listed),
+        };
         // The progress line names the binary that runs, not only the phase.
         self.console.with(|p, _| p.set_item(format!("re-run {id}")));
         let result = run_binary(
@@ -1537,9 +1576,9 @@ impl Exec for PhaseExec<'_> {
         self.time_budget.left()
     }
 
-    fn rerun_expected(&self, id: &str) -> Duration {
-        let (expected, _) = self.by_id.get(id).copied().unwrap_or((30.0, None));
-        Duration::from_secs_f64(expected)
+    fn rerun_expected(&self, id: &str, tests: Option<&[String]>) -> Duration {
+        let (expected, listed) = self.by_id.get(id).copied().unwrap_or((30.0, None));
+        Duration::from_secs_f64(rerun_secs(expected, listed, tests.map(<[String]>::len)))
     }
 
     fn every_binary_named(&self) -> bool {
@@ -1916,7 +1955,7 @@ exec sleep 30
                 seen
             })
         };
-        let r = ex.rerun("p/test/fake");
+        let r = ex.rerun("p/test/fake", None);
         assert!(r.budget_stopped);
         let seen = sampler.join().unwrap();
         assert!(
@@ -2115,7 +2154,7 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             every_binary_named: false,
             time_budget: Budget::unlimited(),
         };
-        let r = ex.rerun("p/test/fake");
+        let r = ex.rerun("p/test/fake", None);
         assert!(
             r.measurements[0].line.contains("switch=1"),
             "{:?}",
@@ -2198,6 +2237,32 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         );
         assert_eq!(limit_for(10.0), Duration::from_secs(600));
         assert_eq!(limit_for(1000.0), Duration::from_secs(2400));
+        // The sandbox user re-run of two baseline failures names exactly
+        // those, in place of the run's own filters.
+        let again = rerun_of(&r, &["tests::b".to_owned(), "tests::c".to_owned()]);
+        assert_eq!(
+            test_args(&again),
+            vec![
+                "--test-threads=1",
+                "--exact",
+                "tests::b",
+                "tests::c",
+                "--skip",
+                "needs_cargo"
+            ]
+        );
+    }
+
+    /// A re-run of some tests of a binary is expected to take their share
+    /// of its whole time, never less than a start-up; with no count known it
+    /// is expected to take the whole.
+    #[test]
+    fn a_rerun_of_some_tests_is_expected_to_take_their_share() {
+        assert_eq!(rerun_secs(1242.0, Some(31), Some(15)), 1242.0 * 15.0 / 31.0);
+        assert_eq!(rerun_secs(100.0, Some(1000), Some(1)), SECS_BINARY_BASE);
+        assert_eq!(rerun_secs(100.0, None, Some(1)), 100.0);
+        assert_eq!(rerun_secs(100.0, Some(10), None), 100.0);
+        assert_eq!(rerun_secs(100.0, Some(10), Some(10)), 100.0);
     }
 
     /// The binaries a sandbox user run measured as slow get limits that

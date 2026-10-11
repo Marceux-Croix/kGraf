@@ -1413,6 +1413,68 @@ fn update_board(
 mod tests {
     use super::*;
 
+    /// What the failed checks of every run under the project `root` said:
+    /// the detail of each `verdict` event of its traces that did not pass,
+    /// first lines each, once. A test that expects a run to complete prints
+    /// it, since a blocked run's reason says only how many attempts failed,
+    /// so a failure the platform caused (a check program that could not
+    /// start) names its cause.
+    fn failed_checks(root: &Path) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let runs = std::fs::read_dir(root.join(".kgraf/runs"))
+            .into_iter()
+            .flatten()
+            .flatten();
+        for run in runs {
+            let trace = std::fs::read_to_string(run.path().join("trace.jsonl")).unwrap_or_default();
+            for line in trace.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let event = v.get("event").unwrap_or(&v);
+                if event.get("event").and_then(|e| e.as_str()) != Some("verdict")
+                    || event.get("passed").and_then(|p| p.as_bool()) != Some(false)
+                {
+                    continue;
+                }
+                let detail = event.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+                let head: Vec<&str> = detail.lines().filter(|l| !l.is_empty()).take(4).collect();
+                let head = head.join(" | ");
+                if !out.contains(&head) {
+                    out.push(head);
+                }
+            }
+        }
+        if out.is_empty() {
+            "failed checks: none in the traces".to_owned()
+        } else {
+            format!("failed checks:\n{}", out.join("\n"))
+        }
+    }
+
+    #[test]
+    fn failed_checks_name_each_failed_verdict_of_every_run_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let run = dir.path().join(".kgraf/runs/r1");
+        std::fs::create_dir_all(&run).expect("mkdir");
+        let failed = r#"{"seq":1,"event":{"event":"verdict","passed":false,"detail":"`test -f made.txt` failed: $ test -f made.txt\n\n[exit code: 0xc0000142]"}}"#;
+        let passed = r#"{"seq":2,"event":{"event":"verdict","passed":true,"detail":"ok"}}"#;
+        std::fs::write(
+            run.join("trace.jsonl"),
+            format!("{failed}\n{failed}\n{passed}\n"),
+        )
+        .expect("trace");
+        assert_eq!(
+            failed_checks(dir.path()),
+            "failed checks:\n`test -f made.txt` failed: $ test -f made.txt | [exit code: 0xc0000142]"
+        );
+        let empty = tempfile::tempdir().expect("dir");
+        assert_eq!(
+            failed_checks(empty.path()),
+            "failed checks: none in the traces"
+        );
+    }
+
     #[test]
     fn the_aggregate_line_never_names_a_schedule() {
         let summary = ScheduleSummary {
@@ -1947,7 +2009,8 @@ mod tests {
         assert_eq!(
             names,
             ["added", "deferred", "started", "completed"],
-            "{kinds:?}"
+            "{kinds:?}\n{}",
+            failed_checks(&root)
         );
         assert!(
             kinds[2].1.starts_with("claimed and started after ")
@@ -2010,7 +2073,8 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, TickEvent::Completed { .. })),
-            "the run completed: {events:?}"
+            "the run completed: {events:?}\n{}",
+            failed_checks(&root)
         );
         let kinds = model.prompts.lock().expect("lock").clone();
         for kind in ["decompose", "worker-patch", "worker-done"] {
@@ -2595,7 +2659,8 @@ mod tests {
             lines
                 .iter()
                 .any(|l| matches!(l, Line::Notice(n) if n.contains("ended completed"))),
-            "{lines:?}"
+            "{lines:?}\n{}",
+            failed_checks(&root)
         );
         assert!(
             lines

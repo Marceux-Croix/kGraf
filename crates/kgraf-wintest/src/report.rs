@@ -227,16 +227,21 @@ pub struct Headline {
     /// Failed end-to-end checks, of the baseline and of the sandbox user.
     pub e2e_fail: usize,
     /// Baseline failures expected under the token sandbox, listed apart
-    /// ([`crate::sandbox_phase::expected_under_token_sandbox`]).
+    /// ([`crate::sandbox_phase::expected_under_token_sandbox`]), and
+    /// baseline end-to-end checks by the same rule
+    /// ([`crate::sandbox_phase::e2e_expected_under_token_sandbox`]).
     pub expected: usize,
     /// Known gaps the run measured, each named on a line of its own.
     pub known_gaps: Vec<String>,
 }
 
-/// The counts behind the verdict. A baseline failure leaves the count only
-/// when the sandbox user re-run passed the same test and its baseline output
-/// names a token sandbox limit; nothing of the re-run and no end-to-end
-/// failure ever leaves it.
+/// The counts behind the verdict. A baseline failure, or a baseline
+/// end-to-end check, leaves the count only when the sandbox user passed the
+/// same test or check and its baseline output names a token sandbox limit.
+/// Of the re-run, only the DNS test's failure leaves it, and only when it is
+/// the DNS gap the gate measured and the headline names as a known gap
+/// ([`crate::sandbox_phase::is_recorded_dns_gap`]); every other failure of
+/// the re-run counts.
 pub fn headline(r: &Report) -> Headline {
     let t = totals(r);
     let mut h = Headline {
@@ -246,19 +251,42 @@ pub fn headline(r: &Report) -> Headline {
         ..Headline::default()
     };
     if let Some(p) = &r.sandbox_user {
-        h.expected =
+        let tests =
             crate::sandbox_phase::expected_under_token_sandbox(&r.binaries, &p.reruns).len();
-        h.failed = h.failed.saturating_sub(h.expected as u64);
+        let checks = crate::sandbox_phase::e2e_expected_under_token_sandbox(&r.e2e, &p.e2e).len();
+        h.expected = tests + checks;
+        h.failed = h.failed.saturating_sub(tests as u64);
+        h.e2e_fail = h.e2e_fail.saturating_sub(checks);
+        let mut gap_tests = Vec::new();
         for rr in &p.reruns {
             let (failed, _, hung) = tally(&rr.result);
-            h.failed += failed;
+            let gap: Vec<&Failure> = rr
+                .result
+                .failures
+                .iter()
+                .filter(|f| crate::sandbox_phase::is_recorded_dns_gap(p, &rr.result.id, f))
+                .collect();
+            h.failed += failed.saturating_sub(gap.len() as u64);
+            gap_tests.extend(
+                gap.iter()
+                    .map(|f| format!("{} :: {}", rr.result.id, f.test)),
+            );
             h.hung_or_crashed += usize::from(hung);
         }
         h.e2e_fail += p.e2e.iter().filter(|c| c.status == Status::Fail).count();
         if let Some(dns) = &p.dns_failed {
+            let tests = if gap_tests.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} fails as the sandbox user while the gap stands and is listed under \
+                     Known gaps, not counted",
+                    gap_tests.join(", ")
+                )
+            };
             h.known_gaps.push(format!(
                 "DNS is not confined on this machine: name lookups by the sandbox users without \
-                 the network can leave it ({dns})"
+                 the network can leave it ({dns}){tests}"
             ));
         }
     }
@@ -450,6 +478,9 @@ pub fn render(r: &Report) -> String {
     let expected = r.sandbox_user.as_ref().map_or_else(Vec::new, |p| {
         crate::sandbox_phase::expected_under_token_sandbox(&r.binaries, &p.reruns)
     });
+    let expected_checks = r.sandbox_user.as_ref().map_or_else(Vec::new, |p| {
+        crate::sandbox_phase::e2e_expected_under_token_sandbox(&r.e2e, &p.e2e)
+    });
     md.push_str("\n## Failures\n\n");
     let mut any = false;
     for b in &r.binaries {
@@ -483,12 +514,19 @@ pub fn render(r: &Report) -> String {
             md.push_str(&fence("text", &f.tail));
             md.push('\n');
         }
-        if !b.rerun_skipped.is_empty() {
+        // A test listed apart as expected needs no solo re-run: the sandbox
+        // user's run of it is the evidence. Only the counted ones are named.
+        let skipped: Vec<&String> = b
+            .rerun_skipped
+            .iter()
+            .filter(|t| !expected.iter().any(|e| e.binary == b.id && &e.test == *t))
+            .collect();
+        if !skipped.is_empty() {
             any = true;
             md.push_str(&format!(
                 "### {}: not re-run alone (cap reached)\n\n{}\n\n",
                 b.id,
-                b.rerun_skipped
+                skipped
                     .iter()
                     .map(|t| format!("- {t}"))
                     .collect::<Vec<_>>()
@@ -506,7 +544,12 @@ pub fn render(r: &Report) -> String {
             md.push('\n');
         }
     }
-    for c in r.e2e.iter().filter(|c| c.status == Status::Fail) {
+    for c in r
+        .e2e
+        .iter()
+        .filter(|c| c.status == Status::Fail)
+        .filter(|c| !expected_checks.iter().any(|e| e.id == c.id))
+    {
         any = true;
         md.push_str(&format!(
             "### e2e {}: {}\n\n{}\n\n",
@@ -520,6 +563,9 @@ pub fn render(r: &Report) -> String {
     if let Some(p) = &r.sandbox_user {
         for b in p.reruns.iter().map(|rr| &rr.result) {
             for f in &b.failures {
+                if crate::sandbox_phase::is_recorded_dns_gap(p, &b.id, f) {
+                    continue;
+                }
                 any = true;
                 md.push_str(&format!(
                     "### sandbox user: {} :: {}\n\nClass: {}\n\n",
@@ -562,17 +608,45 @@ pub fn render(r: &Report) -> String {
         md.push_str("None.\n");
     }
 
+    if let Some(p) = &r.sandbox_user {
+        let gap: Vec<(&str, &Failure)> = p
+            .reruns
+            .iter()
+            .flat_map(|rr| {
+                rr.result
+                    .failures
+                    .iter()
+                    .map(|f| (rr.result.id.as_str(), f))
+            })
+            .filter(|(id, f)| crate::sandbox_phase::is_recorded_dns_gap(p, id, f))
+            .collect();
+        if !gap.is_empty() {
+            md.push_str("\n## Known gaps\n\n");
+            md.push_str(
+                "Sandbox user failures not counted in the verdict: each is the gap the headline \
+                 names, which the selfcheck gate measured on this machine, and its own output \
+                 says so. A leak with every filter in place would be counted above.\n\n",
+            );
+            for (id, f) in gap {
+                md.push_str(&format!("### sandbox user: {id} :: {}\n\n", f.test));
+                md.push_str(&fence("text", &f.tail));
+                md.push('\n');
+            }
+        }
+    }
+
     if r.sandbox_user.is_some() {
         md.push_str(&format!(
             "\n## Expected under the token sandbox ({})\n\n",
-            expected.len()
+            expected.len() + expected_checks.len()
         ));
         md.push_str(
-            "Baseline failures not counted in the verdict: each test passed when it ran again \
-             as the sandbox user, and its baseline output names a limit of the token sandbox \
-             that the sandbox user lifts. Any other baseline failure is counted above.\n\n",
+            "Baseline failures not counted in the verdict: each test or end-to-end check passed \
+             when it ran again as the sandbox user, and its baseline output names a limit of the \
+             token sandbox that the sandbox user lifts. Any other baseline failure is counted \
+             above.\n\n",
         );
-        if expected.is_empty() {
+        if expected.is_empty() && expected_checks.is_empty() {
             md.push_str("None.\n");
         } else {
             md.push_str(
@@ -583,6 +657,13 @@ pub fn render(r: &Report) -> String {
                     "| {} | {} | {} | passed |\n",
                     md_escape(&e.binary),
                     md_escape(&e.test),
+                    md_escape(&e.marker)
+                ));
+            }
+            for e in &expected_checks {
+                md.push_str(&format!(
+                    "| end-to-end check | {} | {} | passed |\n",
+                    md_escape(&e.id),
                     md_escape(&e.marker)
                 ));
             }
@@ -1008,6 +1089,141 @@ mod tests {
             p.reruns[0].result.timed_out = true;
         }
         assert!(verdict(&r).starts_with("FAILURES: 0 test(s) failed, 1 binary run(s) hung"));
+    }
+
+    /// A baseline end-to-end check leaves the count by the rule a test does:
+    /// its own output names a token sandbox limit and the sandbox user passed
+    /// the same check. Without either half it counts.
+    #[test]
+    fn a_baseline_check_is_expected_only_with_a_marker_and_a_sandbox_user_pass() {
+        let mut marked = e2e_check("shell.git_bash", Status::Fail);
+        marked.evidence = format!("ERROR: exit status: -1073741502\nstderr:\n{MSYS}");
+        let run = |baseline: Check, user: Status| {
+            let mut r = Report::default();
+            r.binaries.push(bin("a", &[]));
+            r.e2e.push(baseline);
+            r.sandbox_user = Some(crate::sandbox_phase::SandboxPhase {
+                e2e: vec![e2e_check("shell.git_bash", user)],
+                ..Default::default()
+            });
+            r
+        };
+        let r = run(marked.clone(), Status::Pass);
+        let h = headline(&r);
+        assert_eq!((h.e2e_fail, h.expected), (0, 1));
+        assert_eq!(
+            verdict(&r),
+            "ALL PASSED (failures that need a missing tool are listed apart; 1 baseline \
+             failure(s) expected under the token sandbox are listed apart)"
+        );
+        let md = render(&r);
+        let failures = &md[md.find("## Failures").expect("failures")..];
+        let failures = &failures[..failures.find("## Expected").expect("expected")];
+        assert!(!failures.contains("### e2e shell.git_bash"), "{failures}");
+        assert!(
+            md.contains("| end-to-end check | shell.git_bash | Git Bash (msys) | passed |"),
+            "{md}"
+        );
+        // The sandbox user failed or skipped it: it counts.
+        for user in [Status::Fail, Status::Skipped] {
+            let h = headline(&run(marked.clone(), user));
+            assert_eq!(
+                (h.e2e_fail, h.expected),
+                (2 - usize::from(user == Status::Skipped), 0)
+            );
+        }
+        // No marker in its own output: it counts, though the user passed it.
+        let plain = e2e_check("shell.git_bash", Status::Fail);
+        let h = headline(&run(plain, Status::Pass));
+        assert_eq!((h.e2e_fail, h.expected), (1, 0));
+    }
+
+    /// The DNS test's failure as the sandbox user is the known gap, not a
+    /// counted failure, only when the gate measured the gap and the test says
+    /// it is the recorded one. A leak with every filter in place counts.
+    #[test]
+    fn the_dns_tests_failure_is_the_known_gap_only_when_the_gate_measured_it() {
+        let gap_tail = "the offline user's DnsQuery got a DNS server's answer (status 9003): \
+                        lookups leave the machine. This is the recorded gap: a name resolution \
+                        cache filter is absent or disabled";
+        let defect_tail = "the offline user's DnsQuery got a DNS server's answer (status 9003): \
+                           lookups leave the machine although every name resolution cache \
+                           filter is present and running. That is a defect of the filters, not \
+                           the recorded gap";
+        let run = |test: &str, tail: &str, dns: bool| {
+            let mut r = Report::default();
+            r.binaries.push(bin("kgraf-sandbox/test/dns_windows", &[]));
+            r.sandbox_user = Some(crate::sandbox_phase::SandboxPhase {
+                reruns: vec![crate::sandbox_phase::Rerun {
+                    why: "sandbox test binary".into(),
+                    result: bin("kgraf-sandbox/test/dns_windows", &[(test, tail)]),
+                }],
+                dns_failed: dns.then(|| "dns: not confined (status 9003)".to_owned()),
+                ..Default::default()
+            });
+            r
+        };
+        let test = crate::sandbox_phase::DNS_GAP_TEST.1;
+        let r = run(test, gap_tail, true);
+        let h = headline(&r);
+        assert_eq!(h.failed, 0);
+        assert!(
+            h.known_gaps[0].contains(&format!("kgraf-sandbox/test/dns_windows :: {test} fails")),
+            "{:?}",
+            h.known_gaps
+        );
+        let md = render(&r);
+        let failures = &md[md.find("## Failures").expect("failures")..];
+        let failures = &failures[..failures.find("## Known gaps").expect("known gaps")];
+        assert!(failures.contains("None."), "{failures}");
+        assert!(
+            md.contains("## Known gaps\n\nSandbox user failures not counted in the verdict")
+                && md.contains(&format!(
+                    "### sandbox user: kgraf-sandbox/test/dns_windows :: {test}"
+                )),
+            "{md}"
+        );
+        assert!(verdict(&r).starts_with("ALL PASSED"), "{}", verdict(&r));
+        // The gate did not measure the gap: the failure counts.
+        assert_eq!(headline(&run(test, gap_tail, false)).failed, 1);
+        // Every filter in place, so not the recorded gap: it counts.
+        assert_eq!(headline(&run(test, defect_tail, true)).failed, 1);
+        // Another test of the binary, with the same words: it counts.
+        assert_eq!(headline(&run("netsh_lists", gap_tail, true)).failed, 1);
+    }
+
+    /// A test the baseline could not re-run alone is named under the cap
+    /// only while it counts: one the sandbox user explained is listed apart.
+    #[test]
+    fn the_cap_list_names_only_the_counted_failures() {
+        let mut r = Report::default();
+        let mut b = bin(
+            "x/test/y",
+            &[("msys_a", MSYS), ("plain", "assertion failed")],
+        );
+        b.rerun_skipped = vec!["msys_a".into(), "plain".into()];
+        r.binaries.push(b);
+        let mut again = bin("x/test/y", &[("plain", "assertion failed")]);
+        passed(&mut again, &["msys_a"]);
+        r.sandbox_user = Some(crate::sandbox_phase::SandboxPhase {
+            reruns: vec![crate::sandbox_phase::Rerun {
+                why: "w".into(),
+                result: again,
+            }],
+            ..Default::default()
+        });
+        let md = render(&r);
+        let cap = &md[md
+            .find("### x/test/y: not re-run alone (cap reached)")
+            .expect("cap list")..];
+        let cap = &cap[..cap.find("\n\n###").unwrap_or(cap.len())];
+        assert!(cap.contains("- plain"), "{cap}");
+        assert!(!cap.contains("- msys_a"), "{cap}");
+        // With every skipped test explained, no cap list is printed.
+        if let Some(b) = r.binaries.first_mut() {
+            b.rerun_skipped = vec!["msys_a".into()];
+        }
+        assert!(!render(&r).contains("cap reached"));
     }
 
     #[test]

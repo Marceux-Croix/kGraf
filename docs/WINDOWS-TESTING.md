@@ -106,7 +106,7 @@ gh run download <run id> -n kgraf-windows-selftest
 The artifact holds `report\kgraf-wintest-report-*.md` and `firewall.txt`. The upload step
 runs whatever happened before it (`if: always()`), so a job that is cancelled or reaches its
 limit still uploads the partial results it has. It bills Windows minutes (twice the Linux
-rate on a private repository). The job stops after 150 minutes; the runner stops starting
+rate on a private repository). The job stops after 165 minutes; the runner stops starting
 work earlier than that (see "The time budget" below). A failing test does not fail the
 job; a missing report file does. Two things differ from a standard user's machine: the
 runner account is an administrator, so the sandbox and firewall checks run elevated, and
@@ -146,7 +146,7 @@ baseline, and it stays comparable with earlier runs. Then the phase runs these s
 | (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines and the four loopback filter lines included, except a filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" (or "loopback connections are", or both) and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
 | (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. If selfcheck failed on the sandbox user and printed no result lines (its error names that backend and stops at the probe), step (e) still runs so its tests show which programs start as the sandbox user, and the summary says `GATE FAILED: selfcheck failed on the sandbox user and printed no result lines`. The report then says which of two cases the error line shows: the probe ran and failed the step the line names (an earlier run: "a direct connection to the origin worked"), or the probe did not finish its steps (the line gives only an exit status, for example because Git Bash did not start as that user). Any other failure stops the phase: step (e) does not run. |
 | (b2) to (b4) | the fallback grant, `kgraf sandbox-named-object-probe --launch`, `kgraf sandbox status` | Only where the probe in (b) was refused (`session0::Proof::Refused`) and the window is elevated. The phase runs the fallback's elevated action itself, probes again through the fallback and reads the status. See "Named objects" below. |
-| (e) | re-run | The sandbox test binaries, the baseline binaries that failed for the cargo jobserver, Git Bash or Schannel, and the end-to-end checks, with the sandbox user active. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
+| (e) | re-run | The sandbox test binaries, whole; of each other baseline binary whose failures name a token sandbox limit (the cargo jobserver, Git Bash, msys, Schannel, `STATUS_DLL_INIT_FAILED`), only the tests that failed and the test it was running when it ended, by full name (libtest `--exact`); and the end-to-end checks, with the sandbox user active. A list of names longer than 24,000 characters re-runs the whole binary. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
 | (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING, the launcher service line and the fallback grant line included. A service or a grant that is still there is a failure. |
 
 Rules of the phase:
@@ -193,9 +193,10 @@ What the report part "Sandbox user phase" shows:
   whether the sandbox user is gone.
 - The commands of (b), (c), (d) and (f) with their full output. If the gate fails, the full
   selfcheck output is there and the report says that the phase stopped at the gate.
-- A table with the baseline and the sandbox user side by side for each re-run binary. A
-  second table lists each test that failed in the baseline and ran again: `passed`,
-  `failed`, `hung` or `not reached`. The tail of each is below the table.
+- A table with the baseline and the sandbox user side by side for each re-run binary. For a
+  binary re-run for its failures, the sandbox user columns count only the tests that ran
+  again. A second table lists each test that failed in the baseline and ran again:
+  `passed`, `failed`, `hung` or `not reached`. The tail of each is below the table.
 - "Measurements of the re-run": every output line of the re-run that starts with
   `measurement:`, with its binary, its test and the test's time. The runner measures that
   time from the result of the test before it, or from the start of the binary, to the
@@ -210,26 +211,44 @@ The "Tests" and "End-to-end checks" rows of the first table count the baseline. 
 line counts both halves (`report::headline`):
 
 - every baseline failure, except those listed in "Expected under the token sandbox";
-- every failed test and every hung or crashed binary of the re-run (e);
-- every failed end-to-end check, of the baseline and of the sandbox user.
+- every failed test and every hung or crashed binary of the re-run (e), except the DNS
+  test's failure that "Known gaps" lists (see below);
+- every failed end-to-end check of the sandbox user, and every failed end-to-end check of
+  the baseline except those listed in "Expected under the token sandbox".
 
 A baseline failure is expected under the token sandbox only when both hold: the same test
 passed in the re-run (a pass in the binary's first run; a pass only in a solo re-run does
-not count), and its own baseline output names a token sandbox limit. The limits are the
-markers that select a binary for the re-run (the cargo jobserver, Git Bash, msys,
-`NtCreateDirectoryObject`, the signal pipe, Schannel) and `STATUS_DLL_INIT_FAILED`
+not count), and its own baseline output names a token sandbox limit. The limits, the same
+markers that select a binary for the re-run, are the cargo jobserver, Git Bash, msys,
+`NtCreateDirectoryObject`, the signal pipe, Schannel and `STATUS_DLL_INIT_FAILED`
 (0xC0000142, also printed as -1073741502 or 3221225794), with which Git Bash's programs
 and rustc end under the token sandbox. Those failures are not in the verdict; the section
 "Expected under the token sandbox (N)" lists each with its binary, its test and the marker,
 and the verdict says how many it listed apart. A baseline failure without a marker in its
 own output, or one whose test failed, hung or was not reached in the re-run, still counts,
 as does a failure in a binary the re-run did not take. The Failures section also lists each
-failure of the re-run, with its output, under `sandbox user:`.
+failure of the re-run, with its output, under `sandbox user:`. A baseline test that the cap
+on solo re-runs left out is named under "not re-run alone (cap reached)" only while it
+counts: one listed apart needs no solo re-run, since the sandbox user's run is its evidence.
+
+A baseline end-to-end check is expected under the token sandbox by the same rule: the check
+with the same id passed in the sandbox user's end-to-end checks, and its own baseline detail
+or output carries one of the markers above. `shell.git_bash` is the case: under the token
+sandbox Git Bash ends with `NtCreateDirectoryObject(...): 0xC0000022` and exit status
+-1073741502, and as the sandbox user the same check passes. The section lists such a check
+as `end-to-end check` with its id and marker. A check the sandbox user failed, skipped or
+did not run, or one without a marker in its own output, still counts.
 
 When selfcheck (d) failed on its `dns:` line, a line `Known gap: DNS is not confined on this
-machine ...` follows the verdict, with selfcheck's words. It is not a pass: the DNS test of
-the re-run (`an_offline_lookup_does_not_reach_the_dns_client_service`) fails while the gap
-stands, and that failure counts.
+machine ...` follows the verdict, with selfcheck's words. It is not a pass. While the gap
+stands, the DNS test of the re-run (`kgraf-sandbox/test/dns_windows ::
+an_offline_lookup_does_not_reach_the_dns_client_service`) fails, and its failure is listed
+under "Known gaps" with its output, and named in that line, instead of being counted, only
+when all of these hold: the gate failed on DNS alone, the failure is that test's, and its
+own output says "This is the recorded gap" (the test prints that only when a name
+resolution cache filter is absent or disabled, the gap setup records). A leak with every
+filter in place prints "a defect of the filters", and counts; so does any other failure of
+that binary.
 
 #### The time budget (`--budget-mins`)
 
@@ -260,11 +279,25 @@ How the runner keeps to it:
   not run or was stopped. It never reads `ALL PASSED`; the failures that did happen are still
   counted in the same line. The summary has a "Time budget" row, and the runner exits 1.
 
-The workflow computes the budget from the job: the job limit (150 minutes), less the minutes
+The workflow computes the budget from the job: the job limit (165 minutes), less the minutes
 used when the bundle step starts, less 12 minutes for the steps after it, less 1. The steps
-before the bundle took 20 to 22.5 minutes and the steps after it about 9 (the cache save alone
-7 minutes), so the runner gets about 116 minutes, and the budget line is printed in the step's
-log.
+before the bundle took 20 to 22.5 minutes and the steps after it 2.5 to 9 (the cache save alone
+7 minutes, when it runs), so the runner gets about 130 minutes, and the budget line is printed
+in the step's log.
+
+What a full run needs, measured on the run of 2026-10-11 (Windows Server 2025, the hosted
+runner): the bundle took 102.5 minutes, of which the sandbox user phase took 2,668 s, and the
+budget of 115 minutes did not admit the re-run of `contract_checks` (expected 1,242 s, 762 s
+left). Whole re-runs took 2,489 s of that phase: `kgraf_host#rest` 933 s for its 89 baseline
+failures among 448 tests, the bench-briefs library 677 s for 21 among 70, `contract_flow`
+512 s for 1 among 72. The re-run now runs only the failed tests of such a binary. Timed per
+test on a development machine with one test thread, the failed tests are 66 % of
+`kgraf_host#rest`'s time, 93 % of the bench-briefs library's, 18 % of `contract_flow`'s, 74 % of
+`contract_checks`' and 14 % of `kgraf_shell`'s. Applied to the Windows times, the phase saves
+about 820 s and the `contract_checks` re-run adds 440 to 1,080 s (its whole re-run measured
+600 s and 1,463 s on two runs), so a complete bundle run projects to 97 to 107 minutes and the
+job to 122 to 139 minutes. The job limit is 165 minutes, which leaves about 20 minutes in the
+slower case; a job bills only the minutes it runs, at twice the Linux rate.
 
 #### Reading the progress line
 
@@ -308,15 +341,15 @@ gh workflow run wintest.yml -f only='kgraf-sandbox/test/escape_windows::send_inp
 A confirmation run is a full run (no `only`) with the sandbox user phase. It reads clean
 when:
 
-- The verdict line counts no failed test, no hung or crashed binary and no failed
-  end-to-end check, except what a known gap explains, and the report names each such
-  failure. While the DNS gap stands, that is the re-run's
-  `dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service` with the
-  `Known gap: DNS ...` line. The baseline's end-to-end check `shell.git_bash` fails under the
-  token sandbox by design (Git Bash cannot make its object directory) and is counted; its
-  sandbox user status must be `Pass`.
+- The verdict line reads `ALL PASSED` and counts no failed test, no hung or crashed binary
+  and no failed end-to-end check. While the DNS gap stands, the `Known gap: DNS ...` line
+  follows it and names the re-run's
+  `dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service`, which "Known gaps"
+  lists with its output.
 - "Expected under the token sandbox (N)" lists the baseline's Git Bash, jobserver and
-  0xC0000142 failures, and each one's sandbox user status is `passed`.
+  0xC0000142 failures, and the end-to-end check `shell.git_bash`, and each one's sandbox
+  user status is `passed`.
+- The time budget is not reached: no item under "Not run" says `not run: budget`.
 - In (d): `launch: kGraf's launcher service made window station kgraf-cmd-... and desktop
   Default for the command of sandbox user ... in session 0`, and a `launch: the session-0
   path started a command: ... for a command on kgraf-cmd-...\Default` line for each command.
@@ -327,7 +360,8 @@ when:
   `startup_windows::a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only`,
   `kgraf_bench_briefs` `check::tests::verify_fails_when_a_protected_file_changed`,
   `kgraf_host#rest` `tests::everything_a_check_creates_is_removed_and_nothing_outside` and
-  every test of `contract_checks` pass, and no binary of the re-run timed out.
+  every test of `contract_checks` that failed in the baseline pass, and no binary of the
+  re-run timed out.
 - (f) leaves nothing.
 
 To re-run only the tests these fixes address, pass this `only` value:

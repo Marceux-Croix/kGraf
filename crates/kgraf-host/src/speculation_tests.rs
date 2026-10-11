@@ -167,6 +167,15 @@ fn speculation_finds_a_semantic_conflict_that_textual_merge_misses() {
                 &["test ! -f a.flag || test ! -f b.flag"],
                 Duration::from_secs(60),
             );
+            // The premise first: the gate passes on the tip, where neither
+            // flag is. A gate that cannot run at all (its shell cannot start)
+            // finds no semantic conflict either, and this names why.
+            let tip = r.merge_back.integration_tip().expect("tip");
+            let alone = runner
+                .run(request(&runner, &tip))
+                .await
+                .expect("the gate ran");
+            assert!(alone.passed, "the gate passes on the tip: {alone:?}");
             let refs = all_refs(&r.root);
             let round = speculate_pair(&r, Some(&runner), &wa, &wb).await;
             assert!(round.validated);

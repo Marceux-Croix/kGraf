@@ -18,7 +18,7 @@
 #   5. Uploads the report and the firewall output as one artifact.
 #
 # Cost: this bills Windows minutes, at twice the Linux rate on a private
-# repository. The job stops after 150 minutes.
+# repository. The job stops after 165 minutes.
 #
 # Time: the runner gets a wall-clock budget (--budget-mins) so that it stops
 # starting work early enough to remove the sandbox user and write the report
@@ -31,8 +31,17 @@
 # bundle run took 78 minutes in the faster of two measured runs. The slower
 # one was at 78 minutes with one re-run of the sandbox user phase still
 # running and two to go (baseline 48 minutes), which projects to about 113
-# minutes. With the steps before and after, a complete run needs about 143
-# minutes of the job. The limit is 150.
+# minutes. A full run of 2026-10-11 took 102.5 minutes in the bundle (22.5
+# before it, 2.5 after) and still left the contract_checks re-run unstarted:
+# whole re-runs took 2,489 s of its 2,668 s sandbox user phase. The re-run now
+# runs only the tests that failed in the baseline of each binary that is not a
+# sandbox test binary; timed per test on a development machine, those tests
+# are 66 % of kgraf_host#rest, 18 % of contract_flow, 74 % of contract_checks
+# and 93 % of the bench-briefs library, which projects that run to 97 to 107
+# minutes of bundle with contract_checks included (its whole re-run measured
+# 600 s and 1,463 s). With the steps before and after, a complete run needs
+# 122 to 139 minutes of the job. The limit is 165, so the slower case keeps a
+# margin of about 20 minutes; a job uses only the minutes it runs.
 #
 # Two things differ from a standard user's machine, so read the results with
 # them in mind:
@@ -71,7 +80,7 @@ env:
   CARGO_TERM_COLOR: always
   # Keep equal to `timeout-minutes` below: the job limit cannot read this
   # value, and the budget is computed from it.
-  WINTEST_JOB_MINUTES: "150"
+  WINTEST_JOB_MINUTES: "165"
   # Minutes the steps after the bundle need: about 9 measured, plus 3.
   WINTEST_AFTER_BUNDLE_MINUTES: "12"
 
@@ -79,7 +88,7 @@ jobs:
   wintest:
     name: Windows self-test
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 165
     steps:
       # The budget counts from here. The job's own set-up before this step
       # takes a few seconds, which the minute taken off the budget covers.

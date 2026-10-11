@@ -224,10 +224,32 @@ const OWN_FILE_LINES: usize = 400;
 
 /// `text` with each spelling of a worktree `root` (as given, and with or
 /// without the macOS `/private` prefix) replaced by `<worktree>`, so the
-/// outputs of two runs in different worktrees compare line by line.
-fn with_roots_named(text: &str, roots: &[&Path]) -> String {
+/// outputs of two runs in different worktrees compare line by line. With
+/// `windows` (the output is a Windows program's), the Windows spellings too
+/// ([`windows_spellings`]); a parameter, so the rule is tested on every host.
+///
+/// **Why Windows needs more.** A check's output names files with
+/// backslashes (`<root>\wcl-core\Cargo.toml`, as cargo prints them), which
+/// the matching of [`names_file`] never finds: it reads a whole path between
+/// `/` separators, and a backslash is no path character to it, so the tail
+/// `Cargo.toml` of `<root>\wcl-core\Cargo.toml` was read as the root
+/// manifest. The check runs through Git Bash, whose programs print the
+/// worktree in the MSYS form (`/c/...`); and a folder in the temporary
+/// folder can be spelled with a short 8.3 name (`RUNNER~1`) or its long one.
+/// So on Windows the text's backslashes become `/`, and each root is replaced
+/// in its drive form, its MSYS form, and both again for its canonical (long)
+/// path.
+fn with_roots_named_as(text: &str, roots: &[&Path], windows: bool) -> String {
     let mut spellings: Vec<String> = Vec::new();
     for root in roots {
+        if windows {
+            let given = root.to_string_lossy().into_owned();
+            spellings.extend(windows_spellings(&given));
+            if let Ok(long) = kgraf_core::plain_path::canonicalize(root) {
+                spellings.extend(windows_spellings(&long.to_string_lossy()));
+            }
+            continue;
+        }
         let r = root.to_string_lossy().trim_end_matches('/').to_owned();
         if r.is_empty() {
             continue;
@@ -241,9 +263,39 @@ fn with_roots_named(text: &str, roots: &[&Path]) -> String {
     // Longest first: `/private/x` before `/x`, so no prefix is left behind.
     spellings.sort_by_key(|s| std::cmp::Reverse(s.len()));
     spellings.dedup();
-    let mut out = text.to_owned();
+    let mut out = if windows {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    };
     for s in &spellings {
         out = out.replace(s.as_str(), "<worktree>");
+    }
+    out
+}
+
+/// The spellings of the Windows folder `root` in a check's output once its
+/// backslashes are `/`: the drive form with either case of letter
+/// (`C:/x/y`, a verbatim `\\?\` prefix dropped) and the MSYS form Git
+/// Bash's programs print (`/c/x/y`). A root with no drive letter is kept
+/// as given.
+fn windows_spellings(root: &str) -> Vec<String> {
+    let slashed = root.replace('\\', "/");
+    let slashed = slashed.strip_prefix("//?/").unwrap_or(&slashed);
+    let slashed = slashed.trim_end_matches('/');
+    if slashed.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![slashed.to_owned()];
+    let mut chars = slashed.chars();
+    if let (Some(drive), Some(':')) = (chars.next(), chars.next())
+        && drive.is_ascii_alphabetic()
+    {
+        let rest = &slashed[2..];
+        let lower = drive.to_ascii_lowercase();
+        out.push(format!("{}:{rest}", drive.to_ascii_uppercase()));
+        out.push(format!("{lower}:{rest}"));
+        out.push(format!("/{lower}{rest}"));
     }
     out
 }
@@ -318,8 +370,30 @@ pub(crate) fn own_file_failure(
     writes: &[&str],
     others: &[&str],
 ) -> Option<String> {
-    let attempt = with_roots_named(attempt_output, attempt_roots);
-    let base = with_roots_named(base_output, &[base_root]);
+    own_file_failure_as(
+        attempt_output,
+        attempt_roots,
+        base_output,
+        base_root,
+        writes,
+        others,
+        cfg!(windows),
+    )
+}
+
+/// [`own_file_failure`], with `windows` saying whether the outputs are a
+/// Windows program's ([`with_roots_named_as`]).
+pub(crate) fn own_file_failure_as(
+    attempt_output: &str,
+    attempt_roots: &[&Path],
+    base_output: &str,
+    base_root: &Path,
+    writes: &[&str],
+    others: &[&str],
+    windows: bool,
+) -> Option<String> {
+    let attempt = with_roots_named_as(attempt_output, attempt_roots, windows);
+    let base = with_roots_named_as(base_output, &[base_root], windows);
     let at_base: std::collections::HashSet<&str> = base.lines().map(str::trim).collect();
     let fresh: Vec<&str> = attempt
         .lines()

@@ -567,7 +567,8 @@ async fn a_conflicting_attempt_comes_back_typed_and_the_tip_does_not_move() {
     std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
     for (c, ws) in [(&a, &wa), (&b, &wb)] {
         let v = verifier(&r, "true").verify(c, ws, &result()).await;
-        assert!(v.expect("ran").passed());
+        let v = v.expect("ran");
+        assert!(v.passed(), "{v:?}");
     }
     assert!(matches!(
         r.workspaces.integrate(&a, &wa).await.expect("a"),
@@ -603,7 +604,8 @@ async fn a_real_git_conflicts_attempt_is_kept_until_a_resolver_settles_it() {
     std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
     for (c, ws) in [(&a, &wa), (&b, &wb)] {
         let v = verifier(&r, "true").verify(c, ws, &result()).await;
-        assert!(v.expect("ran").passed());
+        let v = v.expect("ran");
+        assert!(v.passed(), "{v:?}");
     }
     assert!(matches!(
         r.workspaces.integrate(&a, &wa).await.expect("a"),
@@ -1060,13 +1062,11 @@ async fn attempt_refs_are_swept_at_run_end_except_for_open_work() {
     c.verifications = 1;
     let ws = r.workspaces.prepare(&c, &"w-s".into()).await.expect("ws");
     std::fs::write(ws.join("a.txt"), "x\n").expect("write");
-    assert!(
-        verifier(&r, "true")
-            .verify(&c, &ws, &result())
-            .await
-            .expect("ran")
-            .passed()
-    );
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
     let reference = "refs/kgraf/attempts/w-s+1";
     let exists = || !git_out(&r.root, &["rev-parse", "--verify", "--quiet", reference]).is_empty();
     assert!(exists());
@@ -1138,12 +1138,8 @@ async fn a_killed_runs_worktree_is_reopened_by_its_recorded_gitlink() {
         merge_back: again.merge_back.clone(),
         ..verifier(&r, "true")
     };
-    assert!(
-        v.verify(&c, &reopened, &result())
-            .await
-            .expect("ran")
-            .passed()
-    );
+    let verdict = v.verify(&c, &reopened, &result()).await.expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
     assert!(matches!(
         again.integrate(&c, &reopened).await.expect("integrate"),
         Integration::Merged { .. }
@@ -1166,13 +1162,11 @@ async fn a_re_verified_contract_never_collides_with_its_attempt_ref() {
         r.workspaces.handle(&ws).await.expect("handle"),
     );
     c.verifications = 1;
-    assert!(
-        verifier(&r, "true")
-            .verify(&c, &ws, &result())
-            .await
-            .expect("ran")
-            .passed()
-    );
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    assert!(verdict.passed(), "{verdict:?}");
     let first = git_out(&r.root, &["rev-parse", "refs/kgraf/attempts/w-a+1"]);
     assert_eq!(first.len(), 40, "the first verification's ref");
 
@@ -2081,6 +2075,55 @@ impl Provider for ShellCaller {
     fn capabilities(&self) -> kgraf_provider::capability::Capabilities<'_> {
         kgraf_provider::capability::Capabilities::none()
     }
+}
+
+/// What each failed check of a run said, from its trace: the detail of every
+/// `verdict` event that did not pass, its first lines each. A test that
+/// expects a run to complete prints it beside the report, whose held reason
+/// says only how many attempts failed, so a failure the platform caused (a
+/// check program that could not start) names its cause.
+pub(crate) fn failed_verdicts(trace: &str) -> String {
+    let mut out = Vec::new();
+    for line in trace.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = v.get("event").unwrap_or(&v);
+        if event.get("event").and_then(|e| e.as_str()) != Some("verdict")
+            || event.get("passed").and_then(|p| p.as_bool()) != Some(false)
+        {
+            continue;
+        }
+        let detail = event.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+        let head: Vec<&str> = detail.lines().filter(|l| !l.is_empty()).take(4).collect();
+        let head = head.join(" | ");
+        if !out.contains(&head) {
+            out.push(head);
+        }
+    }
+    if out.is_empty() {
+        "failed checks: none in the trace".to_owned()
+    } else {
+        format!("failed checks:\n{}", out.join("\n"))
+    }
+}
+
+#[test]
+fn failed_verdicts_name_what_each_failed_check_said_once() {
+    let trace = concat!(
+        r#"{"seq":1,"event":{"event":"verdict","contract":"a","passed":false,"detail":"`true` failed: $ true\n\n[exit code: 0xc0000142]\n[sandbox] note"}}"#,
+        "\n",
+        r#"{"seq":2,"event":{"event":"verdict","contract":"a","passed":false,"detail":"`true` failed: $ true\n\n[exit code: 0xc0000142]\n[sandbox] note"}}"#,
+        "\n",
+        r#"{"seq":3,"event":{"event":"verdict","contract":"b","passed":true,"detail":"ok"}}"#,
+        "\n",
+        r#"{"seq":4,"event":{"event":"notice","detail":"failed"}}"#,
+    );
+    assert_eq!(
+        failed_verdicts(trace),
+        "failed checks:\n`true` failed: $ true | [exit code: 0xc0000142] | [sandbox] note"
+    );
+    assert_eq!(failed_verdicts(""), "failed checks: none in the trace");
 }
 
 fn gate_runner(r: &Repo, commands: &[&str], timeout: Duration) -> CommandGateRunner {
@@ -4596,6 +4639,68 @@ async fn a_failure_naming_only_another_contracts_file_is_still_deferred() {
         panic!("another contract's file is deferred: {verdict:?}");
     };
     assert!(by.contains("deferred to the root gate"), "{by}");
+}
+
+/// The same path matching for a Windows program's output: cargo names files
+/// with backslashes under the worktree's drive path, and Git Bash's programs
+/// print the worktree in the MSYS form. A member manifest is not read as the
+/// root manifest, and a root manifest in either spelling is.
+#[test]
+fn own_file_failure_reads_windows_paths_in_each_spelling() {
+    use crate::verifier::own_file_failure_as;
+    let root = Path::new(r"C:\Work\TEMP~1\.tmpA\ws\w-green");
+    let base = Path::new(r"C:\Work\TEMP~1\.tmpA\ws\probe-1");
+    let at_base = "error: could not find `Cargo.toml` in \
+                   `C:\\Work\\TEMP~1\\.tmpA\\ws\\probe-1` or any parent \
+                   directory";
+    // Round 16 greenfield, as cargo prints it on Windows: the error names
+    // the member manifest, which an open contract's source completes, so the
+    // failure may be only that contract's missing work.
+    let cargo = "error: failed to load manifest for workspace member \
+                 `C:\\Work\\TEMP~1\\.tmpA\\ws\\w-green\\wcl-core`\n\
+                 referenced by workspace at \
+                 `C:\\Work\\TEMP~1\\.tmpA\\ws\\w-green\\Cargo.toml`\n\n\
+                 Caused by:\n  failed to parse manifest at \
+                 `C:\\Work\\TEMP~1\\.tmpA\\ws\\w-green\\wcl-core\\Cargo.toml`\n\n\
+                 Caused by:\n  no targets specified in the manifest";
+    let writes = ["Cargo.toml", "wcl-core/Cargo.toml", "wcl/Cargo.toml"];
+    let others = ["wcl-core/src/lib.rs", "wcl/src/main.rs"];
+    let own = |out: &str, windows: bool| {
+        own_file_failure_as(out, &[root], at_base, base, &writes, &others, windows)
+    };
+    assert_eq!(own(cargo, true), None, "it waits on the open contracts");
+    // Read with the old rule, the root manifest's name at the end of the
+    // backslash path was taken as the contract's own file.
+    assert!(own(cargo, false).is_some());
+    // A root manifest cargo refuses, named in the drive form or the MSYS
+    // form: the contract's own defect.
+    let only_root = ["Cargo.toml"];
+    let mine = |out: &str| {
+        own_file_failure_as(
+            out,
+            &[root],
+            at_base,
+            base,
+            &only_root,
+            &["wcl-core/Cargo.toml"],
+            true,
+        )
+    };
+    for out in [
+        "error: failed to parse manifest at \
+         `C:\\Work\\TEMP~1\\.tmpA\\ws\\w-green\\Cargo.toml`",
+        "error: failed to parse manifest at \
+         `/c/Work/TEMP~1/.tmpA/ws/w-green/Cargo.toml`",
+        "error: failed to parse manifest at \
+         `c:/Work/TEMP~1/.tmpA/ws/w-green/Cargo.toml`",
+    ] {
+        assert!(mine(out).is_some(), "{out}");
+    }
+    // A manifest under another folder is not the root one.
+    assert_eq!(
+        mine("error: failed to parse manifest at `C:\\elsewhere\\Cargo.toml`"),
+        None
+    );
 }
 
 /// Path matching: whole paths only, the worktree prefix in each spelling,
@@ -7656,7 +7761,8 @@ async fn every_kind_of_attempt_follows_the_policy() {
         std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
         for (c, ws) in [(&a, &wa), (&b, &wb)] {
             let v = verifier(&r, "true").verify(c, ws, &result()).await;
-            assert!(v.expect("ran").passed());
+            let v = v.expect("ran");
+            assert!(v.passed(), "{v:?}");
         }
         // Written after the check, which removes ignored output in the tree.
         let (tree_b, _) = write_build_output(&r, &wb);
@@ -7954,7 +8060,8 @@ async fn a_failed_discard_is_reported_once() {
     std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
     for (c, ws) in [(&a, &wa), (&b, &wb)] {
         let v = verifier(&r, "true").verify(c, ws, &result()).await;
-        assert!(v.expect("ran").passed());
+        let v = v.expect("ran");
+        assert!(v.passed(), "{v:?}");
     }
     r.workspaces.integrate(&a, &wa).await.expect("a");
     assert!(matches!(
@@ -8069,7 +8176,8 @@ async fn a_conflict_kept_by_a_stopped_run_is_settled_when_its_resolver_settles()
         std::fs::write(wb.join("same.txt"), "from b\n").expect("write");
         for (c, ws) in [(&a, &wa), (&b, &wb)] {
             let v = verifier(&r, "true").verify(c, ws, &result()).await;
-            assert!(v.expect("ran").passed());
+            let v = v.expect("ran");
+            assert!(v.passed(), "{v:?}");
         }
         r.workspaces.integrate(&a, &wa).await.expect("a");
         assert!(matches!(

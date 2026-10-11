@@ -117,8 +117,9 @@ async fn an_mcp_rule_is_checked_against_the_tools_the_servers_list_at_run_start(
     assert_eq!(
         outcome.report.status,
         kgraf_orchestrator::RunStatus::Completed,
-        "a notice never stops the run: {:?}",
-        outcome.report
+        "a notice never stops the run: {:?}\n{}",
+        outcome.report,
+        super::failed_verdicts(&trace)
     );
 }
 

@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::budget::{NotRun, not_run_reason};
 use crate::e2e::{Check, Status};
 use crate::libtest::Outcome;
-use crate::report::BinaryResult;
+use crate::report::{BinaryResult, Failure};
 use kgraf_sandbox::sandbox_user::probe;
 use kgraf_sandbox::sandbox_user::session0::Proof;
 
@@ -529,8 +529,9 @@ pub trait Exec {
     /// Runs `kgraf <args>`. `honor_cancel` is false for the removal, which
     /// must run even after Ctrl+C.
     fn cli(&mut self, label: &str, args: &[&str], limit: Duration, honor_cancel: bool) -> StepRun;
-    /// Runs one test binary of the suite again, by manifest id.
-    fn rerun(&mut self, id: &str) -> BinaryResult;
+    /// Runs one test binary of the suite again, by manifest id: only the
+    /// tests `tests` names (libtest `--exact`), or every test when `None`.
+    fn rerun(&mut self, id: &str, tests: Option<&[String]>) -> BinaryResult;
     /// `--only` named every binary of the baseline, so the re-run takes each
     /// of them, whatever the baseline found ([`select`]).
     fn every_binary_named(&self) -> bool {
@@ -553,8 +554,9 @@ pub trait Exec {
     fn time_left(&self) -> Option<Duration> {
         None
     }
-    /// How long re-running the binary `id` is expected to take.
-    fn rerun_expected(&self, _id: &str) -> Duration {
+    /// How long re-running the binary `id` is expected to take, for the
+    /// tests `tests` names or for every test when `None`.
+    fn rerun_expected(&self, _id: &str, _tests: Option<&[String]>) -> Duration {
         Duration::from_secs(30)
     }
 }
@@ -767,28 +769,66 @@ fn failure_texts(b: &BinaryResult) -> Vec<&str> {
 pub struct Selection {
     pub id: String,
     pub why: String,
+    /// The tests to run again, by full name (libtest `--exact`): the
+    /// baseline's failures and the test it was running when it ended. `None`
+    /// runs the whole binary: a sandbox test binary, a binary `--only` named,
+    /// or a list too long for one command line ([`MAX_RERUN_FILTER_CHARS`]).
+    pub tests: Option<Vec<String>>,
+}
+
+/// The longest list of test names one re-run passes on its command line.
+/// Windows caps a command line at 32,767 characters; the bundle path and the
+/// other arguments need the rest. A longer list re-runs the whole binary.
+pub const MAX_RERUN_FILTER_CHARS: usize = 24_000;
+
+/// The tests of a baseline binary a re-run must judge: each failure, and the
+/// test it was running when it ended. `None` when the names do not fit on one
+/// command line, so the whole binary runs.
+fn failed_tests(b: &BinaryResult) -> Option<Vec<String>> {
+    let mut names: Vec<String> = b.failures.iter().map(|f| f.test.clone()).collect();
+    if let Some(open) = &b.open_test
+        && !names.contains(open)
+    {
+        names.push(open.clone());
+    }
+    let chars: usize = names.iter().map(|n| n.len() + 1).sum();
+    (!names.is_empty() && chars <= MAX_RERUN_FILTER_CHARS).then_some(names)
 }
 
 /// The binaries of the baseline to run again with the sandbox user active, in
 /// baseline order, each once. With `every_named` (`--only`), the person named
 /// each binary the baseline ran, so each runs again whatever it did there.
+///
+/// A sandbox test binary runs whole: it is the sandbox user's own proof. Any
+/// other binary is re-run for its baseline failures that name a token sandbox
+/// limit ([`token_sandbox_marker`]), and only those failures run again: the
+/// re-run exists to judge them ([`expected_under_token_sandbox`]), and a test
+/// that passed in the baseline needs no judgment. Each failure still gets a
+/// first run of its own as the sandbox user, so the rule that classifies it is
+/// unchanged.
 pub fn select(first: &[BinaryResult], every_named: bool) -> Vec<Selection> {
     first
         .iter()
         .filter_map(|b| {
-            let why = if every_named {
-                "named by --only".to_owned()
+            let (why, tests) = if every_named {
+                ("named by --only".to_owned(), None)
             } else if ALWAYS.contains(&base_id(&b.id)) {
-                "sandbox test binary".to_owned()
+                ("sandbox test binary".to_owned(), None)
             } else if !b.clean() {
-                let hit = failure_texts(b).into_iter().find_map(blocker)?;
-                format!("failed in the baseline, output names {hit}")
+                let hit = failure_texts(b)
+                    .into_iter()
+                    .find_map(token_sandbox_marker)?;
+                (
+                    format!("failed in the baseline, output names {hit}"),
+                    failed_tests(b),
+                )
             } else {
                 return None;
             };
             Some(Selection {
                 id: b.id.clone(),
                 why,
+                tests,
             })
         })
         .collect()
@@ -978,7 +1018,7 @@ pub fn run_phase(
                 p.cancelled = true;
                 break;
             }
-            let expected = ex.rerun_expected(&s.id);
+            let expected = ex.rerun_expected(&s.id, s.tests.as_deref());
             if let Some(left) = ex.time_left()
                 && (left.is_zero() || left < expected)
             {
@@ -988,7 +1028,7 @@ pub fn run_phase(
                 });
                 continue;
             }
-            let result = ex.rerun(&s.id);
+            let result = ex.rerun(&s.id, s.tests.as_deref());
             if result.budget_stopped {
                 p.stopped_at_budget
                     .push(format!("sandbox user re-run of {}", s.id));
@@ -1078,9 +1118,9 @@ fn after_of(test: &str, r: &BinaryResult) -> (String, String) {
 const DLL_INIT_FAILED: &[&str] = &["0xc0000142", "-1073741502", "3221225794"];
 
 /// The token sandbox limit a failed test's own output names: a [`blocker`],
-/// or `STATUS_DLL_INIT_FAILED`. Only for [`expected_under_token_sandbox`],
-/// which also needs the test to pass as the sandbox user; the re-run
-/// selection reads [`blocker`] alone.
+/// or `STATUS_DLL_INIT_FAILED`. [`select`] re-runs a binary whose baseline
+/// output names one; [`expected_under_token_sandbox`] also needs the test to
+/// pass as the sandbox user.
 pub fn token_sandbox_marker(text: &str) -> Option<&'static str> {
     blocker(text).or_else(|| {
         let lower = text.to_lowercase();
@@ -1139,6 +1179,64 @@ pub fn expected_under_token_sandbox(
         }
     }
     out
+}
+
+/// A baseline end-to-end check that the token sandbox explains, by the same
+/// rule as a test ([`expected_under_token_sandbox`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpectedCheck {
+    pub id: String,
+    /// The marker its baseline output carries, as the report names it.
+    pub marker: String,
+}
+
+/// The baseline end-to-end checks expected under the token sandbox. A check
+/// counts here only when both hold: (a) the check with the same id passed in
+/// the sandbox user's own end-to-end run, and (b) its baseline detail or
+/// output carries a token sandbox marker. A check the sandbox user did not
+/// run, or failed or skipped, still counts, and so does every failure of the
+/// sandbox user's own checks.
+pub fn e2e_expected_under_token_sandbox(first: &[Check], user: &[Check]) -> Vec<ExpectedCheck> {
+    first
+        .iter()
+        .filter(|c| c.status == Status::Fail)
+        .filter(|c| {
+            user.iter()
+                .any(|u| u.id == c.id && u.status == Status::Pass)
+        })
+        .filter_map(|c| {
+            let marker =
+                token_sandbox_marker(&c.evidence).or_else(|| token_sandbox_marker(&c.detail))?;
+            Some(ExpectedCheck {
+                id: c.id.clone(),
+                marker: marker.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The binary and test that prove whether the offline sandbox users' DNS
+/// lookups stay on the machine.
+pub const DNS_GAP_TEST: (&str, &str) = (
+    "kgraf-sandbox/test/dns_windows",
+    "an_offline_lookup_does_not_reach_the_dns_client_service",
+);
+
+/// The sentence that test prints only when a name resolution cache filter
+/// is absent or disabled, the gap setup records. A leak with every filter in
+/// place prints another sentence, and stays a counted failure.
+pub const DNS_GAP_SENTENCE: &str = "This is the recorded gap";
+
+/// Whether a failure of the sandbox user re-run is the DNS gap this run
+/// already measured and names as a known gap: the selfcheck gate failed on
+/// DNS alone ([`SandboxPhase::dns_failed`]), the failure is
+/// [`DNS_GAP_TEST`], and its own output says it is the recorded gap
+/// ([`DNS_GAP_SENTENCE`]). Every other failure counts.
+pub fn is_recorded_dns_gap(p: &SandboxPhase, binary: &str, f: &Failure) -> bool {
+    p.dns_failed.is_some()
+        && base_id(binary) == DNS_GAP_TEST.0
+        && f.test == DNS_GAP_TEST.1
+        && f.tail.contains(DNS_GAP_SENTENCE)
 }
 
 /// Every test that failed (or was running when the binary ended) in the
@@ -1500,13 +1598,15 @@ mod tests {
         gate_times_out: bool,
         /// The limit each `kgraf` step was given.
         limits: Vec<(String, Duration)>,
+        /// The tests each re-run was asked for, by binary id.
+        rerun_tests: Vec<(String, Option<Vec<String>>)>,
     }
 
     impl Exec for Fake {
         fn time_left(&self) -> Option<Duration> {
             self.left
         }
-        fn rerun_expected(&self, id: &str) -> Duration {
+        fn rerun_expected(&self, id: &str, _tests: Option<&[String]>) -> Duration {
             let secs = self
                 .expected
                 .iter()
@@ -1552,8 +1652,10 @@ mod tests {
                 ..StepRun::default()
             }
         }
-        fn rerun(&mut self, id: &str) -> BinaryResult {
+        fn rerun(&mut self, id: &str, tests: Option<&[String]>) -> BinaryResult {
             self.calls.push(format!("rerun {id}"));
+            self.rerun_tests
+                .push((id.to_owned(), tests.map(<[String]>::to_vec)));
             let mut b = bin(id, &[]);
             if self.stopped_rerun == Some(id) {
                 b.budget_stopped = true;
@@ -1611,6 +1713,24 @@ mod tests {
                 &[("w::cargo", "cargo: jobserver failed"), ("w::x", "plain")],
             ),
         ]
+    }
+
+    /// The phase asks for the baseline failures of a binary chosen for them,
+    /// and for every test of a sandbox test binary.
+    #[test]
+    fn the_phase_reruns_a_binarys_failures_and_a_sandbox_binary_whole() {
+        let mut ex = Fake::default();
+        run_phase(&mut ex, &baseline(), Some(true), &|| false);
+        assert_eq!(
+            ex.rerun_tests,
+            vec![
+                ("kgraf-sandbox/test/escape_windows".to_owned(), None),
+                (
+                    "kgraf-cli/test/worker".to_owned(),
+                    Some(vec!["w::cargo".to_owned(), "w::x".to_owned()])
+                ),
+            ]
+        );
     }
 
     /// An item whose expected time does not fit in what is left is not
@@ -1970,10 +2090,20 @@ mod tests {
         );
         let schannel = bin("c/test/three", &[("t", "curl: SEC_E_NO_CREDENTIALS")]);
         let other = bin("d/test/four", &[("t", "assertion failed: left == right")]);
+        // A check whose program could not start under the token sandbox
+        // says only its exit status, and no blocker word.
+        let dll = bin(
+            "g/test/seven",
+            &[
+                ("plain_failure", "assertion failed"),
+                ("t", "`true` failed: $ true\n\n[exit code: 0xc0000142]"),
+            ],
+        );
         let mut hung = bin("e/test/five", &[]);
         hung.timed_out = true;
         hung.exit_code = None;
         hung.tail = Some("fatal: Git Bash could not start".into());
+        hung.open_test = Some("open::one".into());
         // A clean binary whose output once named a blocker is not re-run.
         let clean = bin("f/test/six", &[]);
         jobserver.id = "a/test/one#core".into();
@@ -1982,6 +2112,7 @@ mod tests {
             msys,
             schannel,
             other,
+            dll,
             hung,
             clean,
             bin("kgraf-sandbox/test/tls_windows", &[]),
@@ -1993,6 +2124,7 @@ mod tests {
         let named = select(&first, true);
         assert_eq!(named.len(), first.len());
         assert!(named.iter().all(|s| s.why == "named by --only"));
+        assert!(named.iter().all(|s| s.tests.is_none()), "{named:?}");
         let sel = select(&first, false);
         let ids: Vec<&str> = sel.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
@@ -2001,6 +2133,7 @@ mod tests {
                 "a/test/one#core",
                 "b/test/two",
                 "c/test/three",
+                "g/test/seven",
                 "e/test/five",
                 "kgraf-sandbox/test/tls_windows",
                 "kgraf-sandbox/test/shell_windows#core",
@@ -2010,6 +2143,42 @@ mod tests {
         );
         assert!(sel[0].why.contains("cargo jobserver"));
         assert!(sel[2].why.contains("Schannel"));
+        assert!(
+            sel[3].why.contains("STATUS_DLL_INIT_FAILED"),
+            "{:?}",
+            sel[3]
+        );
+        // A binary chosen for its failures runs those again, and the test it
+        // was running when it ended; a sandbox test binary runs whole.
+        assert_eq!(sel[0].tests, Some(vec!["t".to_owned()]));
+        assert_eq!(
+            sel[3].tests,
+            Some(vec!["plain_failure".to_owned(), "t".to_owned()])
+        );
+        assert_eq!(sel[4].tests, Some(vec!["open::one".to_owned()]));
+        assert!(sel[5..].iter().all(|s| s.tests.is_none()), "{sel:?}");
+    }
+
+    /// Names that would not fit on one Windows command line re-run the
+    /// whole binary instead of a cut list.
+    #[test]
+    fn a_failure_list_too_long_for_one_command_line_reruns_the_whole_binary() {
+        let long: Vec<String> = (0..400)
+            .map(|i| {
+                format!(
+                    "tests::module::a_long_test_name_number_{i:04}_{}",
+                    "x".repeat(40)
+                )
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = long.iter().map(|n| (n.as_str(), "msys")).collect();
+        let b = bin("h/test/eight", &pairs);
+        let sel = select(&[b], false);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].tests, None);
+        let short = bin("h/test/nine", &pairs[..10]);
+        let sel = select(&[short], false);
+        assert_eq!(sel[0].tests.as_ref().map(Vec::len), Some(10));
     }
 
     #[test]
