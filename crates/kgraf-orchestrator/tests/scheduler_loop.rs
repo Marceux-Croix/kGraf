@@ -188,15 +188,18 @@ fn tracked(schedule: Schedule, created_at: chrono::DateTime<Utc>) -> TrackedSche
     }
 }
 
-/// Ticks until every claimed occurrence has settled, or gives up after a generous
-/// number of attempts (a hung test fails loudly instead of looping forever).
+/// Ticks until every claimed occurrence has settled, or gives up after 60 s of
+/// wall clock (a hung test fails loudly instead of looping forever). A hang guard,
+/// not a speed check: a count of ticks bounded the wait at about one second, and a
+/// loaded Windows runner took longer than that to settle a run that was only slow.
 async fn drain(
     loop_: &mut SchedulerLoop,
     schedules: &[TrackedSchedule],
     now: chrono::DateTime<Utc>,
 ) -> Vec<TickEvent> {
     let mut all = Vec::new();
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         let events = loop_.tick(schedules, now).await;
         let done = loop_.pending_count() == 0;
         all.extend(events);

@@ -373,9 +373,12 @@ async fn start(
 /// Reopen a transcript whose previous handle was just dropped. A
 /// `tokio::fs::File` closes its descriptor on the blocking pool after the
 /// drop, so its `flock` can outlive the handle by a moment; a process exiting
-/// (what these drops stand for) releases it at once.
+/// (what these drops stand for) releases it at once. The bound is wall clock, a
+/// hang guard and not a speed check: a loaded runner's blocking pool can take
+/// longer than a fixed count of short waits.
 async fn reopen(path: &Path) -> OpenTranscript {
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         match open_transcript(path).await {
             Ok(opened) => return opened,
             Err(e) if format!("{e:#}").contains("already open for writing") => {
