@@ -1,6 +1,9 @@
 //! Plan intake against the repository: a plan that leaves a named scaffold
 //! file unwritten, or whose acceptance runs cargo in a workspace before its
 //! members exist (in any form: `--workspace`, `-p`, ...), is refused with a reason the planner can act on and is asked again.
+//! A cargo workspace refusal with a mechanical remedy (an edge, a manifest
+//! moved to the contract that needs it, a minimal member source) is repaired
+//! instead, with a trace record and a notice per change, and no ask is spent.
 //!
 //! Round evidence: conflicts-tier2 gave the clearance discount to a contract
 //! that wrote only `catalog/src/lib.rs`, leaving the stub
@@ -65,10 +68,10 @@ fn contract(id: &str, instruction: &str, acceptance: &str, writes: &[&str]) -> s
     })
 }
 
-async fn refusals(dir: &Path) -> Vec<String> {
+async fn trace_events(dir: &Path) -> Vec<TraceEvent> {
     let path = dir.join("runs").join("r1").join("trace.jsonl");
     let started = Instant::now();
-    let events = loop {
+    loop {
         match TraceLog::open(&path).await {
             Ok(log) => break log.load().await.expect("load"),
             Err(_) if started.elapsed() < Duration::from_secs(10) => {
@@ -76,7 +79,10 @@ async fn refusals(dir: &Path) -> Vec<String> {
             }
             Err(e) => panic!("trace: {e:?}"),
         }
-    };
+    }
+}
+
+fn refusals(events: &[TraceEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -86,15 +92,44 @@ async fn refusals(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The traced plan repairs, as (ask, contract, change).
+fn repairs(events: &[TraceEvent]) -> Vec<(u32, String, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::PlanRepaired {
+                ask,
+                contract,
+                change,
+                ..
+            } => Some((*ask, contract.clone(), change.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first accepted plan's contracts and notices.
+fn accepted(events: &[TraceEvent]) -> (Vec<kgraf_orchestrator::PlannedContract>, Vec<String>) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            TraceEvent::PlanAccepted {
+                contracts, notices, ..
+            } => Some((contracts.clone(), notices.clone())),
+            _ => None,
+        })
+        .expect("a plan was accepted")
+}
+
 /// Runs `start` with `instruction` over a repository holding `files`, with the
 /// planner answering `first` and, once refused, `second`. Returns the planner's
-/// prompts and the refusals traced.
+/// prompts and the trace.
 async fn planned(
     files: &[(&str, &str)],
     instruction: &str,
     first: String,
     second: String,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<TraceEvent>) {
     let dir = tempfile::tempdir().expect("dir");
     for (rel, text) in files {
         let path = dir.path().join(rel);
@@ -130,7 +165,7 @@ async fn planned(
     assert!(h.status().await.is_some(), "a plan was accepted");
     h.stop().await;
     run.await.expect("join").expect("planned");
-    (p.planner.prompts(), refusals(dir.path()).await)
+    (p.planner.prompts(), trace_events(dir.path()).await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -157,6 +192,9 @@ async fn a_plan_that_leaves_a_named_stub_unwritten_is_refused_then_accepted_with
         covers_it,
     )
     .await;
+    // An unwritten scaffold has no mechanical remedy: asked again.
+    assert!(repairs(&refused).is_empty());
+    let refused = refusals(&refused);
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(
         refused[0].contains("`discount_clearance/src/lib.rs`"),
@@ -210,13 +248,17 @@ async fn a_named_file_that_mentions_a_placeholder_only_in_text_is_not_refused() 
         first,
     )
     .await;
+    let refused = refusals(&refused);
     assert!(refused.is_empty(), "{refused:?}");
     assert_eq!(prompts.len(), 1, "accepted at the first ask");
 }
 
+/// Greenfield, the first refusal's shape: c1 lists both members and runs
+/// `cargo test --workspace`, and `wcl` is written only by c2, which runs at
+/// the same time. kGraf makes c1 depend on c2; c2 then runs at a root whose
+/// manifest comes later, so c2 writes it too. Accepted at the first ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepted_when_one_contract_writes_them()
- {
+async fn a_workspace_acceptance_before_its_members_exist_is_repaired_without_an_ask() {
     let deadlock = plan(serde_json::json!([
         contract(
             "c1",
@@ -231,6 +273,45 @@ async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepte
             &["wcl/Cargo.toml", "wcl/src/main.rs"]
         ),
     ]));
+    let (prompts, events) = planned(
+        &[("README.md", "a word counter\n")],
+        "Build a word-count tool as a Cargo workspace with wcl-core and wcl.",
+        deadlock.clone(),
+        deadlock,
+    )
+    .await;
+    assert!(refusals(&events).is_empty(), "{:?}", refusals(&events));
+    assert_eq!(prompts.len(), 1, "accepted at the first ask");
+    let fixed = repairs(&events);
+    assert_eq!(fixed.len(), 2, "{fixed:?}");
+    assert_eq!((fixed[0].0, fixed[0].1.as_str()), (1, "c1"), "{fixed:?}");
+    assert!(fixed[0].2.contains("depends on `c2`"), "{fixed:?}");
+    assert_eq!(fixed[1].1, "c2", "{fixed:?}");
+    assert!(fixed[1].2.contains("`Cargo.toml`"), "{fixed:?}");
+    let (contracts, notices) = accepted(&events);
+    assert_eq!(contracts[0].depends_on, vec!["c2".to_owned()]);
+    assert!(contracts[1].writes.contains(&"Cargo.toml".to_owned()));
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|n| n.contains("kGraf repaired it"))
+            .count(),
+        2,
+        "{notices:?}"
+    );
+}
+
+/// A member no contract writes has no mechanical remedy: the plan left it
+/// out, so the planner is asked again with the refusal, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_member_no_contract_writes_is_refused_then_accepted_when_one_contract_writes_them()
+ {
+    let leaves_it = plan(serde_json::json!([contract(
+        "c1",
+        "Create the Cargo workspace at the repository root with `Cargo.toml` specifying members `[\"wcl-core\", \"wcl\"]`, and the `wcl-core` crate.",
+        "Run `cargo test --workspace` locally; it must pass.",
+        &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"]
+    )]));
     let one = plan(serde_json::json!([contract(
         "c1",
         "Create the Cargo workspace at the repository root with `Cargo.toml` specifying members `[\"wcl-core\", \"wcl\"]`, and both crates.",
@@ -243,16 +324,22 @@ async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepte
             "wcl/src/main.rs"
         ]
     )]));
-    let (prompts, refused) = planned(
+    let (prompts, events) = planned(
         &[("README.md", "a word counter\n")],
         "Build a word-count tool as a Cargo workspace with wcl-core and wcl.",
-        deadlock,
+        leaves_it,
         one,
     )
     .await;
+    assert!(repairs(&events).is_empty());
+    let refused = refusals(&events);
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(refused[0].contains("`wcl/Cargo.toml`"), "{}", refused[0]);
-    assert!(refused[0].contains("`c1`"), "{}", refused[0]);
+    assert!(
+        refused[0].contains("written by no contract"),
+        "{}",
+        refused[0]
+    );
     assert!(
         refused[0].contains("cargo test --workspace"),
         "{}",
@@ -261,24 +348,21 @@ async fn a_workspace_acceptance_before_its_members_exist_is_refused_then_accepte
     assert_eq!(prompts.len(), 2, "one ask, one re-ask");
 }
 
-/// Round 8 greenfield: after the first refusal the planner moved the root
-/// contract's acceptance to `cargo test -p wcl-core`, as the refusal then
-/// advised, and that plan was accepted. Cargo loads every member manifest
-/// for `-p` too, so it could never pass. It is refused now, and the remedy
-/// the refusal names (the root contract writes a minimal manifest and source
-/// for each member it lists) is accepted.
+/// Round 8 greenfield: the root contract runs `cargo test -p wcl-core`, and
+/// cargo loads every member manifest for `-p` too, so it could never pass.
+/// The edge to the binary contract would be a cycle, so kGraf makes the
+/// remedy the refusal names: the root contract writes the member manifest
+/// and a minimal source (`main.rs`, which the binary contract fills in after
+/// it). Accepted at the first ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_package_form_before_its_members_exist_is_refused_then_the_named_remedy_is_accepted() {
-    let bin = |instruction: &str| {
-        let mut c = contract(
-            "c2-bin",
-            instruction,
-            "cargo test --workspace && echo SUCCESS",
-            &["wcl/Cargo.toml", "wcl/src/main.rs"],
-        );
-        c["depends_on"] = serde_json::json!(["c1-core"]);
-        c
-    };
+async fn the_package_form_before_its_members_exist_is_repaired_to_the_named_remedy() {
+    let mut bin = contract(
+        "c2-bin",
+        "Create the `wcl` binary crate.",
+        "cargo test --workspace && echo SUCCESS",
+        &["wcl/Cargo.toml", "wcl/src/main.rs"],
+    );
+    bin["depends_on"] = serde_json::json!(["c1-core"]);
     let deadlock = plan(serde_json::json!([
         contract(
             "c1-core",
@@ -286,47 +370,25 @@ async fn the_package_form_before_its_members_exist_is_refused_then_the_named_rem
             "cargo test -p wcl-core && echo SUCCESS",
             &["Cargo.toml", "wcl-core/Cargo.toml", "wcl-core/src/lib.rs"]
         ),
-        bin("Create the `wcl` binary crate."),
+        bin,
     ]));
-    let remedy = plan(serde_json::json!([
-        contract(
-            "c1-core",
-            "Create the workspace root and `wcl-core` library.\n1. Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\", \"wcl\"]\n2. Write a minimal `wcl` crate for the binary contract to fill in.",
-            "cargo test -p wcl-core && echo SUCCESS",
-            &[
-                "Cargo.toml",
-                "wcl-core/Cargo.toml",
-                "wcl-core/src/lib.rs",
-                "wcl/Cargo.toml",
-                "wcl/src/main.rs"
-            ]
-        ),
-        bin("Fill in the `wcl` binary crate."),
-    ]));
-    let (prompts, refused) = planned(
+    let (prompts, events) = planned(
         &[("README.md", "a word counter\n")],
         "Build a word-count tool as a Cargo workspace with wcl-core and wcl.",
+        deadlock.clone(),
         deadlock,
-        remedy,
     )
     .await;
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(refused[0].contains("`c1-core`"), "{}", refused[0]);
-    assert!(
-        refused[0].contains("`cargo test -p wcl-core`"),
-        "{}",
-        refused[0]
-    );
-    assert!(refused[0].contains("`wcl/Cargo.toml`"), "{}", refused[0]);
-    assert!(
-        !refused[0].contains("cargo test -p <package>"),
-        "{}",
-        refused[0]
-    );
-    assert_eq!(prompts.len(), 2, "one ask, one re-ask");
-    assert!(
-        prompts[1].contains("also write `wcl/Cargo.toml`"),
-        "{}",
-        prompts[1]
-    );
+    assert!(refusals(&events).is_empty(), "{:?}", refusals(&events));
+    assert_eq!(prompts.len(), 1, "accepted at the first ask");
+    let fixed = repairs(&events);
+    assert_eq!(fixed.len(), 2, "{fixed:?}");
+    assert!(fixed.iter().all(|(ask, c, _)| *ask == 1 && c == "c1-core"));
+    assert!(fixed[0].2.contains("`wcl/Cargo.toml`"), "{fixed:?}");
+    assert!(fixed[1].2.contains("`wcl/src/main.rs`"), "{fixed:?}");
+    let (contracts, _) = accepted(&events);
+    assert!(contracts[0].depends_on.is_empty(), "no edge to c2-bin");
+    for path in ["wcl/Cargo.toml", "wcl/src/main.rs"] {
+        assert!(contracts[0].writes.contains(&path.to_owned()), "{path}");
+    }
 }

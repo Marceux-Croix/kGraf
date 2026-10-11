@@ -16,6 +16,7 @@ pub mod e2e;
 pub mod facts;
 pub mod libtest;
 pub mod manifest;
+pub mod only;
 pub mod pack;
 pub mod platform;
 pub mod proc;

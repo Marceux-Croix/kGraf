@@ -530,6 +530,11 @@ pub trait Exec {
     fn cli(&mut self, label: &str, args: &[&str], limit: Duration, honor_cancel: bool) -> StepRun;
     /// Runs one test binary of the suite again, by manifest id.
     fn rerun(&mut self, id: &str) -> BinaryResult;
+    /// `--only` named every binary of the baseline, so the re-run takes each
+    /// of them, whatever the baseline found ([`select`]).
+    fn every_binary_named(&self) -> bool {
+        false
+    }
     fn e2e(&mut self) -> Vec<Check>;
     /// The fallback's elevated action, `kgraf sandbox elevated --action
     /// grant-named-objects`, started from the owner's side the way setup
@@ -713,12 +718,15 @@ pub struct Selection {
 }
 
 /// The binaries of the baseline to run again with the sandbox user active, in
-/// baseline order, each once.
-pub fn select(first: &[BinaryResult]) -> Vec<Selection> {
+/// baseline order, each once. With `every_named` (`--only`), the person named
+/// each binary the baseline ran, so each runs again whatever it did there.
+pub fn select(first: &[BinaryResult], every_named: bool) -> Vec<Selection> {
     first
         .iter()
         .filter_map(|b| {
-            let why = if ALWAYS.contains(&base_id(&b.id)) {
+            let why = if every_named {
+                "named by --only".to_owned()
+            } else if ALWAYS.contains(&base_id(&b.id)) {
                 "sandbox test binary".to_owned()
             } else if !b.clean() {
                 let hit = failure_texts(b).into_iter().find_map(blocker)?;
@@ -880,7 +888,7 @@ pub fn run_phase(
     if !passed && p.dns_failed.is_none() && p.failed_under_user.is_none() {
         p.stopped_at_gate = true;
     } else {
-        for s in select(first) {
+        for s in select(first, ex.every_binary_named()) {
             if cancelled() {
                 p.cancelled = true;
                 break;
@@ -945,6 +953,76 @@ fn after_of(test: &str, r: &BinaryResult) -> (String, String) {
         Some(_) => ("not reached".into(), r.tail.clone().unwrap_or_default()),
         None => ("not reached".into(), r.tail.clone().unwrap_or_default()),
     }
+}
+
+/// The forms of `STATUS_DLL_INIT_FAILED` (0xC0000142) a failed process
+/// leaves in a test's output: hex, signed and unsigned decimal. Under the
+/// token sandbox Git Bash's programs and rustc end with it before they run
+/// (msys cannot make its object directory, rustc its jobserver).
+const DLL_INIT_FAILED: &[&str] = &["0xc0000142", "-1073741502", "3221225794"];
+
+/// The token sandbox limit a failed test's own output names: a [`blocker`],
+/// or `STATUS_DLL_INIT_FAILED`. Only for [`expected_under_token_sandbox`],
+/// which also needs the test to pass as the sandbox user; the re-run
+/// selection reads [`blocker`] alone.
+pub fn token_sandbox_marker(text: &str) -> Option<&'static str> {
+    blocker(text).or_else(|| {
+        let lower = text.to_lowercase();
+        DLL_INIT_FAILED
+            .iter()
+            .any(|m| lower.contains(m))
+            .then_some("STATUS_DLL_INIT_FAILED (0xC0000142)")
+    })
+}
+
+/// A baseline failure that the token sandbox explains: the test passed when
+/// it ran again as the sandbox user, and its baseline output names a limit
+/// of the token sandbox that the sandbox user lifts
+/// ([`token_sandbox_marker`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpectedFailure {
+    pub binary: String,
+    pub test: String,
+    /// The marker its baseline output carries, as the report names it.
+    pub marker: String,
+}
+
+/// The baseline failures expected under the token sandbox. A failure counts
+/// here only when both hold: (a) the same test passed in the sandbox user
+/// re-run, a first-run pass and not a solo re-run's, and (b) its own
+/// baseline output carries a token sandbox marker. Every other baseline
+/// failure still counts, and so does one the baseline counted apart for a
+/// missing tool. A hung or crashed baseline binary is not a test failure
+/// and is never classified here.
+pub fn expected_under_token_sandbox(
+    first: &[BinaryResult],
+    reruns: &[Rerun],
+) -> Vec<ExpectedFailure> {
+    let mut out = Vec::new();
+    for rr in reruns {
+        let Some(a) = first.iter().find(|b| b.id == rr.result.id) else {
+            continue;
+        };
+        for f in &a.failures {
+            if f.class != "kgraf_defect_suspected" {
+                continue;
+            }
+            let passed = rr
+                .result
+                .tests
+                .iter()
+                .any(|t| t.name == f.test && t.outcome == Outcome::Passed)
+                && !rr.result.failures.iter().any(|g| g.test == f.test);
+            if let (true, Some(marker)) = (passed, token_sandbox_marker(&f.tail)) {
+                out.push(ExpectedFailure {
+                    binary: a.id.clone(),
+                    test: f.test.clone(),
+                    marker: marker.to_owned(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Every test that failed (or was running when the binary ended) in the
@@ -1607,7 +1685,7 @@ mod tests {
         // A clean binary whose output once named a blocker is not re-run.
         let clean = bin("f/test/six", &[]);
         jobserver.id = "a/test/one#core".into();
-        let sel = select(&[
+        let first = [
             jobserver,
             msys,
             schannel,
@@ -1618,7 +1696,12 @@ mod tests {
             bin("kgraf-sandbox/test/shell_windows#core", &[]),
             bin("kgraf-sandbox/test/startup_windows", &[]),
             bin("kgraf-sandbox/lib/kgraf_sandbox", &[]),
-        ]);
+        ];
+        // `--only` named every binary the baseline ran: each runs again.
+        let named = select(&first, true);
+        assert_eq!(named.len(), first.len());
+        assert!(named.iter().all(|s| s.why == "named by --only"));
+        let sel = select(&first, false);
         let ids: Vec<&str> = sel.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1741,6 +1824,84 @@ mod tests {
             ]
         );
         assert_eq!(cmp[1].tail, "still broken");
+    }
+
+    /// Only a baseline failure that both passed as the sandbox user and
+    /// carries a token sandbox marker is expected; every other one counts.
+    #[test]
+    fn a_baseline_failure_is_expected_only_with_a_rerun_pass_and_a_marker() {
+        const MSYS: &str = "bash.exe: *** fatal error - \
+                            NtCreateDirectoryObject(\\BaseNamedObjects\\msys-2.0S5-1): 0xC0000022";
+        const JOBSERVER: &str = "failed to create jobserver: Access is denied; cargo jobserver";
+        const DLL_INIT: &str = "It said: $ true\n[exit code: 0xc0000142]";
+        let mut first = vec![bin(
+            "x/test/y",
+            &[
+                ("msys_passes", MSYS),
+                ("jobserver_passes", JOBSERVER),
+                ("dll_init_passes", DLL_INIT),
+                ("plain_passes", "assertion `left == right` failed"),
+                ("msys_fails_again", MSYS),
+                ("msys_not_reached", MSYS),
+                ("msys_solo_pass", MSYS),
+                ("msys_needs_tool", MSYS),
+            ],
+        )];
+        first[0].failures[7].class = "needs `cargo`, not on this machine".into();
+        // A binary that was not run again keeps every failure.
+        first.push(bin("z/test/w", &[("msys_elsewhere", MSYS)]));
+        let mut r = bin("x/test/y", &[("msys_fails_again", "still broken")]);
+        for name in [
+            "msys_passes",
+            "jobserver_passes",
+            "dll_init_passes",
+            "plain_passes",
+            "msys_needs_tool",
+        ] {
+            r.tests.push(crate::libtest::TestOutcome {
+                name: name.into(),
+                outcome: Outcome::Passed,
+            });
+        }
+        // Failed in the re-run's first run, passed only when run alone.
+        r.tests.push(crate::libtest::TestOutcome {
+            name: "msys_solo_pass".into(),
+            outcome: Outcome::Failed,
+        });
+        r.failures.push(Failure {
+            test: "msys_solo_pass".into(),
+            class: "kgraf_defect_suspected".into(),
+            tail: "passed".into(),
+            solo: Some("passed".into()),
+        });
+        let reruns = [Rerun {
+            why: "w".into(),
+            result: r,
+        }];
+        let got = expected_under_token_sandbox(&first, &reruns);
+        let names: Vec<(&str, &str)> = got
+            .iter()
+            .map(|e| (e.test.as_str(), e.marker.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("msys_passes", "Git Bash (msys)"),
+                ("jobserver_passes", "cargo jobserver"),
+                ("dll_init_passes", "STATUS_DLL_INIT_FAILED (0xC0000142)")
+            ]
+        );
+        assert!(got.iter().all(|e| e.binary == "x/test/y"));
+        // The decimal forms a Rust `ExitStatus` prints are the same status.
+        for text in ["exit status: -1073741502", "ExitStatus(3221225794)"] {
+            assert_eq!(
+                token_sandbox_marker(text),
+                Some("STATUS_DLL_INIT_FAILED (0xC0000142)")
+            );
+        }
+        assert_eq!(token_sandbox_marker("assertion failed"), None);
+        // The re-run selection does not read it.
+        assert_eq!(blocker("[exit code: 0xc0000142]"), None);
     }
 
     #[test]

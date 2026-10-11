@@ -19,7 +19,10 @@
 //! secondary logon service may do that is not documented. The command's
 //! station keeps it away from the owner's windows, clipboard and global atoms,
 //! and from the runner's. Each station made is recorded
-//! ([`launch_record`]).
+//! ([`launch_record`]). On the session-0 path the runner and the command run
+//! in session 0, where this process can make no station, so kGraf's launcher
+//! service makes the command's, with the same access list, and names it in
+//! its reply ([`via_service`]).
 //!
 //! **Job.** The runner, and through it the command, runs in the job the
 //! caller passes, which kills on close, allows no breakaway and sets no user
@@ -188,11 +191,16 @@ const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 ///   service makes comes from `LogonUser` for the sandbox user alone, so its
 ///   logon SID names a logon session that nothing of the owner's admits, and
 ///   the object directory of session 0 is reached through it.
-/// - **No window station is named.** The service passes an empty desktop, so
-///   Windows makes a window station and desktop for the new logon session,
-///   and the command joins the runner's, which is the same sandbox user in
-///   the same logon session. Nothing of the owner's session is named or
-///   changed.
+/// - **The service makes the command's window station.** A station belongs to
+///   one session, so this process cannot make one in session 0. The service
+///   starts the runner with an empty desktop (Windows makes a station for the
+///   runner's logon session), and names in its reply the station and desktop
+///   it made in session 0 for the commands of this sandbox user
+///   (`service_command_desktop`), with the same access list as on the
+///   owner-session path. This side names that desktop in the runner request,
+///   so the command shares no station with the runner or with another
+///   sandbox user's commands, and records it ([`launch_record`]). Nothing of
+///   the owner's session is named or changed.
 fn via_service(
     user: &Credential<'_>,
     std: [HANDLE; 3],
@@ -218,11 +226,9 @@ fn via_service(
         .with_logon_sid(LogonSidPolicy::Keep);
     let owner_sid = accounts::current_user_sid()?;
     let server = create_pipe(&args.pipe, &owner_sid, user.sid)?;
-    // Empty: the window station Windows made for the runner's logon session.
-    request.desktop = Vec::new();
-    let frame = request
-        .encode()
-        .map_err(|e| failed("write the runner request", e))?;
+    // The runner request is written once the service has replied with the
+    // command's desktop, below. A request that cannot be written then ends
+    // the job, and with it the runner, which waits for it.
 
     // Where this program and its runner live is checked again here, once per
     // process, and not only at the install.
@@ -267,12 +273,13 @@ fn via_service(
         },
     );
     launch_record::note_launch(session0::LaunchPath::Session0, asked.elapsed(), &reply);
-    let (runner_pid, handle, protected) = match reply.map_err(end_job)? {
+    let (runner_pid, handle, desktop, protected) = match reply.map_err(end_job)? {
         ServiceReply::Started {
             pid,
             handle,
+            desktop,
             protected,
-        } => (pid, handle, protected),
+        } => (pid, handle, desktop, protected),
         ServiceReply::Failed { step, code, text } => {
             return Err(end_job(SandboxError::PlatformSetup {
                 step: "start the runner through kGraf's launcher service",
@@ -285,6 +292,13 @@ fn via_service(
     // SAFETY: the launcher duplicated this handle into this process and holds
     // no copy of it, so this code now owns it.
     let runner = unsafe { OwnedHandle::from_raw_handle(handle as HANDLE) };
+    // The reply's desktop was checked when it was read
+    // (`session0::is_command_desktop`).
+    launch_record::note_service_station(&desktop, user.sid, ADMITTED);
+    request.desktop = desktop.encode_utf16().collect();
+    let frame = request
+        .encode()
+        .map_err(|e| end_job(failed("write the runner request", e)))?;
     // The runner is already in this job: the launcher put it there while it
     // was still suspended, so a failure of that step never leaves a command
     // outside the job.
@@ -650,7 +664,7 @@ impl Role {
     fn prefix(self) -> &'static str {
         match self {
             Role::Runner => "kgraf-run-",
-            Role::Command => "kgraf-cmd-",
+            Role::Command => session0::COMMAND_STATION_PREFIX,
         }
     }
 
@@ -808,6 +822,51 @@ fn desktops(owner_sid: &str, user_sid: &str) -> Result<(Vec<u16>, String), Sandb
     Ok(names)
 }
 
+/// The command's `<station>\Default` for the sandbox user `user_sid`, made
+/// by kGraf's launcher service in session 0 on first use and kept for as long
+/// as the service runs. Called by the service only
+/// (`service_main::serve_client`); the owner names the result in the runner
+/// request, as it names its own station on the owner-session path.
+///
+/// **Why the service makes it.** A window station belongs to one session,
+/// and the runner and the command run in session 0, where the owner's
+/// process cannot make one. Without a station named, the command joined the
+/// one Windows made for the runner's logon session. Now the commands of each
+/// sandbox user get one station, with the same access list as on the
+/// owner-session path ([`Station::create`]: SYSTEM, the owner and that user),
+/// so a command shares no desktop, clipboard or atom table with the runner or
+/// with the commands of another sandbox user.
+///
+/// **Lifetime.** A window station ends with its last handle and its last
+/// process. The handles stay in this map until the service process ends, so
+/// a command may start on the station at any time; a command still running
+/// when the service stops keeps the station alive until it ends, and the next
+/// service process makes a new one. The map holds one entry per sandbox user
+/// that logged on, so it is bounded by the slot count. A failure is not kept,
+/// so a later command tries again.
+pub(super) fn service_command_desktop(
+    owner_sid: &str,
+    user_sid: &str,
+) -> Result<String, SandboxError> {
+    static STATIONS: OnceLock<Mutex<HashMap<String, Station>>> = OnceLock::new();
+    let mut stations = STATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| {
+            failed(
+                "make the command's window station in session 0",
+                "a lock was poisoned",
+            )
+        })?;
+    if let Some(found) = stations.get(user_sid) {
+        return Ok(found.full_name.clone());
+    }
+    let made = Station::create(Role::Command, owner_sid, user_sid)?;
+    let name = made.full_name.clone();
+    stations.insert(user_sid.to_owned(), made);
+    Ok(name)
+}
+
 /// Who the access lists of both stations and desktops admit, for the record.
 const ADMITTED: &str = "SYSTEM, the owner and that sandbox user";
 
@@ -819,9 +878,15 @@ impl Station {
     /// The owner's entry lets this process make the desktop on the station
     /// it entered; the command holds neither the owner's SID nor, enabled,
     /// the owner's logon SID (`runner::command_token`), so the entry admits
-    /// no sandboxed program. Called with the lock of [`desktops`] held, so two
-    /// of these never overlap.
+    /// no sandboxed program. In the launcher service, SYSTEM makes both, and
+    /// the owner's entry is the same list on both paths.
+    ///
+    /// Two of these never overlap in one process (the lock below): each switches
+    /// the whole process's window station for a moment.
     fn create(role: Role, owner_sid: &str, user_sid: &str) -> Result<Self, SandboxError> {
+        static CREATE: Mutex<()> = Mutex::new(());
+        // Plain mutual exclusion: a panic elsewhere leaves nothing to repair.
+        let _one_at_a_time = CREATE.lock().unwrap_or_else(|p| p.into_inner());
         let steps = role.steps();
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(|e| failed(steps.name, e))?;

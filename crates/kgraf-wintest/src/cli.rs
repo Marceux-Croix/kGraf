@@ -16,6 +16,9 @@ pub struct RunOptions {
     /// After the suite, set the Windows sandbox user up, re-run the parts it
     /// changes, and remove it again (needs administrator rights).
     pub sandbox_user: bool,
+    /// Run only the named binaries, tests and end-to-end checks
+    /// ([`crate::only`]).
+    pub only: Option<crate::only::Only>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +61,10 @@ kgraf-wintest: runs kGraf's Windows tests and writes one report to the Desktop.
       --report-dir <folder>          write the report there instead of the Desktop
       --sandbox-user                 after the suite: set the Windows sandbox user up, re-run the
                                      parts it changes, remove it (needs administrator rights)
+      --only <filter>                run only these, in the suite and in the sandbox user re-run:
+                                     comma-separated `binary-id` or `binary-id::test-name` items
+                                     (run ids as in the report); `e2e` or `e2e::<check-id>` adds
+                                     end-to-end checks, which otherwise do not run
   kgraf-wintest sandbox-run -- <program> [args...]
                                      run one program inside kGraf's sandbox (for manual tests)
 ";
@@ -139,6 +146,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     "--no-wait" => o.no_wait = true,
                     "--sandbox-user" => o.sandbox_user = true,
                     "--report-dir" => o.report_dir = Some(PathBuf::from(value(&mut it, a)?)),
+                    "--only" => {
+                        let text = value(&mut it, a)?;
+                        // An empty value is the full run, so a workflow can
+                        // pass its input through whether or not it is set.
+                        if !text.trim().is_empty() {
+                            o.only = Some(crate::only::Only::parse(&text)?);
+                        }
+                    }
                     "-h" | "--help" | "/?" => return Ok(Command::Help),
                     other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
                 }
@@ -228,5 +243,22 @@ mod tests {
         assert!(!RunOptions::default().sandbox_user);
         assert_eq!(o.report_dir, Some(PathBuf::from("D:\\r")));
         assert!(p(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn only_takes_a_filter_and_an_empty_one_is_the_full_run() {
+        let Command::Run(o) = p(&["--all", "--only", "a/test/b::t,e2e"]).expect("parses") else {
+            panic!("a run");
+        };
+        assert_eq!(
+            o.only.as_ref().map(|f| f.text.as_str()),
+            Some("a/test/b::t,e2e")
+        );
+        let Command::Run(o) = p(&["--only", ""]).expect("parses") else {
+            panic!("a run");
+        };
+        assert_eq!(o.only, None);
+        assert!(p(&["--only"]).is_err());
+        assert!(p(&["--only", "a,,b"]).is_err());
     }
 }

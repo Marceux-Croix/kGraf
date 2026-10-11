@@ -114,13 +114,26 @@ impl RunLoop {
             let last_ask = reasks >= MAX_PLAN_REASKS;
             let refusal = match self.decompose_once(&request, note_ids).await {
                 Ok(None) => return Ok(None),
-                Ok(Some(specs)) => {
+                Ok(Some(mut specs)) => {
                     // The plan against the repository as it is now (an
                     // unwritten scaffold file, a workspace its acceptance
                     // builds before its members exist). A split's children
                     // are not checked: earlier contracts' work is not in the
-                    // checkout this reads.
-                    if let Some(refusal) = self.plan_repo_refusal(&specs, &named_files, outer) {
+                    // checkout this reads. A cargo workspace refusal with a
+                    // mechanical remedy is repaired before an ask is spent;
+                    // otherwise the unchanged refusal is asked with.
+                    let repo_refusal = match self.plan_repo_refusal(&specs, &named_files, outer) {
+                        Some(refusal) => match self.plan_repo_repair(&specs, &named_files, outer) {
+                            Some((fixed, remedies)) => {
+                                self.note_plan_repairs(reasks + 1, &remedies).await?;
+                                specs = fixed;
+                                None
+                            }
+                            None => Some(refusal),
+                        },
+                        None => None,
+                    };
+                    if let Some(refusal) = repo_refusal {
                         refusal
                     } else {
                         let groups = self.single_test_groups(&specs);
@@ -213,6 +226,60 @@ impl RunLoop {
         }
         let root = self.s.workspaces.repo_root()?;
         crate::plan_repo::refusal(specs, named_files, &crate::plan_repo::DiskRepo(root))
+    }
+
+    /// `specs` repaired against the repository checkout so the cargo
+    /// workspace checks pass, with the changes made
+    /// ([`crate::plan_repo::repaired`]), when the repaired plan also passes
+    /// the plan rules. `None` leaves the refusal to the planner.
+    fn plan_repo_repair(
+        &self,
+        specs: &[ContractSpec],
+        named_files: &[String],
+        outer: &BTreeSet<String>,
+    ) -> Option<(Vec<ContractSpec>, Vec<crate::plan_repo::Remedy>)> {
+        if !outer.is_empty() {
+            return None;
+        }
+        let root = self.s.workspaces.repo_root()?;
+        let (fixed, remedies) =
+            crate::plan_repo::repaired(specs, named_files, &crate::plan_repo::DiskRepo(root))?;
+        validate_plan_with(
+            &fixed,
+            &BTreeSet::new(),
+            &self.roster(),
+            &self.tools(),
+            self.config.max_contracts_per_plan,
+            self.bypass_git_files(),
+        )
+        .ok()?;
+        Some((fixed, remedies))
+    }
+
+    /// One trace record and one run notice per change of a repaired plan, so
+    /// a repair is never silent and a round can count them.
+    async fn note_plan_repairs(
+        &mut self,
+        ask: u32,
+        remedies: &[crate::plan_repo::Remedy],
+    ) -> Result<(), OrchestratorError> {
+        for r in remedies {
+            let at = self.now();
+            self.trace(TraceEvent::PlanRepaired {
+                at_ms: at,
+                ask,
+                contract: r.contract().to_owned(),
+                change: r.to_string(),
+            })
+            .await?;
+            // Contract ids and paths come from the model's answer: scrubbed
+            // before they are shown or persisted.
+            self.intake_notice(kgraf_secrets::scrub_persist_owned(format!(
+                "the planner's answer failed a cargo workspace check; kGraf repaired it \
+                 instead of asking again: {r}"
+            )));
+        }
+        Ok(())
     }
 
     /// The groups of contracts that declare one write set checked by one test

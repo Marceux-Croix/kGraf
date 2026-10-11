@@ -1966,7 +1966,13 @@ mod tests {
             base: &base,
             commit: &commit,
         };
-        assert!(verify(&brief, &attempt, &env_in(scratch.path(), 240)).expect("verify"));
+        // A second attempt gets a scratch folder of its own, as the bench
+        // runner and `kgraf-bench-check` give every attempt one. On the
+        // Windows sandbox user a command runs as the slot user of its first
+        // writable root, the attempt folder, so the build output the first
+        // attempt left in a shared scratch folder belongs to another user.
+        let scratch2 = tempfile::tempdir().expect("scratch");
+        assert!(verify(&brief, &attempt, &env_in(scratch2.path(), 240)).expect("verify"));
     }
 
     /// The interface-greeter fixture with the trait its brief asks for added.

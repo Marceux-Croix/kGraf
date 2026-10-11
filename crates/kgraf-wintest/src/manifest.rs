@@ -47,6 +47,11 @@ pub struct TestRun {
     pub set: Set,
     /// libtest name filters; empty runs every test.
     pub filters: Vec<String>,
+    /// The filters are full test names (libtest `--exact`): set by `--only`
+    /// for a run named with tests ([`crate::only`]); never in a written
+    /// manifest.
+    #[serde(default)]
+    pub exact: bool,
     pub skips: Vec<Skip>,
     /// Seconds each test is expected to take, for the time estimate.
     pub secs_per_test: f64,
@@ -252,7 +257,22 @@ pub const EXTENDED_SECS_PER_TEST: f64 = 0.15;
 /// is cut off before it ends and its later tests are never reported.
 /// `kgraf_host#rest`: each test starts git and worker runs; 428 of its tests
 /// took the whole 600 s limit and it was still running.
-pub const MEASURED_SECS_PER_TEST: &[(&str, f64)] = &[("kgraf-host/lib/kgraf_host#rest", 1.4)];
+///
+/// `contract_checks`: each check builds a fresh copy of a small crate with a
+/// target folder of its own, and a revision test runs up to ten of them in
+/// a row. Under the Windows sandbox user a cold build took about 12 s on a
+/// hosted runner, so 11 tests filled the 600 s limit and the twelfth, ten
+/// builds, did not end within the 120 s of its solo re-run: a test cut off
+/// by its time limit, not one that waits on nothing. On a development Mac
+/// the whole binary takes about 6 minutes.
+///
+/// `kgraf_bench_briefs` lib: its check tests build and test fixtures as the
+/// sandbox user; its 70 tests took 592 s of the 600 s limit.
+pub const MEASURED_SECS_PER_TEST: &[(&str, f64)] = &[
+    ("kgraf-host/lib/kgraf_host#rest", 1.4),
+    ("kgraf-orchestrator/test/contract_checks", 40.0),
+    ("kgraf-bench-briefs/lib/kgraf_bench_briefs", 8.5),
+];
 
 /// One test binary or program from cargo's `--message-format=json` output.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +394,7 @@ pub fn plan_from_messages(
             package_dir: relative(&a.manifest_dir, build_root).to_owned(),
             set: Set::Extended,
             filters: Vec::new(),
+            exact: false,
             skips,
             secs_per_test: EXTENDED_SECS_PER_TEST,
         };

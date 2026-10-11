@@ -654,21 +654,12 @@ impl SandboxRunner {
                     }
                 };
                 let tree = tree.to_path_buf();
+                let limit = self.timeout;
                 blocking(move || {
                     let tar = tarball.0.clone();
                     let mut extract = std::process::Command::new("tar");
                     extract.arg("-xf").arg(&tar).arg("-C").arg(&tree);
-                    // Under the spawn lock, as every spawn: see
-                    // `kgraf_core::child_run::spawn_locked`.
-                    let out = kgraf_core::child_run::output(&mut extract).map_err(io(&tar))?;
-                    if !out.status.success() {
-                        return Err(CheckError::Config(format!(
-                            "cannot extract {}: {}",
-                            tar.display(),
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        )));
-                    }
-                    Ok(())
+                    extract_within(extract, &tar, limit)
                 })
                 .await?;
             }
@@ -1203,6 +1194,37 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Run `extract`, which unpacks the base archive `tar` into a run's tree, to
+/// its end within `limit`, the run's own bound. Every wait on the way to a
+/// check's verdict is bounded: an extraction that does not end (a process
+/// that keeps its output pipe open, a stalled disk) is killed with its
+/// process tree and fails the run naming the archive and the bound, instead
+/// of holding the check, and the caller waiting for it, with no end.
+/// Spawned under the spawn lock, as every spawn
+/// (`kgraf_core::child_run::run`).
+fn extract_within(
+    extract: std::process::Command,
+    tar: &Path,
+    limit: Duration,
+) -> Result<(), CheckError> {
+    let what = format!("extracting the check's base archive {}", tar.display());
+    let out = kgraf_core::child_run::run(
+        extract,
+        &what,
+        None,
+        kgraf_core::child_run::Limits::new(limit),
+    )
+    .map_err(|e| CheckError::Config(format!("{what} failed: {e}")))?;
+    if !out.status.success() {
+        return Err(CheckError::Config(format!(
+            "cannot extract {}: {}",
+            tar.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, CheckError> + Send + 'static,
 ) -> Result<T, CheckError> {
@@ -1698,5 +1720,31 @@ mod tests {
         assert!(missing_program(Some(1), "AssertionError: 0 != 8080").is_none());
         assert!(missing_program(Some(101), "error[E0425]: cannot find value").is_none());
         assert!(missing_program(Some(71), "some other failure").is_none());
+    }
+
+    /// The base extraction is bounded: one that does not end within the
+    /// run's bound is ended and fails loud, naming the archive and the bound,
+    /// rather than holding the check open. A program that waits stands in for
+    /// `tar` (Unix: `sleep`).
+    #[cfg(unix)]
+    #[test]
+    fn an_extraction_that_does_not_end_fails_naming_the_archive() {
+        let mut slow = std::process::Command::new("sleep");
+        slow.arg("30");
+        let started = std::time::Instant::now();
+        let err = super::extract_within(
+            slow,
+            std::path::Path::new("/scratch/base-abc.tar"),
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("a bound");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the bound did not end the wait: {:?}",
+            started.elapsed()
+        );
+        let text = err.to_string();
+        assert!(text.contains("/scratch/base-abc.tar"), "{text}");
+        assert!(text.contains("did not finish within"), "{text}");
     }
 }

@@ -1,5 +1,6 @@
 //! What the Windows launch path did in this process, for a person reading a
-//! test run: each window station and desktop it made, the jobserver
+//! test run: each window station and desktop it made, or kGraf's launcher
+//! service made for its commands in session 0, the jobserver
 //! semaphores it made for the commands' cargo and rustc, how long each
 //! `CreateProcessWithLogonW` call took, how long it waited for the spawn lock
 //! first, and how the spawn lock was used by every spawn in the process.
@@ -63,6 +64,9 @@ impl Timings {
 
 struct Record {
     stations: Vec<String>,
+    /// The stations kGraf's launcher service named in its replies, already
+    /// in `stations`.
+    service_stations: Vec<String>,
     /// The first jobserver semaphore made, and how many were made.
     jobserver: Option<String>,
     jobservers: u64,
@@ -83,6 +87,7 @@ struct Record {
 
 static RECORD: Mutex<Record> = Mutex::new(Record {
     stations: Vec::new(),
+    service_stations: Vec::new(),
     jobserver: None,
     jobservers: 0,
     logon: Timings::ZERO,
@@ -114,6 +119,44 @@ pub fn note_station(role: &str, station: &str, desktop: &str, user_sid: &str, ad
     if r.stations.len() < MAX_STATION_LINES {
         r.stations.push(line);
     }
+}
+
+/// Record that kGraf's launcher service made the window station and desktop
+/// `desktop` (`<station>\<desktop>`) in session 0 for the commands of the
+/// sandbox user `user_sid`, admitting `admitted`, as its reply named it. Once
+/// per station in this process: the service keeps one station per sandbox
+/// user for as long as it runs, so most replies name a station already
+/// recorded, and a new name means the service made a new one.
+pub fn note_service_station(desktop: &str, user_sid: &str, admitted: &str) {
+    let (station, desk) = desktop.split_once('\\').unwrap_or((desktop, ""));
+    let mut r = record();
+    if r.service_stations.iter().any(|s| s == station) {
+        return;
+    }
+    if r.stations.len() < MAX_STATION_LINES {
+        r.service_stations.push(station.to_owned());
+        r.stations.push(service_station_line(
+            now(),
+            station,
+            desk,
+            user_sid,
+            admitted,
+        ));
+    }
+}
+
+fn service_station_line(
+    at: u64,
+    station: &str,
+    desktop: &str,
+    user_sid: &str,
+    admitted: &str,
+) -> String {
+    format!(
+        "launch: kGraf's launcher service made window station {station} and desktop \
+         {desktop} for the command of sandbox user {user_sid} in session 0, admitting \
+         {admitted} (at {at})"
+    )
 }
 
 /// Record that this process made the jobserver semaphore `name` with `tokens`
@@ -307,6 +350,32 @@ mod tests {
              of sandbox user S-1-5-21-1-2-3-1001, admitting SYSTEM, the owner and that user \
              (at 1700000000)"
         );
+    }
+
+    /// The line a Windows run reads to tie the command's station to one kGraf
+    /// made: the runner test looks for "made window station <station> and
+    /// desktop Default for the command".
+    #[test]
+    fn a_station_the_launcher_made_is_recorded_once_with_the_words_a_run_reads() {
+        let desktop = r"kgraf-cmd-feedfacecafe0001\Default";
+        note_service_station(desktop, "S-1-5-21-9-8-7-1010", "SYSTEM, x");
+        note_service_station(desktop, "S-1-5-21-9-8-7-1010", "SYSTEM, x");
+        let all = lines();
+        let found: Vec<&String> = all
+            .iter()
+            .filter(|l| l.contains("kgraf-cmd-feedfacecafe0001"))
+            .collect();
+        assert_eq!(found.len(), 1, "{all:?}");
+        assert!(
+            found[0].contains(
+                "made window station kgraf-cmd-feedfacecafe0001 and desktop Default for the \
+                 command"
+            ),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("in session 0"), "{}", found[0]);
+        assert!(found[0].contains("S-1-5-21-9-8-7-1010"), "{}", found[0]);
     }
 
     #[test]

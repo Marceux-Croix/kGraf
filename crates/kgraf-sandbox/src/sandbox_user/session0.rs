@@ -410,7 +410,39 @@ pub fn runner_for(
 // ---- the service protocol ---------------------------------------------------
 
 pub const REQUEST_MAGIC: &[u8; 8] = b"KGRSVCRQ";
-pub const REQUEST_VERSION: u8 = 1;
+/// Version 2: the reply names the command's window station and desktop
+/// (the `desktop` of [`ServiceReply::Started`]). The request is unchanged; the
+/// version moves so that a launcher and an owner of different builds refuse
+/// each other with words that say so, instead of reading a reply one of them
+/// does not understand.
+pub const REQUEST_VERSION: u8 = 2;
+
+/// The prefix of a window station kGraf makes for the commands of one
+/// sandbox user, on either launch path. The rest of the name is 16 lowercase
+/// hex digits from the system random source.
+pub const COMMAND_STATION_PREFIX: &str = "kgraf-cmd-";
+
+/// The one desktop kGraf makes on each of its window stations.
+pub const COMMAND_DESKTOP: &str = "Default";
+
+/// Whether `name` is `<station>\<desktop>` as kGraf names a command's: a
+/// [`COMMAND_STATION_PREFIX`] station with 16 lowercase hex digits and the
+/// [`COMMAND_DESKTOP`] desktop. The owner passes the name to the runner, which
+/// passes it to Windows as `STARTUPINFOW::lpDesktop`, so nothing else is
+/// accepted from the launcher's reply.
+pub fn is_command_desktop(name: &str) -> bool {
+    let Some((station, desktop)) = name.split_once('\\') else {
+        return false;
+    };
+    let Some(hex) = station.strip_prefix(COMMAND_STATION_PREFIX) else {
+        return false;
+    };
+    desktop == COMMAND_DESKTOP
+        && hex.len() == 16
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// The longest text field the service reads, in UTF-16 units: a Windows
 /// command line's limit.
@@ -666,6 +698,12 @@ pub enum ServiceReply {
         /// the rights it was made with, so one the service duplicated goes on
         /// working after that list is written.
         handle: u64,
+        /// The command's `<station>\<desktop>` ([`is_command_desktop`]): a
+        /// window station and desktop the launcher made in session 0 for the
+        /// commands of this sandbox user, admitting SYSTEM, the owner and that
+        /// user. The owner names it in the runner request, and the runner
+        /// starts the command there, never on the runner's own station.
+        desktop: String,
         /// `Ok(())` when the runner's process and main thread got their
         /// protected access lists before it ran. The text of an error says
         /// the step and the Win32 error, and the owner's side keeps it on the
@@ -682,12 +720,21 @@ pub enum ServiceReply {
 impl fmt::Display for ServiceReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ServiceReply::Started { pid, protected, .. } => match protected {
-                Ok(()) => write!(f, "the launcher started the runner as process {pid}"),
+            ServiceReply::Started {
+                pid,
+                desktop,
+                protected,
+                ..
+            } => match protected {
+                Ok(()) => write!(
+                    f,
+                    "the launcher started the runner as process {pid}, for a command on \
+                     {desktop}"
+                ),
                 Err(why) => write!(
                     f,
-                    "the launcher started the runner as process {pid}, and its access lists \
-                     could not be written before it ran: {why}"
+                    "the launcher started the runner as process {pid}, for a command on \
+                     {desktop}, and its access lists could not be written before it ran: {why}"
                 ),
             },
             ServiceReply::Failed { step, code, text } => {
@@ -709,10 +756,14 @@ impl ServiceReply {
             ServiceReply::Started {
                 pid,
                 handle,
+                desktop,
                 protected,
             } => match protected {
-                Ok(()) => format!("started {pid} {handle} protected\n"),
-                Err(why) => format!("started {pid} {handle} unprotected {}\n", one_line(why)),
+                Ok(()) => format!("started {pid} {handle} {desktop} protected\n"),
+                Err(why) => format!(
+                    "started {pid} {handle} {desktop} unprotected {}\n",
+                    one_line(why)
+                ),
             },
             ServiceReply::Failed { step, code, text } => format!(
                 "fail {} {code} {}\n",
@@ -737,6 +788,11 @@ impl ServiceReply {
                 if handle == 0 {
                     return Err(ServiceError::Reply);
                 }
+                let desktop = words
+                    .next()
+                    .filter(|w| is_command_desktop(w))
+                    .ok_or(ServiceError::Reply)?
+                    .to_owned();
                 let protected = match words.next() {
                     Some("protected") => Ok(()),
                     Some("unprotected") => {
@@ -747,6 +803,7 @@ impl ServiceReply {
                 Ok(ServiceReply::Started {
                     pid,
                     handle,
+                    desktop,
                     protected,
                 })
             }
@@ -999,17 +1056,43 @@ mod tests {
         );
     }
 
+    const DESKTOP: &str = r"kgraf-cmd-0123456789abcdef\Default";
+
+    /// Only a station and desktop kGraf names for a command is passed on to
+    /// the runner as the command's desktop.
+    #[test]
+    fn only_a_command_desktop_kgraf_names_is_accepted() {
+        assert!(is_command_desktop(DESKTOP));
+        for bad in [
+            "",
+            "kgraf-cmd-0123456789abcdef",
+            r"kgraf-cmd-0123456789abcdef\",
+            r"kgraf-cmd-0123456789ABCDEF\Default",
+            r"kgraf-cmd-0123456789abcde\Default",
+            r"kgraf-cmd-0123456789abcdef0\Default",
+            r"kgraf-cmd-0123456789abcdef\Default\x",
+            r"kgraf-run-0123456789abcdef\Default",
+            r"WinSta0\Default",
+            r"Service-0x0-3e7$\Default",
+            r"kgraf-cmd-0123456789abcdef\Default ",
+        ] {
+            assert!(!is_command_desktop(bad), "{bad:?}");
+        }
+    }
+
     #[test]
     fn a_reply_survives_a_round_trip_on_one_line() {
         for reply in [
             ServiceReply::Started {
                 pid: 7,
                 handle: 0x2c,
+                desktop: DESKTOP.into(),
                 protected: Ok(()),
             },
             ServiceReply::Started {
                 pid: 7,
                 handle: u64::from(u32::MAX),
+                desktop: DESKTOP.into(),
                 protected: Err("write the runner's list: Windows error 5".into()),
             },
             ServiceReply::Failed {
@@ -1057,7 +1140,13 @@ mod tests {
             "started x 4 protected\n",
             "started 7 protected\n",
             // A handle value of zero names no object.
-            "started 7 0 protected\n",
+            "started 7 0 kgraf-cmd-0123456789abcdef\\Default protected\n",
+            // A reply of the first version names no desktop for the command.
+            "started 7 44 protected\n",
+            // A desktop kGraf did not name: the runner's own, or another.
+            "started 7 44 Service-0x0-3e7$\\Default protected\n",
+            "started 7 44 kgraf-cmd-0123456789abcdef\\Winlogon protected\n",
+            "started 7 44 kgraf-run-0123456789abcdef\\Default protected\n",
             "fail step\n",
             "ok\n",
         ] {

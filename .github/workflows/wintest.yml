@@ -37,6 +37,14 @@ on:
         description: "Also run the sandbox user phase (setup, status, selfcheck, re-run, remove) after the suite"
         type: boolean
         default: true
+      only:
+        description: "Run only these (kgraf-wintest --only): comma-separated binary-id or binary-id::test-name items; e2e or e2e::<check-id> adds end-to-end checks. Empty runs everything"
+        type: string
+        default: ""
+      appcontainer_dns:
+        description: "Also run the AppContainer DNS probe (scripts/wintest-appcontainer-dns.ps1)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -148,6 +156,8 @@ jobs:
           # test may create its tagged test users and firewall rules.
           KGRAF_SANDBOX_SETUP_TEST: "1"
           SANDBOX_USER: ${{ inputs.sandbox_user }}
+          # Passed through the environment, never pasted into the script.
+          ONLY: ${{ inputs.only }}
         run: |
           set -u
           stage="/c/kgraf-wintest"
@@ -157,6 +167,7 @@ jobs:
           # A failed test is a result, not a job failure.
           extra=()
           if [[ "$SANDBOX_USER" == "true" ]]; then extra+=(--sandbox-user); fi
+          if [[ -n "$ONLY" ]]; then extra+=(--only "$ONLY"); fi
           ./kgraf-wintest.exe --all --no-wait "${extra[@]}" --report-dir "$(cygpath -w "$report_dir")" || echo "kgraf-wintest.exe exited with $?"
           # The report file is the result: no file, no result.
           if ! ls "$report_dir"/kgraf-wintest-report-*.md >/dev/null 2>&1; then
@@ -176,6 +187,15 @@ jobs:
           # The runner account is already an administrator; the script
           # reports whether the process is elevated.
           & scripts/wintest-firewall.ps1 -Bundle $stage -Out "$env:GITHUB_WORKSPACE\wintest-out\firewall.txt"
+          exit 0
+
+      - name: Run the AppContainer DNS probe
+        if: ${{ !cancelled() && inputs.appcontainer_dns }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force wintest-out | Out-Null
+          & scripts/wintest-appcontainer-dns.ps1 -Out "$env:GITHUB_WORKSPACE\wintest-out\appcontainer-dns.md"
           exit 0
 
       - name: Upload the report and the firewall output

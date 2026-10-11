@@ -109,6 +109,8 @@ pub struct Report {
     pub notes: Vec<String>,
     /// The sandbox user phase, when the run asked for it.
     pub sandbox_user: Option<crate::sandbox_phase::SandboxPhase>,
+    /// The `--only` filter the run had, if any: only what it named ran.
+    pub only: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -168,6 +170,22 @@ pub fn classify_failure(tail: &str) -> String {
     "kgraf_defect_suspected".to_owned()
 }
 
+/// One binary's counts: failed tests that count, failed tests that need a
+/// missing tool, and whether the binary hung or crashed.
+fn tally(b: &BinaryResult) -> (u64, u64, bool) {
+    let needs = b
+        .failures
+        .iter()
+        .filter(|f| f.class != "kgraf_defect_suspected")
+        .count() as u64;
+    let needs = needs.min(b.failed);
+    let hung = b.timed_out
+        || b.start_error.is_some()
+        || (b.exit_code != Some(0) && b.failed == 0 && !b.cancelled);
+    (b.failed - needs, needs, hung)
+}
+
+/// The baseline's counts: its test binaries and its end-to-end checks.
 pub fn totals(r: &Report) -> Totals {
     let mut t = Totals {
         binaries: r.binaries.len(),
@@ -177,19 +195,10 @@ pub fn totals(r: &Report) -> Totals {
         t.passed += b.passed;
         t.ignored += b.ignored;
         t.binaries_clean += usize::from(b.clean());
-        let needs = b
-            .failures
-            .iter()
-            .filter(|f| f.class != "kgraf_defect_suspected")
-            .count() as u64;
-        t.failed_needs_tool += needs.min(b.failed);
-        t.failed += b.failed - needs.min(b.failed);
-        if b.timed_out
-            || b.start_error.is_some()
-            || (b.exit_code != Some(0) && b.failed == 0 && !b.cancelled)
-        {
-            t.hung_or_crashed += 1;
-        }
+        let (failed, needs, hung) = tally(b);
+        t.failed_needs_tool += needs;
+        t.failed += failed;
+        t.hung_or_crashed += usize::from(hung);
     }
     for c in &r.e2e {
         match c.status {
@@ -201,16 +210,74 @@ pub fn totals(r: &Report) -> Totals {
     t
 }
 
+/// What the verdict counts, over both halves of a run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Headline {
+    /// Failed tests: the baseline's, less those expected under the token
+    /// sandbox, plus every failure of the sandbox user re-run.
+    pub failed: u64,
+    /// Hung or crashed binary runs, of the baseline and of the re-run.
+    pub hung_or_crashed: usize,
+    /// Failed end-to-end checks, of the baseline and of the sandbox user.
+    pub e2e_fail: usize,
+    /// Baseline failures expected under the token sandbox, listed apart
+    /// ([`crate::sandbox_phase::expected_under_token_sandbox`]).
+    pub expected: usize,
+    /// Known gaps the run measured, each named on a line of its own.
+    pub known_gaps: Vec<String>,
+}
+
+/// The counts behind the verdict. A baseline failure leaves the count only
+/// when the sandbox user re-run passed the same test and its baseline output
+/// names a token sandbox limit; nothing of the re-run and no end-to-end
+/// failure ever leaves it.
+pub fn headline(r: &Report) -> Headline {
+    let t = totals(r);
+    let mut h = Headline {
+        failed: t.failed,
+        hung_or_crashed: t.hung_or_crashed,
+        e2e_fail: t.e2e_fail,
+        ..Headline::default()
+    };
+    if let Some(p) = &r.sandbox_user {
+        h.expected =
+            crate::sandbox_phase::expected_under_token_sandbox(&r.binaries, &p.reruns).len();
+        h.failed = h.failed.saturating_sub(h.expected as u64);
+        for rr in &p.reruns {
+            let (failed, _, hung) = tally(&rr.result);
+            h.failed += failed;
+            h.hung_or_crashed += usize::from(hung);
+        }
+        h.e2e_fail += p.e2e.iter().filter(|c| c.status == Status::Fail).count();
+        if let Some(dns) = &p.dns_failed {
+            h.known_gaps.push(format!(
+                "DNS is not confined on this machine: name lookups by the sandbox users without \
+                 the network can leave it ({dns})"
+            ));
+        }
+    }
+    h
+}
+
 /// The verdict line: what the reader should look at first.
-pub fn verdict(t: &Totals, r: &Report) -> String {
+pub fn verdict(r: &Report) -> String {
+    let h = headline(r);
+    let apart = if h.expected > 0 {
+        format!(
+            "; {} baseline failure(s) expected under the token sandbox are listed apart",
+            h.expected
+        )
+    } else {
+        String::new()
+    };
     if r.interrupted {
         "INTERRUPTED: the run was stopped before the end; results below are partial".into()
-    } else if t.failed == 0 && t.hung_or_crashed == 0 && t.e2e_fail == 0 {
-        "ALL PASSED (failures that need a missing tool are listed apart)".into()
+    } else if h.failed == 0 && h.hung_or_crashed == 0 && h.e2e_fail == 0 {
+        format!("ALL PASSED (failures that need a missing tool are listed apart{apart})")
     } else {
         format!(
-            "FAILURES: {} test(s) failed, {} binary run(s) hung or crashed, {} end-to-end check(s) failed",
-            t.failed, t.hung_or_crashed, t.e2e_fail
+            "FAILURES: {} test(s) failed, {} binary run(s) hung or crashed, {} end-to-end check(s) failed{apart}",
+            h.failed, h.hung_or_crashed, h.e2e_fail
         )
     }
 }
@@ -237,7 +304,18 @@ pub fn render(r: &Report) -> String {
     let mut md = String::new();
     let m = &r.machine;
     md.push_str("# kGraf Windows self-test report\n\n");
-    md.push_str(&format!("**{}**\n\n", verdict(&t, r)));
+    if let Some(only) = &r.only {
+        md.push_str(&format!(
+            "**Filter: `--only {only}`. Only the named test binaries, tests and end-to-end \
+             checks ran, in the suite and in the sandbox user re-run. This is not a full \
+             run.**\n\n"
+        ));
+    }
+    let h = headline(r);
+    md.push_str(&format!("**{}**\n\n", verdict(r)));
+    for gap in &h.known_gaps {
+        md.push_str(&format!("**Known gap: {gap}**\n\n"));
+    }
     md.push_str("| Item | Result |\n|---|---|\n");
     let rows = [
         ("kGraf", format!("{} ({})", r.kgraf_version, r.git_commit)),
@@ -259,7 +337,13 @@ pub fn render(r: &Report) -> String {
                 m.emulated.map_or("unknown".into(), |e| e.to_string())
             ),
         ),
-        ("Mode", r.mode.clone()),
+        (
+            "Mode",
+            match &r.only {
+                Some(only) => format!("{}, filtered: --only {only}", r.mode),
+                None => r.mode.clone(),
+            },
+        ),
         (
             "Test binaries",
             format!(
@@ -303,10 +387,19 @@ pub fn render(r: &Report) -> String {
         md.push_str(&format!("| {k} | {} |\n", md_escape(&v)));
     }
 
+    let expected = r.sandbox_user.as_ref().map_or_else(Vec::new, |p| {
+        crate::sandbox_phase::expected_under_token_sandbox(&r.binaries, &p.reruns)
+    });
     md.push_str("\n## Failures\n\n");
     let mut any = false;
     for b in &r.binaries {
         for f in &b.failures {
+            if expected
+                .iter()
+                .any(|e| e.binary == b.id && e.test == f.test)
+            {
+                continue;
+            }
             any = true;
             md.push_str(&format!(
                 "### {} :: {}\n\nClass: {}\n\n",
@@ -361,8 +454,78 @@ pub fn render(r: &Report) -> String {
         md.push_str(&fence("text", &c.evidence));
         md.push('\n');
     }
+    // The sandbox user re-run's failures count in the verdict, so each is
+    // here with its output, whether or not the baseline failed it too.
+    if let Some(p) = &r.sandbox_user {
+        for b in p.reruns.iter().map(|rr| &rr.result) {
+            for f in &b.failures {
+                any = true;
+                md.push_str(&format!(
+                    "### sandbox user: {} :: {}\n\nClass: {}\n\n",
+                    b.id, f.test, f.class
+                ));
+                if let Some(s) = &f.solo {
+                    md.push_str(&solo_note(s));
+                }
+                md.push_str(&fence("text", &f.tail));
+                md.push('\n');
+            }
+            if tally(b).2 {
+                any = true;
+                md.push_str(&format!(
+                    "### sandbox user: {} (exit {:?}, timed out {}, start error {:?}, running \
+                     test {:?})\n\n",
+                    b.id, b.exit_code, b.timed_out, b.start_error, b.open_test
+                ));
+                let tail = b
+                    .open_test_solo
+                    .as_ref()
+                    .map(|f| f.tail.as_str())
+                    .or(b.tail.as_deref())
+                    .unwrap_or("");
+                md.push_str(&fence("text", tail));
+                md.push('\n');
+            }
+        }
+        for c in p.e2e.iter().filter(|c| c.status == Status::Fail) {
+            any = true;
+            md.push_str(&format!(
+                "### sandbox user e2e {}: {}\n\n{}\n\n",
+                c.id, c.title, c.detail
+            ));
+            md.push_str(&fence("text", &c.evidence));
+            md.push('\n');
+        }
+    }
     if !any {
         md.push_str("None.\n");
+    }
+
+    if r.sandbox_user.is_some() {
+        md.push_str(&format!(
+            "\n## Expected under the token sandbox ({})\n\n",
+            expected.len()
+        ));
+        md.push_str(
+            "Baseline failures not counted in the verdict: each test passed when it ran again \
+             as the sandbox user, and its baseline output names a limit of the token sandbox \
+             that the sandbox user lifts. Any other baseline failure is counted above.\n\n",
+        );
+        if expected.is_empty() {
+            md.push_str("None.\n");
+        } else {
+            md.push_str(
+                "| Binary | Test | Baseline output names | Sandbox user |\n|---|---|---|---|\n",
+            );
+            for e in &expected {
+                md.push_str(&format!(
+                    "| {} | {} | {} | passed |\n",
+                    md_escape(&e.binary),
+                    md_escape(&e.test),
+                    md_escape(&e.marker)
+                ));
+            }
+        }
     }
 
     md.push_str("\n## Test binaries\n\n| Binary | Set | Passed | Failed | Ignored | Exit | Seconds (expected) |\n|---|---|---|---|---|---|---|\n");
@@ -564,7 +727,7 @@ mod tests {
         assert_eq!(t.failed, 1);
         assert_eq!(t.failed_needs_tool, 2);
         assert_eq!(t.binaries_clean, 1);
-        assert!(verdict(&t, &r).starts_with("FAILURES: 1 test(s)"));
+        assert!(verdict(&r).starts_with("FAILURES: 1 test(s)"));
     }
 
     #[test]
@@ -572,7 +735,7 @@ mod tests {
         let mut r = Report::default();
         r.binaries.push(bin("a", &[]));
         assert_eq!(
-            verdict(&totals(&r), &r),
+            verdict(&r),
             "ALL PASSED (failures that need a missing tool are listed apart)"
         );
         let mut hung = bin("h", &[]);
@@ -580,6 +743,138 @@ mod tests {
         hung.exit_code = None;
         r.binaries.push(hung);
         assert_eq!(totals(&r).hung_or_crashed, 1);
+    }
+
+    const MSYS: &str = "bash.exe: *** fatal error - \
+                        NtCreateDirectoryObject(\\BaseNamedObjects\\msys-2.0S5-1): 0xC0000022";
+
+    fn passed(b: &mut BinaryResult, names: &[&str]) {
+        for n in names {
+            b.tests.push(TestOutcome {
+                name: (*n).into(),
+                outcome: Outcome::Passed,
+            });
+        }
+    }
+
+    fn e2e_check(id: &str, status: Status) -> Check {
+        Check {
+            id: id.into(),
+            title: id.into(),
+            simulated: false,
+            status,
+            detail: String::new(),
+            evidence: String::new(),
+        }
+    }
+
+    /// A run whose baseline fails three tests (two by the token sandbox,
+    /// one plainly) and one end-to-end check, and whose sandbox user half
+    /// fails one test of its own, one end-to-end check and the DNS gate.
+    fn two_halves() -> Report {
+        let mut r = Report::default();
+        r.binaries.push(bin(
+            "x/test/y",
+            &[
+                ("msys_a", MSYS),
+                ("msys_b", MSYS),
+                ("plain", "assertion failed"),
+            ],
+        ));
+        r.e2e.push(e2e_check("shell.git_bash", Status::Fail));
+        let mut again = bin("x/test/y", &[("new_failure", "the station is wrong")]);
+        passed(&mut again, &["msys_a", "msys_b", "plain"]);
+        r.sandbox_user = Some(crate::sandbox_phase::SandboxPhase {
+            reruns: vec![crate::sandbox_phase::Rerun {
+                why: "w".into(),
+                result: again,
+            }],
+            e2e: vec![
+                e2e_check("shell.git_bash", Status::Pass),
+                e2e_check("readers.cmd_plain", Status::Fail),
+            ],
+            dns_failed: Some("dns: not confined (status 9003)".into()),
+            ..Default::default()
+        });
+        r
+    }
+
+    /// The headline drops only the baseline failures the token sandbox
+    /// explains, and counts every failure of the sandbox user half and every
+    /// failed end-to-end check; the DNS gap is a named line.
+    #[test]
+    fn the_headline_counts_both_halves_and_lists_the_expected_apart() {
+        let r = two_halves();
+        let h = headline(&r);
+        assert_eq!(h.expected, 2);
+        // `plain` (no marker) and the re-run's own failure.
+        assert_eq!(h.failed, 2);
+        assert_eq!(h.e2e_fail, 2);
+        assert_eq!(h.known_gaps.len(), 1);
+        assert_eq!(
+            verdict(&r),
+            "FAILURES: 2 test(s) failed, 0 binary run(s) hung or crashed, 2 end-to-end check(s) \
+             failed; 2 baseline failure(s) expected under the token sandbox are listed apart"
+        );
+        let md = render(&r);
+        assert!(
+            md.contains("**Known gap: DNS is not confined on this machine"),
+            "{md}"
+        );
+        assert!(md.contains("dns: not confined (status 9003)"));
+        let failures = &md[md.find("## Failures").expect("failures")..];
+        let failures = &failures[..failures.find("## Expected").expect("expected")];
+        assert!(failures.contains("### x/test/y :: plain"));
+        assert!(!failures.contains(":: msys_a"), "{failures}");
+        assert!(failures.contains("### sandbox user: x/test/y :: new_failure"));
+        assert!(failures.contains("### sandbox user e2e readers.cmd_plain"));
+        assert!(failures.contains("### e2e shell.git_bash"));
+        let expected = &md[md
+            .find("## Expected under the token sandbox (2)")
+            .expect("section")..];
+        assert!(expected.contains("| x/test/y | msys_a | Git Bash (msys) | passed |"));
+        assert!(expected.contains("| x/test/y | msys_b | Git Bash (msys) | passed |"));
+    }
+
+    /// With every failure explained, the verdict reads clean and still says
+    /// how many it listed apart; a hung re-run binary counts.
+    #[test]
+    fn a_run_whose_baseline_failures_are_all_expected_reads_clean() {
+        let mut r = Report::default();
+        r.binaries.push(bin("x/test/y", &[("msys_a", MSYS)]));
+        let mut again = bin("x/test/y", &[]);
+        passed(&mut again, &["msys_a"]);
+        r.sandbox_user = Some(crate::sandbox_phase::SandboxPhase {
+            reruns: vec![crate::sandbox_phase::Rerun {
+                why: "w".into(),
+                result: again,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            verdict(&r),
+            "ALL PASSED (failures that need a missing tool are listed apart; 1 baseline \
+             failure(s) expected under the token sandbox are listed apart)"
+        );
+        if let Some(p) = r.sandbox_user.as_mut() {
+            p.reruns[0].result.timed_out = true;
+        }
+        assert!(verdict(&r).starts_with("FAILURES: 0 test(s) failed, 1 binary run(s) hung"));
+    }
+
+    #[test]
+    fn a_filtered_run_says_so_before_the_verdict() {
+        let r = Report {
+            only: Some("kgraf-sandbox/test/escape_windows,e2e".into()),
+            ..Report::default()
+        };
+        let md = render(&r);
+        let filter = md
+            .find("**Filter: `--only kgraf-sandbox/test/escape_windows,e2e`.")
+            .expect("filter line");
+        let verdict = md.find("**ALL PASSED").expect("verdict");
+        assert!(filter < verdict);
+        assert!(md.contains("filtered: --only kgraf-sandbox/test/escape_windows,e2e"));
     }
 
     #[test]

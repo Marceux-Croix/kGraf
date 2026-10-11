@@ -325,6 +325,19 @@ pub enum TraceEvent {
         of: u32,
         reason: String,
     },
+    /// The planner's answer was refused by a cargo workspace check against
+    /// the repository, and kGraf made the mechanical change the refusal
+    /// names instead of asking again (`plan_repo::repaired`). One per
+    /// change; the repaired plan passed every check, and no ask was spent.
+    PlanRepaired {
+        at_ms: i64,
+        /// The ask whose answer was repaired, counting from 1.
+        ask: u32,
+        /// The contract that was changed.
+        contract: String,
+        /// The change, in words.
+        change: String,
+    },
     /// The interface call's answer was refused, in part or whole: every
     /// interface that was not accepted, and every consumed edge still
     /// unbound, with what each needs. One per refused ask, the last one
@@ -643,6 +656,17 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             ask,
             of,
             reason: s(reason),
+        },
+        TraceEvent::PlanRepaired {
+            at_ms,
+            ask,
+            contract,
+            change,
+        } => TraceEvent::PlanRepaired {
+            at_ms,
+            ask,
+            contract: s(contract),
+            change: s(change),
         },
         TraceEvent::CallRetried {
             at_ms,

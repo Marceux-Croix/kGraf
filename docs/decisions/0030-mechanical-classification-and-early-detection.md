@@ -1101,3 +1101,53 @@ Tests: `kgraf-orchestrator` `shortfall.rs`:
 writer named; unlisted path still held; a superseded contract does not count; attended still
 asks) and `a_user_rule_wins_over_the_handover_of_a_finished_contracts_file`. The first was seen to
 fail with the finished-writer lookup disabled.
+
+## Amendment (2026-10-11, second): a cargo workspace refusal with a mechanical remedy is repaired, not asked again
+
+A greenfield canary run (round 17e, `qwen3.6:35b`) asked the planner three times. The checks
+against the repository refused all three plans, and the run ended PlanFailed. The three refusals:
+`c1` ran `cargo test --workspace` while `wcl/Cargo.toml` was written only by `c2`, which `c1` did
+not depend on; `c1` ran `cargo test -p wcl-core` at the root while only `c3`, which ran after
+`c1`, wrote the root `Cargo.toml`; `c1` wrote `wcl/Cargo.toml` but no Rust source under `wcl/`.
+Each refusal named a fix that needs no judgment. Ordering a Rust workspace across contracts is a
+common model deficiency, and this decision already says to derive first and to ask the planner
+only for judgment.
+
+A cargo workspace finding now carries a structured remedy (`plan_repo::Remedy`) next to its
+refusal text. Before a refused plan spends a re-ask, intake makes the remedy of the first finding,
+checks again, and repeats, at most 4 changes per plan. The remedies, each only where it is safe:
+
+- **An edge.** A contract needs a workspace or member manifest that a contract it does not
+  depend on writes: it depends on that writer, when the writer does not depend on it (no cycle).
+  The edge is always tried first.
+- **A manifest moved to the contract that needs it.** When every writer of that manifest runs
+  after the contract (so the edge would be a cycle), the contract also writes the manifest. The
+  later writer rewrites it, which the plan rules allow for two contracts a dependency orders. A
+  manifest no contract writes is not repaired: the plan left it out, which is judgment.
+- **A minimal member source.** A member manifest with no Rust source in time: the contract that
+  writes the manifest also writes `<member>/src/main.rs` when the plan shows a binary (a contract
+  writes `src/main.rs` or a file under `src/bin/`, or an instruction calls the member a binary
+  within two words of its name), else `<member>/src/lib.rs`.
+
+A write is never added when a contract that can run at the same time also declares the path. Go
+and Maven findings, and a package the workspace does not list (the fix changes the member list
+inside a manifest), keep the re-ask. If a finding has no remedy, a remedy is not safe, the
+repaired plan is still refused, or it fails the plan rules, the plan is asked for again with its
+unchanged refusal, exactly as before; on the last ask the run fails as before.
+
+A repair is loud: one `plan_repaired` trace event per change (the ask, the contract, the change in
+words) and one run notice per change, which the accepted plan's notices carry. The canary counts
+the events as `plan_repairs` beside `answer_repairs`; a repair writes no `plan_refused`, so it is
+never a wasted ask.
+
+Tests: `kgraf-orchestrator` `plan_repo.rs`:
+`a_member_manifest_with_no_source_gets_a_minimal_source_from_its_writer` (the third refusal's
+shape), `a_workspace_manifest_a_later_contract_writes_moves_to_the_contract_that_needs_it` (the
+second), `a_member_manifest_another_contract_writes_is_reached_by_an_edge_first` (the first),
+`an_edge_that_makes_a_cycle_is_never_made`, `a_write_a_concurrent_contract_declares_is_never_made`,
+`a_refusal_with_no_mechanical_remedy_is_not_repaired`, `a_member_is_a_binary_only_on_evidence`
+and `repaired_plans_pass_with_cargo` (each repaired plan's contracts pass a real cargo run).
+`tests/plan_repo_intake.rs`: two deadlocked plans are accepted at the first ask with their
+`plan_repaired` events and notices, and a member no contract writes is still refused and asked
+again. With the repair call disabled the repair tests failed; with the cycle and concurrent-writer
+guards disabled their two tests failed.

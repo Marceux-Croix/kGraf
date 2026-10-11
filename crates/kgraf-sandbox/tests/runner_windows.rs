@@ -507,9 +507,11 @@ fn standard_input_and_output_pass_through_a_runner_without_a_console() {
     }
 }
 
-/// The command runs on a window station and desktop that this process, the
-/// owner, made for it (the runner makes none), not on the runner's or the
-/// owner's. Prints the launch record, the lines a Windows run sends back.
+/// The command runs on a window station and desktop kGraf made for it (the
+/// runner makes none), not on the runner's or the owner's: this process, the
+/// owner, makes it on the owner-session path, and kGraf's launcher service
+/// makes it in session 0 on the session-0 path; either way this process
+/// records it. Prints the launch record, the lines a Windows run sends back.
 #[test]
 fn the_command_runs_on_a_desktop_the_owner_made() {
     if !sandbox_user_mode("desktop") {

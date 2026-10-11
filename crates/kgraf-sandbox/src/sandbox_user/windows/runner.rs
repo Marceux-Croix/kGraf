@@ -29,7 +29,9 @@
 //! STATUS_DLL_INIT_FAILED unless it can open its window station and desktop.
 //! The owner's process makes a window station and a desktop for the commands
 //! of this sandbox user, whose DACLs admit SYSTEM, the owner and that user,
-//! and names them in the request (`launch.rs`); the runner checks that it can
+//! and names them in the request (`launch.rs`); on the session-0 path kGraf's
+//! launcher service makes them in session 0 and the owner names them the
+//! same way (`service_main.rs`). The runner checks that it can
 //! open the station ([`command_desktop`]) and starts the command there. The
 //! runner creates no window station: whether a local user started through
 //! the secondary logon service may do so is not documented. No object of the
@@ -232,7 +234,8 @@ pub fn main() -> i32 {
 }
 
 /// The running command. Its window station and desktop stay open in the
-/// owner's process, which made them. The owner's job, which holds the runner
+/// process that made them: the owner's, or kGraf's launcher service on the
+/// session-0 path. The owner's job, which holds the runner
 /// and the command, ends it.
 struct Command {
     process: OwnedHandle,
@@ -866,13 +869,14 @@ const _: () =
 /// show only as the command's own exit code `STATUS_DLL_INIT_FAILED`; with
 /// it, the failure names the call and the Win32 error.
 ///
+/// On the session-0 path the station is one kGraf's launcher service made in
+/// session 0 for this sandbox user, with the same access list, and the owner
+/// names it here the same way.
+///
 /// An empty field means "the window station Windows made for this logon
-/// session": on the session-0 path the launcher service started the runner
-/// with an empty `lpDesktop`, so Windows formed a station name from the logon
-/// session's ID and made that station and its default desktop. The command
-/// then starts on the runner's own station, which no other logon session
-/// shares, and nothing is opened or checked here. The return is empty, and
-/// [`spawn`] passes null.
+/// session": the command then starts on the runner's own station, and
+/// nothing is opened or checked here. The return is empty, and [`spawn`]
+/// passes null. Neither launch path sends an empty field.
 fn command_desktop(request: &Request) -> Result<Vec<u16>, Failure> {
     if request.desktop.is_empty() {
         return Ok(Vec::new());

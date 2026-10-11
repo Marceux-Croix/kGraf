@@ -90,6 +90,21 @@ pub fn sandbox_user_mode() -> bool {
     on
 }
 
+/// Which launch path this machine's setup proved, read from the record
+/// beside the credential store, as every sandboxed command reads it. A
+/// machine with no record takes the owner's session.
+#[cfg(windows)]
+pub fn active_launch_path() -> kgraf_sandbox::sandbox_user::session0::LaunchPath {
+    use kgraf_sandbox::sandbox_user::session0::{Active, LaunchPath};
+    use kgraf_sandbox::sandbox_user::store::{credentials_path, launch_path_file};
+    let tag = std::env::var("KGRAF_SANDBOX_TAG")
+        .ok()
+        .filter(|t| !t.is_empty());
+    credentials_path(tag.as_deref())
+        .and_then(|store| std::fs::read_to_string(launch_path_file(&store)).ok())
+        .map_or(LaunchPath::OwnerSession, |text| Active::decode(&text).path)
+}
+
 /// The name of the switch that makes the sandbox user mandatory.
 pub const REQUIRE_VAR: &str = "KGRAF_REQUIRE_SANDBOX_USER";
 

@@ -2569,8 +2569,10 @@ fn send_input_reaches_nothing_of_the_owners() {
     }
 }
 
-/// The prefix of the window station kGraf's process makes for the commands
-/// of one sandbox user (`sandbox_user::windows::launch`, `Role::Command`).
+/// The prefix of the window station kGraf makes for the commands of one
+/// sandbox user (`sandbox_user::session0::COMMAND_STATION_PREFIX`): the
+/// owner's process makes it on the owner-session path, kGraf's launcher
+/// service in session 0 on the session-0 path.
 const COMMAND_STATION: &str = "kgraf-cmd-";
 
 /// The command has no console, and its user interface is its own, in the way

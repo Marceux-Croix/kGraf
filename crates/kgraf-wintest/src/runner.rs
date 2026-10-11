@@ -348,6 +348,9 @@ fn package_cwd(root: &Path, r: &TestRun) -> PathBuf {
 /// The arguments for one test binary run.
 pub fn test_args(run: &TestRun) -> Vec<String> {
     let mut a = vec!["--test-threads=1".to_owned()];
+    if run.exact {
+        a.push("--exact".to_owned());
+    }
     a.extend(run.filters.iter().cloned());
     for s in &run.skips {
         a.push("--skip".into());
@@ -362,8 +365,20 @@ pub fn limit_for(expected_secs: f64) -> Duration {
     Duration::from_secs_f64((expected_secs * 5.0).clamp(600.0, 2400.0))
 }
 
-/// Time limit for one solo re-run of a test after its binary hung or crashed.
+/// Time limit for one solo re-run of a test after its binary hung or crashed,
+/// for a binary at the default rate.
 const SOLO_RERUN_SECS: u64 = 120;
+
+/// Time limit for one solo re-run of a test of a binary whose tests take
+/// `secs_per_test` each: five times that, as [`limit_for`] gives a binary,
+/// and never less than [`SOLO_RERUN_SECS`] nor more than the solo budget of
+/// a binary. A slow test re-run alone under the fixed limit is reported as
+/// hung while it is still working.
+pub fn solo_limit_for(secs_per_test: f64) -> Duration {
+    Duration::from_secs_f64(
+        (secs_per_test * 5.0).clamp(SOLO_RERUN_SECS as f64, SOLO_RERUN_BUDGET_SECS as f64),
+    )
+}
 /// Most tests re-run alone per binary; the rest are listed in the report.
 const MAX_SOLO_RERUNS: usize = 30;
 /// Total time for all solo re-runs of one binary. Re-runs that would start
@@ -569,7 +584,7 @@ fn run_binary(
         expected,
         listed,
         limit_for(expected),
-        Duration::from_secs(SOLO_RERUN_SECS),
+        solo_limit_for(run.secs_per_test),
     )
 }
 
@@ -773,6 +788,25 @@ pub fn run(o: RunOptions) -> i32 {
             return 2;
         }
     };
+    // `--only`: the runs it names, checked against the manifest before
+    // anything is made or run.
+    let runs: Vec<TestRun> = match &o.only {
+        None => manifest.runs.clone(),
+        Some(only) => match only.apply(&manifest.runs) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                if !o.no_wait {
+                    wait_for_key();
+                }
+                return 2;
+            }
+        },
+    };
+    let e2e_choice = o
+        .only
+        .as_ref()
+        .map_or(crate::only::E2eChoice::All, crate::only::Only::e2e);
     platform::install_ctrl_handler();
     let (started_utc, stamp) = utc_now();
     let t0 = Instant::now();
@@ -802,23 +836,12 @@ pub fn run(o: RunOptions) -> i32 {
         ));
     }
 
-    let core: Vec<&TestRun> = manifest
-        .runs
-        .iter()
-        .filter(|r| r.set == Set::Core)
-        .collect();
-    let extended: Vec<&TestRun> = manifest
-        .runs
-        .iter()
-        .filter(|r| r.set == Set::Extended)
-        .collect();
+    let core: Vec<&TestRun> = runs.iter().filter(|r| r.set == Set::Core).collect();
+    let extended: Vec<&TestRun> = runs.iter().filter(|r| r.set == Set::Extended).collect();
     let mut steps: Vec<(String, f64)> = vec![
         ("machine facts".into(), SECS_FACTS),
         ("source mirror".into(), SECS_MIRROR),
-        (
-            "count tests".into(),
-            SECS_LIST_EACH * manifest.runs.len() as f64,
-        ),
+        ("count tests".into(), SECS_LIST_EACH * runs.len() as f64),
     ];
     for (i, r) in core.iter().enumerate() {
         steps.push((format!("core {}/{} {}", i + 1, core.len(), r.id), 30.0));
@@ -927,8 +950,9 @@ pub fn run(o: RunOptions) -> i32 {
         .map(|(j, r)| expected_of(core.len() + j, r))
         .sum();
 
-    // Which set.
-    let run_extended = match o.extended {
+    // Which set. A filter names what runs, so it asks nothing: what it named
+    // in the extended set runs.
+    let run_extended = match o.extended.or(o.only.as_ref().map(|_| true)) {
         Some(x) => x,
         None => ask(
             &console,
@@ -985,7 +1009,15 @@ pub fn run(o: RunOptions) -> i32 {
             break;
         }
         if i == core.len() {
-            e2e_checks = run_e2e_step(&console, step_e2e, &bundle, &layout, &env, &machine);
+            e2e_checks = run_e2e_step(
+                &console,
+                step_e2e,
+                &bundle,
+                &layout,
+                &env,
+                &machine,
+                &e2e_choice,
+            );
         }
         let step = if i < core.len() {
             3 + i
@@ -1018,7 +1050,15 @@ pub fn run(o: RunOptions) -> i32 {
         binaries.push(b);
     }
     if chosen.len() <= core.len() && !CANCEL.load(Ordering::Relaxed) {
-        e2e_checks = run_e2e_step(&console, step_e2e, &bundle, &layout, &env, &machine);
+        e2e_checks = run_e2e_step(
+            &console,
+            step_e2e,
+            &bundle,
+            &layout,
+            &env,
+            &machine,
+            &e2e_choice,
+        );
     }
 
     // The sandbox user phase: after the baseline, before the cleanup.
@@ -1045,6 +1085,8 @@ pub fn run(o: RunOptions) -> i32 {
             by_id,
             cwd_root: &cwd_root,
             placed: None,
+            e2e_choice: e2e_choice.clone(),
+            every_binary_named: o.only.is_some(),
         };
         let phase = sandbox_phase::run_phase(&mut ex, &binaries, machine.elevated, &|| {
             CANCEL.load(Ordering::Relaxed)
@@ -1122,6 +1164,7 @@ pub fn run(o: RunOptions) -> i32 {
         total_secs: t0.elapsed().as_secs_f64(),
         notes,
         sandbox_user,
+        only: o.only.as_ref().map(|f| f.text.clone()),
     };
     if !run_extended {
         r.notes.push(format!(
@@ -1175,7 +1218,7 @@ pub fn run(o: RunOptions) -> i32 {
 
     let t = report::totals(&r);
     println!();
-    println!("{}", report::verdict(&t, &r));
+    println!("{}", report::verdict(&r));
     println!(
         "Tests: {} passed, {} failed, {} failed for a missing tool, {} ignored. End-to-end: {} passed, {} failed.",
         t.passed, t.failed, t.failed_needs_tool, t.ignored, t.e2e_pass, t.e2e_fail
@@ -1214,8 +1257,13 @@ fn run_e2e_step(
     layout: &Layout,
     env: &Env,
     machine: &MachineFacts,
+    choice: &crate::only::E2eChoice,
 ) -> Vec<e2e::Check> {
     console.with(|p, now| p.start(step, now));
+    if *choice == crate::only::E2eChoice::None {
+        console.with(|p, now| p.finish(step, now));
+        return Vec::new();
+    }
     let ctx = e2e::Ctx {
         kgraf: bundle.join("programs").join("kgraf.exe"),
         dir: layout.e2e.clone(),
@@ -1226,7 +1274,7 @@ fn run_e2e_step(
         network_open: true,
         cancel: &CANCEL,
     };
-    let checks = e2e::run_all(&ctx, cfg!(windows));
+    let checks = crate::only::keep_checks(e2e::run_all(&ctx, cfg!(windows)), choice);
     for c in &checks {
         if c.status == e2e::Status::Fail {
             console.log(&format!("  e2e {} failed: {}", c.id, c.title));
@@ -1253,6 +1301,10 @@ struct PhaseExec<'a> {
     cwd_root: &'a Path,
     /// The runner copy placed beside the test binaries, removed at the end.
     placed: Option<PathBuf>,
+    /// The end-to-end checks `--only` asks for; every check without it.
+    e2e_choice: crate::only::E2eChoice,
+    /// `--only` named every binary of the baseline, so each runs again.
+    every_binary_named: bool,
 }
 
 impl PhaseExec<'_> {
@@ -1371,7 +1423,14 @@ impl Exec for PhaseExec<'_> {
         )
     }
 
+    fn every_binary_named(&self) -> bool {
+        self.every_binary_named
+    }
+
     fn e2e(&mut self) -> Vec<e2e::Check> {
+        if self.e2e_choice == crate::only::E2eChoice::None {
+            return Vec::new();
+        }
         let dir = self.layout.e2e.join("sandbox-user");
         let _ = std::fs::create_dir_all(&dir);
         let ctx = e2e::Ctx {
@@ -1384,7 +1443,7 @@ impl Exec for PhaseExec<'_> {
             network_open: false,
             cancel: &CANCEL,
         };
-        e2e::run_all(&ctx, cfg!(windows))
+        crate::only::keep_checks(e2e::run_all(&ctx, cfg!(windows)), &self.e2e_choice)
     }
 
     fn grant_named_objects(&mut self) -> StepRun {
@@ -1538,6 +1597,7 @@ exec sleep 30
             package_dir: ".".into(),
             set: Set::Core,
             filters: vec![],
+            exact: false,
             skips: vec![],
             secs_per_test: 1.0,
         };
@@ -1581,6 +1641,7 @@ exec sleep 30
             package_dir: ".".into(),
             set: Set::Core,
             filters: vec![],
+            exact: false,
             skips: vec![],
             secs_per_test: 1.0,
         }
@@ -1723,6 +1784,8 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             by_id: std::collections::HashMap::new(),
             cwd_root: dir.path(),
             placed: None,
+            e2e_choice: crate::only::E2eChoice::All,
+            every_binary_named: false,
         };
         let r = ex.rerun("p/test/fake");
         assert!(
@@ -1778,6 +1841,7 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             package_dir: "crates/p".into(),
             set: Set::Core,
             filters: vec!["windows".into()],
+            exact: false,
             skips: vec![Skip {
                 pattern: "needs_cargo".into(),
                 reason: "r".into(),
@@ -1788,8 +1852,53 @@ echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             test_args(&r),
             vec!["--test-threads=1", "windows", "--skip", "needs_cargo"]
         );
+        // A run `--only` named with tests matches their full names.
+        let named = TestRun {
+            filters: vec!["tests::a".into()],
+            exact: true,
+            ..r.clone()
+        };
+        assert_eq!(
+            test_args(&named),
+            vec![
+                "--test-threads=1",
+                "--exact",
+                "tests::a",
+                "--skip",
+                "needs_cargo"
+            ]
+        );
         assert_eq!(limit_for(10.0), Duration::from_secs(600));
         assert_eq!(limit_for(1000.0), Duration::from_secs(2400));
+    }
+
+    /// The binaries a sandbox user run measured as slow get limits that
+    /// cover that measurement: contract_checks' 30 tests at about 12 s per
+    /// cold cargo build, up to ten builds in one test, and bench-briefs' 70
+    /// tests in 592 s. A binary at the default rate keeps the fixed solo
+    /// limit.
+    #[test]
+    fn a_slow_binary_gets_limits_that_cover_its_measured_time() {
+        let rate = |id: &str| {
+            crate::manifest::MEASURED_SECS_PER_TEST
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, s)| *s)
+                .unwrap_or(crate::manifest::EXTENDED_SECS_PER_TEST)
+        };
+        let checks = rate("kgraf-orchestrator/test/contract_checks");
+        assert!(limit_for(30.0 * checks) >= Duration::from_secs(1500));
+        assert!(solo_limit_for(checks) >= Duration::from_secs(150));
+        let briefs = rate("kgraf-bench-briefs/lib/kgraf_bench_briefs");
+        assert!(limit_for(70.0 * briefs) >= Duration::from_secs(2 * 592));
+        assert_eq!(
+            solo_limit_for(crate::manifest::EXTENDED_SECS_PER_TEST),
+            Duration::from_secs(SOLO_RERUN_SECS)
+        );
+        assert_eq!(
+            solo_limit_for(10_000.0),
+            Duration::from_secs(SOLO_RERUN_BUDGET_SECS)
+        );
     }
 
     #[test]

@@ -2774,6 +2774,15 @@ async fn a_check_that_fails_on_a_named_object_says_why() {
 /// sandbox user cannot read such a folder, and Git Bash's `ln -s` then
 /// fails before the link exists ("Not a directory", Windows self-test run
 /// 11), so the test measured the read confinement instead of the cleanup.
+///
+/// The nested repository is written as files (`HEAD`, `objects/`, `refs/`:
+/// what git checks to call a folder a repository), not made with `git init`.
+/// Git writes a ref only after it reads the attributes of every folder above
+/// it, and the Windows sandbox user cannot read those of a folder in the
+/// owner's profile, where a test's temporary folder is: `git init` there
+/// fails with "cannot lock ref 'HEAD'", and the test measured that instead
+/// of the cleanup. The escape test
+/// `the_attributes_of_each_folder_above_the_tree_are_measured` measures it.
 #[tokio::test]
 async fn everything_a_check_creates_is_removed_and_nothing_outside() {
     let r = repo();
@@ -2784,7 +2793,8 @@ async fn everything_a_check_creates_is_removed_and_nothing_outside() {
     std::fs::write(&target, "keep\n").expect("write");
     let check = format!(
         "mkdir -p cache/deep && echo c > cache/deep/c.bin && ln -s '{}' link && \
-         mkdir nested && (cd nested && git init -q && echo n > n.txt) && \
+         mkdir -p nested/.git/objects nested/.git/refs && \
+         printf 'ref: refs/heads/main\\n' > nested/.git/HEAD && echo n > nested/n.txt && \
          mkdir hide && printf '*\\n' > hide/.gitignore && echo h > hide/hidden.txt",
         target.display()
     );
@@ -2808,6 +2818,15 @@ async fn everything_a_check_creates_is_removed_and_nothing_outside() {
             "{p}: {notices:?}"
         );
     }
+    // Git took `nested/` for a repository and did not list what is in it
+    // (the notice also quotes the check's command, which names the file).
+    let listed = notices[0]
+        .split_once("git would stage: ")
+        .map_or("", |(_, l)| l);
+    assert!(
+        listed.contains("nested/") && !listed.contains("nested/n.txt"),
+        "{notices:?}"
+    );
     for p in ["cache", "link", "nested", "hide"] {
         assert!(ws.join(p).symlink_metadata().is_err(), "{p} remains");
     }

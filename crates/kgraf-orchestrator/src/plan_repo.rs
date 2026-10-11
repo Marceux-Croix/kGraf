@@ -25,6 +25,14 @@
 //! worker that meets the second defect anyway and asks for the missing file
 //! is held for a re-plan ([`member_hold`]).
 //!
+//! Before a cargo workspace refusal spends an ask, [`repaired`] tries the
+//! mechanical change it names: an edge to the contract that writes the
+//! missing file, the file added to the contract that needs it when its other
+//! writers run after it, or a minimal source for a member manifest. Each
+//! change must keep the plan acyclic and its writes disjoint, and the
+//! repaired plan must pass every check; otherwise the refusal is asked with
+//! unchanged.
+//!
 //! Go workspaces and Maven reactors load the same way: a `go` command loads
 //! every module its `go.work` uses, and `mvn` every module its `pom.xml`
 //! lists, so a member whose `go.mod` or `pom.xml` comes later is the same
@@ -693,10 +701,181 @@ fn seen_members<C: PlanContract>(
 
 /// One reason a contract's cargo acceptance cannot pass, and the files it is
 /// about: the missing file first, then the files its remedy writes with it.
+/// `remedy` is the change kGraf may make itself ([`repaired`]), when one is
+/// mechanical; the reason is the text the planner is asked again with.
 #[derive(Debug)]
 struct Finding {
     paths: Vec<String>,
     reason: String,
+    remedy: Option<Remedy>,
+}
+
+/// A mechanical change to a plan that a cargo workspace finding names
+/// ([`repaired`]). Structured so the repair never parses refusal text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Remedy {
+    /// `contract` depends on `on`, which writes a file its cargo acceptance
+    /// loads.
+    DependOn { contract: String, on: String },
+    /// `contract` also writes `path`. `why` says what the file is for.
+    Write {
+        contract: String,
+        path: String,
+        why: &'static str,
+    },
+}
+
+impl Remedy {
+    /// The contract the change is made to.
+    pub(crate) fn contract(&self) -> &str {
+        match self {
+            Remedy::DependOn { contract, .. } | Remedy::Write { contract, .. } => contract,
+        }
+    }
+}
+
+impl std::fmt::Display for Remedy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Remedy::DependOn { contract, on } => write!(
+                f,
+                "contract `{contract}` now depends on `{on}`, which writes a file its cargo \
+                 acceptance loads"
+            ),
+            Remedy::Write {
+                contract,
+                path,
+                why,
+            } => write!(f, "contract `{contract}` now also writes `{path}`, {why}"),
+        }
+    }
+}
+
+const WHY_WORKSPACE: &str = "the workspace manifest its cargo acceptance runs in";
+const WHY_MEMBER: &str = "a member manifest cargo loads before its acceptance runs";
+const WHY_SOURCE: &str =
+    "a minimal source so cargo accepts the member manifest; a later writer may fill it in";
+
+/// The most remedies applied to one plan. A member's manifest and its source
+/// are one remedy each, so two members can be repaired; the bound keeps the
+/// repair from ever looping.
+const MAX_REPAIRS: usize = 4;
+
+/// Whether `a` and `b` can never run at the same time: one depends on the
+/// other, directly or through others.
+fn ordered<C: PlanContract>(specs: &[C], a: &str, b: &str) -> bool {
+    a == b || ancestors(specs, a).contains(b) || ancestors(specs, b).contains(a)
+}
+
+/// `specs` with `remedy` made, or `None` when the change is not safe: an
+/// edge that makes a cycle or names no contract, or a write that a contract
+/// which can run at the same time also declares (writes stay disjoint).
+fn apply(specs: &[ContractSpec], remedy: &Remedy) -> Option<Vec<ContractSpec>> {
+    let mut out = specs.to_vec();
+    match remedy {
+        Remedy::DependOn { contract, on } => {
+            if contract == on
+                || !specs.iter().any(|s| s.id == *on)
+                || ancestors(specs, on).contains(contract.as_str())
+            {
+                return None;
+            }
+            let c = out.iter_mut().find(|s| s.id == *contract)?;
+            if c.depends_on.contains(on) {
+                return None;
+            }
+            c.depends_on.push(on.clone());
+        }
+        Remedy::Write { contract, path, .. } => {
+            let concurrent = specs
+                .iter()
+                .filter(|s| s.id != *contract)
+                .filter(|s| s.write_paths().iter().any(|w| norm(w) == path))
+                .any(|s| !ordered(specs, contract, &s.id));
+            if concurrent {
+                return None;
+            }
+            let c = out.iter_mut().find(|s| s.id == *contract)?;
+            if c.writes.iter().any(|w| norm(&w.path) == path) {
+                return None;
+            }
+            c.writes.push(crate::run_state::WriteTarget {
+                path: path.clone(),
+                node: None,
+            });
+        }
+    }
+    Some(out)
+}
+
+/// `specs` repaired so that the cargo workspace checks pass, with the
+/// changes made in order, or `None` when they already pass, when a refusal
+/// has no mechanical remedy, when a remedy is not safe ([`apply`]), or when
+/// the plan is still refused after [`MAX_REPAIRS`] changes. A refused plan
+/// is then asked for again with its unchanged refusal.
+///
+/// Ordering a cargo workspace across contracts is a common planner error,
+/// and each such refusal names a fix that needs no judgment: an edge to the
+/// contract that writes the file, the file moved to the contract that needs
+/// it while the other writer runs after it, or a minimal source for a member
+/// manifest. Making it here saves an ask.
+pub(crate) fn repaired(
+    specs: &[ContractSpec],
+    named: &[String],
+    repo: &dyn RepoView,
+) -> Option<(Vec<ContractSpec>, Vec<Remedy>)> {
+    let mut plan = specs.to_vec();
+    let mut done: Vec<Remedy> = Vec::new();
+    for _ in 0..MAX_REPAIRS {
+        if scaffold_refusal(&plan, named, repo).is_some() {
+            return None;
+        }
+        let Some(finding) = workspace_finding(&plan, repo) else {
+            return (!done.is_empty()).then_some((plan, done));
+        };
+        let remedy = finding.remedy?;
+        plan = apply(&plan, &remedy)?;
+        done.push(remedy);
+    }
+    (!done.is_empty() && refusal(&plan, named, repo).is_none()).then_some((plan, done))
+}
+
+/// Whether the plan shows the member in `member_dir` to be a binary: a
+/// contract writes its `src/main.rs` or a file under `src/bin/`, or, when no
+/// contract writes its `src/lib.rs`, an instruction calls it a binary within
+/// two words of its name.
+fn evidently_binary<C: PlanContract>(specs: &[C], member_dir: &str) -> bool {
+    let written = writes_of(specs);
+    let bin = format!("{member_dir}/src/bin/");
+    if written.contains_key(format!("{member_dir}/src/main.rs").as_str())
+        || written.keys().any(|p| p.starts_with(&bin))
+    {
+        return true;
+    }
+    if written.contains_key(format!("{member_dir}/src/lib.rs").as_str()) {
+        return false;
+    }
+    let name = member_dir
+        .rsplit('/')
+        .next()
+        .unwrap_or(member_dir)
+        .to_ascii_lowercase();
+    specs.iter().any(|s| {
+        let words: Vec<String> = s
+            .instruction()
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        words.iter().enumerate().any(|(i, w)| {
+            *w == name
+                && words[i.saturating_sub(2)..(i + 3).min(words.len())]
+                    .iter()
+                    .any(|v| matches!(v.as_str(), "binary" | "bin" | "executable" | "cli"))
+        })
+    })
 }
 
 /// The directory of a `Cargo.toml` path, `""` for the root.
@@ -1057,6 +1236,8 @@ fn module_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> 
                     command = run.command,
                     by = writers(&member_manifest),
                 ),
+                // Go and Maven are re-asked: the repair covers cargo only.
+                remedy: None,
             });
         }
     }
@@ -1133,9 +1314,26 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                 // member's own directory cargo finds that member's manifest
                 // alone; at the workspace's root it finds none.
                 if run.dir == dir {
-                    let depend = free_writer(manifest)
+                    let free = free_writer(manifest);
+                    let depend = free
                         .map(|w| format!(" or depend on `{w}`, which writes it"))
                         .unwrap_or_default();
+                    // The edge first. Else the manifest moves to `c` too,
+                    // but only when a contract writes it: with no writer the
+                    // plan leaves the workspace out, which is judgment.
+                    // `apply` refuses the write if a writer can run at the
+                    // same time as `c`.
+                    let remedy = match free {
+                        Some(w) => Some(Remedy::DependOn {
+                            contract: c.id().to_owned(),
+                            on: w.to_owned(),
+                        }),
+                        None => written.contains_key(manifest).then(|| Remedy::Write {
+                            contract: c.id().to_owned(),
+                            path: manifest.to_owned(),
+                            why: WHY_WORKSPACE,
+                        }),
+                    };
                     push(Finding {
                         paths: vec![manifest.to_owned()],
                         reason: format!(
@@ -1152,6 +1350,7 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                             },
                             by = writers(manifest),
                         ),
+                        remedy,
                     });
                     break;
                 }
@@ -1194,9 +1393,29 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                 let member_manifest = format!("{base}{member}/Cargo.toml");
                 let src = format!("{base}{member}/src");
                 if !reachable(&member_manifest) {
-                    let depend = free_writer(&member_manifest)
+                    let free = free_writer(&member_manifest);
+                    let depend = free
                         .map(|w| format!("; or make `{}` depend on `{w}`", c.id()))
                         .unwrap_or_default();
+                    // As for the workspace manifest: the edge first, else
+                    // the member manifest moves to `c` when a contract that
+                    // runs after `c` writes it. A member no contract writes
+                    // is left to the planner. The member's source is the
+                    // next pass's finding.
+                    let remedy =
+                        match free {
+                            Some(w) => Some(Remedy::DependOn {
+                                contract: c.id().to_owned(),
+                                on: w.to_owned(),
+                            }),
+                            None => written.contains_key(member_manifest.as_str()).then(|| {
+                                Remedy::Write {
+                                    contract: c.id().to_owned(),
+                                    path: member_manifest.clone(),
+                                    why: WHY_MEMBER,
+                                }
+                            }),
+                        };
                     push(Finding {
                         paths: vec![
                             member_manifest.clone(),
@@ -1221,6 +1440,7 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                             command = run.command,
                             by = writers(&member_manifest),
                         ),
+                        remedy,
                     });
                     continue;
                 }
@@ -1235,6 +1455,35 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                             && by_supplied(ids)
                     });
                 if !has_source {
+                    // The minimal source goes to the writer of the member
+                    // manifest that `c` gets: the one every other supplied
+                    // writer comes before. A later writer of the same path
+                    // must run after it (`apply`).
+                    let manifest_writers: Vec<&str> = written
+                        .get(member_manifest.as_str())
+                        .map(|ids| {
+                            ids.iter()
+                                .copied()
+                                .filter(|id| supplied.contains(id))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let owner = manifest_writers.iter().copied().find(|w| {
+                        let before = ancestors(specs, w);
+                        manifest_writers
+                            .iter()
+                            .all(|o| o == w || before.contains(o))
+                    });
+                    let file = if evidently_binary(specs, &format!("{base}{member}")) {
+                        "main.rs"
+                    } else {
+                        "lib.rs"
+                    };
+                    let remedy = owner.map(|w| Remedy::Write {
+                        contract: w.to_owned(),
+                        path: format!("{src}/{file}"),
+                        why: WHY_SOURCE,
+                    });
                     push(Finding {
                         paths: vec![format!("{src}/lib.rs"), format!("{src}/main.rs")],
                         reason: format!(
@@ -1249,6 +1498,7 @@ fn cargo_findings<C: PlanContract>(specs: &[C], c: &C, repo: &dyn RepoView) -> V
                             id = c.id(),
                             command = run.command,
                         ),
+                        remedy,
                     });
                 }
             }
@@ -1374,16 +1624,24 @@ fn unlisted_package<C: PlanContract>(
                  source file `{src}/lib.rs` or `{src}/main.rs`, which `{id}` may fill in",
                 id = c.id(),
             ),
+            // Re-asked: the fix changes the member list inside a manifest,
+            // content the plan does not show.
+            remedy: None,
         })
     })
 }
 
-/// The first contract whose cargo acceptance cannot pass in its workspace.
-fn workspace_refusal(specs: &[ContractSpec], repo: &dyn RepoView) -> Option<String> {
+/// The first finding of the first contract whose cargo acceptance cannot
+/// pass in its workspace.
+fn workspace_finding(specs: &[ContractSpec], repo: &dyn RepoView) -> Option<Finding> {
     specs
         .iter()
         .find_map(|c| workspace_findings(specs, c, repo).into_iter().next())
-        .map(|f| f.reason)
+}
+
+/// The refusal of [`workspace_finding`].
+fn workspace_refusal(specs: &[ContractSpec], repo: &dyn RepoView) -> Option<String> {
+    workspace_finding(specs, repo).map(|f| f.reason)
 }
 
 /// The hold for a worker of `id` that asked for one of the files `named`,
@@ -2717,5 +2975,273 @@ pub fn f() {}
             ),
         ];
         assert!(refusal(&rewritten, &[], &repo).is_none());
+    }
+
+    fn writes(c: &ContractSpec) -> Vec<&str> {
+        c.writes.iter().map(|w| w.path.as_str()).collect()
+    }
+
+    /// Canary round17e greenfield, the third refusal's shape: c1 writes the
+    /// root manifest, `wcl-core` and `wcl/Cargo.toml` but no source under
+    /// `wcl/`, and runs `cargo check -p wcl-core`; c2 writes
+    /// `wcl/src/main.rs` after c1.
+    fn round17e_third_plan() -> [ContractSpec; 2] {
+        [
+            spec(
+                "c1",
+                "Write `Cargo.toml` with members = [\"wcl-core\", \"wcl\"], the `wcl-core` library \
+                 crate and the `wcl` binary's manifest.",
+                "cargo check -p wcl-core",
+                &[
+                    "Cargo.toml",
+                    "wcl-core/Cargo.toml",
+                    "wcl-core/src/lib.rs",
+                    "wcl/Cargo.toml",
+                ],
+                &[],
+            ),
+            spec(
+                "c2",
+                "Write the `wcl` binary.",
+                "cargo test --workspace",
+                &["wcl/src/main.rs"],
+                &["c1"],
+            ),
+        ]
+    }
+
+    /// Canary round17e greenfield, the second refusal's shape: c1 runs
+    /// `cargo test -p wcl-core` at the root, and only c3, which runs after
+    /// c1, writes the root manifest.
+    fn round17e_second_plan() -> [ContractSpec; 2] {
+        [
+            spec(
+                "c1",
+                "Write `Cargo.toml` with members = [\"wcl-core\"] and the `wcl-core` library crate.",
+                "cargo test -p wcl-core",
+                &["wcl-core/Cargo.toml", "wcl-core/src/lib.rs"],
+                &[],
+            ),
+            spec(
+                "c3",
+                "Write `Cargo.toml` with members = [\"wcl-core\", \"wcl\"] and the `wcl` binary crate.",
+                "cargo test --workspace",
+                &["Cargo.toml", "wcl/Cargo.toml", "wcl/src/main.rs"],
+                &["c1"],
+            ),
+        ]
+    }
+
+    /// Repair (c): the member manifest's writer also writes a minimal
+    /// source. `wcl` is a binary (c2 writes its `main.rs`), so the source is
+    /// `main.rs`, and c2, which runs after c1, writes it again.
+    #[test]
+    fn a_member_manifest_with_no_source_gets_a_minimal_source_from_its_writer() {
+        let specs = round17e_third_plan();
+        let repo = Fake::default();
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(
+            why.contains("no targets specified in the manifest"),
+            "{why}"
+        );
+        let (fixed, remedies) = repaired(&specs, &[], &repo).expect("repaired");
+        assert_eq!(
+            remedies,
+            vec![Remedy::Write {
+                contract: "c1".into(),
+                path: "wcl/src/main.rs".into(),
+                why: WHY_SOURCE,
+            }]
+        );
+        assert!(writes(&fixed[0]).contains(&"wcl/src/main.rs"));
+        assert_eq!(fixed[1], specs[1], "c2 is unchanged");
+        assert!(refusal(&fixed, &[], &repo).is_none());
+        // The refusal text the planner would be asked with is unchanged.
+        assert_eq!(reason(refusal(&specs, &[], &repo)), why);
+    }
+
+    /// Repair (b) of the second refusal: the edge to c3 would be a cycle, so
+    /// c1 writes the root manifest too, and c3 rewrites it after c1.
+    #[test]
+    fn a_workspace_manifest_a_later_contract_writes_moves_to_the_contract_that_needs_it() {
+        let specs = round17e_second_plan();
+        let repo = Fake::default();
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("Make `c1` write `Cargo.toml`"), "{why}");
+        assert!(!why.contains("depend on `c3`"), "{why}");
+        let (fixed, remedies) = repaired(&specs, &[], &repo).expect("repaired");
+        assert_eq!(
+            remedies,
+            vec![Remedy::Write {
+                contract: "c1".into(),
+                path: "Cargo.toml".into(),
+                why: WHY_WORKSPACE,
+            }]
+        );
+        assert!(fixed[0].depends_on.is_empty(), "no edge to c3");
+        assert!(refusal(&fixed, &[], &repo).is_none());
+    }
+
+    /// Repair (a) of the first refusal: c2 does not depend on c1, so c1
+    /// depends on c2. c2 then runs at a root whose manifest only c1 writes,
+    /// and c1 runs after it, so c2 writes the manifest too.
+    #[test]
+    fn a_member_manifest_another_contract_writes_is_reached_by_an_edge_first() {
+        let specs = greenfield(&[], &[]);
+        let repo = Fake::default();
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("make `c1` depend on `c2`"), "{why}");
+        let (fixed, remedies) = repaired(&specs, &[], &repo).expect("repaired");
+        assert_eq!(
+            remedies,
+            vec![
+                Remedy::DependOn {
+                    contract: "c1".into(),
+                    on: "c2".into(),
+                },
+                Remedy::Write {
+                    contract: "c2".into(),
+                    path: "Cargo.toml".into(),
+                    why: WHY_WORKSPACE,
+                },
+            ]
+        );
+        assert_eq!(fixed[0].depends_on, vec!["c2".to_owned()]);
+        assert!(
+            !writes(&fixed[0]).contains(&"wcl/Cargo.toml"),
+            "edge, not a move"
+        );
+        assert!(refusal(&fixed, &[], &repo).is_none(), "{remedies:?}");
+        assert!(remedies.len() <= MAX_REPAIRS);
+    }
+
+    /// The round 8 plan: the edge to c2-bin would be a cycle, so c1-core
+    /// writes `wcl/Cargo.toml` and then a minimal `wcl/src/main.rs`. The
+    /// result is the remedy a planner wrote, which cargo builds.
+    #[test]
+    fn an_edge_that_makes_a_cycle_is_never_made() {
+        let specs = round8_second_plan();
+        let edge = Remedy::DependOn {
+            contract: "c1-core".into(),
+            on: "c2-bin".into(),
+        };
+        assert!(apply(&specs, &edge).is_none(), "c2-bin depends on c1-core");
+        let unknown = Remedy::DependOn {
+            contract: "c1-core".into(),
+            on: "c9".into(),
+        };
+        assert!(apply(&specs, &unknown).is_none());
+        let repo = Fake::default();
+        let (fixed, remedies) = repaired(&specs, &[], &repo).expect("repaired");
+        assert!(
+            remedies
+                .iter()
+                .all(|r| !matches!(r, Remedy::DependOn { .. })),
+            "{remedies:?}"
+        );
+        assert!(fixed[0].depends_on.is_empty());
+        assert_eq!(
+            writes(&fixed[0]),
+            writes(&remedy_stub_members()[0]),
+            "{remedies:?}"
+        );
+        assert!(refusal(&fixed, &[], &repo).is_none());
+    }
+
+    /// Repair (c) is skipped when a contract that can run at the same time
+    /// as the manifest's writer declares the source: writes stay disjoint,
+    /// and the plan is asked for again with the unchanged refusal.
+    #[test]
+    fn a_write_a_concurrent_contract_declares_is_never_made() {
+        let [c1, mut c2] = round17e_third_plan();
+        c2.depends_on.clear();
+        c2.acceptance = "true".into();
+        let specs = [c1, c2];
+        let repo = Fake::default();
+        let why = reason(refusal(&specs, &[], &repo));
+        assert!(why.contains("no targets"), "{why}");
+        assert!(repaired(&specs, &[], &repo).is_none());
+        let write = Remedy::Write {
+            contract: "c1".into(),
+            path: "wcl/src/main.rs".into(),
+            why: WHY_SOURCE,
+        };
+        assert!(apply(&specs, &write).is_none());
+    }
+
+    /// No mechanical remedy, so no repair: a member no contract writes (the
+    /// plan left it out, which is judgment), a workspace manifest no
+    /// contract writes, a refused unwritten scaffold, and a plan that passes.
+    #[test]
+    fn a_refusal_with_no_mechanical_remedy_is_not_repaired() {
+        let repo = Fake::default();
+        let mut nobody = greenfield(&[], &[]);
+        nobody[1].writes.clear();
+        assert!(refusal(&nobody, &[], &repo).is_some());
+        assert!(repaired(&nobody, &[], &repo).is_none());
+
+        let [mut c1, _] = round17e_second_plan();
+        c1.instruction = "Write the `wcl-core` library crate.".into();
+        let no_root = [
+            c1,
+            spec(
+                "c3",
+                "Write the `wcl` binary crate and `Cargo.toml` with members = [\"wcl-core\", \"wcl\"].",
+                "cargo test --workspace",
+                &["wcl/Cargo.toml", "wcl/src/main.rs"],
+                &["c1"],
+            ),
+        ];
+        // Nobody writes the root manifest c3's instruction describes.
+        assert!(repaired(&no_root, &[], &repo).is_none());
+
+        let stub = Fake::with(&[("discount_clearance/src/lib.rs", STUB)]);
+        let named = vec!["discount_clearance/src/lib.rs".to_owned()];
+        assert!(refusal(&round17e_third_plan(), &named, &stub).is_some());
+        assert!(repaired(&round17e_third_plan(), &named, &stub).is_none());
+
+        assert!(repaired(&remedy_stub_members(), &[], &repo).is_none());
+    }
+
+    #[test]
+    fn a_member_is_a_binary_only_on_evidence() {
+        let specs = [spec(
+            "c1",
+            "Create the `wcl-core` library and the `wcl` binary crate.",
+            "true",
+            &[],
+            &[],
+        )];
+        assert!(evidently_binary(&specs, "wcl"));
+        assert!(!evidently_binary(&specs, "wcl-core"));
+        let lib = [spec(
+            "c1",
+            "the `wcl` binary",
+            "true",
+            &["wcl/src/lib.rs"],
+            &[],
+        )];
+        assert!(!evidently_binary(&lib, "wcl"), "a planned lib.rs wins");
+        let bin = [spec("c1", "x", "true", &["tools/wcl/src/bin/a.rs"], &[])];
+        assert!(evidently_binary(&bin, "tools/wcl"));
+    }
+
+    /// A repaired plan builds: every contract of each passes its cargo
+    /// acceptance over the files it can count on.
+    #[cfg(unix)]
+    #[test]
+    fn repaired_plans_pass_with_cargo() {
+        let repo = Fake::default();
+        for (name, specs) in [
+            ("round17e third", round17e_third_plan().to_vec()),
+            ("round17e second", round17e_second_plan().to_vec()),
+            ("round 8", round8_second_plan().to_vec()),
+        ] {
+            let (fixed, remedies) = repaired(&specs, &[], &repo).expect(name);
+            for c in &fixed {
+                let (passed, stderr) = cargo_passes(&fixed, &c.id, &[]);
+                assert!(passed, "{name}, `{}` after {remedies:?}: {stderr}", c.id);
+            }
+        }
     }
 }

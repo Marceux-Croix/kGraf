@@ -31,6 +31,9 @@
 //!                                               of that process
 //!                                             the job ends what it holds?
 //!                                             LogonUser(slot user, INTERACTIVE)
+//!                                             the command's window station
+//!                                               kgraf-cmd-<hex>\Default for
+//!                                               that user (made once, kept)
 //!                                             CreateEnvironmentBlock
 //!                                             CreateProcessAsUser(suspended,
 //!                                               handle list + job list)
@@ -40,7 +43,8 @@
 //!                                             duplicate the runner's process
 //!                                               handle into the owner, to
 //!                                               wait on and read
-//!     <--- "started <pid> <handle> ..." ----   close the instance
+//!     <--- "started <pid> <handle>          close the instance
+//!           <desktop> ..." ----------------
 //! ```
 //!
 //! The owner's side opens the pipe with `SECURITY_SQOS_PRESENT |
@@ -706,12 +710,35 @@ fn serve_client(io: &mut PipeIo, args: &ServiceArgs) -> Result<ServiceReply, Fai
     check_client(&io.0, &request, args)?;
     let handles = duplicate(&request, args)?;
     let token = logon(&request)?;
+    let desktop = command_desktop(args, &token)?;
     let environment = Environment::of(&token)?;
     let (pid, handle, protected) = start(args, &request, &token, &handles, &environment)?;
     Ok(ServiceReply::Started {
         pid,
         handle,
+        desktop,
         protected,
+    })
+}
+
+/// The window station and desktop the commands of the user `token` logged
+/// on run on, in session 0 (`launch::service_command_desktop`): made on that
+/// user's first command and kept for the life of this process. Its access
+/// list admits SYSTEM, the owner and the user the token names, read from the
+/// token and not from the request, so it names the user the runner and the
+/// command really run as.
+///
+/// Made before the runner starts, so a refusal starts nothing: the reply
+/// names the step and the Win32 error, and the command is refused rather
+/// than run on the runner's own station. The owner-session path refuses a
+/// command the same way when it cannot make the station.
+fn command_desktop(args: &ServiceArgs, token: &OwnedHandle) -> Result<String, Failure> {
+    let user_sid = token_user_sid(token)?;
+    super::launch::service_command_desktop(&args.owner_sid, &user_sid).map_err(|e| match e {
+        crate::error::SandboxError::PlatformSetup { step, source } => {
+            Failure::with(step, source.raw_os_error().map_or(0, |c| c as u32), source)
+        }
+        other => Failure::other("make the command's window station in session 0", other),
     })
 }
 
@@ -1373,10 +1400,12 @@ impl Drop for StartAttributes {
 /// **The window station.** `lpDesktop` is an empty string, not null. For a
 /// noninteractive logon session Windows then forms a window station name from
 /// the logon session's ID and creates that station and its default desktop
-/// (Microsoft, "Process Connection to a Window Station"). Each command
+/// (Microsoft, "Process Connection to a Window Station"). Each runner
 /// therefore gets a window station of its own, and no access list of the
 /// owner's is touched. A null `lpDesktop` would give the runner this
-/// service's own station and desktop, which is wrong.
+/// service's own station and desktop, which is wrong. The command does not
+/// run there: the runner starts it on the station [`command_desktop`] made for
+/// its sandbox user, which the reply names and the owner passes on.
 ///
 /// **The job is joined in the creation call.** The job the request named is in
 /// the creation attributes (`PROC_THREAD_ATTRIBUTE_JOB_LIST`), so the process

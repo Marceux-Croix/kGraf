@@ -206,11 +206,19 @@ fn a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only() {
     if as_user {
         assert!(safe > 0, "no safe.directory entry: {listing}");
         assert_eq!(keys, 5 + safe, "{listing}");
-        // The jobserver kGraf made for this command.
+        // The jobserver kGraf made for this command, under the name of the
+        // launch path this machine's setup proved: `Global\` on the
+        // session-0 path, no prefix on the owner-session path
+        // (`sandbox_user::jobserver::semaphore_name`).
+        let want = kgraf_sandbox::sandbox_user::jobserver::semaphore_name(
+            common::active_launch_path(),
+            [0; 8],
+        );
+        let prefix = want.trim_end_matches(|c: char| c.is_ascii_hexdigit());
         assert!(
             value_of(&listing, "CARGO_MAKEFLAGS")
-                .is_some_and(|v| v.contains("--jobserver-auth=kgraf-jobserver-")),
-            "{listing}"
+                .is_some_and(|v| v.contains(&format!("--jobserver-auth={prefix}"))),
+            "expected --jobserver-auth={prefix}...: {listing}"
         );
     } else {
         assert_eq!((keys, safe), (5, 0), "{listing}");

@@ -2124,3 +2124,56 @@ What a Windows run must show: item 10 of the named-objects list in `docs/WINDOWS
 The sandbox user re-run of the shell, startup, escape, runner, stdio and contract tests no
 longer fails on the trust check; the two pipe tests pass; and a refused launch, where one
 happens, is one line that says what to run.
+
+## Amendment (2026-10-10): the command's own window station in session 0, and a self-test that can read clean
+
+A Windows self-test (Windows Server 2025 Datacenter 24H2, build 26100.33438) ran cargo and
+rustc as the sandbox user through the launcher service. Its headline counted 143 failed
+tests, all from the baseline; the sandbox user re-run had 8 failures and one binary that ran
+out of time, and none of them was in the headline. The fixes below stand on code reading and
+host and cross-compiled checks.
+
+- **The command ran on the runner's window station.** Four tests saw the command on
+  `Service-0x0-<luid>$\Default`, the station Windows makes for the runner's logon session,
+  not on a `kgraf-cmd-<hex>` station kGraf made. The service started the runner with an
+  empty desktop and the owner named none for the command. A window station belongs to one
+  session, so the owner's process cannot make one in session 0. The service now makes one
+  station and its `Default` desktop per sandbox user in session 0
+  (`launch::service_command_desktop`), with the access list of the owner-session path
+  (SYSTEM, the owner, and the user the logged-on token names), before it starts the runner.
+  It keeps the handles for its own lifetime; a command still running when the service stops
+  keeps the station until it ends, and the next service process makes a new one. Its reply
+  names the desktop; the owner accepts only a `kgraf-cmd-<16 hex>\Default` name
+  (`session0::is_command_desktop`), records a launch line, and passes the name in the runner
+  request, where the runner uses it as `STARTUPINFOW::lpDesktop`. The runner keeps its
+  Windows-made station, so the command shares no station with the runner or with another
+  sandbox user's commands. A station the service cannot make refuses the command with the
+  step and the Win32 error, as the owner-session path does. The request version moves to 2,
+  so a service and an owner of different builds refuse each other in words. Unchanged: the
+  owner-only pipe, the handle type checks, the pinned runner.
+- **The cleared-environment test expected the owner-session jobserver name.** On the
+  session-0 path the semaphore is `Global\kgraf-jobserver-<hex>`; the test now expects the
+  recorded path's name, with its no-leak checks unchanged.
+- **contract_checks did not hang; it ran out of time.** Each check builds a fresh copy of a
+  small crate with a target folder of its own, and a revision test runs up to ten builds in a
+  row. At about 12 s per cold build as the sandbox user, the binary's 600 s limit and the
+  120 s solo re-run limit were too short. The self-test manifest now gives contract_checks
+  and the bench-briefs library measured rates, and a solo re-run's limit follows the
+  binary's rate. The base archive's extraction, the one wait on a check's path that had no
+  bound, now runs within the run's own bound and fails naming the archive.
+- **Two tests assumed what the sandbox user cannot do.** One verified a second attempt in
+  the first attempt's scratch folder, whose build output belonged to another slot user; each
+  attempt now gets its own scratch folder, as the bench runner gives it. Another ran
+  `git init` inside a check in a tree in the owner's profile; git reads the attributes of
+  every folder above a ref before it writes it, which the sandbox user cannot do there. The
+  nested repository is now written as the files git checks. A check that runs `git init` in
+  a tree inside the owner's profile still fails as the sandbox user; that is a limit of this
+  design, which changes no access list above a granted tree.
+- **The self-test verdict covers both halves.** A baseline failure is listed apart as
+  expected under the token sandbox only when the same test passed in the sandbox user re-run
+  and its own baseline output names a token sandbox limit (the re-run selection markers, plus
+  `STATUS_DLL_INIT_FAILED`, 0xC0000142). Every other baseline failure, every failure and hang
+  of the re-run and every failed end-to-end check of either half counts. A DNS gate failure
+  is a "Known gap" line under the verdict.
+- **`--only <filter>`** runs named binaries or tests in both halves
+  (`docs/WINDOWS-TESTING.md`).

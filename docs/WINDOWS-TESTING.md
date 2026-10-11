@@ -39,7 +39,8 @@ libtest prints a failed test's panic and captured output only at the end of a bi
 so a binary that hangs (killed at its time limit) or crashes loses it. The runner then runs
 each test the binary reported FAILED, and the test that was running, alone again
 (`<binary> --exact <name> --test-threads=1`, same environment and working folder). Each
-re-run has a 120 second limit (`SOLO_RERUN_SECS`); a binary gets at most 30 re-runs
+re-run has five times the binary's expected seconds per test as its limit, at least 120
+seconds (`SOLO_RERUN_SECS`) and at most 600 (`solo_limit_for`); a binary gets at most 30 re-runs
 (`MAX_SOLO_RERUNS`) and 10 minutes of re-runs in all (`SOLO_RERUN_BUDGET_SECS`), the running
 test first. The report uses that output as the test's tail, says it came from a solo re-run,
 and says whether the re-run passed, failed or hung (JSON: `solo` on each failure,
@@ -126,9 +127,11 @@ work:
 
 #### The sandbox user phase
 
-The workflow has one input, `sandbox_user`, on by default. It adds `--sandbox-user` to the
+The workflow has two inputs. `sandbox_user`, on by default, adds `--sandbox-user` to the
 runner. Turn it off with `gh workflow run wintest.yml -f sandbox_user=false`. A person can
-add the same flag on any Windows machine: `kgraf-wintest.exe --all --sandbox-user`.
+add the same flag on any Windows machine: `kgraf-wintest.exe --all --sandbox-user`. `only`,
+empty by default, is passed to the runner as `--only <value>` when it is set (see "Running
+only some tests" below).
 
 The suite runs first, exactly as without the flag, with no sandbox user set up. That is the
 baseline, and it stays comparable with earlier runs. Then the phase runs these steps:
@@ -200,14 +203,99 @@ What the report part "Sandbox user phase" shows:
 - The end-to-end checks with the baseline status and the sandbox user status.
 - The confirmation after (f). If anything is left, the runner exits with a non-zero code.
 
-The totals and the verdict at the top of the report count the baseline only.
+The "Tests" and "End-to-end checks" rows of the first table count the baseline. The verdict
+line counts both halves (`report::headline`):
+
+- every baseline failure, except those listed in "Expected under the token sandbox";
+- every failed test and every hung or crashed binary of the re-run (e);
+- every failed end-to-end check, of the baseline and of the sandbox user.
+
+A baseline failure is expected under the token sandbox only when both hold: the same test
+passed in the re-run (a pass in the binary's first run; a pass only in a solo re-run does
+not count), and its own baseline output names a token sandbox limit. The limits are the
+markers that select a binary for the re-run (the cargo jobserver, Git Bash, msys,
+`NtCreateDirectoryObject`, the signal pipe, Schannel) and `STATUS_DLL_INIT_FAILED`
+(0xC0000142, also printed as -1073741502 or 3221225794), with which Git Bash's programs
+and rustc end under the token sandbox. Those failures are not in the verdict; the section
+"Expected under the token sandbox (N)" lists each with its binary, its test and the marker,
+and the verdict says how many it listed apart. A baseline failure without a marker in its
+own output, or one whose test failed, hung or was not reached in the re-run, still counts,
+as does a failure in a binary the re-run did not take. The Failures section also lists each
+failure of the re-run, with its output, under `sandbox user:`.
+
+When selfcheck (d) failed on its `dns:` line, a line `Known gap: DNS is not confined on this
+machine ...` follows the verdict, with selfcheck's words. It is not a pass: the DNS test of
+the re-run (`an_offline_lookup_does_not_reach_the_dns_client_service`) fails while the gap
+stands, and that failure counts.
+
+#### Running only some tests (`--only`)
+
+`kgraf-wintest.exe --only <filter>` runs only what the filter names, in the baseline suite
+and in the sandbox user re-run alike. The filter is a comma-separated list of items:
+
+- `<run id>`: one test binary, whole. Run ids are the ones in the report's "Test binaries"
+  table, for example `kgraf-sandbox/test/escape_windows`. An id without its `#core` or
+  `#rest` part names both parts.
+- `<run id>::<test name>`: one test of that binary, by its full name as the report prints
+  it, for example
+  `kgraf-bench-briefs/lib/kgraf_bench_briefs::check::tests::verify_fails_when_a_protected_file_changed`.
+  The named tests of one binary run together with libtest `--exact`. Name the part
+  (`#core` or `#rest`) of a split binary to run a test once.
+- `e2e`: every end-to-end check. `e2e::<check id>` (for example `e2e::shell.git_bash`)
+  keeps that check; the checks run in groups that share one worker run, so its group runs
+  and only the named check is reported. Without an `e2e` item no end-to-end check runs.
+
+An item that names no binary of the bundle stops the runner before it starts anything, and a
+named end-to-end check that did not run is reported as a failed check. With a filter, the
+runner asks nothing about the extended set, and in the sandbox user phase every binary the
+filter named runs again, whatever the baseline found. The report states the filter in a
+line above the verdict and in the "Mode" row. An empty value is the full run, so the
+workflow passes its `only` input through as it is:
+
+```
+gh workflow run wintest.yml -f only='kgraf-sandbox/test/escape_windows::send_input_reaches_nothing_of_the_owners'
+```
+
+#### What a confirmation run must show
+
+A confirmation run is a full run (no `only`) with the sandbox user phase. It reads clean
+when:
+
+- The verdict line counts no failed test, no hung or crashed binary and no failed
+  end-to-end check, except what a known gap explains, and the report names each such
+  failure. While the DNS gap stands, that is the re-run's
+  `dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service` with the
+  `Known gap: DNS ...` line. The baseline's end-to-end check `shell.git_bash` fails under the
+  token sandbox by design (Git Bash cannot make its object directory) and is counted; its
+  sandbox user status must be `Pass`.
+- "Expected under the token sandbox (N)" lists the baseline's Git Bash, jobserver and
+  0xC0000142 failures, and each one's sandbox user status is `passed`.
+- In (d): `launch: kGraf's launcher service made window station kgraf-cmd-... and desktop
+  Default for the command of sandbox user ... in session 0`, and a `launch: the session-0
+  path started a command: ... for a command on kgraf-cmd-...\Default` line for each command.
+- In (e): `escape_windows` (`send_input_reaches_nothing_of_the_owners`,
+  `the_command_runs_on_its_own_desktop_without_a_console`,
+  `user_interface_objects_are_shared_the_way_the_backend_shares_them`),
+  `runner_windows::the_command_runs_on_a_desktop_the_owner_made`,
+  `startup_windows::a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only`,
+  `kgraf_bench_briefs` `check::tests::verify_fails_when_a_protected_file_changed`,
+  `kgraf_host#rest` `tests::everything_a_check_creates_is_removed_and_nothing_outside` and
+  every test of `contract_checks` pass, and no binary of the re-run timed out.
+- (f) leaves nothing.
+
+To re-run only the tests these fixes address, pass this `only` value:
+
+```
+kgraf-sandbox/test/escape_windows::send_input_reaches_nothing_of_the_owners,kgraf-sandbox/test/escape_windows::the_command_runs_on_its_own_desktop_without_a_console,kgraf-sandbox/test/escape_windows::user_interface_objects_are_shared_the_way_the_backend_shares_them,kgraf-sandbox/test/runner_windows::the_command_runs_on_a_desktop_the_owner_made,kgraf-sandbox/test/startup_windows::a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only,kgraf-orchestrator/test/contract_checks,kgraf-bench-briefs/lib/kgraf_bench_briefs::check::tests::verify_fails_when_a_protected_file_changed,kgraf-host/lib/kgraf_host#rest::tests::everything_a_check_creates_is_removed_and_nothing_outside
+```
 
 What the phase collects about the launch path, in the output of selfcheck (b0) and (d):
 after the report lines, selfcheck prints its launch record on standard error, each line
 starting with `  launch:`. On the sandbox user (d) they are: one line for each window
 station and desktop kGraf made (`made window station kgraf-run-... and desktop Default for
 the runner of sandbox user S-1-5-21-...` and the same with `kgraf-cmd-...` for the
-command), the logon calls (`CreateProcessWithLogonW calls N (F failed): last ..., mean ...,
+command; on the session-0 path, `kGraf's launcher service made window station kgraf-cmd-...
+and desktop Default for the command of sandbox user S-1-5-21-... in session 0`), the logon calls (`CreateProcessWithLogonW calls N (F failed): last ..., mean ...,
 longest ...; spawn lock wait before them: ...`), and the spawn lock (`spawn lock, every
 spawn in this process: taken N, waits that ran out T; wait mean ..., longest ...; longest
 hold ...`). The report keeps them with the rest of the output. Read the station lines
