@@ -5032,3 +5032,64 @@ async fn a_second_rejected_patch_carries_a_worked_example_for_its_file() {
     assert!(third.starts_with("ERROR: refused: "), "{third}");
     assert!(!third.contains("A minimal valid patch"), "{third}");
 }
+
+/// Three rejected `apply_patch` calls in a row on one file: the third
+/// rejection, and no earlier one, names the whole-file route. A rejection for a
+/// different file keeps its own count, and a successful patch on a file clears
+/// that file's count.
+#[tokio::test]
+async fn a_third_rejected_patch_on_one_file_names_the_whole_file_route() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    std::fs::write(worktree.path().join("a.rs"), "one\n").expect("seed");
+    std::fs::write(worktree.path().join("b.rs"), "one\n").expect("seed");
+    let bad = |file: &str, n: u32| {
+        json!({"patch": format!(
+            "*** Begin Patch\n*** Update File: {file}\n@@\n-missing {n}\n+x\n*** End Patch"
+        )})
+    };
+    let good =
+        json!({"patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-one\n+two\n*** End Patch"});
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "apply_patch", bad("a.rs", 1))]),
+        1 => Round::tool(vec![("t2", "apply_patch", bad("a.rs", 2))]),
+        2 => Round::tool(vec![("t3", "apply_patch", bad("b.rs", 3))]),
+        3 => Round::tool(vec![("t4", "apply_patch", bad("a.rs", 4))]),
+        4 => Round::tool(vec![("t5", "apply_patch", bad("b.rs", 5))]),
+        5 => Round::tool(vec![("t6", "apply_patch", good.clone())]),
+        6 => Round::tool(vec![("t7", "apply_patch", bad("a.rs", 7))]),
+        _ => Round::answer("done"),
+    });
+    let env = env_with(
+        provider.clone(),
+        vec![Arc::new(kgraf_tools::ApplyPatchTool)],
+        CallMode::Stream,
+    );
+    let handle = spawn_worker(
+        Arc::new(env),
+        brief("w1", "edit it", worktree.path(), 12),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let hint = "replace the whole file in one patch";
+    for id in ["t1", "t2", "t3", "t5"] {
+        let (out, is_error) = finished_output(&events, id);
+        assert!(is_error, "{id}: {out}");
+        assert!(!out.contains(hint), "{id}: {out}");
+    }
+    // a.rs: t1, t2, t4 fail in a row (the b.rs failure between does not reset it).
+    let (t4, _) = finished_output(&events, "t4");
+    assert!(t4.contains(hint), "{t4}");
+    assert!(
+        t4.contains("*** Delete File: a.rs\n*** Add File: a.rs\n+full new content"),
+        "{t4}"
+    );
+    // b.rs failed twice only (t3, t5). The good patch on a.rs clears its
+    // count, so t7 is a first failure again.
+    let (t6, is_error) = finished_output(&events, "t6");
+    assert!(!is_error, "{t6}");
+    let (t7, is_error) = finished_output(&events, "t7");
+    assert!(is_error, "{t7}");
+    assert!(!t7.contains(hint), "{t7}");
+}

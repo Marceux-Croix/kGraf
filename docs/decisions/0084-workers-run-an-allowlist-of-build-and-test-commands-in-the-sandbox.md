@@ -1078,3 +1078,27 @@ Tests: `an_unlisted_command_without_timeout_secs_gets_the_short_default`,
 `a_dropped_request_is_never_answered_by_its_late_response`,
 `a_failed_reconnect_names_both_failures` (kgraf-tbench-bridge); `test_bridge_timeout.py` (the
 bridge server). Each fails with its part of the change reverted.
+
+## Amendment (2026-10-11): an `@@` marker with no space is read, and a file that keeps failing is offered a whole-file replace
+
+In one benchmark round a worker made nine `apply_patch` calls on one file and every one failed.
+Some wrote the `@@` marker glued to its text (`@@-//! Contract: x`, `@@! Contract: x`) and were
+refused as unexpected lines; the rest had context lines that did not match the file.
+
+- **`@@text` is read as `@@ text`** inside an Update File section. A body line never starts with
+  `@`, so no other reading exists. `@@@ x` is not read and is still refused. When the context
+  is missing from the file and starts with one `-` or `+`, it is looked up again without that
+  character, which is taken as a stray diff sign. The text as written always wins, and a
+  context missing under both readings is refused. Each repair is stated in the result as a
+  `note:`. A glued unified-diff header (`@@-1,2 +1,2 @@ text`) goes the unified-diff way.
+- **A third failure on one file offers the whole-file route.** The worker counts rejected
+  `apply_patch` calls per file, by the first file the patch names, in one attempt. A call that
+  succeeds on that file clears its count. From the third rejection in a row, a format or
+  matching error ends with a sentence and a two-header skeleton: `*** Delete File: <path>`
+  then `*** Add File: <path>` with the full new content. The tool already applies a Delete
+  File and an Add File of one path as a replace (above). Only error text changes.
+
+Tests: `kgraf-tools` `an_at_marker_glued_to_its_text_is_read_as_a_context_line`,
+`a_context_with_a_leading_sign_that_is_in_the_file_is_not_stripped`,
+`an_ambiguous_at_marker_is_still_refused`, `the_whole_file_hint_skeleton_replaces_the_file`;
+`kgraf-runtime` `a_third_rejected_patch_on_one_file_names_the_whole_file_route`.

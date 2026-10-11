@@ -91,8 +91,33 @@ fn compute_replacements(
         // If a chunk has a `change_context`, we use `seek` to find it, then
         // adjust our `line_index` to continue from there.
         if let Some(ctx_line) = &chunk.change_context {
-            let pattern = std::slice::from_ref(ctx_line);
-            match seek_sequence::seek(original_lines, pattern, line_index, /*eof*/ false) {
+            let mut pattern = std::slice::from_ref(ctx_line);
+            let mut found = seek_sequence::seek(original_lines, pattern, line_index, false);
+            // A context that starts with `-` or `+` and matches nothing is
+            // retried without that one character: it is most likely a diff
+            // sign glued to the marker (`@@-text`). The text as written
+            // always wins; the retry runs only when it is missing.
+            let unsigned = [ctx_line
+                .strip_prefix(['-', '+'])
+                .unwrap_or(ctx_line)
+                .to_string()];
+            if matches!(found, Seek::Missing)
+                && unsigned[0] != *ctx_line
+                && !matches!(
+                    seek_sequence::seek(original_lines, &unsigned, line_index, false),
+                    Seek::Missing
+                )
+            {
+                pattern = &unsigned;
+                found = seek_sequence::seek(original_lines, pattern, line_index, false);
+                notes.push(format!(
+                    "note: in {path}, the `@@` context '{ctx_line}' is not in the file; the \
+                     leading '{}' was taken as a stray diff sign and the context read as '{}'",
+                    &ctx_line[..1],
+                    unsigned[0]
+                ));
+            }
+            match found {
                 Seek::Exact(idx) => line_index = idx + 1,
                 Seek::Tolerant(idx) => {
                     notes.push(tolerant_note(path, "the `@@` context line", idx));

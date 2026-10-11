@@ -192,6 +192,22 @@ pub fn rejection_help(error: &str, target: Option<&PatchTarget>) -> Option<Strin
     ))
 }
 
+/// Consecutive failed `apply_patch` calls on one file after which an error
+/// for that file offers the whole-file route ([`whole_file_hint`]).
+pub const WHOLE_FILE_HINT_AFTER: u32 = 3;
+
+/// One sentence for a model whose patches on `path` keep failing: replacing
+/// the whole file needs no context or `-` line to match. The tool applies a
+/// Delete File and an Add File of one path as a replace.
+pub fn whole_file_hint(path: &str) -> String {
+    format!(
+        "\nThis file has failed to patch repeatedly. You can replace the whole file in one \
+         patch: `*** Delete File: {path}` followed by `*** Add File: {path}` with the full new \
+         content, every line starting with `+`:\n*** Begin Patch\n*** Delete File: {path}\n\
+         *** Add File: {path}\n+full new content\n*** End Patch"
+    )
+}
+
 /// A patch longer than this is refused before it is even parsed (cap
 /// patch size). Generous for a real multi-file change; a patch this large is
 /// already an unusual model output worth refusing rather than absorbing.
@@ -230,6 +246,9 @@ const UNIFIED_NOTE: &str = "note: an `@@ -a,b +c,d @@` header is a unified-diff 
      format does not use; its line numbers were ignored and the text after it, if any, was taken as \
      the `@@` context line";
 
+const GLUED_NOTE: &str = "note: an `@@` marker written with no space before its text (`@@text`) \
+     was read as `@@ text`, the `@@` context line";
+
 /// A patch repaired into the form the parser takes, and a note per repair.
 /// Models send the hunks without the envelope, drop or mangle the end line,
 /// or head a chunk with a unified-diff `@@ -a,b +c,d @@` line. Each repair is
@@ -240,6 +259,11 @@ const UNIFIED_NOTE: &str = "note: an `@@ -a,b +c,d @@` header is a unified-diff 
 /// - A patch that begins with `*** Begin Patch` (or was given one) and whose
 ///   last line is not `*** End Patch` gets one; a last line that is only a
 ///   mangled end marker (`***/ End Patch`) is replaced by it.
+/// - `@@text` (no space; the text does not start with `@`) in an Update File
+///   section becomes `@@ text`. A body line never starts with `@`, so this
+///   reads nothing else; `@@@ x` and other `@@@` forms are left for the parser
+///   to refuse. A leading `-` or `+` on the text is dealt with when the
+///   context is matched against the file, where the file can decide.
 /// - `@@ -a,b +c,d @@ text` in an Update File section becomes `@@ text`
 ///   (`@@` when there is no text).
 fn repaired(patch: &str) -> (String, Vec<&'static str>) {
@@ -294,6 +318,16 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
         let t = line.trim_end();
         if t.starts_with("*** ") {
             in_update = t.starts_with(parser::UPDATE_FILE_MARKER);
+        } else if in_update && let Some(glued) = glued_marker_text(t) {
+            let spaced = format!("@@ {glued}");
+            *line = match unified_header_context(&spaced) {
+                Some("") => "@@".to_string(),
+                Some(context) => format!("@@ {context}"),
+                None => spaced,
+            };
+            if !notes.contains(&GLUED_NOTE) {
+                notes.push(GLUED_NOTE);
+            }
         } else if in_update && let Some(context) = unified_header_context(t) {
             *line = if context.is_empty() {
                 "@@".to_string()
@@ -306,6 +340,14 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
         }
     }
     (lines.join("\n"), notes)
+}
+
+/// The text of an `@@` line written with no space after the marker
+/// (`@@text`), or `None`. Text starting with `@` is not read (`@@@ x`).
+fn glued_marker_text(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("@@")?;
+    let first = rest.chars().next()?;
+    (!first.is_whitespace() && first != '@').then_some(rest)
 }
 
 /// The text after a unified-diff hunk header `@@ -a[,b] +c[,d] @@`, trimmed
@@ -1655,6 +1697,116 @@ mod tests {
         )
         .await;
         assert!(out.expect_err("refused").contains("more than one hunk"));
+    }
+
+    /// Round evidence (round20, loyalty): `@@-//! Contract: x` and `@@! Contract: x`
+    /// were refused as unexpected lines. The marker with no space reads as
+    /// `@@ text`, and one stray `-` or `+` on the text is dropped only when the
+    /// file has the text without it.
+    #[tokio::test]
+    async fn an_at_marker_glued_to_its_text_is_read_as_a_context_line() {
+        let file = "//! Contract: x
+//! more
+fn a() {
+    old();
+}
+";
+        for (marker, expect_sign_note) in [
+            ("@@-//! Contract: x", true),
+            ("@@+//! Contract: x", true),
+            ("@@//! Contract: x", false),
+            ("@@ //! Contract: x", false),
+        ] {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: l.rs\n{marker}\n //! more\n-fn a() {{\n+fn b() {{\n*** End Patch"
+            );
+            let (out, dir) = run_patch(&[("l.rs", file)], &patch).await;
+            let text = out.unwrap_or_else(|e| panic!("{marker}: {e}"));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("l.rs")).expect("read"),
+                "//! Contract: x\n//! more\nfn b() {\n    old();\n}\n",
+                "{marker}"
+            );
+            assert_eq!(
+                text.contains("no space before its text"),
+                !marker.contains("@@ "),
+                "{marker}: {text}"
+            );
+            assert_eq!(
+                text.contains("stray diff sign"),
+                expect_sign_note,
+                "{marker}: {text}"
+            );
+        }
+        let file = "! Contract: y\nfn a() {}\n";
+        let (out, dir) = run_patch(
+            &[("l.rs", file)],
+            "*** Begin Patch\n*** Update File: l.rs\n@@! Contract: y\n-fn a() {}\n+fn b() {}\n*** End Patch",
+        )
+        .await;
+        out.expect("applies");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("l.rs")).expect("read"),
+            "! Contract: y\nfn b() {}\n"
+        );
+    }
+
+    /// The text as written wins over the sign-stripped text.
+    #[tokio::test]
+    async fn a_context_with_a_leading_sign_that_is_in_the_file_is_not_stripped() {
+        let file = "x\n-- sql comment\ny\n-- sql comment\nz\n";
+        let (out, dir) = run_patch(
+            &[("q.sql", file)],
+            "*** Begin Patch\n*** Update File: q.sql\n@@ -- sql comment\n y\n--- sql comment\n+-- other\n*** End Patch",
+        )
+        .await;
+        let text = out.expect("applies");
+        assert!(!text.contains("stray diff sign"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("q.sql")).expect("read"),
+            "x\n-- sql comment\ny\n-- other\nz\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_at_marker_is_still_refused() {
+        let file = "a\nb\n";
+        // `@@@` is not a context marker; a signed context absent from the file
+        // under either reading is refused; so is a glued unified-diff header
+        // whose text is not in the file.
+        for (marker, want) in [
+            ("@@@ a", "Unexpected line found"),
+            ("@@-zzz", "Failed to find context '-zzz'"),
+            ("@@-1,2 +1,2 @@ zzz", "Failed to find context 'zzz'"),
+        ] {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: f.txt\n{marker}\n a\n-b\n+c\n*** End Patch"
+            );
+            let (out, dir) = run_patch(&[("f.txt", file)], &patch).await;
+            let err = out.expect_err(marker);
+            assert!(err.contains(want), "{marker}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+                file
+            );
+        }
+    }
+
+    /// The whole-file route the repeated-failure hint names must itself apply.
+    #[tokio::test]
+    async fn the_whole_file_hint_skeleton_replaces_the_file() {
+        let hint = whole_file_hint("src/lib.rs");
+        let skeleton = &hint[hint.find("*** Begin Patch").expect("skeleton")..];
+        assert_eq!(
+            skeleton,
+            "*** Begin Patch\n*** Delete File: src/lib.rs\n*** Add File: src/lib.rs\n+full new content\n*** End Patch"
+        );
+        let (out, dir) = run_patch(&[("src/lib.rs", "old\nlines\n")], skeleton).await;
+        out.expect("applies");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read"),
+            "full new content\n"
+        );
     }
 
     /// Round evidence (pricing_engine): `@@ -1,4 +1,4 @@` and

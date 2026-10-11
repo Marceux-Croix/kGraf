@@ -61,7 +61,8 @@ mod untrusted;
 pub(crate) use access::normalize_relative;
 pub use access::{Access, PathCase, detect_path_case};
 pub use apply_patch::{
-    ApplyPatchTool, PatchTarget, ProtectedApplyPatch, patch_target, rejection_help,
+    ApplyPatchTool, PatchTarget, ProtectedApplyPatch, WHOLE_FILE_HINT_AFTER, patch_target,
+    rejection_help, whole_file_hint,
 };
 pub use approval::{INVALID_INPUT, SKILLS_POLICY};
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};

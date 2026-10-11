@@ -850,6 +850,7 @@ async fn prepare(
         kgraf_shortfall: None,
         capabilities: std::collections::HashMap::new(),
         patch_rejections: 0,
+        patch_failures_by_file: std::collections::HashMap::new(),
         fence: options.fence,
         steering,
         stop_point: options.stop_point,
@@ -1298,6 +1299,11 @@ struct Worker {
     /// `apply_patch` calls this worker made that the tool rejected: once there
     /// are two, a rejection carries a worked example for the file it targeted.
     patch_rejections: u32,
+    /// Consecutive rejected `apply_patch` calls by the first file the patch
+    /// names. A successful call on a file clears its entry; the map holds at
+    /// most one entry per file the attempt patched. From the third in a row
+    /// the rejection offers the whole-file route.
+    patch_failures_by_file: std::collections::HashMap<String, u32>,
     /// This worker's write fence, if it has one (decision 0067, point 5).
     fence: Option<ScopeFence>,
     /// This worker's steering queue (decision 0067, point 3).
@@ -3905,6 +3911,15 @@ impl Worker {
         else {
             return;
         };
+        if let Some(target) = self
+            .capabilities
+            .get(call_id.as_str())
+            .filter(|c| c.tool == "apply_patch")
+            .and_then(|c| c.patch_target.as_ref())
+            && !*is_error
+        {
+            self.patch_failures_by_file.remove(&target.path);
+        }
         if !*is_error
             || output.starts_with(DENIED_PREFIX)
             || output.starts_with(REFUSED_PREFIX)
@@ -3916,15 +3931,29 @@ impl Worker {
             return;
         }
         self.patch_rejections += 1;
-        if self.patch_rejections < 2 {
-            return;
-        }
         let target = self
             .capabilities
             .get(call_id.as_str())
             .and_then(|c| c.patch_target.as_ref());
-        if let Some(help) = kgraf_tools::rejection_help(output, target) {
-            output.push_str(&help);
+        let help = kgraf_tools::rejection_help(output, target);
+        if self.patch_rejections >= 2
+            && let Some(help) = &help
+        {
+            output.push_str(help);
+        }
+        // A format or matching error on a file that has now failed three calls
+        // in a row also names the whole-file route.
+        if help.is_some()
+            && let Some(target) = target
+        {
+            let count = self
+                .patch_failures_by_file
+                .entry(target.path.clone())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= kgraf_tools::WHOLE_FILE_HINT_AFTER {
+                output.push_str(&kgraf_tools::whole_file_hint(&target.path));
+            }
         }
     }
 
