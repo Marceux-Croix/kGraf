@@ -528,6 +528,26 @@ verdicts follow:
 | 20 | FALLBACK-SENT | 6 | 18 |
 | 21 | FALLBACK-SENT | 8 | 24 |
 | 22 | CONFINED | 0 | 18 |
+| probe-only (38179466993) | CONFINED, by name and by process | 0 (no DNS packet at all) | 4 named `example.com` |
+
+The probe-only run (GitHub run 38179466993, kGraf b05fcc2e, 2026-10-11, about one minute of
+job time) used the per-packet and per-query records and settles the attribution:
+
+- Inside the container, both lookups were refused: getaddrinfo with "No such host is known"
+  and `DnsQuery_W` with status 87. The DNS Client log names the caller in each event header:
+  the container's two processes asked for `example.com` (event 3006), and each request ended
+  in about 2 ms with status 87 (event 3008). No event shows the DNS Client service sending
+  the query or receiving an answer (events 3009 to 3011, process 1324 in the control phase).
+- The capture of the container phase holds no DNS packet at all, for any name.
+- In the control phase, the same two calls answered, and the capture holds the query and the
+  answer for `example.com` (71-byte query frames, 103-byte answers, to 168.63.129.16).
+- The earlier runs' extra packets were 109 and 121 bytes, the size of a query for a longer
+  name, not of an `example.com` query (71 bytes), so they were other traffic on the machine.
+
+So, on Windows Server 2025, the DNS Client service refuses a lookup from an AppContainer that
+has no network capability, before anything is sent, and the caller does not fall back to a
+query of its own. The run was as the runner account, not a sandbox user. Git and `cargo build`
+still did not run in the container (the same errors as before).
 
 What the probe found, and what it does not show:
 
@@ -538,9 +558,9 @@ What the probe found, and what it does not show:
 - The packet count differs between runs with the same code: 0, 6, 12, 6, 8 and 0. The
   script counts every packet on ports 53 and 853 in the capture window on the machine, not
   only the container's, and the report cannot tell the container's packets from the
-  machine's own. Two runs read CONFINED and four read FALLBACK-SENT. The probe therefore
-  does not show that an AppContainer confines DNS, and it does not show that it leaks.
-  The question stays open.
+  machine's own. Two runs read CONFINED and four read FALLBACK-SENT. Those runs alone
+  could not show whether an AppContainer confines DNS; the probe-only run above settles
+  it by name and by process.
 - Git does not run in the container: `fatal: could not open '/dev/null' for reading and
   writing: Permission denied`, for `git --version` and `git status`, with the read grant on
   Git for Windows in place. `cargo --version` runs (exit 0). `cargo build` exits 101:

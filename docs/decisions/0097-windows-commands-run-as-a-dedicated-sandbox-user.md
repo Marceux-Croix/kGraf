@@ -2351,7 +2351,8 @@ on the hosted runner, as the runner account, six times (the cancelled run wrote 
 - Packets on ports 53 and 853 in the container phase: 0, 6, 12, 6, 8 and 0. Two runs read
   CONFINED and four read FALLBACK-SENT. The capture counts every packet on those ports on
   the machine, so a packet from another process counts, and the report cannot separate the
-  two. The probe shows neither that an AppContainer confines DNS nor that it leaks.
+  two. These six runs alone show neither that an AppContainer confines DNS nor that it
+  leaks; the probe-only run below settles it.
 - Git exits 128 in the container ("could not open '/dev/null' for reading and writing:
   Permission denied"). `cargo --version` runs; `cargo build` exits 101 because cargo cannot
   execute `rustc.exe`, with read and execute granted on the cargo home, the rustup home and
@@ -2364,6 +2365,18 @@ decision to move the sandbox to an AppContainer, or to add one for DNS, would ne
 packet attribution (a capture filtered to the container's process or package) and a way to
 run git and rustc in it. Neither exists, so 0097 keeps the dedicated sandbox user and the
 recorded DNS gap.
+
+Probe-only run (2026-10-11, GitHub run 38179466993). With per-packet names and the DNS Client
+log, which names the calling process in each event: inside the container, getaddrinfo and
+`DnsQuery_W` were both refused (status 87 within about 2 ms), the service logged no send and no
+answer for the container's processes, and the capture held no DNS packet at all. The control
+sent and received `example.com`. The earlier extra packets were 109 and 121 bytes, the size of
+queries for other names. So the DNS Client service refuses a capability-less AppContainer
+before any query leaves the machine, and the caller does not fall back to its own query. This
+was the runner account, not a sandbox user, and git and rustc still did not run in the
+container, so the decision above stands: the sandbox keeps the dedicated user and records the
+DNS gap.
+
 
 What the campaign does not cover: a standard-user Windows 11 machine, ARM64, a machine
 without Git for Windows, and the fallback grant on a real run (the session-0 probe read
