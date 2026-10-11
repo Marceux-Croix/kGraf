@@ -90,6 +90,11 @@ what is planned next, as things you can do or expect, not as an internal project
   connections are confined by WFP filters; a launcher service starts commands in
   session 0, where a sandbox user can make the named objects cargo and rustc need.
   The DNS filter is refused by Windows Server 2025 and reported as a gap.
+  2026-10-11: a full Windows self-test with the sandbox user read clean except for that gap
+  (5,577 tests passed; every baseline failure that names a limit of the token sandbox passed
+  again as the sandbox user; removal left nothing). An offline sandbox user's name lookups
+  still leave the machine on Windows Server 2025. A probe of a capability-less AppContainer
+  was inconclusive and git and rustc did not run in it, so the dedicated sandbox user stays.
   macOS and Linux confinement is in daily use.
 - Signed, notarized installers for macOS, Linux and Windows. Local packaging scripts
   already build the app and the command line for all three platforms; the packages are

@@ -1,9 +1,12 @@
 # Testing kGraf on Windows
 
-The Windows sandbox (decision 0011) and the worker's shell on Windows are built and
-compile-checked from macOS, but nothing in them has run on a Windows machine yet. These
-steps test them on a fresh Windows 11 machine, on x86_64 (Intel or AMD) and on ARM64
-(Snapdragon). They take about an hour, most of it the first build.
+The Windows sandbox (decisions 0011 and 0097) and the worker's shell on Windows are built
+and compile-checked from macOS. The self-test bundle (section 0) has run them on a hosted
+Windows Server 2025 runner, and its last full run read clean except for one named gap
+(see "Results of the confirmation campaign" below). Nothing has run on a standard-user
+Windows 11 machine, on ARM64, or without Git for Windows installed. These steps test them
+on a fresh Windows 11 machine, on x86_64 (Intel or AMD) and on ARM64 (Snapdragon). They
+take about an hour, most of it the first build.
 
 Run every command in **Windows PowerShell or PowerShell 7, as a normal user** (not "Run as
 administrator"): the sandbox is made for a user without administrator rights, and an
@@ -335,6 +338,183 @@ workflow passes its `only` input through as it is:
 ```
 gh workflow run wintest.yml -f only='kgraf-sandbox/test/escape_windows::send_input_reaches_nothing_of_the_owners'
 ```
+
+#### Results of the confirmation campaign (2026-10-11)
+
+The campaign ran the self-test bundle on GitHub-hosted runners (Windows Server 2025
+Datacenter 24H2, build 26100.33438, x86_64, 2 cores, 8 GiB memory, Git for Windows
+2.55.0.windows.5, cargo 1.99.0) until a full run with the sandbox user phase read clean.
+All runs were `workflow_dispatch` runs of `wintest.yml`. The last run before the campaign
+is listed first, for comparison. "Pin" is the commit the bundle was built from, as the
+report's `kGraf` row prints it. "Counted" is what the verdict line counted; "apart" is the
+number of baseline failures listed under "Expected under the token sandbox".
+
+| # | GitHub run | Pin | Verdict | Counted | Apart | Bundle time | Job time |
+|---|---|---|---|---|---|---|---|
+| 15 | 38086805879 | `384a104d` | FAILURES | 143 tests, 1 end-to-end check (no classification yet) | 0 | 1:17:48 | not recorded |
+| 16 | 38101426277 | `056ec4b3` | ALL PASSED (filtered: 8 items) | 0 | 17 | 31:40 | 62.7 min |
+| 17 | 38104966373 | `ea643ad9` | cancelled at the 120 minute job limit; no report | none | none | not written | 120.3 min |
+| 18 | 38112396765 | `3af966b0` | INCOMPLETE (budget 115 min) | 46 tests, 1 end-to-end check | 103 | 1:42:28 | 127.8 min |
+| 19 | 38124181868 | `f0ebf25d` | FAILURES | 2 tests | 143 | 1:34:26 | 117.6 min |
+| 20 | 38134080482 | `3a1117c2` | FAILURES | 2 tests | 144 | 1:34:37 | 117.8 min |
+| 21 | 38149445796 | `300ef853` | FAILURES | 9 tests, 1 binary hung | 135 | 1:43:10 | 126.8 min |
+| 22 | 38163271605 | `69d798cb` | ALL PASSED, known gap: DNS only | 0 | 144 | 1:36:25 | 119.7 min |
+
+Runs 18 to 22 are full runs with the sandbox user phase. The job times are the workflow
+job's start to its end, from the Actions record. The seven jobs of the campaign (16 to 22)
+ran 792.7 minutes in all.
+
+What each run showed, and what the next one changed:
+
+- **Run 16** ran only the eight tests the earlier fixes address (the `only` value in "What a
+  confirmation run must show"). All of them passed as the sandbox user. This run also
+  made the first AppContainer DNS probe (see below). The probe's third phase failed on a
+  script bug: PowerShell objects were passed to the container's environment where strings
+  were needed, and the script now passes strings.
+- **Run 17** was the first full run with that probe fix. The job reached its 120 minute
+  limit while the bundle step was still running (99.2 minutes into it), and the platform
+  cancelled the job. The upload step skipped on the cancel, so no report exists. This
+  led to the time budget, the named progress items and the upload that runs after a
+  cancel ("The time budget" above), and to a job limit of 150 minutes.
+- **Run 18** was the first full run that wrote a report. The budget of 115 minutes did not
+  admit the re-run of `contract_checks` (expected 1,242 s, 762 s left), so the verdict read
+  INCOMPLETE. Of what ran, 42 baseline failures and 4 sandbox user failures counted, and 1
+  end-to-end check (`shell.git_bash`). The bundle step took 102.6 minutes, 2,668 s of it in
+  the sandbox user phase, of which 2,489 s were whole re-runs. This led to the triage set:
+  portable tests, own-file paths read on Windows, causes printed in the tests' own output,
+  re-runs of failed tests alone, the two named exemptions (`shell.git_bash` and the DNS
+  test), and a job limit of 165 minutes.
+- **Run 19** (the triage set) counted 2 tests. The own-file test
+  `a_failure_naming_a_file_the_contract_wrote_is_not_deferred` echoed a command so long
+  that the 300 characters a deferred notice quotes held none of the sandbox status, so the
+  run counted a limit of the token sandbox as a defect. The lease test
+  `a_lease_lost_just_before_acceptance_voids_the_result` timed out on a run that was slow,
+  not lost: its file ran about six times slower than usual on the runner. The command is
+  shorter now, with a compile-time bound, and every run timeout in the plan and lease
+  guards is a hang guard of 90 s.
+- **Run 20** counted 2 tests of `scheduler_loop`
+  (`one_schedule_unable_to_claim_does_not_stop_another_from_firing` and
+  `probe_p2_a_claim_committed_by_tick_schedule_then_crash_is_reclaimed`). Each passed when
+  re-run alone in 0.5 s. The drain helper gave up after 200 ticks, about one second, and
+  a loaded runner took longer. The drain and the transcript reopen in `worker_e2e` now wait
+  by wall clock (60 s and 30 s) as hang guards.
+- **Run 21** counted 9 tests of `kgraf_host#rest` and one hung binary. The sandbox user
+  re-run of that binary (89 tests chosen for their baseline failures) was cut off at its
+  limit of 625.2 s after 80 tests had passed; the other 9 were never judged, so their
+  baseline failures counted. The limit came from the tests' share of the binary's
+  expected time (125 s, five times that), but the tests a re-run selects failed fast in
+  the baseline and run to the end as the sandbox user. They had taken 526 s to 538 s on
+  two earlier runners. A re-run of some tests of a binary now gets the whole binary's
+  limit; the expected time used for the budget stays the share.
+- **Run 22** read `ALL PASSED` with the known DNS gap named. It is the confirmation run.
+
+Run 22 in numbers (the report's own figures):
+
+- 181 test binaries run, 170 clean, 0 hung or crashed. 5,577 tests passed, 143 failed in
+  the baseline, 11 ignored. 14 end-to-end checks passed and 1 failed in the baseline.
+- The 144 baseline failures (143 tests and the end-to-end check `shell.git_bash`) are all
+  listed under "Expected under the token sandbox (144)", and every one passed when it ran
+  again as the sandbox user. Their markers: 77 `STATUS_DLL_INIT_FAILED` (0xC0000142), 34
+  cargo jobserver, 31 Git Bash (msys) plus the one end-to-end check named Git Bash, and 1
+  Schannel (`SEC_E_NO_CREDENTIALS`). The binaries: `kgraf_host#rest` 89,
+  `kgraf_bench_briefs` 21, `contract_checks` 15, `kgraf_tools#core` 4, `kgraf_shell` 3,
+  `startup_windows` 3, `shell_windows` 3, `worker_e2e` 2, and 1 each in `tls_windows`,
+  `escape_windows` and `contract_flow`.
+- In the sandbox user re-run, 15 binaries ran. All passed in full except `dns_windows`
+  (3 passed, 1 failed), whose failure is the known gap. `escape_windows` passed 45 of 45,
+  `kgraf_sandbox` 488 of 488, `runner_windows` 11 of 11 and `stdio_windows` 8 of 8.
+  The re-run of `kgraf_host#rest` took 519.9 s and `contract_checks` 1,283.9 s. The
+  sandbox user phase took 3,022 s.
+- The runner process was in Windows session 2. The launcher service made a window station
+  `kgraf-cmd-<hex>` per sandbox user in session 0, and the probe in setup read `Proved`: a
+  sandbox user made a named semaphore and an unprefixed named mutex through the
+  session-0 path. The fallback grant was not needed and did not run. Selfcheck (d) printed
+  `network: only the egress proxy was reachable`.
+- Step (f) removed everything: "Launcher service after the removal: gone. Fallback grant
+  after the removal: gone." and "Confirmed: nothing of the sandbox user is left".
+- The time budget was 131 minutes and was not reached. Nothing under "Not run" says
+  `not run: budget`. The entries there are tests that need a model provider, Docker,
+  Rust at run time or the full git checkout, and parts that run in the core set.
+
+The known gap, as run 22 printed it. The filter on the user-mode RPC layer is present. The
+filters on the name resolution cache layer, IPv4 and IPv6, are absent: Windows Server 2025
+refused them at setup with `FWP_E_OUT_OF_BOUNDS`. The offline sandbox user's lookup then
+got a DNS server's answer (status 9003, `DNS_ERROR_RCODE_NAME_ERROR`): lookups leave the
+machine. `selfcheck` fails on its `dns:` line alone, and
+`kgraf-sandbox/test/dns_windows :: an_offline_lookup_does_not_reach_the_dns_client_service`
+fails with "This is the recorded gap". Both are named in the `Known gap:` line, and the test
+is listed under "Known gaps" with its output, not counted. All six full or filtered runs
+from 16 to 22 that wrote a report show the same gap. Every other part of the network
+confinement passed: the loopback filters and the egress proxy line.
+
+Run times for planning. The job takes 17 to 19 minutes to build the bundle and 1.4 to 2.3
+minutes for the AppContainer probe. On runs 19 to 22 the bundle step took 94.5 to 103.2
+minutes, the sandbox user part 2,951 to 3,050 s, and the job 117.6 to 126.8 minutes, inside
+the projection of 122 to 139 minutes and 38 minutes or more under the 165 minute limit. The
+budget the workflow computed was 131 minutes. Run 18, on the 115 minute budget, is the
+case a short budget gives.
+
+The AppContainer DNS probe. The workflow runs `scripts/wintest-appcontainer-dns.ps1`
+after the bundle, as the runner account. It makes an AppContainer profile with no
+capabilities, captures ports 53 and 853 with `pktmon` in each phase, flushes the DNS Client
+cache before each phase, and tries three things. Phase A looks up a name inside the container.
+Phase B looks it up outside, as a control. Phase C runs git and cargo inside the container,
+with read and execute granted on the cargo home, the rustup home and Git for Windows. It
+never fails the job, and writes `appcontainer-dns.md` to the artifact. The verdicts:
+
+| Run | Verdict | Packets on 53 or 853 in phase A | Control packets (phase B) |
+|---|---|---|---|
+| 16 | CONFINED | 0 | 18 |
+| 17 | no output (job cancelled) | none | none |
+| 18 | FALLBACK-SENT | 6 | 18 |
+| 19 | FALLBACK-SENT | 12 | 18 |
+| 20 | FALLBACK-SENT | 6 | 18 |
+| 21 | FALLBACK-SENT | 8 | 24 |
+| 22 | CONFINED | 0 | 18 |
+
+What the probe found, and what it does not show:
+
+- In all six runs, `Dns.GetHostAddresses` (getaddrinfo) inside the container failed with
+  "No such host is known", and the same call outside it answered. `Resolve-DnsName` did
+  not run inside the container at all: PowerShell reported the cmdlet as not recognized.
+  That is a missing command, not a refused lookup, so it says nothing about DNS.
+- The packet count differs between runs with the same code: 0, 6, 12, 6, 8 and 0. The
+  script counts every packet on ports 53 and 853 in the capture window on the machine, not
+  only the container's, and the report cannot tell the container's packets from the
+  machine's own. Two runs read CONFINED and four read FALLBACK-SENT. The probe therefore
+  does not show that an AppContainer confines DNS, and it does not show that it leaks.
+  The question stays open.
+- Git does not run in the container: `fatal: could not open '/dev/null' for reading and
+  writing: Permission denied`, for `git --version` and `git status`, with the read grant on
+  Git for Windows in place. `cargo --version` runs (exit 0). `cargo build` exits 101:
+  cargo could not execute `rustc.exe -vV` ("never executed") even with read and execute
+  granted on the rustup home. A tool in an AppContainer needs access grants that the
+  sandbox user design does not need, and these two tools did not work with the grants the
+  probe gave.
+- The probe ran as the runner account, an administrator, with a profile made for the
+  probe. It did not run as a sandbox user, through the launcher service, or on a standard
+  user's machine. No part of the sandbox uses an AppContainer. Decision 0097 keeps the
+  dedicated sandbox user and records the DNS gap.
+
+What the campaign does not prove:
+
+- DNS confinement. Windows Server 2025 refuses the name resolution cache filters, and the
+  DNS Client service sends the query itself, so a filter on the caller cannot stop it.
+  Another Windows version may take those filters; none was tested.
+- A standard-user Windows 11 machine, ARM64, and a machine without Git for Windows. The
+  runner is an administrator account on Server 2025 with Git for Windows installed, and
+  its process runs in session 2.
+- That a test which passed in the baseline also passes as the sandbox user, outside the
+  sandbox test binaries. A re-run of another binary runs only its baseline failures.
+- The fallback grant on a real run. The probe through session 0 read `Proved` in every
+  full run that wrote a report, so the fallback never ran.
+
+How to read a verdict from here: `ALL PASSED` with a `Known gap: DNS ...` line is the clean
+result while the gap stands. A verdict that names any other counted test, a hung binary, an
+end-to-end failure, a `not run: budget` item or a non-empty status after step (f) is not
+clean. The count in "Expected under the token sandbox" is the number of baseline failures
+the sandbox user re-run explained: 143 on run 19, 144 on runs 20 and 22, and 135 on run 21,
+where 9 were never judged because the re-run timed out.
 
 #### What a confirmation run must show
 

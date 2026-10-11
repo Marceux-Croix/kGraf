@@ -2269,3 +2269,104 @@ What the next full run should read: `ALL PASSED`, with the `Known gap: DNS ...` 
 the DNS test, which "Known gaps" lists; "Expected under the token sandbox" lists the
 baseline's token sandbox failures and `shell.git_bash`, each `passed` as the sandbox user;
 nothing under "Not run" says `not run: budget`; (f) leaves nothing.
+
+## Amendment (2026-10-11): the confirmation run read clean, one gap stays, and what the AppContainer probe found
+
+A full Windows self-test with the sandbox user phase read `ALL PASSED` on GitHub run
+38163271605 (pin `69d798cb`, started 18:18 UTC, ended 20:18 UTC; Windows Server 2025
+Datacenter 24H2, build 26100.33438). It names one known gap: DNS. This closes the campaign
+that began with the first filtered run of the fixes below. The numbers are from the reports
+of the runs; `docs/WINDOWS-TESTING.md`, "Results of the confirmation campaign", holds the
+full tables.
+
+| GitHub run | Pin | Result |
+|---|---|---|
+| 38101426277 | `056ec4b3` | Filtered to 8 tests: ALL PASSED. 17 baseline failures listed apart. |
+| 38104966373 | `ea643ad9` | Cancelled at the 120 minute job limit during the bundle step. No report. |
+| 38112396765 | `3af966b0` | INCOMPLETE (budget 115 min): 46 tests and 1 end-to-end check counted; 103 listed apart. |
+| 38124181868 | `f0ebf25d` | 2 tests counted; 143 listed apart. |
+| 38134080482 | `3a1117c2` | 2 tests counted; 144 listed apart. |
+| 38149445796 | `300ef853` | 9 tests counted and 1 binary hung; 135 listed apart. |
+| 38163271605 | `69d798cb` | ALL PASSED; 144 listed apart; known gap: DNS only. |
+
+What the last run showed. 181 test binaries ran, 170 clean, none hung. 5,577 tests passed;
+the baseline had 143 failures and 1 failed end-to-end check (`shell.git_bash`), and all 144
+passed again as the sandbox user, each with a token sandbox marker in its own baseline
+output (77 `STATUS_DLL_INIT_FAILED`, 34 cargo jobserver, 32 Git Bash, 1 Schannel). In the
+sandbox user re-run every binary passed in full except `dns_windows` (3 passed, 1 failed).
+The launcher service made one window station per sandbox user in session 0, the setup probe
+read `Proved` (a sandbox user made a named semaphore and an unprefixed mutex through that
+path), and the fallback grant did not run. Step (f) left nothing: the launcher service and
+the fallback grant were both gone. The run took 1:36:25 inside a budget of 131 minutes; the
+job took 119.7 minutes against a limit of 165.
+
+What stands open: DNS. Windows Server 2025 refuses the two filters on the name resolution
+cache layer (`FWP_E_OUT_OF_BOUNDS`). The filter on the user-mode RPC layer is present but
+does not see a lookup made on the machine. An offline sandbox user's lookup gets a DNS
+server's answer (status 9003). Selfcheck fails on its `dns:` line alone, and
+`dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service` fails with "This is
+the recorded gap". The report lists it under "Known gaps", not in the count. Nothing in this
+campaign closed the gap. The status of 0097 is unchanged: the command path, the file
+confinement and the loopback and proxy network confinement are proved on a hosted runner;
+DNS confinement is not.
+
+What the fixes in the window were, by run:
+
+- **The station per sandbox user in session 0, measured limits, the report classification
+  and the `only` filter** (the amendment of 2026-10-10). The filtered run proved the eight
+  tests they address.
+- **The AppContainer probe** (`scripts/wintest-appcontainer-dns.ps1`), added to the
+  workflow as a diagnostic that never fails the job, with a cache flush before each phase
+  and string values for the container's environment (the first run of it failed its third
+  phase on a script bug).
+- **The time budget, named re-run items, an upload after a cancel and a longer job
+  limit.** The run that was cancelled left no report; the budget makes a run that cannot
+  finish say so (`INCOMPLETE`) and still upload. The job limit went from 120 to 150 minutes
+  and then to 165.
+- **The triage set**, from the first run that wrote a full report: portable tests, own-file
+  paths read on Windows, causes printed in the tests' own output, re-runs of failed tests
+  alone, and the two named exemptions (`shell.git_bash`, and the DNS test while the gap is
+  measured). The amendment above this one gives each.
+- **Two wall-clock waits.** A test's own timeout guarded speed, not a hang, and a slow
+  runner tripped it. The lease test's run timeouts are now hang guards of 90 s. The
+  scheduler drain (200 ticks, about 1 s) waits 60 s by wall clock; the transcript reopen in
+  the worker end-to-end test waits 30 s. The quoted command of the own-file test is shorter,
+  with a compile-time bound, so the sandbox status stays inside the 300 characters a
+  deferred notice quotes.
+- **The whole binary's limit for a failed-only re-run.** The first full run with failed-only
+  re-runs cut `kgraf_host#rest` off at 625.2 s after 80 of 89 tests, because the limit came
+  from the tests' share of the binary's expected time (125 s, times five) and those tests
+  run to the end as the sandbox user: 526 to 538 s on two earlier runners. A subset takes no
+  longer than the whole, so the re-run now gets the whole binary's limit. The expected time
+  for the budget stays the share. The next run took 519.9 s.
+
+What the AppContainer probe found. The question was whether a capability-less AppContainer
+process can resolve names, because the DNS Client service answers local callers itself and
+documents that it admits AppContainer callers only with a network capability. The probe ran
+on the hosted runner, as the runner account, six times (the cancelled run wrote nothing):
+
+- getaddrinfo inside the container failed ("No such host is known") in all six runs, and the
+  same call outside it answered. `Resolve-DnsName` did not run inside the container (the
+  cmdlet was not recognized), which is a missing command and not a refusal.
+- Packets on ports 53 and 853 in the container phase: 0, 6, 12, 6, 8 and 0. Two runs read
+  CONFINED and four read FALLBACK-SENT. The capture counts every packet on those ports on
+  the machine, so a packet from another process counts, and the report cannot separate the
+  two. The probe shows neither that an AppContainer confines DNS nor that it leaks.
+- Git exits 128 in the container ("could not open '/dev/null' for reading and writing:
+  Permission denied"). `cargo --version` runs; `cargo build` exits 101 because cargo cannot
+  execute `rustc.exe`, with read and execute granted on the cargo home, the rustup home and
+  Git for Windows.
+
+What the probe does not prove. It ran as the runner account (an administrator), not as a
+sandbox user and not through the launcher service. It made one profile for the probe, and
+the sandbox uses no AppContainer. The tools needed grants and still did not all run. A
+decision to move the sandbox to an AppContainer, or to add one for DNS, would need a stable
+packet attribution (a capture filtered to the container's process or package) and a way to
+run git and rustc in it. Neither exists, so 0097 keeps the dedicated sandbox user and the
+recorded DNS gap.
+
+What the campaign does not cover: a standard-user Windows 11 machine, ARM64, a machine
+without Git for Windows, and the fallback grant on a real run (the session-0 probe read
+`Proved` every time). A re-run of a binary outside the sandbox test binaries runs only its
+baseline failures, so the run does not show that its passing tests also pass as the sandbox
+user.
