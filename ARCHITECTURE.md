@@ -60,7 +60,7 @@ These terms are used throughout. Each is defined once, here.
 - **Attempt**: one worker's try at one contract, in its own git worktree. A retry is a new attempt.
 - **Contract**: one unit of planned work. It has an instruction, an acceptance command, the file paths it may write, and its dependencies on other contracts.
 - **Gate**: a work node that runs the project's own validation commands (for example `cargo test --workspace`) against a pinned commit. The **root gate** is the gate at the top of the hierarchy. It runs once everything is built.
-- **Galaxy**: the graph view. Code, agents and work items are drawn as points in clusters.
+- **Galaxy**: the graph view. Code, agents and work items are drawn as points in clusters. Code dots are gray and sized by number of connections, in the built-in demo scene too; color marks only state (selection or match, needs input, failure).
 - **Coupling cluster**: a set of contracts whose write sets overlap, that depend on each other, or whose files share a co-change count of 3 or more. The cluster cap and vendor routing treat the set as one unit.
 - **Hand-back**: what a worker does at its stop point. It returns the unfinished remainder to the orchestrator, which makes it a new child contract.
 - **Handshake**: a note that the worker of each of two coupled contracts writes on its own route. It states what the worker provides, what it assumes the other provides, what it assumes will not change, and what it touches.

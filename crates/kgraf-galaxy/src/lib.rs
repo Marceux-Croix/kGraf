@@ -3,8 +3,8 @@
 //! from the graph store's change log.
 //!
 //! - Input is baked layout data ([`scene::Scene`]); nothing here simulates forces.
-//!   [`project`] builds it from a project's graph store: cached positions, stellar
-//!   color and size, cluster-aware edge intensities, plus agents and work items as
+//!   [`project`] builds it from a project's graph store: cached positions, gray
+//!   dots sized by connections, cluster-aware edge intensities, plus agents and work items as
 //!   their own populations. [`feed`] tails the change log on a background thread and
 //!   [`project_view`] applies each batch in place, animated.
 //! - Nodes are instanced camera-facing sprites: a depth-writing core and a glow halo;

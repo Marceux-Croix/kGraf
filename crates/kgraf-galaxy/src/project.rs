@@ -4,13 +4,13 @@
 //!
 //! Three populations, each with its own visual channel:
 //!
-//! - **Code** nodes at their cached layout positions (0007, 0058), colored and sized by
-//!   degree with `kgraf_graph::layout::stellar` (the port of the reference's
-//!   stellar classification); edges colored by kind at the density module's
+//! - **Code** nodes at their cached layout positions (0007, 0058), gray (the palette's
+//!   code-dot color) and sized by connections with
+//!   `kgraf_graph::layout::stellar::node_size`; edges in the palette's neutral edge color at the density module's
 //!   same-cluster (0.25) or cross-cluster (0.06) intensity.
-//! - **Agents**: every worker holding a lease. Degree owns color and size for code, so
+//! - **Agents**: every worker holding a lease. Code dots are gray and sized by connections, so
 //!   agents do not reuse either (the reference design keeps the encodings apart): a fixed teal
-//!   outside the stellar table, a fixed size, a diamond sprite, hovering
+//!   outside the code-dot gray, a fixed size, a diamond sprite, hovering
 //!   [`AGENT_LIFT`] above the centroid of what they act on. An agent's live edges run
 //!   to the nodes it holds (0.85) and has touched in its task (0.3), and to its task.
 //! - **Work items**: every task a live agent is working, as a magenta square at an

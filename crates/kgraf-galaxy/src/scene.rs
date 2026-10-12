@@ -40,9 +40,9 @@ pub struct EdgeInput {
 }
 
 /// Which population a node belongs to. Each has its own visual channel: code nodes
-/// are stellar discs colored and sized by degree; agents and work items must not
+/// are gray discs sized by connections (STG-DRAW-2); agents and work items must not
 /// reuse that encoding (the reference design keeps the encodings apart), so they get their own
-/// sprite shape and a fixed palette outside the stellar table.
+/// sprite shape and a fixed palette color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Population {
     /// A code node from the graph: a shaded disc.

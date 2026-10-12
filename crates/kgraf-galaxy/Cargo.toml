@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-# The project graph: cached layout, stellar and density data functions, the change log
+# The project graph: cached layout, dot size and density data functions, the change log
 # and the read-only snapshot queries the scene is built from. Taken rather than copied
 # (the renderer's own density copy was removed): the shell needs the graph to open a
 # project anyway, so a separate copy saved no dependency and risked drift.

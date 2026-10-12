@@ -28,7 +28,7 @@
 //!   at one angle and clusters separate by construction, not by physics.
 //! - **Z from call depth**, 50 units per level, entry points on top
 //!   ([`call_depths`], [`z_for`]).
-//! - The stellar color and size tables ([`stellar`]) and the density rules
+//! - The dot size table ([`stellar`]) and the density rules
 //!   ([`density`]), as data functions the renderer consumes.
 //!
 //! Deviations from the source, each deliberate and measured (synthetic graphs,
@@ -294,11 +294,9 @@ pub struct NodeVisual {
     pub position: Position,
     /// Call depth, the input to Z.
     pub depth: u32,
-    /// Degree over every edge kind, the input to color and size (upstream
-    /// counts every mapped edge).
+    /// Degree over every edge kind, the input to size (upstream counts every
+    /// mapped edge).
     pub degree: u32,
-    /// `0xRRGGBB`, from [`stellar::stellar_color`].
-    pub color: u32,
     /// Scene units, from [`stellar::node_size`].
     pub size: f32,
 }
@@ -351,7 +349,6 @@ pub fn layout_graph(
             ),
             depth: depth[i],
             degree: degree[i],
-            color: stellar::stellar_color(degree[i]),
             size: stellar::node_size(node.kind, degree[i]),
         })
         .collect())
@@ -867,7 +864,6 @@ mod tests {
         assert_eq!(out[1].position, position("src", "b", 1, 2));
         assert_eq!(out[0].position, position_for("src", "a"));
         assert_eq!(out[1].degree, 2);
-        assert_eq!(out[1].color, stellar::stellar_color(2));
         assert_eq!(out[0].size, stellar::node_size(NodeKind::File, 2));
     }
 

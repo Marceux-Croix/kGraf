@@ -2,12 +2,17 @@
 //! frame benchmark, where a scene of an exact size and shape is needed without an
 //! index. The shell draws real projects ([`crate::project`]), never this.
 //!
-//! Colors and sizes use `kgraf_graph::layout::stellar` (the port of
-//! codebase-memory-mcp's `stellar_color` and size rule); the positions are this
-//! module's own clustered ring, not the layout's.
+//! Dots follow the project view's rule (style guide STG-DRAW-2): every dot is the
+//! palette's neutral code-dot color, and its size comes from
+//! `kgraf_graph::layout::stellar::node_size` (kind and number of connections), the
+//! same function [`crate::project`] calls. Edges use the palette's neutral edge color.
+//! Color never carries degree or cluster. The positions are this module's own
+//! clustered ring, not the layout's.
 
-use kgraf_graph::layout::stellar::{channels, degree_boost, stellar_color};
+use kgraf_graph::NodeKind;
+use kgraf_graph::layout::stellar::node_size;
 
+use crate::palette::Palette;
 use crate::scene::{EdgeInput, NodeInput, SceneInput};
 
 /// Deterministic generator (splitmix64); the demo must look the same on every launch.
@@ -50,7 +55,7 @@ pub fn synthetic(n: usize, seed: u64) -> SceneInput {
     let ring = (n as f32 / 10_000.0).sqrt().max(1.0);
     let mut positions = Vec::with_capacity(n);
     let mut cluster_of = Vec::with_capacity(n);
-    let mut base_size = Vec::with_capacity(n);
+    let mut kinds = Vec::with_capacity(n);
     for c in 0..clusters {
         let angle = rng.unit() * std::f32::consts::TAU;
         let radius = (500.0 + rng.unit() * 250.0) * ring;
@@ -67,16 +72,17 @@ pub fn synthetic(n: usize, seed: u64) -> SceneInput {
                 center[2] + rng.bell() * sigma * 0.5,
             ]);
             cluster_of.push(c);
-            // Label base sizes: mostly functions (4), some files (8), few modules (15).
+            // Mostly functions, some files, few modules.
             let roll = rng.below(400);
-            base_size.push(match roll {
-                0 => 15.0,
-                1..=9 => 8.0,
-                _ => 4.0,
+            kinds.push(match roll {
+                0 => NodeKind::Module,
+                1..=9 => NodeKind::File,
+                _ => NodeKind::Function,
             });
         }
     }
     let n = positions.len();
+    let palette = Palette::default();
     let mut edges = Vec::with_capacity(n * 2);
     let mut degree = vec![0u32; n];
     for i in 0..n {
@@ -98,11 +104,7 @@ pub fn synthetic(n: usize, seed: u64) -> SceneInput {
             edges.push(EdgeInput {
                 source: i as u32,
                 target: j as u32,
-                color: if same {
-                    [0.55, 0.65, 1.0]
-                } else {
-                    [0.9, 0.7, 1.0]
-                },
+                color: palette.edge,
                 intensity: if same { 0.25 } else { 0.06 },
             });
             degree[i] += 1;
@@ -111,13 +113,12 @@ pub fn synthetic(n: usize, seed: u64) -> SceneInput {
     }
     let nodes = positions
         .into_iter()
-        .zip(base_size)
+        .zip(kinds)
         .zip(&degree)
-        .map(|((position, base), &d)| NodeInput {
+        .map(|((position, kind), &d)| NodeInput {
             position,
-            color: channels(stellar_color(d)),
-            // Base by label plus the degree boost (the reference design).
-            size: base + degree_boost(d),
+            color: palette.code_dot,
+            size: node_size(kind, d),
         })
         .collect();
     SceneInput { nodes, edges }
@@ -297,5 +298,21 @@ mod tests {
         );
         assert_eq!(a, synthetic(10_000, 7));
         Scene::new(a).expect("valid scene");
+    }
+
+    #[test]
+    fn demo_dots_carry_no_category_or_degree_color() {
+        let palette = Palette::default();
+        let scene = synthetic(2_000, 7);
+        // Sizes still vary with connections, so a uniform color is not a uniform scene.
+        let sizes: std::collections::HashSet<u32> =
+            scene.nodes.iter().map(|n| n.size.to_bits()).collect();
+        assert!(sizes.len() > 3, "sizes should vary with kind and degree");
+        for n in &scene.nodes {
+            assert_eq!(n.color, palette.code_dot);
+        }
+        for e in &scene.edges {
+            assert_eq!(e.color, palette.edge);
+        }
     }
 }

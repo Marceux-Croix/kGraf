@@ -10,7 +10,8 @@ Ported (logic translated to Rust, not copied verbatim):
     -> crates/kgraf-graph/src/layout.rs (cluster_center, cluster_key)
     - Z_DEPTH_SPACING and the call-depth walk
     -> crates/kgraf-graph/src/layout.rs (z_for, call_depths)
-    - stellar_color, size_for_label, degree size boost
+    - size_for_label, degree size boost (the stellar_color table was
+      ported here and later removed: kGraf draws code dots gray)
     -> crates/kgraf-graph/src/layout/stellar.rs
 
   graph-ui/src/lib/density.ts
@@ -59,7 +60,7 @@ Ported (logic translated to Rust) into the galaxy renderer:
     -> crates/kgraf-galaxy/src/camera.rs
 
   src/ui/layout3d.c
-    - stellar_color table and label base sizes: used from
+    - label base sizes: used from
       crates/kgraf-graph/src/layout/stellar.rs by the scene builder
       (crates/kgraf-galaxy/src/project.rs) and the synthetic test scenes
       (crates/kgraf-galaxy/src/demo.rs); no copy remains in the renderer.

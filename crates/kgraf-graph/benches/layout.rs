@@ -4,7 +4,7 @@
 //! definitions per directory cluster, one `contains` edge per definition and
 //! two name-resolved `calls` edges per definition, 80% inside the directory.
 //! `layout_graph` is the whole derivation the renderer needs: positions from
-//! identity and call depth, color and size from degree and kind.
+//! identity and call depth, size from degree and kind.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kgraf_graph::NodeKind;
