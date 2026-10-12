@@ -36,6 +36,7 @@ and named in the checkpoint record.
 ```bash
 cargo update --dry-run               # compatible updates; then cargo update to apply
 cargo deny check advisories          # known security advisories in the lock file
+cargo deny check licenses            # enforces the about.toml list via deny.toml
 ```
 
 Then run the three gates above. A major version bump, or a pinned GitHub Action SHA, is

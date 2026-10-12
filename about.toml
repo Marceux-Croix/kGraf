@@ -11,6 +11,7 @@
 # WITH LLVM-exception (target-lexicon, winx). Where a crate offers a
 # choice (`MIT OR Apache-2.0`), cargo-about picks the first accepted license in this
 # order.
+# Keep this list identical to `[licenses] allow` in deny.toml.
 accepted = [
     "Apache-2.0",
     "MIT",
