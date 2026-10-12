@@ -144,6 +144,7 @@ pub mod error;
 mod gates;
 pub mod host;
 pub mod limits;
+mod local_version;
 pub mod migrate;
 pub mod reasoning;
 pub mod rule_conflicts;

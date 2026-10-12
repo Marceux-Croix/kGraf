@@ -210,6 +210,13 @@ otherwise.
   [0089](decisions/0089-models-of-every-kind-are-routes.md).
 - **Text Embeddings Inference names no model** (`tei`). The model echo cannot be checked.
   Decision [0089](decisions/0089-models-of-every-kind-are-routes.md).
+- **The `ollama` route is verified against Ollama 0.34.4.** The 2026-09-28 live exchange ran
+  on that server (`GET /api/version` reported 0.34.4 in that run's record).
+  At run start kGraf reads the server's version and each model's `requires` from the server
+  itself (decision [0041](decisions/0041-openai-compatible-is-two-protocols-and-vendors-live-in-a-catalog.md),
+  amended 2026-10-12). A model that needs a newer server fails the run. A server older than
+  0.34.4 gets a notice, and a server that does not report a version gets a notice that it is
+  unknown. Both let the run go on. The check covers the `ollama` route only.
 - **Some local models return tool calls as text** (`ollama`, a VERIFIED route). The model
   `qwen2.5-coder:7b` writes its tool call as JSON inside the reply text, and the server
   returns no structured call. kGraf reads that as a finished reply, so a worker on that model

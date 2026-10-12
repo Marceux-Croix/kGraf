@@ -837,6 +837,7 @@ async fn prepare(
         reasoning_off: false,
         malformed_retries: 0,
         lost_output_retries: 0,
+        pasted_patches: 0,
         no_change_notices: 0,
         force_tool_call: false,
         tool_choice_recorded: false,
@@ -1163,6 +1164,12 @@ pub fn malformed_output_notice(retry: u32) -> String {
 const NO_CHANGE_ABANDON_REASON: &str =
     "the turn ended with no tool call although the contract writes files";
 
+/// The notice after a turn whose reply held one complete patch block as text
+/// and no tool call: kGraf ran the block as an `apply_patch` call, and its
+/// result is in the same turn.
+const PASTED_PATCH_NOTICE: &str = "The reply held a patch as text; kGraf applied it as an \
+     apply_patch call. Its result is above. Call apply_patch yourself for the next change.";
+
 /// The smallest floor of undelivered output tokens
 /// ([`kgraf_provider::Provider::undelivered_output_tokens`]) that makes a reply
 /// with no tool call a lost one. A dropped tool call is a whole call (a patch
@@ -1272,6 +1279,8 @@ struct Worker {
     /// part of them; capped at [`MAX_LOST_OUTPUT_RETRIES`]. Never cleared: it
     /// bounds the extra rounds a server fault can cost one attempt.
     lost_output_retries: u32,
+    /// Patches kGraf ran from a reply's text so far; numbers the call ids.
+    pasted_patches: u32,
     /// Notices this attempt got for ending as done with no tool call although
     /// its contract writes files; capped at [`MAX_NO_CHANGE_NOTICES`].
     no_change_notices: u32,
@@ -1445,7 +1454,11 @@ impl Worker {
                     let why = if scope.is_empty() {
                         format!("{}{WRITELESS_SCOPE}", path.display())
                     } else {
-                        format!("{} is outside the declared write scope", path.display())
+                        format!(
+                            "{} {}",
+                            path.display(),
+                            crate::shortfall::OUTSIDE_WRITE_SCOPE
+                        )
                     };
                     return Some((why, Some(repo_path_text(path))));
                 }
@@ -1895,7 +1908,7 @@ impl Worker {
                 .prefix
                 .check(&request)
                 .map_err(|e| Halt::Failed(e.to_string()))?;
-            let response = match self.call_model(ep, &request, final_round).await {
+            let mut response = match self.call_model(ep, &request, final_round).await {
                 Err(Halt::Abandoned {
                     phase,
                     partial,
@@ -1988,6 +2001,10 @@ impl Worker {
             self.malformed_retries = 0;
             // The forced choice was for this round, which has its answer.
             self.force_tool_call = false;
+            // A reply that ends with one complete patch block as text and no
+            // tool call is run as an `apply_patch` call. Not on the final
+            // round, whose tool calls never run.
+            let pasted_patch = !final_round && self.adopt_pasted_patch(&mut response);
             let uses: Vec<(String, String, serde_json::Value)> = response
                 .tool_uses()
                 .into_iter()
@@ -2307,7 +2324,21 @@ impl Worker {
                         String::new(),
                     ));
                 }
-                Ok(None) => self.file_shortfall_if_due(ep).await?,
+                Ok(None) => {
+                    // After the result, so the notice joins the turn that
+                    // carries it and never splits the call from its result.
+                    if pasted_patch {
+                        self.emit(
+                            ep,
+                            WorkerEvent::Notice {
+                                kind: crate::event::NoticeKind::PatchAsText,
+                                text: PASTED_PATCH_NOTICE.to_owned(),
+                            },
+                        )
+                        .await?;
+                    }
+                    self.file_shortfall_if_due(ep).await?
+                }
                 Err(Halt::Abandoned { phase, partial, .. }) => {
                     // Reached only from `dispatch`'s own `Halt::Abandoned` (below),
                     // which always fires after the round's model call already ran;
@@ -2320,8 +2351,47 @@ impl Worker {
         }
     }
 
+    /// When `response` ended its turn with no tool call and its text holds
+    /// exactly one complete patch block, add an `apply_patch` call for the
+    /// block to the response and end the turn on a tool call, so the block
+    /// goes through the approval chain, the ledger and the trace as a call
+    /// the model made, and its result goes back to the model. Once per turn
+    /// by construction: it needs a turn with no tool call, and adds one.
+    /// Returns whether it did.
+    fn adopt_pasted_patch(&mut self, response: &mut Response) -> bool {
+        if !matches!(
+            response.stop_reason,
+            StopReason::EndTurn | StopReason::StopSequence
+        ) || !response.tool_uses().is_empty()
+            || self.env.tools.get("apply_patch").is_none()
+        {
+            return false;
+        }
+        let Some(patch) = crate::pasted_patch::single_block(&response.text()) else {
+            return false;
+        };
+        // Only a block that applies cleanly to the tree as it is now: a
+        // final answer that quotes a patch already applied would otherwise
+        // be applied again and fail. Decided by the tool's own parser and
+        // matcher, with no write; a block that would not apply leaves the
+        // turn to the guards that judge it today.
+        let input = serde_json::json!({ "patch": patch });
+        if kgraf_tools::check_applies(&input, &self.brief.workspace_root).is_err() {
+            return false;
+        }
+        self.pasted_patches += 1;
+        response.content.push(Content::ToolUse {
+            id: format!("kgraf-pasted-patch-{}", self.pasted_patches),
+            name: "apply_patch".to_owned(),
+            input,
+            signature: None,
+        });
+        response.stop_reason = StopReason::ToolUse;
+        true
+    }
+
     /// File the permission report for a worker that was refused one command
-    /// line twice and did not report it (see [`crate::shortfall::RepeatedRefusals`]).
+    /// line, or one path for its write scope, twice and did not report it (see [`crate::shortfall::RepeatedRefusals`]).
     /// The report goes through the approval chain and the registered
     /// `report_shortfall` tool, so the orchestrator decides as it does for a
     /// report the model wrote: it grants, asks, or holds, and cancels the
@@ -2359,7 +2429,7 @@ impl Worker {
             tool: crate::shortfall::SHORTFALL_TOOL.to_owned(),
             input: serde_json::json!({
                 "kind": "permission",
-                "scope": "command",
+                "scope": report.scope,
                 "need": report.need,
                 "why": report.why,
             }),
@@ -4099,6 +4169,7 @@ impl Worker {
         if call.file_write().is_none() {
             self.repeated.refused(&tool, &recorded, call.subjects());
         }
+        let script_without_grant = recorded.script_without_grant();
         self.refused.refused(recorded);
         let can_report = self
             .env
@@ -4108,6 +4179,9 @@ impl Worker {
         *output = crate::shortfall::with_refusal_hint(output, can_report);
         if let Some(write) = call.file_write() {
             output.push_str(&kgraf_tools::file_write_hint(write));
+        }
+        if script_without_grant && call.file_write().is_none() {
+            output.push_str(crate::shortfall::SCRIPT_SPLIT_HINT);
         }
     }
 

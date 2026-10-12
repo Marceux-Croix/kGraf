@@ -786,6 +786,35 @@ fn apply_all_names(
     })
 }
 
+/// Whether the `apply_patch` call `input` would apply cleanly to the tree at
+/// `root` right now, decided by the same parser, path guards and matcher the
+/// call uses, stopping before the commit pass: nothing is written. `Err` is
+/// the reason the call would be refused.
+pub fn check_applies(input: &Value, root: &Path) -> Result<(), String> {
+    let check = || -> Result<(), ToolError> {
+        let Parsed { hunks, .. } = parse(input)?;
+        if hunks.is_empty() {
+            return Err(internal("the patch made no changes"));
+        }
+        refuse_repeated_paths(&hunks, lexical)?;
+        let dir = fs_safety::open_workspace("apply_patch", root)?;
+        refuse_repeated_paths(&hunks, |path| {
+            fs_safety::resolve_links("apply_patch", &dir, path)
+        })?;
+        for hunk in &hunks {
+            for path in written_paths(hunk)? {
+                fs_safety::guard_write_names("apply_patch", &dir, &path, fs_safety::Names::Plain)?;
+            }
+        }
+        let mut notes = Vec::new();
+        for hunk in &hunks {
+            plan_one(hunk, &dir, &mut notes)?;
+        }
+        Ok(())
+    };
+    check().map_err(|e| e.to_string())
+}
+
 fn plan_one(hunk: &Hunk, dir: &Dir, notes: &mut Vec<String>) -> Result<Planned, ToolError> {
     match hunk {
         Hunk::AddFile { path, contents } => {

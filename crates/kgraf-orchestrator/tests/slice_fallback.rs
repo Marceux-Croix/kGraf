@@ -42,11 +42,18 @@ async fn run(
     let dir = tempfile::tempdir().expect("dir");
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
     std::fs::write(dir.path().join("src/budget.rs"), BUDGET).expect("write");
+    // A second file with the same stem, so a bare `budget` is ambiguous.
+    std::fs::create_dir_all(dir.path().join("other")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("other/budget.rs"),
+        "pub fn other_thing() {}\n",
+    )
+    .expect("write");
     {
         let g =
             kgraf_graph::GraphStore::open(&dir.path().join("graph.db"), dir.path()).expect("graph");
         kgraf_graph::Indexer::new(&g)
-            .index_paths(&["src/budget.rs".to_owned()])
+            .index_paths(&["src/budget.rs".to_owned(), "other/budget.rs".to_owned()])
             .expect("index");
     }
     let plan = plan(slices);
@@ -148,4 +155,39 @@ async fn a_named_slice_that_resolves_is_used_and_no_fallback_is_taken() {
             .any(|n| n.contains("declared files")),
         "{events:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_and_symbol_name_resolves_without_the_fallback() {
+    let (report, events, opening, _dir) = run(json!(["src/budget.rs::estimate_tokens"])).await;
+    assert!(opening.contains("fn estimate_tokens"), "{opening}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::EmptyGraphLookup { .. })),
+        "{events:?}"
+    );
+    let c = report.counters;
+    assert_eq!(c.empty_slice_lookups, 0, "{c:?}");
+    assert_eq!(c.slices_from_writes, 0, "{c:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stem_shared_by_two_files_is_a_miss_that_names_both() {
+    let (report, events, _opening, _dir) = run(json!(["budget"])).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EmptyGraphLookup { lookup, .. } if lookup == "budget"
+        )),
+        "{events:?}"
+    );
+    let names = notices(&events);
+    assert!(
+        names.iter().any(|n| n.contains("`budget` matches 2 nodes")
+            && n.contains("src/budget.rs")
+            && n.contains("other/budget.rs")),
+        "the candidates are traced: {names:?}"
+    );
+    assert_eq!(report.counters.slices_from_writes, 1);
 }

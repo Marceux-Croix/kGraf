@@ -72,6 +72,9 @@ pub struct OrchestrateArgs {
     pub check_compile_timeout: Duration,
     /// `--shell-timeout` (decision 0084): wins over the worker configuration.
     pub shell_timeout: Option<Duration>,
+    /// `--time-limit`: the run's wall-clock limit, whose share is the planner's
+    /// time for the optional asks.
+    pub time_limit: Option<Duration>,
     /// Output ceiling of each orchestrator call.
     pub planner_max_tokens: u32,
     /// `--reasoning` and `--planner-reasoning` over the `[reasoning]` user
@@ -147,6 +150,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
         shell_timeout: args.shell_timeout,
+        time_limit: args.time_limit,
         // Decision 0067: on by default (`--sessions false`
         // to turn it off): a live run shows the steer, an
         // orchestrator-answered question and an admitted, merged subagent
@@ -251,6 +255,7 @@ fn notice_line(n: &Notice) -> String {
         Notice::ChecksNetworkOpen(sentence) | Notice::ShellNetworkOpen(sentence) => {
             format!("sandbox    {sentence}")
         }
+        Notice::LocalServer(sentence) => format!("notice     {sentence}"),
         Notice::GraphEmpty { root, files_seen } => format!(
             "graph      empty after indexing {} ({files_seen} file(s) seen): no graph slices \
              for this run, likely no supported language in the tree",
@@ -1374,6 +1379,7 @@ mod tests {
             check_timeout: Duration::from_secs(600),
             check_compile_timeout: Duration::from_secs(600),
             shell_timeout: None,
+            time_limit: None,
             planner_max_tokens: kgraf_host::limits::DEFAULT_PLANNER_MAX_TOKENS,
             reasoning: kgraf_provider::ReasoningLevels::new(),
             retry_gate: None,

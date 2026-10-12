@@ -258,6 +258,19 @@ pub enum NotReady {
         endpoint: String,
         detail: String,
     },
+    /// The Ollama server is older than the model's minimum (`requires` of its
+    /// `/api/show`): every call to the model would fail.
+    #[error(
+        "route `{route}` model `{model}` needs Ollama {minimum} or later, and the server at \
+         {endpoint} runs {server}; update Ollama or choose another model"
+    )]
+    ServerTooOld {
+        route: String,
+        model: String,
+        endpoint: String,
+        server: String,
+        minimum: String,
+    },
 }
 
 impl kgraf_diag::DiagCode for NotReady {
@@ -268,6 +281,7 @@ impl kgraf_diag::DiagCode for NotReady {
             NotReady::MissingCredential { .. } => "KG-0501",
             NotReady::PricesUnreadable { .. } => "KG-0501",
             NotReady::Unreachable { .. } => "KG-0501",
+            NotReady::ServerTooOld { .. } => "KG-0501",
             NotReady::Invalid(_) => kgraf_diag::catch_all_for("kgraf-host").code,
         }
     }

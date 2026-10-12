@@ -350,9 +350,19 @@ fn subjects_of(scope: RequestScope, c: &RefusedCall) -> Vec<String> {
     out
 }
 
+/// Whether the refusal is of a shell script refused whole, recorded against
+/// its shell with the programs it held ([`RefusedCall::held`]).
+fn is_script_refusal(c: &RefusedCall) -> bool {
+    c.tool == "shell" && !c.whole_tool && c.path.is_none() && !c.held.is_empty()
+}
+
 fn subject_of(scope: RequestScope, c: &RefusedCall) -> Option<String> {
     match (scope, &c.path) {
         (RequestScope::File, Some(p)) => Some(p.trim_start_matches("./").to_owned()),
+        // A script refused whole offers the programs inside it
+        // ([`subjects_of`]), never its shell: a grant of `sh` runs none of
+        // them, so it would be granted and refused again.
+        (RequestScope::Command, None) if is_script_refusal(c) => None,
         (RequestScope::Command, None) if c.tool == "shell" && c.capability != "shell" => {
             Some(c.capability.clone())
         }
@@ -369,6 +379,20 @@ fn describe_refusal(c: &RefusedCall) -> String {
         None if c.tool == "shell" && c.whole_tool => format!(
             "the tool `shell` (scope tool), running `{}` (scope command)",
             c.capability
+        ),
+        None if c.script_without_grant() => format!(
+            "a shell script (`{}`) that is not judged command by command, so no grant covers \
+             it: its commands run as separate calls",
+            c.capability
+        ),
+        None if is_script_refusal(c) => format!(
+            "a shell script (`{}`; scope command, naming {}, which a grant names)",
+            c.capability,
+            c.needs
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         None if c.tool == "shell" && c.needs.len() > 1 => format!(
             "`{}` (scope command; it also runs {}, which a grant names with it)",
@@ -503,6 +527,20 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
                 answer.push_str(
                     " A refused shell command is reported with scope command, naming its \
                      program.",
+                );
+            }
+            // A worker that names the shell of a refused script has the
+            // subject wrong: a grant of the shell runs nothing inside it.
+            if scope == RequestScope::Command
+                && unretried.iter().any(|c| is_script_refusal(c))
+                && token.as_deref().is_some_and(|t| {
+                    kgraf_tools::permissions::SCRIPT_SHELLS
+                        .contains(&t.rsplit('/').next().unwrap_or(t))
+                })
+            {
+                answer.push_str(
+                    " A shell script is not granted by naming its shell. Name a program inside \
+                     it that was refused, or split it into separate commands.",
                 );
             }
             if let Some(e) = &record.last_input_error {
@@ -1983,7 +2021,12 @@ mod tests {
         else {
             panic!("no skill, nothing of scope tool refused: {control:?}");
         };
-        assert!(answer.contains("`sh` (scope command)"), "{answer}");
+        // The refusal was a script: the answer names the program inside it
+        // for a grant, not the shell.
+        assert!(
+            answer.contains("a shell script (`sh`; scope command, naming `wc`"),
+            "{answer}"
+        );
         assert!(answer.contains("reported with scope command"), "{answer}");
     }
 
@@ -2036,6 +2079,85 @@ mod tests {
             ground(RequestScope::Command, "python3", &full),
             Grounding::Refused { subject, .. } if subject == "/usr/bin/python3"
         ));
+    }
+
+    /// A shell script refused whole, as the worker loop records one: the
+    /// refusal is against the shell, and `needs` holds the programs inside
+    /// it that a grant names (empty when kGraf cannot read the script
+    /// command by command).
+    fn refused_script(held: &[&str], needs: &[&str]) -> RefusedCall {
+        let mut c = refused_program("sh", "");
+        c.reason = "ERROR: refused: the call may write anywhere (it declares no paths)".into();
+        c.held = held.iter().map(|s| (*s).to_owned()).collect();
+        c.needs = needs.iter().map(|s| (*s).to_owned()).collect();
+        c
+    }
+
+    /// A script refused whole is grounded in the programs inside it, never in
+    /// its shell, and the decision grants those programs together.
+    #[test]
+    fn a_script_is_grounded_in_the_programs_inside_it_not_the_shell() {
+        let r = record(vec![refused_script(&["mkdir", "cp"], &["mkdir", "cp"])]);
+        // The shell is not a subject: a grant of it runs nothing inside.
+        let Grounding::NothingRefused { answer } = ground(RequestScope::Command, "sh", &r) else {
+            panic!("`sh` must not ground a script refusal");
+        };
+        assert!(
+            answer.contains("not granted by naming its shell"),
+            "{answer}"
+        );
+        assert!(answer.contains("`mkdir`, `cp`"), "{answer}");
+        // Either program grounds it, with the other beside it.
+        for named in ["mkdir", "cp"] {
+            let Grounding::Refused { subject, with, .. } = ground(RequestScope::Command, named, &r)
+            else {
+                panic!("{named} is inside the refused script");
+            };
+            assert_eq!(subject, "mkdir");
+            assert_eq!(with, vec!["cp".to_owned()]);
+        }
+        // The grant names both programs and never the shell.
+        let a = authority(PermissionMode::OrchestratorDecides, true);
+        let Grounding::Refused { subject, with, .. } = ground(RequestScope::Command, "mkdir", &r)
+        else {
+            panic!("grounded above");
+        };
+        let d = decide_in_plan(
+            ShortfallKind::Permission,
+            RequestScope::Command,
+            &subject,
+            &with,
+            "the script needs them",
+            &contract(),
+            &a,
+            None,
+            &[],
+        );
+        let ShortfallDecision::Grant { grant, .. } = d else {
+            panic!("the programs are granted: {d:?}");
+        };
+        assert_eq!(grant.programs(), vec!["mkdir", "cp"]);
+    }
+
+    /// Counter-case: a refusal of `sh` that held no script (it ran a file) is
+    /// still grounded in `sh`, and a script kGraf cannot read grounds nothing
+    /// and is told to split.
+    #[test]
+    fn a_refusal_of_the_shell_alone_still_grounds_and_an_unreadable_script_does_not() {
+        let plain = record(vec![refused_script(&[], &[])]);
+        assert!(matches!(
+            ground(RequestScope::Command, "sh", &plain),
+            Grounding::Refused { subject, .. } if subject == "sh"
+        ));
+        let unreadable = record(vec![refused_script(&["mkdir", "cp"], &[])]);
+        for named in ["sh", "mkdir"] {
+            let Grounding::NothingRefused { answer } =
+                ground(RequestScope::Command, named, &unreadable)
+            else {
+                panic!("{named} grounds nothing for an unreadable script");
+            };
+            assert!(answer.contains("no grant covers it"), "{answer}");
+        }
     }
 
     // ------------------------------------------------ skills and the modes

@@ -639,3 +639,45 @@ its open-contract failures are this decision's deferral.
 Tests: `kgraf-host`
 `a_narrowed_check_that_needs_an_open_members_manifest_is_deferred_to_the_root_gate`,
 `a_narrowed_check_needs_the_absent_manifest_of_a_listed_member`.
+
+## Amendment (2026-10-12): the packages that depend on a contract's package run as an earlier behavior signal
+
+Across 63 recorded multi-contract cargo runs, all 443 consumed dependency edges were judged
+compile-only: each contract's narrowed check builds or tests its own package, which has no tests.
+These tasks keep their one behavior test in a package above every contract (an integration test),
+so it ran only at the root gate. The root gate failed and a fix contract was dispatched in 13 of
+about 28 runs of the deepest tasks. Most of about 40 root-gate failures were semantic (a failing
+test, a missing method); about 9 were syntax breakage from patches that applied but were wrong.
+
+- **Rule.** When an attempt passes its narrowed cargo check (committed, not deferred, not a gate
+  remediation), the run's command narrowed to `-p <package>` also runs for each workspace package
+  that depends on the attempt's packages, directly or through other packages, when no open
+  contract writes a file in that package or in any package it builds with, every path dependency
+  it builds with is a package of the tree, and no absent open file is one cargo needs to load the
+  workspace. An open contract's root file (a manifest, a lockfile, `.cargo/`) runs none. Packages
+  with tests of their own come first, then the nearest, then by name; at most 2 per attempt. They
+  run on the attempt merged onto the integration tip, in one throwaway worktree, with the gate
+  timeout.
+- **Judgment.** A dependent that fails runs again at the integration tip alone. It counts against
+  the attempt when it passes at the tip, or when a line new to the output names a file the
+  contract writes and no open contract's file. Any other failure is a notice, never a failure or a
+  hold; the root gate still judges the merged result. The passing checks, and the packages the cap
+  left out, are recorded in the verdict.
+- **Rejected: a test that reached the contract's code counts against it.** Such a test also builds
+  with merged work that was checked compile-only. Failing the attempt for it would retry and hold a
+  worker that may not write the file at fault.
+- **Rejected as the only change: one mid-run gate when the integration test's dependencies have
+  merged.** There the integration package depends on every contract, so that gate is this rule at
+  the last attempt; the dependency rule also catches a merged package that breaks on an attempt.
+- **Syntax.** Not changed: a contract's narrowed check compiles its own files, and the own-file
+  rule (2026-10-11) keeps an error naming them from being deferred.
+- **Cost.** Most attempts pay only a manifest read. One with eligible dependents pays a worktree
+  and at most 2 cargo runs, plus one run at the tip per failure until one is attributed, each
+  bounded by the gate timeout. On the test fixture the verification took 12 to 14 s without the
+  dependents and 22 to 31 s with 2 dependents passing.
+
+Tests: `kgraf-host` `a_wrong_behavior_fails_on_a_dependents_test_and_is_attributed`,
+`a_right_attempt_passes_with_its_dependents_run_up_to_the_cap`,
+`a_failure_not_tied_to_the_attempt_is_a_notice_and_the_attempt_passes`,
+`a_dependents_test_that_panics_in_the_contracts_file_is_attributed`,
+`dependents_are_those_that_can_build_now_ordered_and_capped`.

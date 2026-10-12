@@ -12,6 +12,8 @@
 //! 5. A shell command that only writes a file in the worktree, refused twice,
 //!    files nothing and its refusal carries the `apply_patch` skeleton; a write
 //!    outside the worktree, or one that also runs a command, files as before.
+//! 6. The same path refused for the write scope twice files a `file` report
+//!    for it; two different paths refused once each file nothing.
 
 use kgraf_core::{Protocol, TokenUsage};
 use kgraf_provider::message::ToolDefinition;
@@ -190,6 +192,40 @@ impl Tool for Shell {
     }
 }
 
+/// Writes nothing; declares the write of `path`, so a declared write scope
+/// can refuse it.
+struct WriteFile;
+
+#[async_trait::async_trait]
+impl Tool for WriteFile {
+    fn name(&self) -> &str {
+        "write_file"
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "write_file".into(),
+            description: "Write a file".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+    fn access(&self, input: &Value) -> Result<Access, ToolError> {
+        Access::none()
+            .write_path(input["path"].as_str().unwrap_or_default())
+            .map_err(|source| ToolError::Access {
+                tool: "write_file".into(),
+                source,
+            })
+    }
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+        _permit: &CallPermit,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("written"))
+    }
+}
+
 /// Stands in for the orchestrator's `report_shortfall`: records its input and
 /// answers as a held decision does.
 struct ShortfallStandIn {
@@ -232,6 +268,9 @@ fn env(provider: Arc<Fake>, inputs: Arc<Mutex<Vec<Value>>>) -> Arc<WorkerEnv> {
         .register_builtin(Arc::new(Shell), Exposure::Prefix)
         .expect("register");
     registry
+        .register_builtin(Arc::new(WriteFile), Exposure::Prefix)
+        .expect("register");
+    registry
         .register_builtin(Arc::new(ShortfallStandIn { inputs }), Exposure::Prefix)
         .expect("register");
     let prefix = PrefixSnapshot::new(
@@ -272,11 +311,21 @@ fn brief(root: &Path) -> WorkerBrief {
 }
 
 async fn run(provider: Arc<Fake>) -> (Vec<WorkerEvent>, WorkerResult, Vec<Value>) {
+    run_scoped(provider, None).await
+}
+
+/// [`run`] with the contract's declared write scope.
+async fn run_scoped(
+    provider: Arc<Fake>,
+    write_scope: Option<Vec<std::path::PathBuf>>,
+) -> (Vec<WorkerEvent>, WorkerResult, Vec<Value>) {
     let dir = tempfile::tempdir().expect("dir");
     let inputs = Arc::new(Mutex::new(Vec::new()));
+    let mut brief = brief(dir.path());
+    brief.write_scope = write_scope;
     let handle = spawn_worker(
         env(provider, inputs.clone()),
-        brief(dir.path()),
+        brief,
         SpawnOptions::default(),
     )
     .await
@@ -502,35 +551,167 @@ async fn a_heredoc_file_write_refused_twice_files_nothing_and_names_apply_patch(
     }
 }
 
-/// A heredoc to a path outside the worktree is no pure write: it files.
+/// A heredoc to a path outside the worktree is no pure write, and kGraf
+/// cannot read the script command by command, so no grant covers it: nothing
+/// is filed for it (not for `sh`), no patch is offered, and each refusal says
+/// to split the script.
 #[tokio::test]
-async fn a_heredoc_write_outside_the_worktree_still_files() {
+async fn a_heredoc_write_outside_the_worktree_files_nothing_and_says_to_split() {
     let script = "cat > /etc/kgraf_probe << 'EOF'\nx\nEOF";
     let provider = Fake::new(move |request| match results_in(request) {
         0 | 1 => shell("t", &["sh", "-c", script]),
         _ => says("done"),
     });
     let (events, result, filed) = run(provider).await;
-    assert_eq!(filed.len(), 1, "{filed:?}");
-    assert_eq!(filed[0]["need"], "sh");
-    assert!(result.kgraf_shortfall.is_some());
-    assert!(
-        refusals_seen(&events)
-            .iter()
-            .all(|t| !t.contains("*** Begin Patch"))
-    );
+    assert!(filed.is_empty(), "{filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+    let seen = refusals_seen(&events);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for text in seen {
+        assert!(!text.contains("*** Begin Patch"), "{text}");
+        assert!(text.contains("split it into separate commands"), "{text}");
+    }
 }
 
-/// A script that writes and also runs a command is no pure write: it files.
+/// `sh -c "mkdir -p out && cp a b"` refused twice, unretried: the report names
+/// the programs inside the script that a grant must name, `mkdir` first and
+/// `cp` with it, and never `sh` (a grant of `sh` runs none of them).
 #[tokio::test]
-async fn a_write_that_also_runs_a_command_still_files() {
-    let script = "cat > a.txt << 'EOF'\nx\nEOF\nmake";
+async fn a_script_refused_twice_files_for_the_programs_inside_it_not_the_shell() {
+    let script = "mkdir -p out && cp templates/a.txt out/a.txt";
     let provider = Fake::new(move |request| match results_in(request) {
         0 | 1 => shell("t", &["sh", "-c", script]),
         _ => says("done"),
     });
     let (events, result, filed) = run(provider).await;
     assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_eq!(filed[0]["scope"], "command");
+    assert_eq!(filed[0]["need"], "mkdir");
+    let why = filed[0]["why"].as_str().expect("why");
+    assert!(why.starts_with(KGRAF_FILED_LEAD), "{why}");
+    assert!(why.contains("refused `mkdir`, `cp` and"), "{why}");
+    assert!(why.contains("`mkdir` refused 2 time(s)"), "{why}");
+    assert!(!why.contains("`sh`"), "{why}");
+    let report = result.kgraf_shortfall.as_ref().expect("a filed report");
+    assert_eq!(report.need, "mkdir");
+    // A script that is read command by command is not told to split.
+    assert!(
+        refusals_seen(&events)
+            .iter()
+            .all(|t| !t.contains("split it into separate commands"))
+    );
+}
+
+/// A script kGraf cannot read command by command (a substitution), refused
+/// twice: no program grant covers it, so nothing is filed, and the refusal
+/// says to split the script.
+#[tokio::test]
+async fn an_unparsable_script_refused_twice_files_nothing_and_says_to_split() {
+    let script = "mkdir -p out && cp $(date) out/a.txt";
+    let provider = Fake::new(move |request| match results_in(request) {
+        0 | 1 => shell("t", &["sh", "-c", script]),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert!(filed.is_empty(), "{filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+    assert!(filed_notices(&events).is_empty());
+    let seen = refusals_seen(&events);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(
+        seen.iter()
+            .all(|t| t.contains("split it into separate commands")),
+        "{seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------- write scope
+
+/// A write of `path`, with `content`.
+fn writes(id: &str, path: &str, content: &str) -> Reply {
+    Reply {
+        text: String::new(),
+        calls: vec![(
+            id.into(),
+            "write_file".into(),
+            json!({"path": path, "content": content}),
+        )],
+    }
+}
+
+fn scope_of(paths: &[&str]) -> Option<Vec<std::path::PathBuf>> {
+    Some(paths.iter().map(std::path::PathBuf::from).collect())
+}
+
+/// The same path outside the write scope refused twice, with another call
+/// between and different content, and no report. kGraf files a `file` report
+/// for the path, once.
+#[tokio::test]
+async fn the_same_path_refused_for_the_write_scope_twice_files_a_file_report() {
+    let provider = Fake::new(|request| match results_in(request) {
+        0 => writes("t1", "pyproject.toml", "a"),
+        1 => shell("t2", &["python3", "--allowed"]),
+        2 => writes("t3", "pyproject.toml", "b"),
+        3 => writes("t4", "pyproject.toml", "c"),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run_scoped(provider, scope_of(&["src/a.rs"])).await;
+    assert_eq!(filed.len(), 1, "one filing per attempt: {filed:?}");
+    assert_eq!(filed[0]["kind"], "permission");
+    assert_eq!(filed[0]["scope"], "file");
+    assert_eq!(filed[0]["need"], "pyproject.toml");
+    let why = filed[0]["why"].as_str().expect("why");
+    assert!(why.starts_with(KGRAF_FILED_LEAD), "{why}");
+    assert!(why.contains("`pyproject.toml` refused 2 time(s)"), "{why}");
+    let report = result.kgraf_shortfall.as_ref().expect("a filed report");
+    assert_eq!(report.scope, "file");
+    assert_eq!(report.need, "pyproject.toml");
+    assert_eq!(report.reply.as_deref(), Some("held: stand-in. Stop now."));
+    assert_eq!(filed_notices(&events).len(), 1);
+}
+
+/// Two different paths outside the scope, refused once each, are two first
+/// refusals: nothing is filed.
+#[tokio::test]
+async fn two_different_paths_refused_once_each_file_nothing() {
+    let provider = Fake::new(|request| match results_in(request) {
+        0 => writes("t1", "pyproject.toml", "a"),
+        1 => writes("t2", "setup.cfg", "a"),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run_scoped(provider, scope_of(&["src/a.rs"])).await;
+    assert!(filed.is_empty(), "{filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+    assert!(filed_notices(&events).is_empty());
+    assert_eq!(result.refused.len(), 2);
+}
+
+/// A report by the model before the second refusal of a path ends the guard.
+#[tokio::test]
+async fn a_report_by_the_model_ends_the_path_guard() {
+    let provider = Fake::new(|request| match results_in(request) {
+        0 => writes("t1", "pyproject.toml", "a"),
+        1 => reports("r1", "pyproject.toml"),
+        2 => writes("t2", "pyproject.toml", "b"),
+        _ => says("done"),
+    });
+    let (_, result, filed) = run_scoped(provider, scope_of(&["src/a.rs"])).await;
+    assert_eq!(filed.len(), 1, "only the model's own: {filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+}
+
+/// A script that writes and also runs a command is no pure write: it files,
+/// for the programs inside it.
+#[tokio::test]
+async fn a_write_that_also_runs_a_command_still_files() {
+    let script = "touch a.txt && ls";
+    let provider = Fake::new(move |request| match results_in(request) {
+        0 | 1 => shell("t", &["sh", "-c", script]),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_eq!(filed[0]["need"], "touch");
     assert!(result.kgraf_shortfall.is_some());
     assert!(
         refusals_seen(&events)

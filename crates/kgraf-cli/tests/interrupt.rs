@@ -38,7 +38,8 @@ struct Stub {
     arrived: mpsc::Receiver<usize>,
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<()> {
+/// The request line of the next request, read whole.
+fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -57,7 +58,8 @@ fn read_request(stream: &mut TcpStream) -> Option<()> {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
         if buffer.len() >= end + 4 + length {
-            return Some(());
+            let line = String::from_utf8_lossy(&buffer[..end]);
+            return Some(line.lines().next().unwrap_or("").to_owned());
         }
     }
 }
@@ -72,7 +74,17 @@ impl Stub {
                 let Ok(mut stream) = stream else { return };
                 let (tx, count) = (tx.clone(), count.clone());
                 std::thread::spawn(move || {
-                    while read_request(&mut stream).is_some() {
+                    while let Some(line) = read_request(&mut stream) {
+                        // The run asks the server's native API for its version
+                        // before the first model call. That is not a model
+                        // request: answer "not found" without counting it.
+                        if !line.contains("/chat/completions") {
+                            let miss = "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
+                            if stream.write_all(miss.as_bytes()).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
                         let _ = tx.send(n);
                         if n >= hang_from {

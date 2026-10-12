@@ -16,14 +16,14 @@ use support::*;
 const WINDOW: u64 = 200_000;
 const SCAFFOLD: &str = "pub fn rate(_s: &str) -> u32 {\n    0\n}\n";
 
-/// c1 rewrites `src/rate.rs`; c2 depends on c1 and asks for the slice `rate`.
+/// c1 rewrites `src/pricing.rs` (a stem other than the slice name, which would resolve as a file); c2 depends on c1 and asks for the slice `rate`.
 fn plan() -> String {
     json!({"contracts": [
         {
             "id": "c1",
-            "instruction": "implement rate WRITE src/rate.rs",
-            "acceptance": "src/rate.rs exists",
-            "writes": [{"path": "src/rate.rs"}],
+            "instruction": "implement rate WRITE src/pricing.rs",
+            "acceptance": "src/pricing.rs exists",
+            "writes": [{"path": "src/pricing.rs"}],
             "depends_on": [],
             "tools": ["write_file"],
             "attempts": 1,
@@ -47,12 +47,12 @@ fn plan() -> String {
 async fn run(written: &str) -> (Parts, Vec<TraceEvent>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("dir");
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir");
-    std::fs::write(dir.path().join("src/rate.rs"), SCAFFOLD).expect("write");
+    std::fs::write(dir.path().join("src/pricing.rs"), SCAFFOLD).expect("write");
     {
         let g =
             kgraf_graph::GraphStore::open(&dir.path().join("graph.db"), dir.path()).expect("graph");
         kgraf_graph::Indexer::new(&g)
-            .index_paths(&["src/rate.rs".to_owned()])
+            .index_paths(&["src/pricing.rs".to_owned()])
             .expect("index");
     }
     let plan = plan();

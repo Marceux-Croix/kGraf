@@ -152,6 +152,18 @@ const WRITE_SLICE_TOKENS: u64 = 4_000;
 /// counts at the bound.
 const WRITE_SLICE_EACH_TOKENS: u64 = 2_000;
 
+/// What a contract's slice names resolved to.
+struct SliceLookup {
+    /// The nodes found.
+    nodes: Vec<NodeId>,
+    /// Their estimated tokens.
+    tokens: u64,
+    /// Names that found none.
+    missing: Vec<String>,
+    /// Notices for names that matched several nodes, which listed the candidates.
+    ambiguous: Vec<String>,
+}
+
 /// One vendor and model workers can be dispatched to.
 #[derive(Clone)]
 pub struct Route {
@@ -568,6 +580,11 @@ pub struct OrchestratorConfig {
     /// contract at once, short enough that a restarted one is back within a
     /// minute.
     pub route_fault_cooldown: Duration,
+    /// The run's wall-clock limit, when the caller knows one (a benchmark
+    /// task window, `kgraf orchestrate --time-limit`). A share of it is the
+    /// budget of the optional planner asks: the interface asks and the
+    /// re-plans ([`crate::planner_budget`]). `None`: no ask is held back.
+    pub time_limit: Option<Duration>,
 }
 
 impl Default for OrchestratorConfig {
@@ -590,6 +607,7 @@ impl Default for OrchestratorConfig {
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
             approve_plan: false,
             route_fault_cooldown: Duration::from_secs(30),
+            time_limit: None,
         }
     }
 }
@@ -2458,6 +2476,8 @@ struct RunLoop {
     /// the `plan_accepted` trace record. `notices` is a set, so a notice an
     /// earlier plan raised would not show as new for a re-plan.
     intake_notices: Vec<String>,
+    /// Planner time spent against the share of the run's time limit.
+    planner_budget: crate::planner_budget::PlannerBudget,
     /// Worktrees that could not be removed after use (`Workspaces::take_problems`),
     /// reported as warnings with the run.
     workspace_problems: Vec<String>,
@@ -2748,6 +2768,7 @@ impl RunLoop {
         let keeper_task = Some(keeper.clone().spawn(tx.clone()));
         let route_fault_cooldown_ms =
             i64::try_from(config.route_fault_cooldown.as_millis()).unwrap_or(i64::MAX);
+        let time_limit = config.time_limit;
         let mut me = Self {
             since_reground: 0,
             reground_on_resume: resumed,
@@ -2787,6 +2808,7 @@ impl RunLoop {
             frugal: frugality::FrugalRuntime::new(),
             notices: BTreeSet::new(),
             intake_notices: Vec::new(),
+            planner_budget: crate::planner_budget::PlannerBudget::new(time_limit),
             workspace_problems: Vec::new(),
             subagents: subagents::Subagents::default(),
             spec: speculate::SpecRuntime::default(),
@@ -3444,7 +3466,25 @@ impl RunLoop {
         names: &[String],
         from: Option<String>,
     ) -> Result<(Vec<NodeId>, u64), OrchestratorError> {
-        let (nodes, tokens, missing) = self.lookup_slices(names, from)?;
+        let SliceLookup {
+            nodes,
+            tokens,
+            missing,
+            ambiguous,
+        } = self.lookup_slices(names, from)?;
+        // A name written against a file that matched several nodes gets none
+        // of them; the candidates are traced so the planner's spelling can be
+        // made exact.
+        for detail in ambiguous {
+            let at = self.now();
+            self.trace(TraceEvent::Notice {
+                at_ms: at,
+                contract: contract.to_owned(),
+                worker: String::new(),
+                detail,
+            })
+            .await?;
+        }
         for name in missing {
             self.record.counters.empty_slice_lookups += 1;
             let at = self.now();
@@ -3464,9 +3504,10 @@ impl RunLoop {
         &self,
         names: &[String],
         from: Option<String>,
-    ) -> Result<(Vec<NodeId>, u64, Vec<String>), OrchestratorError> {
+    ) -> Result<SliceLookup, OrchestratorError> {
         let graph = self.s.graph.clone();
         let names_owned = names.to_vec();
+        let mut ambiguous: Vec<String> = Vec::new();
         let resolved: Vec<(String, Option<(String, u64)>)> = blocking(|| {
             let g = graph.lock().map_err(|_| StoreError::Poisoned)?;
             let mut out = Vec::new();
@@ -3479,10 +3520,32 @@ impl RunLoop {
                         // so is a crate-relative name found in several crates
                         // with none chosen by `from`: giving one of them would
                         // be a guess.
-                        Err(
-                            kgraf_graph::GraphError::UnknownSymbol { .. }
-                            | kgraf_graph::GraphError::AmbiguousSymbol { .. },
-                        ) => None,
+                        Err(kgraf_graph::GraphError::AmbiguousSymbol { .. }) => None,
+                        // `path::Name`, `path::Type::method` and a bare file
+                        // stem: taken only when exactly one node matches.
+                        Err(kgraf_graph::GraphError::UnknownSymbol { .. }) => {
+                            match g.resolve_file_form(name) {
+                                Ok(mut found) if found.len() == 1 => found.pop(),
+                                Ok(found) => {
+                                    ambiguous.push(format!(
+                                        "graph lookup `{name}` matches {} nodes and none was \
+                                         given: {}",
+                                        found.len(),
+                                        found
+                                            .iter()
+                                            .map(|n| format!(
+                                                "{} ({}:{})",
+                                                n.qualified_name, n.path, n.start_line
+                                            ))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ));
+                                    None
+                                }
+                                Err(kgraf_graph::GraphError::UnknownSymbol { .. }) => None,
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
                         Err(e) => return Err(e.into()),
                     },
                 };
@@ -3508,7 +3571,12 @@ impl RunLoop {
                 None => missing.push(name),
             }
         }
-        Ok((nodes, tokens, missing))
+        Ok(SliceLookup {
+            nodes,
+            tokens,
+            missing,
+            ambiguous,
+        })
     }
 
     /// The slices a contract gets when none of its named slices resolve (or it
@@ -3619,9 +3687,8 @@ impl RunLoop {
         contract: OpenContract,
     ) -> Result<OpenContract, OrchestratorError> {
         let (named_nodes, missing) = if !contract.slice_names.is_empty() {
-            let (nodes, _, missing) =
-                self.lookup_slices(&contract.slice_names, contract.slice_from.clone())?;
-            (nodes, missing)
+            let found = self.lookup_slices(&contract.slice_names, contract.slice_from.clone())?;
+            (found.nodes, found.missing)
         } else if contract.slices.is_empty() || contract.slices_from_writes {
             (Vec::new(), Vec::new())
         } else {
@@ -4493,6 +4560,15 @@ impl RunLoop {
         let Some(parts) = self.replan_failures() else {
             return Ok(false);
         };
+        // A re-plan is optional: with the planner time budget spent the held
+        // plan's outcome stands, as it does when no re-plan is left.
+        if let Some(why) = self.planner_budget_gate("replan").await? {
+            self.notices
+                .insert(kgraf_secrets::scrub_persist_owned(format!(
+                    "the plan was held before any work started and is not planned again: {why}"
+                )));
+            return Ok(false);
+        }
         let failures = parts
             .iter()
             .map(|f| f.text.as_str())

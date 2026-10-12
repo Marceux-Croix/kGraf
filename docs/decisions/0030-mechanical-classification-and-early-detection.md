@@ -1190,3 +1190,74 @@ notice, the trace event, the count, no stub landed), `a_check_that_cannot_run_fo
 `a_contract_in_a_language_this_machine_cannot_check_skips_its_checks_and_runs`, and the canary test
 `test_skipped_interface_checks_are_read_as_a_fact_with_the_program_named`. With the skip arm disabled the
 first test failed.
+
+## Amendment (2026-10-12): an interface refused again for a reason it was told is not asked for again; a repeated missing tests file becomes compile-only
+
+A canary run of `benchmark-terminal-bench-c` on a local model spent all three interface asks on the same
+omission. The planner answered interfaces with no tests file, was told so, and answered again with no
+tests file under a new interface id that grouped the edges differently. The repeat check compared an
+answer only with the last ask, and matched an interface only by its id or by exactly the same edges, so
+the repeat was not seen. The last ask (156 s on a local model) bought nothing. A model that repeats the
+same omission after being told is a common deficiency. kGraf degrades instead of asking again.
+
+The rule:
+- An interface refused in an earlier ask is measured against the reasons of every earlier ask, not the last
+  one only. It is the same interface when it has the same id or shares one edge (consumer and producer)
+  with an earlier refused interface. Reasons are compared with the interface id taken out.
+- When every refusal of an interface was already given, the interface is not asked for again. Its edges
+  are unchecked with that reason, as before.
+- When the one refusal is a missing tests file (`has no tests files`), and the interface passes every other
+  check, kGraf keeps it as a compile-only interface: no reference, no test, the stub and consumer files as
+  given, the existing compile check run against the stub (`check_derived_compile`). A notice names the
+  interface and says its behavior check does not run. The edge is still counted as not run, because a
+  compile-only interface binds no behavior. When the interface cannot be kept (a file named by path alone
+  is missing, a stub path replaces a file that was not declared, the compile check fails), a notice says
+  why and the edge is unchecked.
+- Asks whose reasons differ are unchanged: the planner made progress, and the budget (3 asks) is not
+  reduced. No rule here adds an ask.
+- The canary's wasted-ask rule needs no change. A degraded repeat writes no `interfaces_refused` event,
+  because the refusal text holds only reasons that were not given before, and the loop ends when it is
+  empty. A refusal that does repeat an earlier reason still counts as waste.
+
+Tests: `a_tests_file_missing_in_two_asks_ends_in_a_compile_only_interface` (two asks, no third, one
+compile-only interface, the notice; it fails with the compile-only branch disabled),
+`the_same_other_reason_twice_ends_unchecked_with_no_third_ask`,
+`different_reasons_in_two_asks_still_get_the_third_ask`, and
+`a_reason_told_in_an_earlier_ask_is_repeated_under_a_new_name_and_edges`.
+
+## Amendment (2026-10-12): the optional planner asks have a budget when the run has a time limit
+
+Canary rounds 15b to 26 of `benchmark-terminal-bench-c` (a 900 s task window) spent 51 to 82 percent of
+the window in planner asks: 82% (15b), 79% (20), 60% (21), 65% (24), 70% (25), 51% (26). In round 26 the
+contracts ask took 81 s, three interface asks took 104, 102 and 156 s, and all three were refused. The
+workers then had 3 to 14 steps. A refused interface ask is an optional ask that bought nothing, and no
+rule stopped it from taking the time the work needed.
+
+The rule:
+- A run may be given a wall-clock limit (`kgraf orchestrate --time-limit <seconds>`, `time_limit` in
+  `.kgraf/run.json`, `OrchestratorConfig::time_limit`). The Terminal-Bench bridge passes the task's agent
+  window (`--ak time_limit_sec`). Without a limit nothing below applies and behavior is unchanged.
+- The planner asks get 30 percent of the limit. The share is a measured choice: it holds a contracts ask
+  and one or two interface asks on a local model (81 s and 104 s of 270 s in round 26) and leaves two
+  thirds of the window to the workers.
+- Planner time is the wall-clock time of the planner asks of this run so far (contracts, splits,
+  interfaces, re-plans). Before an interface ask or a re-plan, the ask is not made when the time spent is
+  at or past the budget, or when the time spent plus the mean ask so far is past it.
+- The contracts ask is never skipped, and neither are its re-asks for a refused answer or a split: without
+  a plan there is no run.
+- A skipped interface ask ends the interface call as a spent budget does. Every edge no behavior interface
+  binds is unchecked, counted as not run, with the reason `behavior check not run: the interface ask was
+  not made, the planner time budget was spent (...)`. Compile-only interfaces kGraf derived stay. A
+  notice names the budget.
+- A skipped re-plan leaves the held plan's outcome as it is when no re-plan is left, with a notice.
+- Each skip is a `planner_budget_skipped` contract event (`phase` `interfaces` or `replan`) and counts in
+  `planner_budget_skips`. The canary reads the events: the fact `planner_budget_skips`, and a budget stop
+  counts as an honest end of the interface call, so the edges it left unchecked are not a defect.
+- A resumed run counts planner time from the resume.
+
+Tests: `slow_planner_asks_stop_the_interface_asks_at_the_budget` (a 9 s limit, asks of 1 s: the second
+interface ask is not made, the edge is unchecked and counted, the notice and the event; it fails with the
+gate disabled), `with_no_time_limit_the_interface_asks_are_not_held_back`,
+`the_contracts_ask_is_never_skipped_by_the_budget`, `a_replan_is_skipped_when_the_budget_is_spent`, the unit
+tests in `planner_budget.rs`, and the canary tests `test_a_budget_stop_is_an_honest_end_of_the_interface_call_and_a_fact`
+and `test_only_the_counted_skip_record_ends_the_interface_call`.

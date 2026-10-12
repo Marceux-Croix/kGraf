@@ -7486,6 +7486,10 @@ mod check_inputs;
 #[path = "check_network_tests.rs"]
 mod check_network;
 
+#[cfg(unix)]
+#[path = "dependents_tests.rs"]
+mod dependents;
+
 /// The run-start notice: named, printed, and handed to the orchestrator for
 /// the trace and the report, only where the network is open for checks.
 #[test]
@@ -8214,6 +8218,70 @@ fn a_build_with_an_unreachable_local_route_fails_at_start() {
     );
     assert!(
         !host.root().join(".git/refs/heads/kgraf/unreach").exists(),
+        "no integration branch was made"
+    );
+}
+
+/// A server that accepts, so the dial passes, and answers like Ollama 0.29.1
+/// whose model needs 0.30.0. The build stops at the version check, before a
+/// branch or a worktree exists, and the version was noted first.
+#[test]
+fn a_build_whose_model_needs_a_newer_ollama_fails_at_start() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            // The request is one write; read it whole before answering.
+            let mut raw = Vec::new();
+            while !String::from_utf8_lossy(&raw).contains("\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let head = String::from_utf8_lossy(&raw).into_owned();
+            let body = if head.contains("/api/version") {
+                r#"{"version":"0.29.1"}"#
+            } else {
+                r#"{"requires":"0.30.0"}"#
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let (_dir, mut config) = project();
+    config.routes = vec!["ollama:qwen3.6:35b".into()];
+    let host = Host::open(config)
+        .expect("open")
+        .with_local_endpoint("ollama", &url)
+        .expect("endpoint");
+    let startup = host.startup(&mut |_| {}).expect("startup");
+    let mut notices = Vec::new();
+    let Err(err) = host.build_base(&startup, RunId::new("too-old"), &mut |n| notices.push(n))
+    else {
+        panic!("a server older than the model's minimum fails the build");
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("qwen3.6:35b") && text.contains("0.29.1") && text.contains("0.30.0"),
+        "{text}"
+    );
+    assert!(text.contains("update Ollama"), "{text}");
+    assert!(
+        notices
+            .iter()
+            .any(|n| matches!(n, crate::Notice::LocalServer(s) if s.contains("Ollama 0.29.1"))),
+        "{notices:?}"
+    );
+    assert!(
+        !host.root().join(".git/refs/heads/kgraf/too-old").exists(),
         "no integration branch was made"
     );
 }

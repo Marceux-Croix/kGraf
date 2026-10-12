@@ -600,6 +600,20 @@ and each model route with the tool that reaches it.
   connection, or the run fails before it builds anything:
   "route `ollama` is unreachable at http://localhost:11434/v1: ...; start its server or
   remove the route". Hosted routes are not dialed at start.
+- **The `ollama` server's version is read at run start.** After the connection check passes,
+  kGraf asks the route's own server for its version (`GET /api/version`) and for the minimum
+  version of each `ollama` model of the planner and workers (`POST /api/show`, field
+  `requires`). It uses the base URL without `/v1`, so a moved `KGRAF_OLLAMA_BASE_URL` is
+  honored. No other host is contacted. Each request waits at most 3 s and is not retried.
+  - A model that needs a newer server fails the run before it builds anything: "route
+    `ollama` model `qwen3.6:35b` needs Ollama 0.30.0 or later, and the server at ... runs
+    0.29.1; update Ollama or choose another model".
+  - A server older than 0.34.4, the version this route was last verified with, gets a
+    run-start notice. The run goes on.
+  - A server that does not answer as Ollama (another server behind the route, an Ollama
+    without the endpoint, a development build, an `https://` address) gets a notice that the
+    version is unknown. The run goes on.
+  - Every run prints the server version as a notice, so the run's output shows it.
 - **A local route's address can be moved.** A route that takes no credential is called at its
   catalog address unless `KGRAF_<ROUTE>_BASE_URL` is set (`KGRAF_OLLAMA_BASE_URL`,
   `KGRAF_LLAMA_CPP_BASE_URL`: the route id upper-cased, `-` as `_`) to an `http://` or
@@ -823,6 +837,11 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   command line reads `KGRAF_SETTINGS_PATH` when set, otherwise the app's settings file.
   A single worker still uses at most 100,000 tokens of the window (decision 0057), so a
   window above that changes the orchestrator's view only.
+- **Time limit.** `kgraf orchestrate --time-limit <seconds>` tells a run the wall-clock time it has.
+  The planner's optional asks (the interface asks and the re-plans) share 30 percent of it. An ask that
+  would start past that budget, or is expected to end past it from the asks so far, is not made: the
+  interface edges are left unchecked with a notice, and a held plan is not planned again. The first plan
+  is never skipped. Without the flag nothing is held back. The flag does not stop the run at the limit.
 - **Answer wait.** A worker's `ask_user_question` goes to the orchestrator's model first, and
   the worker waits for that answer. The wait fits the model that answers: without a set value,
   each call waits twice the 95th percentile of that model's last 50 answer and connection

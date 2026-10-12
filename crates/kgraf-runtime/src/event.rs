@@ -260,6 +260,10 @@ pub enum NoticeKind {
     /// attempt although its contract writes files; it was told once to
     /// continue or call `report_shortfall`. A second such end fails the attempt.
     NoChange,
+    /// A turn ended with no tool call and its text held exactly one complete
+    /// `*** Begin Patch ... *** End Patch` block; kGraf ran the block as an
+    /// `apply_patch` call. Sent once for that turn, after the call's result.
+    PatchAsText,
     /// The server could not parse the model's own tool-call output and
     /// answered with a 5xx; the round was dropped and sent again. Sent on each
     /// of the bounded retries.

@@ -282,6 +282,10 @@ pub struct ContractCounters {
     /// program is not installed ([`ContractEvent::ChecksSkipped`]); their
     /// parties ran without contract checks.
     pub interface_checks_skipped: u64,
+    /// Optional planner asks (interface asks, re-plans) not made because the
+    /// run's planner time budget was spent
+    /// ([`ContractEvent::PlannerBudgetSkipped`]).
+    pub planner_budget_skips: u64,
 }
 
 impl ContractCounters {
@@ -472,6 +476,16 @@ pub enum ContractEvent {
         calls: u64,
         ms: u64,
         output_tokens: u64,
+    },
+    /// An optional planner ask was not made because the run's planner time
+    /// budget was spent or would be by the ask ([`crate::planner_budget`]).
+    /// Counted in [`ContractCounters::planner_budget_skips`].
+    PlannerBudgetSkipped {
+        /// The ask held back: `interfaces` or `replan`.
+        phase: String,
+        spent_ms: u64,
+        budget_ms: u64,
+        expected_ms: u64,
     },
 }
 
@@ -678,6 +692,9 @@ impl ContractBook {
                 c.interface_asks += calls;
                 c.interface_ask_ms += ms;
                 c.interface_ask_output_tokens += output_tokens;
+            }
+            ContractEvent::PlannerBudgetSkipped { .. } => {
+                c.planner_budget_skips += 1;
             }
             ContractEvent::Registered { interface } => {
                 if !self.entries.contains_key(&interface.id) {

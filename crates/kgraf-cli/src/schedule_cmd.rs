@@ -673,6 +673,7 @@ fn run_now_with(
             check_timeout: kgraf_host::config::defaults::check_timeout(),
             check_compile_timeout: kgraf_host::config::defaults::check_compile_timeout(),
             shell_timeout: args.shell_timeout,
+            time_limit: None,
             fetch_deps: args.fetch_deps,
             planner_max_tokens: args.planner_max_tokens,
             // The `[reasoning]` user setting, as every run takes it.

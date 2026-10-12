@@ -188,3 +188,21 @@ usage-dialect representation; the third is a data edit.
   worktree or model call. A route that accepts no connection fails the run (KG-0501): "route
   `ollama` is unreachable at http://localhost:11434/v1: ...; start its server or remove the
   route". Hosted routes are not dialed; their first call reports their vendor's state.
+
+## Amendments (2026-10-12)
+
+- **The `ollama` route's server version is read at run start.** A server too old for a model
+  used to fail on its first call with an unclear error (`qwen3.6:35b` needs Ollama 0.30.0 or
+  later). After the reachability check passes, a build asks only the route's own server:
+  `GET /api/version`, and `POST /api/show` for each `ollama` model of the planner and the
+  workers, reading its `requires`. The native root is the route's base URL without `/v1`, so
+  a moved base URL (`KGRAF_OLLAMA_BASE_URL`) is honored, with any path before `/v1` kept.
+  Each request is bounded at 3 s and not retried. No registry, release page or other host is
+  contacted. Versions compare as semver, so `0.30.0-rc1` is older than `0.30.0`. A model
+  whose `requires` is newer than the server fails the run (KG-0501): "route `ollama` model
+  `qwen3.6:35b` needs Ollama 0.30.0 or later, and the server at ... runs 0.29.1; update
+  Ollama or choose another model". A server older than 0.34.4, the version the route was last
+  verified with, gets a run-start notice and the run goes on. A server that does not answer
+  as Ollama (no `/api/version`, no JSON, a development build reporting 0.0.0, an `https://`
+  address) gets a notice that the version is unknown and the run goes on. Every run notes the
+  server version as a notice.

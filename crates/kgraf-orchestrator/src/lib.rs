@@ -95,6 +95,7 @@ mod placeholder;
 mod plan;
 mod plan_repo;
 mod plan_shapes;
+mod planner_budget;
 pub mod planner_context;
 mod port;
 mod question_route;

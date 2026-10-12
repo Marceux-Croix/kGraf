@@ -397,6 +397,15 @@ enum Command {
         /// configuration's `shell_timeout_secs`; without either, 600.
         #[arg(long)]
         shell_timeout: Option<u64>,
+        /// The run's wall-clock limit in seconds, when the caller has one (a
+        /// benchmark task window). A share of it (30 percent) is the planner's
+        /// time for the optional asks: the interface asks and the re-plans.
+        /// An ask that would start past that budget, or is expected to end
+        /// past it, is not made: the interface edges go unchecked, with a
+        /// notice, and a held plan is not planned again. The first plan is
+        /// never skipped. Without this flag nothing is held back.
+        #[arg(long)]
+        time_limit: Option<u64>,
         /// Output ceiling, in tokens, of each orchestrator call, lowered to the
         /// planner model's supported limit with a notice. An answer cut off at
         /// it fails, naming this flag. Default: the `planner_max_tokens` user
@@ -1291,6 +1300,7 @@ fn run_cli() -> Result<()> {
             check_timeout,
             check_compile_timeout,
             shell_timeout,
+            time_limit,
             planner_max_tokens,
             planner_reasoning,
             reasoning,
@@ -1365,6 +1375,7 @@ fn run_cli() -> Result<()> {
                     check_timeout: std::time::Duration::from_secs(check_timeout),
                     check_compile_timeout: std::time::Duration::from_secs(check_compile_timeout),
                     shell_timeout: shell_timeout.map(std::time::Duration::from_secs),
+                    time_limit: time_limit.map(std::time::Duration::from_secs),
                     planner_max_tokens: limits.planner_max_tokens.0,
                     reasoning: limits.reasoning,
                     retry_gate,

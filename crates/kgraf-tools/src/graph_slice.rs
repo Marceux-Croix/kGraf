@@ -79,15 +79,36 @@ fn resolve(store: &Mutex<GraphStore>, symbol: &str) -> Result<NodeRecord, ToolEr
     let store = store.lock().unwrap_or_else(|p| p.into_inner());
     // No requesting file: a crate-relative path found in several crates is
     // refused with its candidates rather than resolved to the first.
-    store
-        .resolve_symbol_from(symbol, None)
-        .map_err(|e| match e {
-            // The model named a symbol that does not exist, or a
-            // crate-relative path several crates hold: its input to fix.
-            kgraf_graph::GraphError::UnknownSymbol { .. }
-            | kgraf_graph::GraphError::AmbiguousSymbol { .. } => invalid(e.to_string()),
-            other => internal(other),
-        })?
+    let found = match store.resolve_symbol_from(symbol, None) {
+        Ok(found) => found,
+        // `path::Name` and a bare file stem: one node, or the candidates.
+        Err(kgraf_graph::GraphError::UnknownSymbol { name }) => {
+            let mut found = store.resolve_file_form(symbol).map_err(|e| match e {
+                kgraf_graph::GraphError::UnknownSymbol { .. } => {
+                    invalid(format!("no symbol `{name}` in the graph"))
+                }
+                other => internal(other),
+            })?;
+            if found.len() > 1 {
+                let list: Vec<String> = found
+                    .iter()
+                    .map(|n| format!("{} ({}:{})", n.qualified_name, n.path, n.start_line))
+                    .collect();
+                return Err(invalid(format!(
+                    "`{symbol}` is ambiguous; name one of: {}",
+                    list.join(", ")
+                )));
+            }
+            found.truncate(1);
+            found
+        }
+        // A crate-relative path several crates hold: its input to fix.
+        Err(e @ kgraf_graph::GraphError::AmbiguousSymbol { .. }) => {
+            return Err(invalid(e.to_string()));
+        }
+        Err(other) => return Err(internal(other)),
+    };
+    found
         .into_iter()
         .next()
         .ok_or_else(|| invalid(format!("no symbol `{symbol}` in the graph")))
@@ -124,8 +145,9 @@ impl Tool for GraphSliceTool {
         ToolDefinition {
             name: TOOL.into(),
             description: "Read a symbol and its neighborhood (enclosing element, callees, \
-                callers, siblings) from the code graph. The graph is indexed before the run; \
-                slices of files you have changed may be stale."
+                callers, siblings) from the code graph. Names that work: `name`, `Type.method` or \
+                `Type::method`, `crate::name`, `path/to/file.rs::name`. The graph is indexed \
+                before the run; slices of files you have changed may be stale."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -272,6 +294,31 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(tool.access(&json!({"symbol": "a::alpha"})).is_ok());
+    }
+
+    /// `path::name` resolves to the one symbol in that file; a bare stem held
+    /// by two files, or a path part shared by two, is refused with both.
+    #[tokio::test]
+    async fn a_path_qualified_name_resolves_and_an_ambiguous_one_lists_candidates() {
+        let (_dir, tool) = indexed(&[
+            ("a/src/lib.rs", "pub fn alpha() {}\n"),
+            ("b/src/lib.rs", "pub fn alpha() {}\n"),
+            ("b/src/util.rs", "pub fn beta() {}\n"),
+        ]);
+        let access = tool
+            .access(&json!({"symbol": "a/src/lib.rs::alpha"}))
+            .expect("one file");
+        assert!(access.reads_paths().contains(Path::new("a/src/lib.rs")));
+        assert!(tool.access(&json!({"symbol": "util"})).is_ok());
+        for name in ["src/lib.rs::alpha", "lib"] {
+            match tool.access(&json!({"symbol": name})) {
+                Err(ToolError::InvalidInput { reason, .. }) => assert!(
+                    reason.contains("a/src/lib.rs") && reason.contains("b/src/lib.rs"),
+                    "{name}: {reason}"
+                ),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 
     /// The slice text comes from the graph, but a hard-linked source file is

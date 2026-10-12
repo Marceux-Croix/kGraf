@@ -49,6 +49,7 @@ mod fence;
 mod handle;
 mod inject;
 mod masking;
+mod pasted_patch;
 mod paths;
 mod permission_resolver;
 mod prefix;

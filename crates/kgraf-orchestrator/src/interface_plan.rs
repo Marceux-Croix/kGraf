@@ -601,6 +601,15 @@ pub fn unbound_reason(open: &[(String, Vec<String>)]) -> String {
     )
 }
 
+/// The refusal of an interface that gives no tests file.
+pub fn no_tests_problem(id: &str) -> String {
+    format!(
+        "interface `{id}` has no tests files: give a test file that fails against the stub \
+         and passes against the reference; a test file the repository already has may be \
+         named by path alone ({{\"path\":\"...\"}}) when it does this"
+    )
+}
+
 /// What an interface lacks before it can be checked, each said as what to
 /// give: the artifact check's findings, written for the planner. `writes`
 /// gives a party's declared writes, `None` for a party outside this answer.
@@ -643,11 +652,7 @@ pub fn shape_problems(
         }
     }
     if ic.tests.is_empty() {
-        out.push(format!(
-            "interface `{id}` has no tests files: give a test file that fails against the stub \
-             and passes against the reference; a test file the repository already has may be \
-             named by path alone ({{\"path\":\"...\"}}) when it does this"
-        ));
+        out.push(no_tests_problem(id));
     }
     for (what, argv) in [("compile", &ic.compile), ("test", &ic.test)] {
         if argv.first().is_none_or(|p| p.trim().is_empty()) {

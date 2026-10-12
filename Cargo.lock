@@ -3437,6 +3437,7 @@ dependencies = [
  "kgraf-tbench-bridge",
  "kgraf-tools",
  "libc",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

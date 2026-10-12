@@ -21,9 +21,9 @@ use kgraf_core::{AgentId, RunId};
 use kgraf_orchestrator::{
     Basis, Challenge, Challenger, CheckStage, ConsumerTestRequest, ConsumerTestWriter,
     ContractChecks, ContractControl, ContractEvent, ContractReply, CostBasis, Evidence,
-    FileOverlay, GitStubLander, HandshakeFinding, InterfaceContract, ModelCaller, ModelHandshaker,
-    ModelReviewer, Orchestrator, OrchestratorHandle, PlanError, Resolution, Revision,
-    RevisionClass, RunReport, RunStatus, StubLander, StubScope, TraceEvent, TraceLog,
+    FileOverlay, GitStubLander, HandshakeFinding, InterfaceContract, ManualClock, ModelCaller,
+    ModelHandshaker, ModelReviewer, Orchestrator, OrchestratorHandle, PlanError, Resolution,
+    Revision, RevisionClass, RunReport, RunStatus, StubLander, StubScope, TraceEvent, TraceLog,
 };
 use kgraf_sandbox::{Identity, MergeBack, WorkspaceManager};
 use std::path::Path;
@@ -1966,6 +1966,368 @@ async fn after_three_asks_a_failing_interface_is_counted_unchecked_and_the_run_g
             .notices
             .iter()
             .any(|n| n.contains("contract checks did not run for cons <- prod")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// `py_ic` without a tests file, and a compile command that needs none: the
+/// only thing wrong with it is the missing test.
+fn no_tests_ic() -> InterfaceContract {
+    let mut ic = py_ic();
+    ic.tests.clear();
+    ic.compile = s(&[py(), "-c", "import consumer"]);
+    ic
+}
+
+/// A planner that answers `answers[0]` to the contracts ask and the first
+/// interface ask, then one answer per ask in order, the last one for every ask
+/// after.
+fn answers_in_turn(answers: Vec<String>) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    move |_: &str| {
+        let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        answers[n.saturating_sub(1).min(answers.len() - 1)].clone()
+    }
+}
+
+/// A planner that leaves out the tests file twice is not asked a third time:
+/// the interface is kept as compile-only (the consumers compile against the
+/// stub), the edge is counted as not run, and a notice names the interface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tests_file_missing_in_two_asks_ends_in_a_compile_only_interface() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&no_tests_ic()),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "the contracts ask and two interface asks, no third"
+    );
+    assert!(prompts[2].contains("no tests files"), "{}", prompts[2]);
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.compile_only_registered),
+        (1, 1),
+        "{report:?}"
+    );
+    assert_eq!((c.unchecked_edges, c.checks_not_run), (1, 1), "{report:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains("`config`")
+            && n.contains("missing tests file twice")
+            && n.contains("compile-only")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// Two asks refused for the same reason that a tests file cannot cure end the
+/// interface call: the edge is unchecked with that reason, and there is no
+/// third ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_other_reason_twice_ends_unchecked_with_no_third_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut no_symbols = py_ic();
+    no_symbols.symbols.clear();
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&no_symbols),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(rig.parts.planner.prompts().len(), 3, "no third ask");
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.unchecked_edges),
+        (0, 1),
+        "{report:?}"
+    );
+    let reason = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the edge is recorded");
+    assert!(
+        reason.contains("repeated an answer refused for the same reason")
+            && reason.contains("has no symbols"),
+        "{reason}"
+    );
+}
+
+/// Two asks refused for different reasons are the planner making progress:
+/// the third ask is made, and its good answer is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn different_reasons_in_two_asks_still_get_the_third_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut no_symbols = py_ic();
+    no_symbols.symbols.clear();
+    let rig = Rig::with_planner(
+        dir.path(),
+        answers_in_turn(vec![
+            plan_with(&no_tests_ic()),
+            plan_with(&no_symbols),
+            plan_with(&py_ic()),
+        ]),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        4,
+        "the contracts ask and three interface asks"
+    );
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interfaces_registered, c.compile_only_registered),
+        (1, 0),
+        "{report:?}"
+    );
+    assert_eq!(c.unchecked_edges, 0, "{report:?}");
+}
+
+/// A planner whose every ask takes `ask_ms` on `clock` (a clock the test moves,
+/// so the budget is exercised without sleeping) and answers with `answers`
+/// as [`answers_in_turn`] does.
+fn slow_planner(
+    clock: Arc<ManualClock>,
+    ask_ms: i64,
+    answers: Vec<String>,
+) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    let answer = answers_in_turn(answers);
+    move |prompt: &str| {
+        clock.advance(ask_ms);
+        answer(prompt)
+    }
+}
+
+/// An orchestrator on `clock`, with the run's time limit set to `limit`.
+fn orchestrator_on(rig: &Rig, clock: Arc<ManualClock>, limit: Option<Duration>) -> Orchestrator {
+    let mut services = rig.parts.services(WINDOW);
+    services.clock = clock;
+    let mut cfg = config();
+    cfg.time_limit = limit;
+    Orchestrator::new(cfg, services)
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks(vec![]))
+        .expect("contracts")
+}
+
+/// A plan whose interface has no symbols: refused on every ask, for a reason
+/// the planner is told and does not cure.
+fn refused_forever() -> String {
+    let mut no_symbols = py_ic();
+    no_symbols.symbols.clear();
+    plan_with(&no_symbols)
+}
+
+/// With a time limit and slow planner asks, the interface asks stop at the
+/// planner budget: a 9 s limit gives 2.7 s, each ask takes 1 s, so the
+/// contracts ask and the first interface ask are made (2 s spent, 3 s expected
+/// at the second, past the budget) and the second is not. The run goes on with
+/// the edge unchecked, a notice names the budget, and the skip is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_planner_asks_stop_the_interface_asks_at_the_budget() {
+    let dir = tempfile::tempdir().expect("dir");
+    let clock = Arc::new(ManualClock::new(1_000_000));
+    let rig = Rig::with_planner(
+        dir.path(),
+        slow_planner(clock.clone(), 1_000, vec![refused_forever()]),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(9)))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "the contracts ask and one interface ask, no second"
+    );
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interface_asks, c.planner_budget_skips, c.unchecked_edges),
+        (1, 1, 1),
+        "{report:?}"
+    );
+    assert_eq!(c.checks_not_run, 1, "the edge is counted as not run");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("planner time budget") && n.contains("interfaces")),
+        "{:?}",
+        report.notices
+    );
+    let events = rig.contract_events().await;
+    let reason = events
+        .iter()
+        .find_map(|e| match e {
+            ContractEvent::Unchecked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the edge is recorded");
+    assert!(
+        reason.contains("behavior check not run:") && reason.contains("the planner time budget"),
+        "{reason}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ContractEvent::PlannerBudgetSkipped { phase, budget_ms: 2_700, .. } if phase == "interfaces"
+    )));
+}
+
+/// The same run with no limit is unchanged: both interface asks are made (the
+/// second ends the call on the repeated reason) and nothing is skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_time_limit_the_interface_asks_are_not_held_back() {
+    let dir = tempfile::tempdir().expect("dir");
+    let clock = Arc::new(ManualClock::new(1_000_000));
+    let rig = Rig::with_planner(
+        dir.path(),
+        slow_planner(clock.clone(), 1_000, vec![refused_forever()]),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = orchestrator_on(&rig, clock, None)
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(rig.parts.planner.prompts().len(), 3, "no ask is held back");
+    assert_eq!(report.contracts.planner_budget_skips, 0, "{report:?}");
+    assert!(
+        report
+            .notices
+            .iter()
+            .all(|n| !n.contains("planner time budget")),
+        "{:?}",
+        report.notices
+    );
+}
+
+/// The contracts ask is never skipped, whatever the budget: with a 1 s limit
+/// (0.3 s budget) and asks of 1 s, a refused first answer is asked again and
+/// the plan is taken. Only the interface ask, which is optional, is skipped (the
+/// plan has no consumed edge, so there is none to leave unchecked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_contracts_ask_is_never_skipped_by_the_budget() {
+    let dir = tempfile::tempdir().expect("dir");
+    let clock = Arc::new(ManualClock::new(1_000_000));
+    let rig = Rig::with_planner(
+        dir.path(),
+        {
+            let good = plan_with(&py_ic());
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let advance = clock.clone();
+            move |_: &str| {
+                advance.advance(1_000);
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    "this is not JSON".to_owned()
+                } else {
+                    good.clone()
+                }
+            }
+        },
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(1)))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        2,
+        "the refused contracts ask and its re-ask, both made; no interface ask"
+    );
+    let c = &report.contracts;
+    assert_eq!(
+        (c.interface_asks, c.planner_budget_skips, c.unchecked_edges),
+        (0, 1, 0),
+        "{report:?}"
+    );
+}
+
+/// A re-plan is optional: with the budget spent, a plan the gate holds is not
+/// planned again, and the run ends on the hold as it does when no re-plan is
+/// left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replan_is_skipped_when_the_budget_is_spent() {
+    let dir = tempfile::tempdir().expect("dir");
+    let clock = Arc::new(ManualClock::new(1_000_000));
+    let rig = Rig::with_planner(
+        dir.path(),
+        slow_planner(clock.clone(), 1_000, vec![plan_with(&py_ic())]),
+        // The consumer disagrees: the gate holds the plan.
+        |prompt| {
+            if prompt.contains("You are party `cons`") {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing(prompt)
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(9)))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_ne!(report.status, RunStatus::Completed, "{report:?}");
+    assert!(
+        rig.parts
+            .planner
+            .prompts()
+            .iter()
+            .all(|p| !p.contains("before any work started")),
+        "no re-plan ask was made"
+    );
+    assert_eq!(report.contracts.planner_budget_skips, 1, "{report:?}");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("planner time budget") && n.contains("replan")),
         "{:?}",
         report.notices
     );

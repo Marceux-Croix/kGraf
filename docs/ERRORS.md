@@ -176,11 +176,11 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 ### KG-0501 Route Not Ready
 
-**Meaning:** A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.
+**Meaning:** A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start; or the Ollama server is older than the minimum version a model needs.
 
-**Likely cause:** The environment is not fully set up for the routes a run names, or the local model server is not running.
+**Likely cause:** The environment is not fully set up for the routes a run names, the local model server is not running, or the installed Ollama is too old for the model.
 
-**What to do:** Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`), point the route at the server's address with `KGRAF_<ROUTE>_BASE_URL` (for example `KGRAF_OLLAMA_BASE_URL`), or remove the route.
+**What to do:** Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`), point the route at the server's address with `KGRAF_<ROUTE>_BASE_URL` (for example `KGRAF_OLLAMA_BASE_URL`), or remove the route. For an Ollama that is too old, update Ollama or choose another model.
 
 ### KG-0502 Run Not Found
 

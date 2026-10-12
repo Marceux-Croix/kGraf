@@ -43,7 +43,10 @@ use std::time::Duration;
 /// 6. what the command left is removed, descriptor-relative and never through
 ///    a symlink (`MergeBack::discard_leftovers`). New files are reported as
 ///    notices and never merged. A committed file the command changed fails the
-///    verification: the merged tree would differ from the tree it checked.
+///    verification: the merged tree would differ from the tree it checked;
+/// 7. a committed attempt that passed a narrowed cargo check also runs the
+///    checks of the packages that depend on its packages and can build now,
+///    in a throwaway worktree ([`check_dependents`]).
 ///
 /// The commit comes before the check. With the check first, the commit swept
 /// up whatever the check wrote, so the scope check refused the worker for a
@@ -570,6 +573,277 @@ fn on_tip_notice(contract: &str, command: &str, tip: &str) -> String {
         clean(contract),
         clean(command)
     )
+}
+
+/// Output a dependent's failing check keeps. Larger than an attempt's own:
+/// the attribution reads the lines that name files, and a test binary's
+/// panic lines come after its list of tests.
+const DEPENDENT_OUTPUT_CAP: usize = 4_000;
+
+/// What the checks of an attempt's dependent packages said
+/// ([`check_dependents`]; decision 0018, amended 2026-10-12).
+#[derive(Debug, Default)]
+struct DependentsOutcome {
+    /// A failure that is this attempt's: the attempt fails with it.
+    against: Option<String>,
+    /// The commands that passed, recorded in the verdict's `by`.
+    passed: Vec<String>,
+    /// Eligible dependents the cap left out.
+    over_cap: Vec<String>,
+    /// Failures not tied to this attempt, and runs that could not be made.
+    notices: Vec<String>,
+}
+
+/// Run the check of each package that depends on the attempt's packages and
+/// can build now ([`crate::scoped_check::dependents`]), on the attempt merged
+/// onto the integration tip (the attempt itself when the tip has not moved),
+/// in a throwaway worktree. A dependent that fails there runs again at the tip
+/// alone, and the failure counts against the attempt when:
+///
+/// - it passes at the tip: the attempt's change is the only difference; or
+/// - a line new to the output names a file this contract writes and no file
+///   an open contract writes ([`own_file_failure`]): a panic or a compile
+///   error in this contract's own code, reached through the dependent's tests.
+///
+/// Any other failure (a test that fails without the attempt too, failing in
+/// the dependent's own code) may be the fault of merged work this contract
+/// cannot change; failing the attempt for it would retry and hold a worker
+/// that cannot fix it. It is a notice, and the root gate judges the merged
+/// result as before. No error here fails the attempt.
+#[allow(clippy::too_many_arguments)]
+fn check_dependents(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    merge_back: &kgraf_sandbox::MergeBack,
+    contract: &str,
+    attempt: &str,
+    dispatch_base: &str,
+    attempt_root: &Path,
+    denies: &[PathBuf],
+    whole: &str,
+    writes: &[&str],
+    open: &[&str],
+    timeout: Duration,
+    warm: Option<&Path>,
+) -> DependentsOutcome {
+    use crate::scoped_check::{DEPENDENTS_CAP, dependents};
+    let mut out = DependentsOutcome::default();
+    // Read first on the attempt's own tree: most attempts have no eligible
+    // dependent, and then no worktree is made.
+    if dependents(whole, attempt_root, writes, open, DEPENDENTS_CAP)
+        .run
+        .is_empty()
+    {
+        return out;
+    }
+    let not_run = |why: String| {
+        format!(
+            "contract {}: the checks of the packages that depend on its packages did not run: \
+             {why}",
+            clean(contract)
+        )
+    };
+    let tip = match merge_back.integration_tip() {
+        Ok(tip) => tip,
+        Err(e) => {
+            out.notices.push(not_run(format!(
+                "the integration tip could not be read: {e}"
+            )));
+            return out;
+        }
+    };
+    let target = if tip == dispatch_base {
+        attempt.to_owned()
+    } else {
+        match merge_back.trial_merge(&[attempt.to_owned()]) {
+            Ok(kgraf_sandbox::merge::TrialMerge::Clean { commit, .. }) => commit,
+            Ok(kgraf_sandbox::merge::TrialMerge::Conflicted { paths, .. }) => {
+                out.notices.push(not_run(format!(
+                    "the attempt conflicts with the integration tip on {}",
+                    clean(&paths.join(", "))
+                )));
+                return out;
+            }
+            Err(e) => {
+                out.notices.push(not_run(format!(
+                    "the attempt could not be merged onto the integration tip: {e}"
+                )));
+                return out;
+            }
+        }
+    };
+    // (command, output, worktree root) of each failure.
+    let mut failed: Vec<(String, String, PathBuf)> = Vec::new();
+    let ran = with_worktree(manager, &target, |ws| {
+        // Chosen again on the tree that runs: work merged after the dispatch
+        // base can add a dependent or an edge.
+        let chosen = dependents(whole, ws.root(), writes, open, DEPENDENTS_CAP);
+        out.over_cap = chosen.over_cap;
+        for d in chosen.run {
+            match run_confined(
+                ws,
+                manager.repo(),
+                denies,
+                &d.command,
+                timeout,
+                DEPENDENT_OUTPUT_CAP,
+                warm,
+            ) {
+                Ok((true, _)) => out.passed.push(d.command),
+                Ok((false, output)) => failed.push((d.command, output, ws.root().to_path_buf())),
+                Err(e) => out
+                    .notices
+                    .push(not_run(format!("`{}`: {e}", clean(&d.command)))),
+            }
+        }
+    });
+    if let Err(e) = ran {
+        out.notices.push(not_run(e));
+        return out;
+    }
+    if failed.is_empty() {
+        return out;
+    }
+    let short: String = tip.chars().take(12).collect();
+    let failing: Vec<String> = failed.iter().map(|(c, _, _)| clean(c)).collect();
+    let ran = with_worktree(manager, &tip, |ws| {
+        for (command, output, root) in failed {
+            // One failure tied to the attempt fails it; the rest need not run.
+            if out.against.is_some() {
+                break;
+            }
+            let tip_run = run_confined(
+                ws,
+                manager.repo(),
+                denies,
+                &command,
+                timeout,
+                DEPENDENT_OUTPUT_CAP,
+                warm,
+            )
+            .map(|(ok, o)| (ok, o, ws.root().to_path_buf()));
+            judge_dependent(
+                &mut out, contract, &short, writes, open, command, output, root, tip_run,
+            );
+        }
+    });
+    // The worktree could not be made (nothing was judged) or removed.
+    if let Err(e) = ran {
+        out.notices.push(format!(
+            "contract {}: `{}` failed with this attempt; the throwaway worktree at the \
+             integration tip {short}, which tells whether the attempt causes it, failed: {e}; \
+             the attempt is not failed for what was not judged",
+            clean(contract),
+            failing.join("`, `")
+        ));
+    }
+    out
+}
+
+/// Judge one dependent's check that failed with the attempt, by its run at
+/// the integration tip ([`check_dependents`]).
+#[allow(clippy::too_many_arguments)]
+fn judge_dependent(
+    out: &mut DependentsOutcome,
+    contract: &str,
+    short: &str,
+    writes: &[&str],
+    open: &[&str],
+    command: String,
+    output: String,
+    root: PathBuf,
+    tip_run: Result<(bool, String, PathBuf), String>,
+) {
+    let quoted = clean_lines(&output);
+    let own = match &tip_run {
+        Ok((false, tip_out, tip_root)) => {
+            own_file_failure(&output, &[root.as_path()], tip_out, tip_root, writes, open)
+        }
+        _ => None,
+    };
+    match (tip_run, own) {
+        (Ok((true, _, _)), _) => {
+            out.against = Some(format!(
+                "`{}`, the check of a package that depends on this contract's packages, \
+                 fails with this attempt and passes without it (at the integration tip \
+                 {short}), so this attempt's change breaks it: {quoted}",
+                clean(&command)
+            ));
+        }
+        (Ok((false, _, _)), Some(line)) => {
+            out.against = Some(format!(
+                "`{}`, the check of a package that depends on this contract's packages, \
+                 fails with this attempt, and the line `{}` names a file this contract \
+                 writes, so the failure is in this contract's own work: {quoted}",
+                clean(&command),
+                clean(&line)
+            ));
+        }
+        (Ok(_), _) => out.notices.push(format!(
+            "contract {}: `{}`, the check of a package that depends on its packages, fails \
+             with this attempt, and the failure could not be tied to this contract's files \
+             (it fails at the integration tip {short} too, and names no file this contract \
+             writes); the attempt is not failed for it, and the root gate judges the merged \
+             result. It said: {}",
+            clean(contract),
+            clean(&command),
+            quoted
+                .chars()
+                .take(DEFERRED_OUTPUT_CHARS)
+                .collect::<String>()
+        )),
+        (Err(e), _) => out.notices.push(format!(
+            "contract {}: `{}`, the check of a package that depends on its packages, fails \
+             with this attempt, and it could not be run at the integration tip {short} to \
+             tell whether the attempt causes it: {e}; the attempt is not failed for it. It \
+             said: {}",
+            clean(contract),
+            clean(&command),
+            quoted
+                .chars()
+                .take(DEFERRED_OUTPUT_CHARS)
+                .collect::<String>()
+        )),
+    }
+}
+
+/// Run `f` in a throwaway worktree of `commit`, removed on every path.
+fn with_worktree(
+    manager: &kgraf_sandbox::WorkspaceManager,
+    commit: &str,
+    f: impl FnOnce(&kgraf_sandbox::Workspace),
+) -> Result<(), String> {
+    let name = crate::workspaces::harness_worktree_name(crate::workspaces::PROBE_PREFIX);
+    let ws = manager
+        .create(&kgraf_sandbox::WorkspaceSpec {
+            name: &name,
+            base: commit,
+            branch: None,
+        })
+        .map_err(|e| format!("cannot create a worktree at {commit}: {e}"))?;
+    f(&ws);
+    manager
+        .remove(ws)
+        .map_err(|e| format!("cannot remove the worktree at {commit}: {e}"))
+}
+
+/// The verdict's `by` with the dependents' checks that passed, and those the
+/// cap left out, so the record says what judged the attempt.
+fn by_with_dependents(by: String, outcome: &DependentsOutcome) -> String {
+    if outcome.passed.is_empty() && outcome.over_cap.is_empty() {
+        return by;
+    }
+    let mut parts = Vec::new();
+    if !outcome.passed.is_empty() {
+        parts.push(format!("dependents passed: {}", outcome.passed.join(", ")));
+    }
+    if !outcome.over_cap.is_empty() {
+        parts.push(format!(
+            "dependents not run, at most {} per attempt: {}",
+            crate::scoped_check::DEPENDENTS_CAP,
+            outcome.over_cap.join(", ")
+        ));
+    }
+    format!("{by} ({})", parts.join("; "))
 }
 
 /// What a worker checked by the whole command is told about deferral.
@@ -1480,7 +1754,47 @@ impl Verifier for CommandVerifier {
             if !left.changed.is_empty() {
                 return fail(attempt, changed_reason(&command, &left.changed));
             }
+            // Decision 0018, amended 2026-10-12: the earlier behavior
+            // signal. A narrowed check runs only the contract's own package,
+            // which often has no tests, so a semantic defect surfaced only at
+            // the root gate. The packages that depend on this one and can
+            // build now run too; only a failure tied to this attempt fails it.
+            let dependents = match (&commit, &scope) {
+                (Some(sha), crate::scoped_check::Scope::Narrowed { .. })
+                    if deferred.is_none() && contract.gate_commands.is_empty() =>
+                {
+                    let writes: Vec<&str> =
+                        contract.writes.iter().map(|w| w.path.as_str()).collect();
+                    let open: Vec<&str> = unmerged
+                        .iter()
+                        .filter(|o| o.contract != contract.contract)
+                        .flat_map(|o| o.writes.iter().map(|w| w.path.as_str()))
+                        .collect();
+                    check_dependents(
+                        &manager,
+                        &merge_back,
+                        &contract.contract,
+                        sha,
+                        ws.head(),
+                        ws.root(),
+                        &denies,
+                        &whole,
+                        &writes,
+                        &open,
+                        timeout,
+                        warm.as_deref(),
+                    )
+                }
+                _ => DependentsOutcome::default(),
+            };
+            if let Some(reason) = dependents.against.clone() {
+                return fail(
+                    attempt,
+                    format!("`{}` passed, but {reason}", clean(&command)),
+                );
+            }
             let mut notices = worker_notices(attempt.excluded());
+            notices.extend(dependents.notices.iter().cloned());
             if let Some(tip) = &on_tip_passed {
                 notices.push(on_tip_notice(&contract.contract, &command, tip));
             }
@@ -1600,7 +1914,7 @@ impl Verifier for CommandVerifier {
                     ));
                     format!("{command} (deferred to the root gate)")
                 }
-                None => command,
+                None => by_with_dependents(command, &dependents),
             };
             Ok(Verdict::Pass {
                 by: by.clone(),

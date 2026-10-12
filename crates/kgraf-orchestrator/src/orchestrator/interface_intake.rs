@@ -21,6 +21,10 @@
 //!                   notice, not a re-ask
 //!                 --asks spent, or the answer cut off--> every edge no behavior
 //!                   interface binds is recorded as unchecked, with the reason
+//!   next ask --the run's planner time budget is spent, or the ask is expected
+//!             to end past it--> not made; the same unchecked record, with the
+//!             budget as the reason, a notice, and a counted event
+//!             ([`crate::planner_budget`]); no time limit, no such stop
 //! ```
 //!
 //! A behavior check is asked of the planner for a producer only when no
@@ -332,10 +336,13 @@ impl RunLoop {
         // unreconciled (it may have billed), the hold is settled whole, and
         // the loop ends as stopped. Nothing of the answer is used.
         let stop = self.stop_token.clone();
+        let asked_at = self.now();
         let out = tokio::select! {
             out = self.s.decomposer.decompose(request) => Some(out),
             () = stop.cancelled() => None,
         };
+        self.planner_budget
+            .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
         let Some(out) = out else {
             self.stopping = true;
             self.settle_model_tool_calls()?;
@@ -468,6 +475,8 @@ impl RunLoop {
         let mut repeated: BTreeMap<(String, String), String> = BTreeMap::new();
         let mut asked = asked;
         let mut last_refusal: Option<String> = None;
+        // Set when the planner time budget ended the call before its asks ran out.
+        let mut budget_stop: Option<String> = None;
         for ask in 1..=MAX_INTERFACE_ASKS {
             // Nothing to ask: every asked edge is bound, or every consumed edge
             // has its behavior check decided without the planner. A plan with
@@ -477,6 +486,10 @@ impl RunLoop {
                 && previous.is_none()
                 && !(consumers.is_empty() && ask == 1)
             {
+                break;
+            }
+            if let Some(why) = self.planner_budget_gate("interfaces").await? {
+                budget_stop = Some(why);
                 break;
             }
             let request = InterfaceRequest {
@@ -502,7 +515,10 @@ impl RunLoop {
                             &refused_before,
                         )
                         .await?;
-                    refused_before = taken.records;
+                    // Kept across asks: a reason refused in any earlier ask
+                    // counts as told, whichever name the interface had then.
+                    refused_before.extend(taken.records);
+                    accepted.extend(taken.compile_only);
                     for r in taken.repeated {
                         for (consumer, producer) in r.edges {
                             for (c, ps) in &mut asked {
@@ -586,6 +602,17 @@ impl RunLoop {
                     .map_or("no compile check was derived", |d| d.compile_note.as_str());
                 let why = match skipped.get(producer) {
                     Some(why) => format!("behavior check not run: {why}"),
+                    None if budget_stop.is_some() => format!(
+                        "behavior check not run: the interface ask was not made, the planner time budget \
+                         was spent ({}){}",
+                        budget_stop.as_deref().unwrap_or_default(),
+                        last_refusal
+                            .as_deref()
+                            .map_or_else(String::new, |r| format!(
+                                "; the last refusal was: {}",
+                                one_line(r, 600)
+                            ))
+                    ),
                     None if repeated.contains_key(&(consumer.clone(), producer.clone())) => {
                         format!(
                             "behavior check not run: the planner repeated an answer refused for \
@@ -610,6 +637,30 @@ impl RunLoop {
         }
         accepted.extend(behavior);
         Ok(Some((accepted, unchecked)))
+    }
+
+    /// The planner time budget's answer before an optional ask (`phase`:
+    /// `interfaces` or `replan`). `Some(why)`: the ask is not to be made; a
+    /// notice and a counted event have recorded the stop. `None`: ask.
+    pub(super) async fn planner_budget_gate(
+        &mut self,
+        phase: &str,
+    ) -> Result<Option<String>, OrchestratorError> {
+        let Err(over) = self.planner_budget.check() else {
+            return Ok(None);
+        };
+        let why = over.describe();
+        self.intake_notice(kgraf_secrets::scrub_persist_owned(format!(
+            "the planner time budget stopped the {phase} ask: {why}"
+        )));
+        self.contract_event(ContractEvent::PlannerBudgetSkipped {
+            phase: phase.to_owned(),
+            spent_ms: over.spent_ms,
+            budget_ms: over.budget_ms,
+            expected_ms: over.expected_ms,
+        })
+        .await?;
+        Ok(Some(why))
     }
 
     /// A notice of what kGraf derived and what it asks the planner: the
@@ -685,10 +736,13 @@ impl RunLoop {
             .output_limit("interfaces", request.output_cap);
         let reservation = self.reserve_rounds(&basis, input, 0);
         let stop = self.stop_token.clone();
+        let asked_at = self.now();
         let out = tokio::select! {
             out = self.s.decomposer.interfaces(request) => Some(out),
             () = stop.cancelled() => None,
         };
+        self.planner_budget
+            .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
         let Some(out) = out else {
             self.stopping = true;
             self.settle_call(reservation, None)?;
@@ -897,12 +951,76 @@ impl RunLoop {
                     self.intake_notice(note);
                     continue;
                 }
+                // The planner left out the tests file again and nothing else
+                // is wrong: the interface still checks that the consumers
+                // compile against the stub, so it is kept as compile-only.
+                if problems == [interface_plan::no_tests_problem(&ic.id)]
+                    && Taken::repeats(&ic.id, &edges, &problems, previous)
+                {
+                    match self.compile_only_of(&ic, &from_repository).await {
+                        Ok(co) => {
+                            self.intake_notice(kgraf_secrets::scrub_persist_owned(format!(
+                                "interface `{}` was refused for a missing tests file twice; \
+                                 kGraf registers it as a compile-only interface (the consumers \
+                                 compile against the stub, no behavior test), and its behavior \
+                                 check does not run",
+                                ic.id
+                            )));
+                            taken.repeated.push(Repeated {
+                                edges,
+                                reason: kgraf_secrets::scrub_persist_owned(problems.join("; ")),
+                            });
+                            taken.compile_only.push(co);
+                            continue;
+                        }
+                        Err(why) => {
+                            self.intake_notice(kgraf_secrets::scrub_persist_owned(format!(
+                                "interface `{}` could not be kept as compile-only ({why})",
+                                ic.id
+                            )))
+                        }
+                    }
+                }
                 if let Some(note) = taken.refuse(&ic.id, edges, &problems, index, previous) {
                     self.intake_notice(note);
                 }
             }
         }
         Ok(taken)
+    }
+
+    /// `ic` as a compile-only interface: no reference, no test, and its
+    /// compile check run against the stub. `Err`: why it cannot be kept (a
+    /// file named by path alone is missing, a stub path replaces a file
+    /// undeclared, no check base, the compile check fails).
+    async fn compile_only_of(
+        &mut self,
+        ic: &InterfaceContract,
+        from_repository: &[(&'static str, usize)],
+    ) -> Result<InterfaceContract, String> {
+        let mut co = ic.clone();
+        co.kind = crate::checks::InterfaceKind::CompileOnly;
+        co.reference.clear();
+        co.wrong.clear();
+        co.tests.clear();
+        co.test.clear();
+        let mut problems = self.fill_from_repository(&mut co, from_repository).await;
+        problems.extend(self.undeclared_replacements(&co).await);
+        let Some(runner) = self.checks_runner() else {
+            return Err("this run has no check base".to_owned());
+        };
+        if problems.is_empty() {
+            match crate::checks::check_derived_compile(&runner, &co).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(failure)) => problems.push(failure.to_string()),
+                Err(e) => problems.push(e.to_string()),
+            }
+        }
+        if problems.is_empty() {
+            Ok(co)
+        } else {
+            Err(one_line(&problems.join("; "), 600))
+        }
     }
 
     /// Fill into `ic` what kGraf derived for its producer and the answer left
@@ -1584,6 +1702,8 @@ struct Taken {
     /// The interfaces refused for the same reasons as their previous answer:
     /// not asked for again.
     repeated: Vec<Repeated>,
+    /// Interfaces kept as compile-only after a repeated missing tests file.
+    compile_only: Vec<InterfaceContract>,
 }
 
 /// One refused interface, as the next ask compares its answer with it.
@@ -1620,6 +1740,27 @@ impl Taken {
     /// edges), asking again gives the planner nothing it has not been told:
     /// the interface is recorded as repeated and a notice is returned.
     /// Otherwise its reasons go to the next ask.
+    /// Whether every reason of `problems` was already given for the same
+    /// interface in an earlier ask: the same id, or an edge in common (the
+    /// planner renames and regroups interfaces between asks). The reasons of
+    /// every earlier ask count, not only the last.
+    fn repeats(
+        id: &str,
+        edges: &[(String, String)],
+        problems: &[String],
+        previous: &[RefusedRecord],
+    ) -> bool {
+        let told: Vec<&RefusedRecord> = previous
+            .iter()
+            .filter(|r| r.id == id || edges.iter().any(|e| r.edges.contains(e)))
+            .collect();
+        !told.is_empty()
+            && problems.iter().all(|p| {
+                let key = normalized(p, id);
+                told.iter().any(|r| r.reasons.contains(&key))
+            })
+    }
+
     fn refuse(
         &mut self,
         id: &str,
@@ -1629,10 +1770,7 @@ impl Taken {
         previous: &[RefusedRecord],
     ) -> Option<String> {
         let reasons: BTreeSet<String> = problems.iter().map(|p| normalized(p, id)).collect();
-        let before = previous
-            .iter()
-            .find(|r| r.id == id || (!edges.is_empty() && r.edges == edges));
-        if before.is_some_and(|r| reasons.is_subset(&r.reasons)) {
+        if Self::repeats(id, &edges, problems, previous) {
             let reason = kgraf_secrets::scrub_persist_owned(one_line(&problems.join("; "), 600));
             let note = kgraf_secrets::scrub_persist_owned(format!(
                 "interface `{id}` was refused again for the same reason as its previous answer \
@@ -1966,6 +2104,40 @@ mod refusal_memory_tests {
         let both = [no_content("i_a", "x.sh"), no_content("i_a", "y.sh")];
         assert!(taken.refuse("i_a", edges(), &both, 0, &before).is_none());
         assert_eq!(taken.refusals.len(), 2);
+    }
+
+    #[test]
+    fn a_reason_told_in_an_earlier_ask_is_repeated_under_a_new_name_and_edges() {
+        let tests = |id: &str| interface_plan::no_tests_problem(id);
+        let mut taken = Taken::default();
+        let setup = vec![("c3".to_owned(), "c1".to_owned())];
+        assert!(
+            taken
+                .refuse("i_a_c3", setup, &[tests("i_a_c3")], 0, &[])
+                .is_none()
+        );
+        // Ask 2 refuses the same edge for another reason; only that one is the last ask's.
+        let mut second = Taken::default();
+        let setup = vec![("c3".to_owned(), "c1".to_owned())];
+        let other = "interface `i_a_c3` has no symbols: name the items".to_owned();
+        assert!(
+            second
+                .refuse("i_a_c3", setup, &[other], 0, &taken.records)
+                .is_none()
+        );
+        let history: Vec<RefusedRecord> = taken.records.into_iter().chain(second.records).collect();
+        // Ask 3 merges the edges under a new id and says the first reason again.
+        let both = vec![
+            ("c2".to_owned(), "c1".to_owned()),
+            ("c3".to_owned(), "c1".to_owned()),
+        ];
+        assert!(Taken::repeats("i_a", &both, &[tests("i_a")], &history));
+        assert!(!Taken::repeats(
+            "i_a",
+            &both,
+            &[tests("i_a")],
+            &history[1..]
+        ));
     }
 
     #[test]

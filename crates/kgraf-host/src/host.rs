@@ -177,6 +177,11 @@ pub enum Notice {
     /// the run opens, and each worker's shell says it in its first result
     /// and in its description.
     ShellNetworkOpen(String),
+    /// What the run learned of a local route's server from the server itself:
+    /// the Ollama version it reports, that it is older than the version the
+    /// route was last verified with, or that the version could not be learned.
+    /// The sentence is the whole notice; the run goes on.
+    LocalServer(String),
 }
 
 /// Say, once per run, that checks run with the network open: the notice for
@@ -556,6 +561,7 @@ impl Host {
             routing: config.routing,
             // Decision 0094: `--approve-plan`, the command line's only.
             approve_plan: config.approve_plan,
+            time_limit: config.time_limit,
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at
@@ -1350,6 +1356,25 @@ impl Host {
         )
     }
 
+    /// The `ollama` route's server version against the planner's and workers'
+    /// models ([`crate::local_version::check_ollama_versions`]). Fails only for
+    /// a model that needs a newer server; every other finding is a notice.
+    fn check_local_versions(
+        &self,
+        notices: &mut (dyn FnMut(Notice) + Send),
+    ) -> Result<(), NotReady> {
+        let verified = semver::Version::parse(crate::local_version::OLLAMA_VERIFIED_VERSION)
+            .map_err(|e| NotReady::Invalid(e.to_string()))?;
+        crate::local_version::check_ollama_versions(
+            &self.route_set(),
+            &|r| self.in_process.contains_key(r),
+            &|r| self.local_endpoints.get(r).cloned(),
+            REACHABLE_TIMEOUT,
+            &verified,
+            notices,
+        )
+    }
+
     /// The credential of each route of the set, from the environment: the one
     /// readiness fact that can differ between runs of a configured host (a key
     /// removed from the shell), so the per-schedule check.
@@ -1715,6 +1740,9 @@ impl Host {
         // a branch, a worktree or a model call (fail loud), instead of failing
         // every attempt and orchestrator call routed to it.
         self.check_reachable()?;
+        // The Ollama server's own version, once it accepts a connection: a
+        // model it is too old for fails here, not on its first call.
+        self.check_local_versions(notices)?;
         let _claim = BaseBuildClaim::take(&self.base_builds, run.as_str())?;
         let root = self.config.root.as_path();
         let manager = &startup.manager;

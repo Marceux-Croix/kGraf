@@ -289,3 +289,37 @@ Now:
 Tests: `kgraf-runtime` `announce_without_tool_call.rs`, the `compaction.rs` no-change tests,
 `kgraf-host` `each_attempt_gets_a_shell_bound_to_its_own_worktree`, and the adapter wire tests
 in `kgraf-provider-openai` and `kgraf-provider-anthropic`.
+
+## Amendment (2026-10-12): a patch pasted as text is applied as the call
+
+**Evidence.** Several no-change notices in canary runs show the model's reply holding a
+complete `*** Begin Patch ... *** End Patch` block as plain text, with no tool call. The turn
+read as an announcement: the notice cost a round, and the patch was still not applied.
+
+- **The rule** (`WorkerLoop::adopt_pasted_patch`, `kgraf-runtime` `worker.rs`; the block is found
+  by `pasted_patch::single_block`). When a turn ends (`EndTurn` or `StopSequence`) with no tool
+  call and its text holds exactly one complete patch block, and `apply_patch` is registered, the
+  loop adds an `apply_patch` call for that block to the response (id `kgraf-pasted-patch-N`,
+  input `{"patch": BLOCK}`) and ends the turn on a tool call. The call then runs through the
+  same path as a call the model made: the approval chain, the write scope, the ledger, the
+  trace and the stall check. Its result goes back to the model as usual.
+- **Exactly one complete block.** Two blocks, a block with no end line, a begin inside an open
+  block, and a reply that also made a tool call are left as they were. A marker is a whole line,
+  so a patch line that quotes one (`+*** End Patch`) does not close the block. Text around the
+  block (a sentence, a code fence) is left out of the patch.
+- **Only a block that applies now.** The block is checked first with `kgraf_tools::check_applies`:
+  the tool's own parser, path guards and matcher, stopping before the commit pass, so nothing is
+  written. A block that would not apply (an Update that no longer matches, as in a final answer
+  that quotes a patch already applied) is not adopted; the turn is judged as it was before.
+- **Once per turn.** The call is added only to a turn that has no tool call, and adding it gives
+  the turn one. Not on the final round, whose tool calls never run.
+- **It is said.** After the call's result, a `NoticeKind::PatchAsText` notice joins the same
+  turn: "The reply held a patch as text; kGraf applied it as an apply_patch call." The canary
+  counts it as `patch_as_text_applied`, next to `no_change_notices`.
+- **Not changed.** The no-change guard, its bound of two, and the forced tool choice. A block
+  that the tool rejects is rejected as any other call is, with the same help.
+
+Tests: `kgraf-runtime` `tests/patch_pasted_as_text.rs`
+`one_pasted_block_is_applied_as_an_apply_patch_call`, and its counter-cases
+`two_pasted_blocks_are_not_applied`, `a_block_beside_a_tool_call_is_not_applied` and
+`an_unfinished_block_is_not_applied`.

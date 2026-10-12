@@ -56,6 +56,13 @@
 //! too (`verifier.rs`, decision 0018 amended 2026-10-02). The acceptance
 //! command is a root gate in every case ([`with_whole_gate`]).
 //!
+//! **Dependents.** A contract's own package often has no tests, so a narrowed
+//! cargo check is often compile-only. Under cargo, [`dependents`] also names
+//! the packages above the contract's that can build now (no open contract
+//! writes them or anything they build with), at most [`DEPENDENTS_CAP`]; the
+//! verifier runs their checks as an earlier behavior signal (decision 0018,
+//! amended 2026-10-12).
+//!
 //! **Known limit.** Cargo narrows to the package, not further: two contracts in
 //! one crate still see each other's stubs fail that crate's tests.
 
@@ -1179,6 +1186,318 @@ fn cargo_packages(root: &Path) -> BTreeSet<String> {
     out
 }
 
+// -- dependents: an earlier behavior signal (decision 0018, amended 2026-10-12) ------------
+
+/// Dependent packages whose check runs, at most, per attempt. Each costs one
+/// cargo run on the attempt (and one more without it when it fails); the cap
+/// keeps a contract in a widely used crate from paying for every crate above
+/// it.
+pub(crate) const DEPENDENTS_CAP: usize = 2;
+
+/// A workspace package that depends on a contract's packages and can build
+/// now: no open contract writes it or anything it builds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Dependent {
+    pub(crate) package: String,
+    /// The run's command narrowed to the package (`cargo test -p <package>`).
+    pub(crate) command: String,
+}
+
+/// The dependents [`dependents`] chose, and the eligible ones the cap left out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Dependents {
+    pub(crate) run: Vec<Dependent>,
+    pub(crate) over_cap: Vec<String>,
+}
+
+/// One workspace package, as its manifest declares it.
+struct Member {
+    name: String,
+    /// Directory relative to the root, `/`-separated; empty for the root.
+    dir: String,
+    /// Workspace packages it builds with (normal and build dependencies).
+    normal: Vec<String>,
+    /// Workspace packages only its own tests build with.
+    dev: Vec<String>,
+    /// A path dependency that is no package of the tree: it cannot build.
+    unresolved: bool,
+}
+
+/// The packages that depend on the packages of `writes`, directly or through
+/// other packages, and whose check can run on the tree at `root` now, for a
+/// run whose command is a cargo command over the workspace. A package
+/// qualifies when no file of `open` (the files of the plan's other open
+/// contracts) lies in it or in any package it builds with, every path
+/// dependency it builds with is a package of the tree, and no absent open
+/// file is one cargo needs to load the workspace ([`needs_absent`]). A
+/// failure there is then not another contract's missing work.
+///
+/// The order: packages with tests of their own first, then the nearest to
+/// the contract's packages, then by name; at most `cap` are chosen. Any other
+/// command, or an open file at the root (a manifest, a lockfile, cargo's
+/// configuration) that may change every package, chooses none.
+pub(crate) fn dependents(
+    command: &str,
+    root: &Path,
+    writes: &[&str],
+    open: &[&str],
+    cap: usize,
+) -> Dependents {
+    let Ok(Runner::Cargo { drop }) = runner(command, root) else {
+        return Dependents::default();
+    };
+    let own: BTreeSet<String> = writes
+        .iter()
+        .filter_map(|w| cargo_package_of(root, w))
+        .collect();
+    if own.is_empty() {
+        return Dependents::default();
+    }
+    let mut open_packages = BTreeSet::new();
+    for w in open {
+        let w = w.trim_start_matches("./");
+        match cargo_package_of(root, w) {
+            Some(p) => {
+                open_packages.insert(p);
+            }
+            // A root file, or cargo's configuration: it can change any
+            // package, so none is judged before it lands.
+            None if !w.contains('/') || w.starts_with(".cargo/") => {
+                return Dependents::default();
+            }
+            // A file of a package whose manifest is not there yet: no
+            // package of the tree can depend on it by path.
+            None => {}
+        }
+    }
+    let members = cargo_members(root);
+    let by_name: std::collections::BTreeMap<&str, &Member> =
+        members.iter().map(|m| (m.name.as_str(), m)).collect();
+    let mut eligible: Vec<(bool, usize, String)> = Vec::new();
+    for m in &members {
+        if own.contains(&m.name) || open_packages.contains(&m.name) || m.unresolved {
+            continue;
+        }
+        // What `cargo test -p <m>` builds: its dependencies and its own
+        // dev-dependencies, then their dependencies; with the hops to each.
+        let mut hops: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut frontier: Vec<String> = m.normal.iter().chain(&m.dev).cloned().collect();
+        let mut depth = 1;
+        let mut blocked = false;
+        while !frontier.is_empty() && !blocked {
+            let mut next = Vec::new();
+            for name in frontier {
+                if hops.contains_key(&name) {
+                    continue;
+                }
+                hops.insert(name.clone(), depth);
+                match by_name.get(name.as_str()) {
+                    Some(dep) if !dep.unresolved && !open_packages.contains(&dep.name) => {
+                        next.extend(dep.normal.iter().cloned());
+                    }
+                    _ => blocked = true,
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        if blocked {
+            continue;
+        }
+        let Some(nearest) = own.iter().filter_map(|o| hops.get(o)).min().copied() else {
+            continue;
+        };
+        let selected = [format!("package {}", m.name)];
+        let needs_open = open.iter().any(|w| {
+            let w = w.trim_start_matches("./");
+            root.join(w).symlink_metadata().is_err() && needs_absent(command, root, &selected, w)
+        });
+        if needs_open {
+            continue;
+        }
+        eligible.push((!has_tests(&root.join(&m.dir)), nearest, m.name.clone()));
+    }
+    eligible.sort();
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let base: Vec<&str> = tokens.iter().copied().filter(|t| *t != drop).collect();
+    let mut out = Dependents::default();
+    for (_, _, name) in eligible {
+        if out.run.len() < cap {
+            out.run.push(Dependent {
+                command: cargo_part(&base, &name),
+                package: name,
+            });
+        } else {
+            out.over_cap.push(name);
+        }
+    }
+    out
+}
+
+/// Whether the package at `dir` has tests of its own: a `.rs` file under
+/// `tests/`, or a test attribute in its sources. Bounded like the test search.
+fn has_tests(dir: &Path) -> bool {
+    let rs_under = |sub: &str, need_test_attr: bool| {
+        let mut stack = vec![dir.join(sub)];
+        let mut seen = 0usize;
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                seen += 1;
+                if seen > MAX_FILES {
+                    return false;
+                }
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    stack.push(path);
+                } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
+                    let found = !need_test_attr
+                        || std::fs::read_to_string(&path)
+                            .is_ok_and(|t| t.contains("#[test]") || t.contains("::test]"));
+                    if found {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+    rs_under("tests", false) || rs_under("src", true)
+}
+
+/// Every package under `root` with its workspace dependencies, read from the
+/// manifests: a dependency with a `path`, or `workspace = true` where the
+/// root's `[workspace.dependencies]` gives a path. A registry dependency is
+/// not a workspace package and is not read.
+fn cargo_members(root: &Path) -> Vec<Member> {
+    let mut manifests: Vec<(String, String, toml::Table)> = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    let mut seen = 0usize;
+    while let Some(rel) = stack.pop() {
+        let dir = root.join(&rel);
+        if let Some(doc) = std::fs::read_to_string(dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            && let Some(name) = doc
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_owned)
+        {
+            manifests.push((slash(&rel), name, doc));
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_FILES {
+                break;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type().is_ok_and(|k| k.is_dir())
+                && !SKIP_DIRS.contains(&name.as_ref())
+                && !name.starts_with('.')
+            {
+                stack.push(rel.join(name.as_ref()));
+            }
+        }
+    }
+    let names: std::collections::BTreeMap<&str, &str> = manifests
+        .iter()
+        .map(|(dir, name, _)| (dir.as_str(), name.as_str()))
+        .collect();
+    let workspace_paths: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(root.join("Cargo.toml"))
+            .ok()
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            .and_then(|doc| {
+                doc.get("workspace")?
+                    .get("dependencies")?
+                    .as_table()
+                    .cloned()
+            })
+            .map(|deps| {
+                deps.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.get("path")?.as_str()?.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+    let mut out = Vec::new();
+    for (dir, name, doc) in &manifests {
+        let mut member = Member {
+            name: name.clone(),
+            dir: dir.clone(),
+            normal: Vec::new(),
+            dev: Vec::new(),
+            unresolved: false,
+        };
+        fn collect<'a>(t: &'a toml::Table, tables: &mut Vec<(&'static str, &'a toml::Table)>) {
+            for key in [
+                "dependencies",
+                "build-dependencies",
+                "build_dependencies",
+                "dev-dependencies",
+                "dev_dependencies",
+            ] {
+                if let Some(deps) = t.get(key).and_then(|v| v.as_table()) {
+                    tables.push((key, deps));
+                }
+            }
+        }
+        let mut tables = Vec::new();
+        collect(doc, &mut tables);
+        if let Some(targets) = doc.get("target").and_then(|v| v.as_table()) {
+            for t in targets.values().filter_map(|v| v.as_table()) {
+                collect(t, &mut tables);
+            }
+        }
+        for (key, deps) in tables {
+            for (dep, spec) in deps {
+                let path = match spec.get("path").and_then(|p| p.as_str()) {
+                    Some(p) => joined(dir, p),
+                    None if spec.get("workspace").and_then(|w| w.as_bool()) == Some(true) => {
+                        match workspace_paths.get(dep) {
+                            Some(p) => joined("", p),
+                            None => continue,
+                        }
+                    }
+                    None => continue,
+                };
+                match path.as_deref().and_then(|p| names.get(p)) {
+                    Some(n) if key.starts_with("dev") => member.dev.push((*n).to_owned()),
+                    Some(n) => member.normal.push((*n).to_owned()),
+                    None => member.unresolved = true,
+                }
+            }
+        }
+        out.push(member);
+    }
+    out
+}
+
+/// `path` taken from the directory `dir` (both relative to the root), with
+/// `.` and `..` resolved; `None` when it leaves the root.
+fn joined(dir: &str, path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            p => parts.push(p),
+        }
+    }
+    Some(parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +2019,88 @@ mod tests {
         ));
         assert_eq!(parts, ["npm test --workspace=packages/price --if-present"]);
         assert!(!narrowable("npm test --workspace=tools", t.path()));
+    }
+
+    fn pkg(name: &str, deps: &str) -> String {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n{deps}")
+    }
+
+    /// The dependents chosen for a contract in `core`: direct and transitive
+    /// ones, read through `path` and `workspace = true`; tests first, then
+    /// the nearest; never one that builds with an open contract's package or
+    /// an unresolved path; at most the cap.
+    #[test]
+    fn dependents_are_those_that_can_build_now_ordered_and_capped() {
+        let (core, mid, top, side, open, wants_open, ghost) = (
+            pkg("core", ""),
+            pkg("mid", "core = { workspace = true }\n"),
+            pkg("top", "mid = { path = \"../mid\" }\n"),
+            pkg("side", "core = { path = \"../core\" }\n"),
+            pkg("open", ""),
+            pkg(
+                "wants_open",
+                "core = { path = \"../core\" }\nopen = { path = \"../open\" }\n",
+            ),
+            pkg(
+                "ghost",
+                "core = { path = \"../core\" }\nnone = { path = \"../none\" }\n",
+            ),
+        );
+        let t = tree(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"*\"]\n\n[workspace.dependencies]\ncore = { path = \
+                 \"core\" }\n",
+            ),
+            ("core/Cargo.toml", &core),
+            ("core/src/lib.rs", ""),
+            ("mid/Cargo.toml", &mid),
+            ("mid/src/lib.rs", ""),
+            ("top/Cargo.toml", &top),
+            ("top/src/lib.rs", ""),
+            ("top/tests/it.rs", "#[test]\nfn t() {}\n"),
+            ("side/Cargo.toml", &side),
+            (
+                "side/src/lib.rs",
+                "#[cfg(test)]\nmod t {\n    #[test]\n    fn t() {}\n}\n",
+            ),
+            ("open/Cargo.toml", &open),
+            ("open/src/lib.rs", ""),
+            ("wants_open/Cargo.toml", &wants_open),
+            ("wants_open/src/lib.rs", ""),
+            ("wants_open/tests/it.rs", "#[test]\nfn t() {}\n"),
+            ("ghost/Cargo.toml", &ghost),
+            ("ghost/src/lib.rs", ""),
+        ]);
+        let cmd = "cargo test --workspace";
+        let open_files = ["open/src/lib.rs"];
+        let got = dependents(cmd, t.path(), &["core/src/lib.rs"], &open_files, 10);
+        let names: Vec<&str> = got.run.iter().map(|d| d.package.as_str()).collect();
+        // `side` (tests, 1 hop), `top` (tests, 2 hops), `mid` (no tests).
+        assert_eq!(names, ["side", "top", "mid"]);
+        assert_eq!(got.run[0].command, "cargo test -p side");
+        assert!(got.over_cap.is_empty());
+        let capped = dependents(cmd, t.path(), &["core/src/lib.rs"], &open_files, 2);
+        assert_eq!(capped.run.len(), 2);
+        assert_eq!(capped.over_cap, ["mid"]);
+        // An open contract in `mid` blocks `mid` and `top`, which builds it.
+        let blocked = dependents(
+            cmd,
+            t.path(),
+            &["core/src/lib.rs"],
+            &["open/src/lib.rs", "mid/src/lib.rs"],
+            10,
+        );
+        let names: Vec<&str> = blocked.run.iter().map(|d| d.package.as_str()).collect();
+        assert_eq!(names, ["side"]);
+        // A root file of an open contract may change every package: none.
+        let root_open = dependents(cmd, t.path(), &["core/src/lib.rs"], &["Cargo.toml"], 10);
+        assert!(root_open.run.is_empty());
+        // Another runner: none.
+        assert!(
+            dependents("pytest", t.path(), &["core/src/lib.rs"], &[], 10)
+                .run
+                .is_empty()
+        );
     }
 }

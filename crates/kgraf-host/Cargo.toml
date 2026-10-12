@@ -67,6 +67,9 @@ cap-std = "4.0.3"
 # Decision 0087: the root manifest's `[patch]` and `[replace]` tables, read
 # before a fetch. Same version kgraf-shell uses, already in Cargo.lock.
 toml = "1.1.6"
+# The local Ollama server's version against a model's minimum (`local_version`).
+# Same crate the shell uses, already in Cargo.lock.
+semver.workspace = true
 # `limits::UserLimits::default_path`: the per-user settings file the desktop writes.
 directories.workspace = true
 

@@ -133,6 +133,11 @@ pub struct RunConfig {
     /// configuration's `shell_timeout_secs`, itself 600 s when absent.
     #[serde(default, with = "opt_seconds", skip_serializing_if = "Option::is_none")]
     pub shell_timeout: Option<Duration>,
+    /// The run's wall-clock limit (`--time-limit`, in seconds on disk). A
+    /// share of it is the planner's time for the optional asks (interface
+    /// asks, re-plans); `None` holds nothing back.
+    #[serde(default, with = "opt_seconds", skip_serializing_if = "Option::is_none")]
+    pub time_limit: Option<Duration>,
     /// Every agent is an addressable session (decision 0067): registers the
     /// session tools (`ask_user_question`, `spawn_subagent`, `send_message`,
     /// `request_connection`) in every worker environment. **On by default**:
@@ -396,6 +401,7 @@ impl RunConfig {
             check_timeout: defaults::check_timeout(),
             check_compile_timeout: defaults::check_compile_timeout(),
             shell_timeout: None,
+            time_limit: None,
             sessions: defaults::sessions(),
             planner_max_tokens: defaults::planner_max_tokens(),
             planner_reasoning: None,
@@ -680,6 +686,11 @@ impl RunConfig {
                 "--shell-timeout must be at least one second: every worker shell command \
                  would be killed"
                     .into(),
+            ));
+        }
+        if self.time_limit.is_some_and(|t| t.is_zero()) {
+            return Err(Error::Invalid(
+                "--time-limit must be at least one second: the planner would have no time".into(),
             ));
         }
         Ok(())

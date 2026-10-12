@@ -157,3 +157,27 @@ loud, as does a worker-specific byte (`refuse_worker_specific`).
 
 Tests: `a_graph_that_appears_mid_run_replaces_the_shared_prefix_and_says_so` (host),
 `a_replaced_shared_prefix_is_said_in_the_trace` (orchestrator).
+
+## Amendment (2026-10-12): a slice name takes the forms a planner writes
+
+Canary rounds 15 to 26 traced 300 empty graph lookups. The common ones were
+`path::Name` (`iface/src/lib.rs::Order`), `Type::method`
+(`Discount::discount_cents`) and a bare file stem (`lib`). The orchestrator then gave the worker
+whole declared files in place of slices, and workers called `graph_slice` 26 times against 2,512
+file reads. Rust-path lookups (`Type::method`, a crate or module prefix) already resolved; the
+misses were the forms below.
+
+A name the graph does not know is now tried as: `path::Name` and `path::Type::method` (the symbol
+defined in that file; a path part such as `src/lib.rs` may match several files); `Trait::method`
+for a method declared without a body, which the graph holds inside the trait node, so the trait
+is the result; a bare file stem, when one file has it; and a crate prefix that is the package name
+in the crate's manifest. Rules: a type and its `impl` block count as one node; a prefix that names no
+part of the symbol's file matches nothing; a name that matches more than one node gives none, the
+miss stays an `empty_graph_lookup`, and a notice lists the candidates. Names that resolved before
+resolve as before. The `graph_slice` tool takes the same forms and refuses an ambiguous one with the
+candidates.
+
+Not changed: a symbol the task has yet to create is still a miss, and that is correct.
+
+Tests: `resolve_file_forms.rs` (graph), `a_path_and_symbol_name_resolves_without_the_fallback` and
+`a_stem_shared_by_two_files_is_a_miss_that_names_both` (orchestrator).

@@ -86,6 +86,18 @@ pub struct RefusedCall {
 }
 
 impl RefusedCall {
+    /// A shell script refused whole whose commands kGraf cannot name for a
+    /// grant (a construct it does not judge, a path-named shell): no program
+    /// grant covers it, so a report for any program, the shell included,
+    /// would be refused again. Its commands have to run as separate calls.
+    pub fn script_without_grant(&self) -> bool {
+        self.tool == "shell"
+            && !self.whole_tool
+            && self.path.is_none()
+            && !self.held.is_empty()
+            && self.needs.is_empty()
+    }
+
     /// The skill that refused this call, if a skill's `allowed-tools` did:
     /// the name its refusal gives (``... is not permitted by skill `NAME`'s
     /// allowed-tools``) under [`kgraf_tools::SKILLS_POLICY`].
@@ -266,7 +278,10 @@ impl CallCapability {
         call.held = self.held_by_script(&call);
         if !by_rule {
             call.needs = self.needs_for(&call, by);
-            if let Some(first) = call.needs.first()
+            // A script keeps its shell as the capability: it is retried when
+            // every program it held has run ([`RefusedCall::held`]).
+            if call.held.is_empty()
+                && let Some(first) = call.needs.first()
                 && call.capability == self.capability
             {
                 call.capability = first.clone();
@@ -292,10 +307,23 @@ impl CallCapability {
             || !grantable
             || call.whole_tool
             || call.path.is_some()
-            || !call.held.is_empty()
             || self.grant_programs.len() < 2
         {
             return Vec::new();
+        }
+        // A script refused whole: the programs inside it, in script order.
+        // Its shell is left out; a grant of it covers none of them.
+        if !call.held.is_empty() {
+            let mut inside: Vec<String> = Vec::new();
+            for p in &self.grant_programs {
+                if *p != self.capability
+                    && !DIRECTORY_CHANGERS.contains(&p.as_str())
+                    && !inside.contains(p)
+                {
+                    inside.push(p.clone());
+                }
+            }
+            return inside;
         }
         // The program a command-level match named comes first; the rest,
         // innermost first.
@@ -365,6 +393,12 @@ pub fn refusal_hint(can_report: bool) -> &'static str {
          why."
     }
 }
+
+/// Appended to the refusal of a shell script that no grant covers as a whole
+/// ([`RefusedCall::script_without_grant`]): reporting it would ask for a
+/// grant that cannot work.
+pub const SCRIPT_SPLIT_HINT: &str = " This script is not judged command by command, so no \
+     report or grant covers it: split it into separate commands and run each as its own call.";
 
 /// What follows the next step in a refusal a worker sees: the refusal's own
 /// text, as the policy wrote it.
@@ -462,12 +496,27 @@ const MAX_REPORTED_LINES: usize = 3;
 /// The most characters of one refused command line a report quotes.
 const MAX_REPORTED_LINE_CHARS: usize = 160;
 
+/// The text a write-scope refusal carries after the path it names. The worker
+/// writes it; [`RepeatedRefusals`] reads it, so a refusal of another kind
+/// that also names a path (a protected file, a user rule) is not counted as
+/// a scope refusal.
+pub const OUTSIDE_WRITE_SCOPE: &str = "is outside the declared write scope";
+
+fn command_scope() -> String {
+    "command".to_owned()
+}
+
 /// A permission report that kGraf filed for a worker that was refused the
-/// same command line twice and never reported it. At most one per attempt.
+/// same command line, or the same path for its write scope, twice and never
+/// reported it. At most one per attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KgrafShortfall {
-    /// The program the report asks for: the one whose command line was refused
-    /// twice.
+    /// The scope of the report, as `report_shortfall` takes it: `command` for
+    /// a program refused twice, `file` for a path refused twice.
+    #[serde(default = "command_scope")]
+    pub scope: String,
+    /// What the report asks for: the program whose command line was refused
+    /// twice, or the repository path refused twice.
     pub need: String,
     /// The report's reason, which names every refused program and its
     /// command lines. Begins with [`KGRAF_FILED_LEAD`].
@@ -492,17 +541,32 @@ pub struct KgrafShortfall {
 ///   stuck on the refusal. Only the same command line (the same words,
 ///   whitespace aside) refused twice is a worker that will not give up the
 ///   command, so kGraf reports it.
+/// - A shell script (`sh -c`) refused whole files a report for the programs
+///   inside it that a grant must name, the first as `need`, never for the
+///   shell: a grant of `sh` does not lift the refusal. A script kGraf cannot
+///   read command by command counts for nothing; no grant covers it, and the
+///   worker is told to run its commands as separate calls.
 /// - A shell command whose only effect is writing a file inside the worktree
 ///   does not count (the caller skips it): `apply_patch` writes that file, so
 ///   the worker lacks no permission.
+/// - The same repository path refused for the write scope twice in one
+///   attempt counts, whatever tool or content each call carried: the worker
+///   is stuck on a file its contract does not list, so kGraf files a `file`
+///   report for the path. Two different paths refused once each do not.
 /// - Any `report_shortfall` call by the model ends the guard for the attempt.
-/// - It fires once per attempt.
+/// - It fires once per attempt, for a command or a path, whichever repeats
+///   first.
 #[derive(Debug, Default)]
 pub(crate) struct RepeatedRefusals {
+    /// Paths refused for the write scope, in order of first refusal, with
+    /// how many times each was refused.
+    paths: Vec<(String, usize)>,
     /// Per program, in order of first refusal: the command lines refused,
     /// each with its whitespace normalized and not shortened, so two lines
     /// that differ only late compare as different.
-    by_program: Vec<(String, Vec<String>)>,
+    /// For a script refused whole, the other programs it runs that a grant
+    /// must name with the first (the key), in script order.
+    by_program: Vec<(String, Vec<String>, Vec<String>)>,
     model_reported: bool,
     filed: bool,
 }
@@ -515,28 +579,44 @@ impl RepeatedRefusals {
 
     /// A call that ran `programs` finished without error.
     pub(crate) fn ran(&mut self, programs: &[String]) {
-        self.by_program.retain(|(p, _)| !programs.contains(p));
+        self.by_program.retain(|(p, ..)| !programs.contains(p));
     }
 
     /// A call of `tool` was refused: `call` is its record and `lines` its
     /// command lines.
     pub(crate) fn refused(&mut self, tool: &str, call: &RefusedCall, lines: &[String]) {
+        if let Some(path) = &call.path
+            && call.by.is_empty()
+            && !call.whole_tool
+            && call.reason.contains(OUTSIDE_WRITE_SCOPE)
+        {
+            let path = path.trim_start_matches("./");
+            match self.paths.iter_mut().find(|(p, _)| p == path) {
+                Some((_, n)) => *n += 1,
+                None => self.paths.push((path.to_owned(), 1)),
+            }
+            return;
+        }
         let counts = tool == "shell"
             && !call.whole_tool
             && call.path.is_none()
             && call.by != kgraf_tools::permissions::PERMISSION_RULES_HOOK
-            && !call.capability.is_empty();
+            && !call.capability.is_empty()
+            && !call.script_without_grant();
         if !counts {
             return;
         }
-        let entry = match self
-            .by_program
-            .iter()
-            .position(|(p, _)| *p == call.capability)
-        {
+        // A script refused whole is keyed by the first program it runs: a
+        // grant of its shell would not lift the refusal (`sh` never runs the
+        // script's commands), a grant of the programs inside does.
+        let (key, with) = match call.needs.split_first() {
+            Some((first, rest)) if !call.held.is_empty() => (first.clone(), rest.to_vec()),
+            _ => (call.capability.clone(), Vec::new()),
+        };
+        let entry = match self.by_program.iter().position(|(p, ..)| *p == key) {
             Some(i) => &mut self.by_program[i].1,
             None => {
-                self.by_program.push((call.capability.clone(), Vec::new()));
+                self.by_program.push((key, Vec::new(), with));
                 &mut self.by_program.last_mut().expect("just pushed").1
             }
         };
@@ -549,16 +629,18 @@ impl RepeatedRefusals {
         if self.model_reported || self.filed {
             return None;
         }
-        let (need, _) = self.by_program.iter().find(|(_, lines)| {
+        let Some((need, _, with)) = self.by_program.iter().find(|(_, lines, _)| {
             lines
                 .iter()
                 .enumerate()
                 .any(|(i, line)| lines[..i].contains(line))
-        })?;
+        }) else {
+            return self.path_due();
+        };
         let named: Vec<String> = self
             .by_program
             .iter()
-            .map(|(program, lines)| {
+            .map(|(program, lines, _)| {
                 let shown: Vec<String> = lines
                     .iter()
                     .take(MAX_REPORTED_LINES)
@@ -575,11 +657,36 @@ impl RepeatedRefusals {
             })
             .collect();
         Some(KgrafShortfall {
+            scope: command_scope(),
             need: need.clone(),
             why: format!(
                 "{KGRAF_FILED_LEAD}the worker was refused {} and the instruction cannot be done \
                  without it. Refused: {}.",
-                format_args!("`{need}`"),
+                std::iter::once(need)
+                    .chain(with)
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                named.join("; ")
+            ),
+            reply: None,
+        })
+    }
+
+    /// The `file` report for the first path refused for the write scope twice.
+    fn path_due(&self) -> Option<KgrafShortfall> {
+        let (path, _) = self.paths.iter().find(|(_, n)| *n >= 2)?;
+        let named: Vec<String> = self
+            .paths
+            .iter()
+            .map(|(p, n)| format!("`{p}` refused {n} time(s)"))
+            .collect();
+        Some(KgrafShortfall {
+            scope: "file".to_owned(),
+            need: path.clone(),
+            why: format!(
+                "{KGRAF_FILED_LEAD}the worker was refused a write to `{path}` for its write scope \
+                 and the instruction cannot be done without it. Refused: {}.",
                 named.join("; ")
             ),
             reply: None,

@@ -1173,10 +1173,26 @@ impl GraphStore {
         name: &str,
         keep: impl Fn(&NodeRecord) -> bool,
     ) -> Result<Vec<NodeRecord>> {
+        // The directory and file-stem spellings first, as always. Only when
+        // they find nothing is a prefix also read as the package name in the
+        // manifest of the defining file's crate (`fx_counter::Pricing` for a
+        // package `fx-counter` in `crates/counter`), so no earlier result moves.
+        match self.resolve_path_with(name, &keep, false) {
+            Err(GraphError::UnknownSymbol { .. }) => self.resolve_path_with(name, &keep, true),
+            other => other,
+        }
+    }
+
+    fn resolve_path_with(
+        &self,
+        name: &str,
+        keep: &impl Fn(&NodeRecord) -> bool,
+        by_package: bool,
+    ) -> Result<Vec<NodeRecord>> {
         let found: Vec<NodeRecord> = self
             .symbols_named(name)?
             .into_iter()
-            .filter(&keep)
+            .filter(|n| keep(n))
             .collect();
         if !found.is_empty() {
             return Ok(found);
@@ -1205,7 +1221,12 @@ impl GraphStore {
             let found: Vec<NodeRecord> = self
                 .symbols_named(&tail)?
                 .into_iter()
-                .filter(|n| prefix.iter().all(|m| path_names_module(&n.path, m)) && keep(n))
+                .filter(|n| {
+                    prefix.iter().all(|m| {
+                        path_names_module(&n.path, m)
+                            || (by_package && self.package_named(&n.path, m))
+                    }) && keep(n)
+                })
                 .collect();
             if !found.is_empty() {
                 return Ok(found);
@@ -1214,6 +1235,139 @@ impl GraphStore {
         Err(GraphError::UnknownSymbol {
             name: name.to_owned(),
         })
+    }
+
+    /// Whether the crate holding `path` declares the package `name` (`-` and
+    /// `_` alike) in its `Cargo.toml`.
+    fn package_named(&self, path: &str, name: &str) -> bool {
+        let Some(dir) = self.crate_dir(path) else {
+            return false;
+        };
+        let Ok(manifest) = std::fs::read_to_string(self.root.join(dir).join("Cargo.toml")) else {
+            return false;
+        };
+        let mut in_package = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_package = line == "[package]";
+            } else if in_package
+                && let Some(value) = line
+                    .strip_prefix("name")
+                    .map(str::trim_start)
+                    .and_then(|r| r.strip_prefix('='))
+            {
+                let package = value.trim().trim_matches('"');
+                return package.replace('-', "_") == name.replace('-', "_");
+            }
+        }
+        false
+    }
+
+    /// `Trait::method` (with any crate or module prefix) for a method the
+    /// trait declares without a body. The graph holds a trait's bodyless
+    /// method signatures inside the trait node, not as nodes of their own, so
+    /// the trait is the smallest node that holds the method. Only traits whose
+    /// source declares `fn method` are returned.
+    fn trait_method_form(&self, name: &str) -> Result<Vec<NodeRecord>> {
+        let segments: Vec<&str> = name.split("::").map(str::trim).collect();
+        let [prefix @ .., holder, method] = segments.as_slice() else {
+            return Ok(Vec::new());
+        };
+        if holder.is_empty() || method.is_empty() || prefix.iter().any(|s| s.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let declares = |source: &str| {
+            let needle = format!("fn {method}");
+            source.match_indices(&needle).any(|(at, _)| {
+                !source[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        };
+        let mut found = Vec::new();
+        for n in self.symbols_named(holder)? {
+            let in_prefix = prefix
+                .iter()
+                .all(|m| path_names_module(&n.path, m) || self.package_named(&n.path, m));
+            if n.kind == NodeKind::Trait
+                && in_prefix
+                && self.source_of(&n).is_ok_and(|text| declares(&text))
+            {
+                found.push(n);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The nodes a name written against a file resolves to, for a name
+    /// [`GraphStore::resolve_symbol`] does not know:
+    ///
+    /// - `path::Name`, `path::Type::method`: the symbol defined in that file.
+    ///   `path` is an indexed file path, or a trailing part of one that starts
+    ///   at a folder (`src/lib.rs`), which several files may share.
+    /// - `Trait::method` for a method the trait declares without a body: the
+    ///   trait, which holds the signature.
+    /// - a bare file stem (`lib`): the file node of every file with that stem.
+    ///
+    /// Every candidate is returned. A caller that needs one takes it only when
+    /// exactly one comes back: a type and its `impl` block count as one (the
+    /// `impl` is dropped when the type is there), and two files that share a
+    /// stem or a symbol are an ambiguity the caller reports, never a pick.
+    /// [`GraphError::UnknownSymbol`] when nothing matches. A path that names a
+    /// file other than the symbol's matches nothing.
+    pub fn resolve_file_form(&self, name: &str) -> Result<Vec<NodeRecord>> {
+        let unknown = || GraphError::UnknownSymbol {
+            name: name.to_owned(),
+        };
+        let name = name.trim();
+        let mut found: Vec<NodeRecord> = Vec::new();
+        if let Some((path, rest)) = name.split_once("::") {
+            let path = path.trim().trim_start_matches("./");
+            let rest: Vec<&str> = rest.split("::").map(str::trim).collect();
+            if path.is_empty() || rest.iter().any(|s| s.is_empty()) {
+                return Err(unknown());
+            }
+            let files: Vec<String> = self
+                .file_paths()?
+                .into_iter()
+                .filter(|f| f == path || f.ends_with(&format!("/{path}")))
+                .collect();
+            if files.is_empty() {
+                return self
+                    .trait_method_form(name)
+                    .and_then(|f| if f.is_empty() { Err(unknown()) } else { Ok(f) });
+            }
+            found = self
+                .symbols_named(&rest.join("."))?
+                .into_iter()
+                .filter(|n| n.kind != NodeKind::File && files.contains(&n.path))
+                .collect();
+            if found.iter().any(|n| n.kind != NodeKind::Impl) {
+                found.retain(|n| n.kind != NodeKind::Impl);
+            }
+            if found.is_empty() {
+                found = self.trait_method_form(&rest.join("::"))?;
+                found.retain(|n| files.contains(&n.path));
+            }
+        } else if !name.is_empty() && !name.contains(['/', '.', ' ']) {
+            for path in self.file_paths()? {
+                let stem = Path::new(&path).file_stem().and_then(|s| s.to_str());
+                if stem == Some(name)
+                    && let Some(file) = self
+                        .nodes_in_file(&path)?
+                        .into_iter()
+                        .find(|n| n.kind == NodeKind::File)
+                {
+                    found.push(file);
+                }
+            }
+        }
+        if found.is_empty() {
+            return Err(unknown());
+        }
+        Ok(found)
     }
 
     /// Nodes whose qualified name or bare name is exactly `name`, the exact
