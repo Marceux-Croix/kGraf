@@ -210,3 +210,26 @@ has a verified form, and every answer to it is checked.
 Tests: `kgraf-runtime` `worker_loop.rs` (`a_reasoning_only_turn_is_followed_by_a_request_with_reasoning_off`,
 `a_route_without_an_off_level_keeps_the_empty_turn_behavior`,
 `the_next_attempt_starts_at_the_configured_reasoning_level`).
+
+### Addition (2026-10-12): a route that ignores the fallback
+
+The bullet above about a server that ignores the off request holds for a level the user
+configured. It does not hold for the worker's own fallback. A server that answers the fallback
+request with reasoning anyway has made no configuration error: nothing was set for the route.
+
+- When the request that carried the fallback `off` is answered with reasoning
+  (`ReasoningNotOff`), the worker does not fail the call with that error. The call is billed and
+  recorded as usual. The worker emits a `ReasoningOffIgnored` notice ("the route ignored the
+  reasoning-off fallback; the empty-turn handling continues"), drops the fallback for the
+  attempt, and ends the attempt with the empty-turn reason: that answer is the second empty turn
+  in a row.
+- The route is remembered for the rest of the run. The flag lives on the worker environment,
+  which every worker dispatched to one vendor and model shares, so no later attempt on that
+  route tries the fallback again. It is not kept across runs.
+- A configured worker-round level of `off` is unchanged: an ignored request still fails with
+  `ReasoningNotOff`, naming the setting.
+
+Tests: `kgraf-runtime` `worker_loop.rs`
+(`a_route_that_ignores_the_reasoning_off_fallback_ends_as_an_empty_turn`,
+`a_configured_off_that_is_ignored_still_fails_with_reasoning_not_off`; the working fallback is
+`a_reasoning_only_turn_is_followed_by_a_request_with_reasoning_off`).

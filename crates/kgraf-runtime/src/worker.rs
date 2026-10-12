@@ -175,6 +175,7 @@ use kgraf_tools::{
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// How the loop calls the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +311,11 @@ pub struct WorkerEnv {
     /// runs, for the run's `report_shortfall` (decision 0093). `None`: no
     /// tool reads them.
     pub refusals: Option<Arc<crate::shortfall::RefusalDirectory>>,
+    /// Set once this route has ignored the worker's own reasoning-off
+    /// fallback (it answered with reasoning anyway). The env is shared by every
+    /// worker dispatched to the route, so no later attempt tries the fallback
+    /// again. Never set by a configured `off`, which stays a hard failure.
+    pub reasoning_off_ignored: AtomicBool,
 }
 
 impl WorkerEnv {
@@ -336,6 +342,7 @@ impl WorkerEnv {
             skills: None,
             protected_writes: None,
             refusals: None,
+            reasoning_off_ignored: AtomicBool::new(false),
         }
     }
 }
@@ -940,6 +947,12 @@ enum Halt {
     /// ([`kgraf_provider::ProviderError::ModelOutputMalformed`]). `drive` sends
     /// the round again, a bounded number of times, before it fails the attempt.
     ModelOutputMalformed(String),
+    /// The server ignored the worker's own reasoning-off fallback
+    /// ([`kgraf_provider::ProviderError::ReasoningNotOff`] while
+    /// `Worker::reasoning_off` is set). Not a configuration error: `drive`
+    /// marks the fallback unavailable on the route and ends the attempt as an
+    /// empty turn.
+    ReasoningOffIgnored,
     /// An interrupt-mode message abandoned the round in flight. Not an end:
     /// `drive` appends `RoundAbandoned` and continues to the boundary.
     Abandoned {
@@ -1101,6 +1114,10 @@ pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool 
 /// turn that held reasoning and nothing else.
 pub const REASONING_OFF_NOTICE: &str = "The model ended a turn with reasoning only; the next \
      request runs with reasoning off.";
+
+/// The notice that says the route ignored the reasoning-off fallback.
+pub const REASONING_OFF_IGNORED_NOTICE: &str =
+    "the route ignored the reasoning-off fallback; the empty-turn handling continues";
 
 /// How many times a round is sent again after the server failed to parse the
 /// model's own output. Beyond it the attempt fails, naming the cause. The
@@ -1469,6 +1486,14 @@ impl Worker {
             Err(Halt::Failed(error) | Halt::ModelOutputMalformed(error)) => {
                 (WorkerOutcome::Failed { error }, String::new())
             }
+            // `drive` handles this halt where the round is sent; one reaching
+            // here came from a call made elsewhere, so it is a plain failure.
+            Err(Halt::ReasoningOffIgnored) => (
+                WorkerOutcome::Failed {
+                    error: "the route ignored the reasoning-off fallback".into(),
+                },
+                String::new(),
+            ),
             // `drive` handles every abandon itself; one reaching here is a
             // loop defect, reported rather than read as success (fail loud).
             Err(Halt::Abandoned { .. }) => (
@@ -1558,6 +1583,12 @@ impl Worker {
         }
         if e.is_malformed_model_output() {
             return Halt::ModelOutputMalformed(text);
+        }
+        // Only the fallback sets `reasoning_off`; a configured `off` that the
+        // server ignores stays a failure that names the setting.
+        if self.reasoning_off && matches!(e, kgraf_provider::ProviderError::ReasoningNotOff { .. })
+        {
+            return Halt::ReasoningOffIgnored;
         }
         Halt::Failed(text)
     }
@@ -1929,6 +1960,29 @@ impl Worker {
                     .await?;
                     continue;
                 }
+                Err(Halt::ReasoningOffIgnored) => {
+                    // The call is billed and recorded. The answer was another
+                    // reasoning-only turn, which follows the one that started
+                    // the fallback, so it is the second empty turn in a row.
+                    self.env
+                        .reasoning_off_ignored
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.reasoning_off = false;
+                    self.emit(
+                        ep,
+                        WorkerEvent::Notice {
+                            kind: crate::event::NoticeKind::ReasoningOffIgnored,
+                            text: REASONING_OFF_IGNORED_NOTICE.to_owned(),
+                        },
+                    )
+                    .await?;
+                    return Err(Halt::Failed(
+                        "the model ended its turn with no tool call and no answer twice in a \
+                         row, after being told to continue (reasoning only: true; the route \
+                         ignored the reasoning-off fallback)"
+                            .into(),
+                    ));
+                }
                 other => other?,
             };
             self.malformed_retries = 0;
@@ -2076,6 +2130,10 @@ impl Worker {
                     // runs with it off. That gets one more continuation even
                     // after an earlier empty turn, as it changes the request.
                     let turn_off = !self.reasoning_off
+                        && !self
+                            .env
+                            .reasoning_off_ignored
+                            .load(std::sync::atomic::Ordering::Relaxed)
                         && !response.reasoning().trim().is_empty()
                         && self.env.provider.turns_reasoning_off()
                         && self

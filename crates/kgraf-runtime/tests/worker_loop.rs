@@ -102,6 +102,9 @@ struct Fake {
     counts_delivery: bool,
     /// What `Provider::turns_reasoning_off` answers.
     turns_off: bool,
+    /// Whether an answer to a reasoning-off request that holds reasoning is
+    /// refused after it is settled, as the Chat Completions adapter does.
+    checks_off: bool,
 }
 
 impl Fake {
@@ -114,6 +117,23 @@ impl Fake {
             resends_reasoning: false,
             counts_delivery: false,
             turns_off: true,
+            checks_off: false,
+        })
+    }
+
+    /// A route that can turn reasoning off, ignores the request, and checks
+    /// every answer to it: a server that does not know the setting.
+    fn turning_off_but_ignoring(
+        script: impl Fn(&Request) -> Round + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            script: Box::new(script),
+            requests: Mutex::new(Vec::new()),
+            streams: false,
+            resends_reasoning: false,
+            counts_delivery: false,
+            turns_off: true,
+            checks_off: true,
         })
     }
 
@@ -125,6 +145,7 @@ impl Fake {
             resends_reasoning: false,
             counts_delivery: false,
             turns_off: false,
+            checks_off: false,
         })
     }
 
@@ -138,6 +159,7 @@ impl Fake {
             resends_reasoning: false,
             counts_delivery: true,
             turns_off: false,
+            checks_off: false,
         })
     }
 
@@ -150,6 +172,7 @@ impl Fake {
             resends_reasoning: true,
             counts_delivery: false,
             turns_off: false,
+            checks_off: false,
         })
     }
 
@@ -235,7 +258,11 @@ impl Provider for Fake {
         }
         tokio::time::sleep(round.delay).await;
         token.settle(&round.usage, None)?;
-        Ok(response(request, &round))
+        let answer = response(request, &round);
+        if self.checks_off {
+            kgraf_provider::check_reasoning_off("fake", request, &answer)?;
+        }
+        Ok(answer)
     }
 
     fn capabilities(&self) -> Capabilities<'_> {
@@ -5246,5 +5273,85 @@ async fn the_next_attempt_starts_at_the_configured_reasoning_level() {
     assert_eq!(
         efforts_of(&provider),
         vec![Some(Medium), Some(Off), Some(Medium), Some(Off)]
+    );
+}
+
+fn notices_of(events: &[WorkerEvent], wanted: NoticeKind) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, WorkerEvent::Notice { kind, .. } if *kind == wanted))
+        .count()
+}
+
+/// The stub shape: every answer is reasoning only, and the server ignores the
+/// reasoning-off request. The fallback was the worker's own, so the attempt
+/// ends with the empty-turn reason, with one "ignored the fallback" notice,
+/// and not with `ReasoningNotOff`. The route is then remembered: a later
+/// attempt on the same environment does not try the fallback again.
+#[tokio::test]
+async fn a_route_that_ignores_the_reasoning_off_fallback_ends_as_an_empty_turn() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::turning_off_but_ignoring(|_| reasoning_only());
+    let env = Arc::new(medium_env(provider.clone()));
+    let (events, result) = run_one(&env, dir.path()).await;
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => {
+            assert!(error.contains("no tool call and no answer"), "{error}");
+            assert!(
+                !error.contains("ignored the reasoning-off setting"),
+                "{error}"
+            );
+            assert!(!error.contains("Remove the setting"), "{error}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    use kgraf_provider::ReasoningEffort::{Medium, Off};
+    assert_eq!(efforts_of(&provider), vec![Some(Medium), Some(Off)]);
+    assert_eq!(notices_of(&events, NoticeKind::EmptyTurn), 1);
+    assert_eq!(notices_of(&events, NoticeKind::ReasoningOff), 1);
+    assert_eq!(notices_of(&events, NoticeKind::ReasoningOffIgnored), 1);
+    // The ignored answer was billed and recorded: one ledger call per request.
+    assert_eq!(result.calls.len(), 2, "{:?}", result.calls);
+
+    // A later attempt on the same route does not try the fallback again.
+    let (events, result) = run_one(&env, dir.path()).await;
+    assert!(
+        matches!(&result.outcome, WorkerOutcome::Failed { error } if error.contains("no tool call and no answer")),
+        "{result:?}"
+    );
+    assert_eq!(
+        efforts_of(&provider),
+        vec![Some(Medium), Some(Off), Some(Medium), Some(Medium)]
+    );
+    assert_eq!(reasoning_off_notices(&events), 0);
+    assert_eq!(notices_of(&events, NoticeKind::ReasoningOffIgnored), 0);
+}
+
+/// A configured `off` that the server ignores is the user's setting, so the
+/// call still fails with `ReasoningNotOff`, and the fallback is not involved.
+#[tokio::test]
+async fn a_configured_off_that_is_ignored_still_fails_with_reasoning_not_off() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::turning_off_but_ignoring(|_| reasoning_only());
+    let mut env = env_with(provider.clone(), vec![], CallMode::Complete);
+    env.settings.reasoning = kgraf_provider::ReasoningLevels::new().with(
+        kgraf_provider::ReasoningScope::All,
+        kgraf_provider::ReasoningEffort::Off.into(),
+    );
+    let env = Arc::new(env);
+    let (events, result) = run_one(&env, dir.path()).await;
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => {
+            assert!(
+                error.contains("ignored the reasoning-off setting"),
+                "{error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(notices_of(&events, NoticeKind::ReasoningOffIgnored), 0);
+    assert!(
+        !env.reasoning_off_ignored
+            .load(std::sync::atomic::Ordering::Relaxed)
     );
 }

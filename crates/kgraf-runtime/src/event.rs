@@ -252,6 +252,10 @@ pub enum NoticeKind {
     /// off: the rest of the attempt's rounds run with reasoning off. Sent once
     /// an attempt.
     ReasoningOff,
+    /// The route answered the worker's own reasoning-off request with
+    /// reasoning anyway. The fallback is unavailable on this route for the
+    /// rest of the run, and the attempt ends as a second empty turn.
+    ReasoningOffIgnored,
     /// The model ended the attempt as done with no tool call in the whole
     /// attempt although its contract writes files; it was told once to
     /// continue or call `report_shortfall`. A second such end fails the attempt.
