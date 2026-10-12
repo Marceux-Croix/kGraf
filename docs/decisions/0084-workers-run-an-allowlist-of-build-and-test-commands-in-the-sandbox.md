@@ -1102,3 +1102,27 @@ Tests: `kgraf-tools` `an_at_marker_glued_to_its_text_is_read_as_a_context_line`,
 `a_context_with_a_leading_sign_that_is_in_the_file_is_not_stripped`,
 `an_ambiguous_at_marker_is_still_refused`, `the_whole_file_hint_skeleton_replaces_the_file`;
 `kgraf-runtime` `a_third_rejected_patch_on_one_file_names_the_whole_file_route`.
+
+### Addition (2026-10-12): an Add File body with no `+` is read as plain text
+
+In round 24 a worker followed the whole-file hint and wrote the Add File body as plain lines.
+The tool refused it, the worker fell back to a shell heredoc that Manual mode denied, and the
+run blocked.
+
+- **Rule.** In an Add File section where no body line starts with `+`, every body line is
+  content, as written. The section ends at the next line that starts with `***`. The result
+  carries a `note:` saying so.
+- **Blank lines.** A blank line inside the body is a blank line of the file. Blank lines just
+  before the next marker are separators and are dropped.
+- **Lines starting with `***`.** They cannot be content. Such a line ends the section and is
+  refused as a bad hunk header.
+- **Mixed sections** (some lines with `+`, some without) are still refused. A prefixed body is
+  unchanged.
+
+Tests: `kgraf-tools` `an_unprefixed_add_file_body_after_a_delete_replaces_the_file`,
+`an_unprefixed_add_file_alone_creates_the_file_and_drops_trailing_blanks`,
+`a_mixed_add_file_body_is_still_refused`,
+`a_prefixed_add_file_body_is_unchanged_and_carries_no_raw_note`,
+`a_raw_add_file_line_starting_with_stars_ends_the_section_and_is_refused`. The `kgraf-runtime`
+test `a_second_rejected_patch_carries_a_worked_example_for_its_file` now uses a mixed body as its
+rejected patch, since a bare body is no longer rejected.

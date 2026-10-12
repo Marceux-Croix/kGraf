@@ -203,7 +203,7 @@ pub fn whole_file_hint(path: &str) -> String {
     format!(
         "\nThis file has failed to patch repeatedly. You can replace the whole file in one \
          patch: `*** Delete File: {path}` followed by `*** Add File: {path}` with the full new \
-         content, every line starting with `+`:\n*** Begin Patch\n*** Delete File: {path}\n\
+         content, every line starting with `+` (a body with no `+` at all is read as plain text):\n*** Begin Patch\n*** Delete File: {path}\n\
          *** Add File: {path}\n+full new content\n*** End Patch"
     )
 }
@@ -249,6 +249,10 @@ const UNIFIED_NOTE: &str = "note: an `@@ -a,b +c,d @@` header is a unified-diff 
 const GLUED_NOTE: &str = "note: an `@@` marker written with no space before its text (`@@text`) \
      was read as `@@ text`, the `@@` context line";
 
+const RAW_ADD_NOTE: &str = "note: an Add File section had no line starting with '+', so every \
+     line of it was read as content of the new file, as written; write a '+' before each line \
+     of the new file";
+
 /// A patch repaired into the form the parser takes, and a note per repair.
 /// Models send the hunks without the envelope, drop or mangle the end line,
 /// or head a chunk with a unified-diff `@@ -a,b +c,d @@` line. Each repair is
@@ -266,6 +270,13 @@ const GLUED_NOTE: &str = "note: an `@@` marker written with no space before its 
 ///   context is matched against the file, where the file can decide.
 /// - `@@ -a,b +c,d @@ text` in an Update File section becomes `@@ text`
 ///   (`@@` when there is no text).
+/// - An Add File section with no body line starting with `+` holds raw text:
+///   every line up to the next line starting with `***` is content. Blank
+///   lines inside are blank lines of the file; blank lines just before the
+///   next marker are separators and are dropped. A body line that itself
+///   starts with `***` cannot be raw content: it ends the section, and the
+///   parser refuses it as a bad header. A section with any `+` line is left
+///   alone and refused if it also has a bare line.
 fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     let mut notes = Vec::new();
     let first = patch.lines().map(str::trim).find(|l| !l.is_empty());
@@ -313,6 +324,9 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
             notes.push(END_NOTE);
         }
     }
+    if prefix_raw_add_bodies(&mut lines) {
+        notes.push(RAW_ADD_NOTE);
+    }
     let mut in_update = false;
     for line in &mut lines {
         let t = line.trim_end();
@@ -340,6 +354,43 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
         }
     }
     (lines.join("\n"), notes)
+}
+
+/// Gives every line of an all-raw Add File body a `+` (see [`repaired`]).
+/// True when a section was changed.
+fn prefix_raw_add_bodies(lines: &mut Vec<String>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i]
+            .trim_start()
+            .starts_with(parser::ADD_FILE_MARKER.trim_end())
+        {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < lines.len() && !lines[end].trim_start().starts_with("***") {
+            end += 1;
+        }
+        // Blank lines before the next marker separate sections; they are not
+        // a final blank line of the file.
+        let mut body_end = end;
+        while body_end > start && lines[body_end - 1].trim().is_empty() {
+            body_end -= 1;
+        }
+        if body_end > start && lines[start..body_end].iter().all(|l| !l.starts_with('+')) {
+            for l in &mut lines[start..body_end] {
+                l.insert(0, '+');
+            }
+            lines.drain(body_end..end);
+            end = body_end;
+            changed = true;
+        }
+        i = end.max(i + 1);
+    }
+    changed
 }
 
 /// The text of an `@@` line written with no space after the marker
@@ -1807,6 +1858,65 @@ fn a() {
             std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read"),
             "full new content\n"
         );
+    }
+
+    /// Round evidence (pricing_engine): the whole-file route was followed, but
+    /// the Add File body was written without `+`. The body is read as content.
+    #[tokio::test]
+    async fn an_unprefixed_add_file_body_after_a_delete_replaces_the_file() {
+        let patch = "*** Begin Patch\n*** Delete File: src/lib.rs\n*** Add File: src/lib.rs\n\
+                     //! Contract 5 of 6\nuse a::B;\n\nfn price() {\n    1\n}\n*** End Patch";
+        let (out, dir) = run_patch(&[("src/lib.rs", "old\nlines\n")], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("no line starting with '+'"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read"),
+            "//! Contract 5 of 6\nuse a::B;\n\nfn price() {\n    1\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unprefixed_add_file_alone_creates_the_file_and_drops_trailing_blanks() {
+        let patch = "*** Begin Patch\n*** Add File: n.txt\none\n\ntwo\n\n*** Add File: m.txt\n+x\n*** End Patch";
+        let (out, dir) = run_patch(&[], patch).await;
+        out.expect("applies");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
+            "one\n\ntwo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("m.txt")).expect("read"),
+            "x\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_add_file_body_is_still_refused() {
+        let patch = "*** Begin Patch\n*** Add File: n.txt\n+one\ntwo\n*** End Patch";
+        let (out, dir) = run_patch(&[], patch).await;
+        let err = out.expect_err("refused");
+        assert!(err.contains("does not start with '+'"), "{err}");
+        assert!(!dir.path().join("n.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_add_file_body_is_unchanged_and_carries_no_raw_note() {
+        let patch = "*** Begin Patch\n*** Add File: n.txt\n+one\n+\n+++two\n*** End Patch";
+        let (out, dir) = run_patch(&[], patch).await;
+        let text = out.expect("applies");
+        assert!(!text.contains("no line starting with '+'"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
+            "one\n\n++two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_raw_add_file_line_starting_with_stars_ends_the_section_and_is_refused() {
+        let patch = "*** Begin Patch\n*** Add File: n.txt\none\n*** two\n*** End Patch";
+        let (out, dir) = run_patch(&[], patch).await;
+        out.expect_err("refused");
+        assert!(!dir.path().join("n.txt").exists());
     }
 
     /// Round evidence (pricing_engine): `@@ -1,4 +1,4 @@` and
