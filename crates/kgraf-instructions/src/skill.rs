@@ -49,7 +49,7 @@ pub(crate) fn read(candidate: &Candidate) -> Result<(Skill, Vec<Problem>), Probl
         std::fs::read_to_string(&skill_md).map_err(|e| problem(format!("cannot read: {e}")))?;
     let (yaml, body) = split_frontmatter(&text)
         .ok_or_else(|| problem("no YAML frontmatter between `---` lines".to_owned()))?;
-    let frontmatter: serde_json::Value = serde_yaml_ng::from_str(yaml)
+    let frontmatter: serde_json::Value = serde_saphyr::from_str(yaml)
         .map_err(|e| problem(format!("frontmatter is not valid YAML: {e}")))?;
     let map = frontmatter
         .as_object()
@@ -320,5 +320,40 @@ mod tests {
         }
         let problem = result.expect_err("a bundle that cannot be read is not hashed");
         assert!(problem.reason.contains("refs"), "{}", problem.reason);
+    }
+
+    fn read_with_frontmatter(frontmatter: &str) -> Result<(Skill, Vec<Problem>), Problem> {
+        let root = tempfile::tempdir().expect("dir");
+        let dir = skill_dir(root.path());
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\nBody\n"),
+        )
+        .expect("skill");
+        read(&candidate(&dir))
+    }
+
+    #[test]
+    fn frontmatter_anchors_and_aliases_resolve() {
+        let (skill, _) =
+            read_with_frontmatter("name: demo\nbase: &d A demo.\ndescription: *d\n").expect("read");
+        assert_eq!(skill.description, "A demo.");
+    }
+
+    #[test]
+    fn frontmatter_with_a_tab_indent_is_not_valid_yaml() {
+        let problem = read_with_frontmatter("name: demo\nextra:\n\t- a\ndescription: x\n")
+            .expect_err("a tab cannot indent YAML");
+        assert!(
+            problem.reason.contains("not valid YAML"),
+            "{}",
+            problem.reason
+        );
+    }
+
+    #[test]
+    fn empty_frontmatter_is_refused_not_a_panic() {
+        let problem = read_with_frontmatter("").expect_err("no mapping");
+        assert!(!problem.reason.is_empty());
     }
 }

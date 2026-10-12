@@ -9,8 +9,8 @@ into this repository is listed under `third_party/`, each block with its
 
 ## Overview
 
-- Apache License 2.0 (Apache-2.0): 475 crate(s)
-- MIT License (MIT): 168 crate(s)
+- Apache License 2.0 (Apache-2.0): 480 crate(s)
+- MIT License (MIT): 166 crate(s)
 - Unicode License v3 (Unicode-3.0): 23 crate(s)
 - ISC License (ISC): 21 crate(s)
 - BSD 3-Clause "New" or "Revised" License (BSD-3-Clause): 8 crate(s)
@@ -4617,6 +4617,7 @@ Used by:
 
 Used by:
 
+- [annotate-snippets 0.12.16](https://github.com/rust-lang/annotate-snippets-rs)
 - [anstream 1.0.0](https://github.com/rust-cli/anstyle.git)
 - [anstyle-parse 1.0.0](https://github.com/rust-cli/anstyle.git)
 - [anstyle-query 1.1.5](https://github.com/rust-cli/anstyle.git)
@@ -8269,6 +8270,7 @@ Used by:
 - [crossbeam-utils 0.8.23](https://github.com/crossbeam-rs/crossbeam)
 - [displaydoc 0.2.7](https://github.com/yaahc/displaydoc)
 - [either 1.19.0](https://github.com/rayon-rs/either)
+- [encoding_rs_io 0.1.8](https://github.com/BurntSushi/encoding_rs_io)
 - [equivalent 1.0.2](https://github.com/indexmap-rs/equivalent)
 - [errno 0.3.14](https://github.com/lambda-fairy/rust-errno)
 - [euclid 0.20.14](https://github.com/servo/euclid)
@@ -11962,6 +11964,7 @@ Used by:
 - [allocator-api2 0.2.21](https://github.com/zakarumych/allocator-api2)
 - [anyhow 1.0.104](https://github.com/dtolnay/anyhow)
 - [arboard 3.6.1](https://github.com/1Password/arboard)
+- [arraydeque 0.5.1](https://github.com/andylokandy/arraydeque)
 - [async-trait 0.1.92](https://github.com/dtolnay/async-trait)
 - [auto_enums 0.8.10](https://github.com/taiki-e/auto_enums)
 - [aws-credential-types 1.3.0](https://github.com/smithy-lang/smithy-rs)
@@ -11994,6 +11997,7 @@ Used by:
 - [fdeflate 0.3.7](https://github.com/image-rs/fdeflate)
 - [fearless_simd 0.4.1](https://github.com/linebender/fearless_simd)
 - [gl_generator 0.14.0](https://github.com/brendanzab/gl-rs/)
+- [granit-parser 1.3.0](https://github.com/bourumir-wyngs/granit-parser)
 - [guillotiere 0.7.0](https://github.com/nical/guillotiere)
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs)
 - [ident_case 1.0.1](https://github.com/TedDriggs/ident_case)
@@ -12036,6 +12040,7 @@ Used by:
 - [rustversion 1.0.23](https://github.com/dtolnay/rustversion)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [semver 1.0.28](https://github.com/dtolnay/semver)
+- [serde-saphyr 1.3.0](https://github.com/bourumir-wyngs/serde-saphyr)
 - [serde 1.0.229](https://github.com/serde-rs/serde)
 - [serde_core 1.0.229](https://github.com/serde-rs/serde)
 - [serde_derive 1.0.229](https://github.com/serde-rs/serde)
@@ -13659,38 +13664,6 @@ Copyright (c) 1995-2003 by Internet Software Consortium
 Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
 
 THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL ISC BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
-```
-
-### MIT License (MIT)
-
-Used by:
-
-- [serde_yaml_ng 0.10.0](https://github.com/acatton/serde-yaml-ng)
-
-```text
-                                  MIT License
-
-Copyright 2024 Antoine Catton
-Copyright 2016-2024 David Tolnay
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the “Software”), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ```
 
@@ -15541,7 +15514,6 @@ OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 Used by:
 
 - [endi 1.1.1](https://github.com/zeenix/endi)
-- [unsafe-libyaml 0.2.11](https://github.com/dtolnay/unsafe-libyaml)
 - [x11-dl 2.21.0](https://github.com/AltF02/x11-rs.git)
 - [zbus-lockstep-macros 0.5.2](https://github.com/luukvanderduim/zbus-lockstep)
 - [zbus-lockstep 0.5.2](https://github.com/luukvanderduim/zbus-lockstep)

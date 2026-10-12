@@ -140,9 +140,9 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
 ignore = "0.4.33"
-# Maintained fork of the archived serde_yaml; SKILL.md frontmatter is YAML, and a
+# Pure-Rust, panic-free YAML with no unsafe-libyaml; SKILL.md frontmatter is YAML, and a
 # hand-rolled subset parser would misread the files it does not expect.
-serde_yaml_ng = "0.10"
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 trybuild = "1"
 wiremock = "0.6"
 tempfile = "3"

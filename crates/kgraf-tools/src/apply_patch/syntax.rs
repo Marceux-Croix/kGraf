@@ -13,7 +13,7 @@
 //!
 //! Python uses the tree-sitter grammar the graph indexer already builds (its
 //! external scanner tracks INDENT and DEDENT, so an unexpected indent is an
-//! ERROR node). YAML uses `serde_yaml_ng`, already in the workspace. A Makefile
+//! ERROR node). YAML uses `serde-saphyr`, already in the workspace. A Makefile
 //! has no cheap parser here; [`super::reindent`] alone covers it.
 
 use std::path::Path;
@@ -56,11 +56,11 @@ fn first_error(kind: Kind, source: &str) -> Result<Option<usize>, String> {
             Ok(Some(first_error_row(root) + 1))
         }
         Kind::Yaml => {
-            use serde::Deserialize;
-            for doc in serde_yaml_ng::Deserializer::from_str(source) {
-                if let Err(e) = serde_yaml_ng::Value::deserialize(doc) {
-                    return Ok(Some(e.location().map_or(1, |l| l.line())));
-                }
+            // `IgnoredAny` walks every node of every document, so a syntax
+            // error anywhere surfaces without building a value tree.
+            match serde_saphyr::from_multiple::<serde::de::IgnoredAny>(source) {
+                Ok(_) => {}
+                Err(e) => return Ok(Some(e.location().map_or(1, |l| l.line() as usize))),
             }
             Ok(None)
         }
@@ -331,6 +331,31 @@ mod tests {
             first_error(Kind::Yaml, "a: 1\n---\nb: 2\n").expect("runs"),
             None
         );
+    }
+
+    #[test]
+    fn yaml_edge_cases_keep_their_verdicts() {
+        // Anchors and aliases resolve.
+        assert_eq!(
+            first_error(Kind::Yaml, "a: &x 1\nb: *x\n").expect("runs"),
+            None
+        );
+        // An alias to an anchor that was never defined is an error.
+        assert!(first_error(Kind::Yaml, "b: *x\n").expect("runs").is_some());
+        // An error in a later document is found, on its own line.
+        assert_eq!(
+            first_error(Kind::Yaml, "a: 1\n---\nb:\n  c: 1\n    d: 2\n").expect("runs"),
+            Some(5)
+        );
+        // A tab as indentation is an error.
+        assert!(
+            first_error(Kind::Yaml, "a:\n\t- b\n")
+                .expect("runs")
+                .is_some()
+        );
+        // Empty and comment-only files are valid.
+        assert_eq!(first_error(Kind::Yaml, "").expect("runs"), None);
+        assert_eq!(first_error(Kind::Yaml, "# nothing\n").expect("runs"), None);
     }
 
     #[test]
