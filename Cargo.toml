@@ -45,7 +45,7 @@ members = [
     # Harbor shim. Not part of the shipped app; `publish = false` in its own
     # manifest.
     "crates/kgraf-tbench-bridge",
-    # Dev-only: the soak driver the canary's memory-soak scenario runs. Many runs on one
+    # Dev-only: the memory-soak driver. Many runs on one
     # Host in one process, one JSON line of process resources per run. `publish = false`,
     # `dist = false`, same reasoning as kgraf-crosslimit-hammer above.
     "crates/kgraf-soak",

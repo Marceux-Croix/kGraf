@@ -1103,7 +1103,7 @@ mod tests {
         r
     }
 
-    /// Round 10 greenfield: SIGTERM stopped the run after `c1` merged, while
+    /// A new workspace: SIGTERM stopped the run after `c1` merged, while
     /// the worker of `c2` ran; the report said `status Stopped` and
     /// `verified c1`, and named neither `c2` nor the root gate.
     #[test]

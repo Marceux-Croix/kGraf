@@ -552,7 +552,7 @@ impl ScheduleStore {
     }
 
     /// Extend a still-valid claim's lease (a heartbeat, per big-AGI/LibreChat's
-    /// "renewed at half its TTL" pattern, evidence §A6). Fenced the same way as
+    /// "renewed at half its TTL" pattern). Fenced the same way as
     /// `record_outcome`: `claimant` and `generation` must match the occurrence's
     /// current claim, and the lease must not have already expired - a lapsed lease may
     /// already belong to a new claimant by the time this call runs, and renewing it

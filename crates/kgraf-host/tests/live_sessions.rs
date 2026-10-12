@@ -188,7 +188,7 @@ async fn live_run_shows_a_steer_a_question_and_a_subagent() {
         routes.push("openai:gpt-6-luna".to_owned());
     }
     // These are the run's own internal admission
-    // caps, not this exercise's $0.60 real-spend ceiling -- sized generously so
+    // caps, not the final spend assertion -- sized generously so
     // no call is refused for budget, on a dry run of the reservation math in
     // `kgraf-orchestrator/src/sizing.rs` and `orchestrator.rs::reserve_call`:
     //   - A worker dispatch's unmeasured-default reservation (no task history
@@ -473,14 +473,13 @@ async fn live_run_shows_a_steer_a_question_and_a_subagent() {
     );
     let total = Money::from_micros(total_micros);
     println!("total ${:.6}", total_micros as f64 / 1e6);
-    // A fresh $0.60 real-spend ceiling for
-    // this rerun, separate from the first pass's $0.550095. This is the run's *actual* ledger
-    // spend, not the internal caps set above -- every prior run in that first
-    // pass spent well under its own cap (the highest was 24% of cap), so a
-    // generous `cap_run`/`cap_task` does not by itself risk this ceiling.
+    // The run's *actual* ledger spend, not the internal caps set above, is
+    // asserted against 600,000 micro-dollars. Earlier runs spent well under
+    // their own cap (the highest was 24% of cap), so a generous
+    // `cap_run`/`cap_task` does not by itself risk this limit.
     assert!(
         total_micros <= 600_000,
-        "spend cap: ${:.6} exceeds this rerun's $0.60 ceiling",
+        "spend cap: ${:.6} exceeds the 600000 micro-dollar limit",
         total_micros as f64 / 1e6
     );
     let _ = total;

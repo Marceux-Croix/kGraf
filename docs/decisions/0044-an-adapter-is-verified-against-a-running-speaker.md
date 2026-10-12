@@ -57,7 +57,7 @@ that produced it; the next adapter has the same exposure.
 
 **Require a live exchange in the automated test gate.** Puts a network dependency and a large
 model checkpoint in a gate meant to run offline and fast. The live exchange belongs in a
-recorded evidence file instead, dated once.
+recorded exchange file instead, dated once.
 
 **Verify against a running speaker, record it, and add a field-for-field schema test to the
 gate.** Chosen. The gate stays offline and fast; the claim that the shape is right is checked

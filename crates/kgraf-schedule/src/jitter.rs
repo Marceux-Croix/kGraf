@@ -4,9 +4,8 @@
 //! `packages/api/src/schedules/` (MIT), as recorded in
 //! the decision 0055 research notes: "Cron plus
 //! deterministic per-schedule jitter within 120s, so everyone's 9:00 spreads out while
-//! each displayed next-run time stays stable." LibreChat is TypeScript; per that
-//! evidence file's own license note, a cross-language port carries the *idea*, not
-//! copied source. The idea ported here is exactly the two properties named above:
+//! each displayed next-run time stays stable." LibreChat is TypeScript; a cross-language
+//! port carries the *idea*, not copied source. The idea ported here is exactly the two properties named above:
 //! spread (many schedules due at the same instant do not all fire at once) and
 //! stability (the same schedule always gets the same offset, so its displayed next-run
 //! time never jumps between recomputations).

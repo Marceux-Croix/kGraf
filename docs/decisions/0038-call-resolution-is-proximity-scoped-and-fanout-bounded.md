@@ -3,6 +3,7 @@
 **Status:** Accepted. A deliberate exception to decision 0020's "weight, do
 not threshold" principle, argued once and in writing rather than
 re-litigated every time someone reads the constant.
+**Amended by:** 0065 (a call resolves only within its language family)
 **Related:** decisions 0007, 0020
 
 ---

@@ -1,6 +1,7 @@
 # Decision 0048: The registry makes deadlock unconstructible; the orchestrator arbitrates blocks
 
 **Status:** Accepted
+**Amended by:** 0049 (extends the granularity note)
 **Related:** implements decision 0022's lease requirement; decisions 0004, 0007, 0014, 0015,
 0016, 0017, 0024, 0039
 

@@ -150,7 +150,7 @@ async fn live_anthropic_plain_and_streaming_calls_parse_and_price_usage() {
             Protocol::Additive,
             MODEL,
             "live-plain",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let mut request = Request::new(MODEL, "placeholder", 32);
@@ -212,7 +212,7 @@ async fn live_anthropic_plain_and_streaming_calls_parse_and_price_usage() {
             Protocol::Additive,
             MODEL,
             "live-stream",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let mut request = Request::new(MODEL, "placeholder", 32);
@@ -304,7 +304,7 @@ async fn live_anthropic_tool_round_trip_is_accepted() {
             Protocol::Additive,
             MODEL,
             "live-tool-1",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let first = adapter
@@ -347,7 +347,7 @@ async fn live_anthropic_tool_round_trip_is_accepted() {
             Protocol::Additive,
             MODEL,
             "live-tool-2",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let second = adapter
@@ -398,7 +398,7 @@ async fn live_anthropic_prompt_cache_is_read_on_the_second_call() {
             Protocol::Additive,
             MODEL,
             "live-cache-cold",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let cold = adapter
@@ -428,7 +428,7 @@ async fn live_anthropic_prompt_cache_is_read_on_the_second_call() {
             Protocol::Additive,
             MODEL,
             "live-cache-warm",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let warm = adapter

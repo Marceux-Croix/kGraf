@@ -44,8 +44,8 @@ date verified: 2026-09-26
   branch moves, so it does not say what was copied.
 - **paths**: upstream paths, relative to the repository root, comma separated.
 - **license**: the SPDX identifier, read from the upstream repository at that commit
-  on the day of copying. A license recorded in an evidence file is a lead, not a
-  verification (SR-013).
+  on the day of copying. A license recorded in a note is a lead, not a
+  verification.
 - **date verified**: the day the license was read at the source, `YYYY-MM-DD`.
 
 A later refresh from upstream appends a new block; it does not overwrite the old one.

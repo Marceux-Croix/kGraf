@@ -1,6 +1,6 @@
 // Edges: one line-list segment per edge, per-vertex color already scaled by intensity,
 // blended additively, depth tested against the sprite cores but never writing depth
-// (evidence section 4, "Nodes and edges").
+// (the reference's "Nodes and edges" rendering).
 // Written for kGraf: re_renderer's lines.wgsl draws thick quads with caps and joins,
 // which is far more fill than the reference's one-pixel additive segments need.
 

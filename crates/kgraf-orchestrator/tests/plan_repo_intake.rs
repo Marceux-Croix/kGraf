@@ -5,10 +5,10 @@
 //! moved to the contract that needs it, a minimal member source) is repaired
 //! instead, with a trace record and a notice per change, and no ask is spent.
 //!
-//! Round evidence: conflicts-tier2 gave the clearance discount to a contract
+//! Observed cases: a plan gave the clearance discount to a contract
 //! that wrote only `catalog/src/lib.rs`, leaving the stub
 //! `discount_clearance/src/lib.rs` to no contract, and its worker was held at
-//! the file; greenfield wrote `Cargo.toml` with members `wcl-core` and `wcl` in
+//! the file; a plan for a new workspace wrote `Cargo.toml` with members `wcl-core` and `wcl` in
 //! one contract and `wcl` in another, with `cargo test --workspace` accepting
 //! the first, then `cargo test -p wcl-core` once that was refused. The
 //! planner, grounder and workers are fake providers.
@@ -348,7 +348,7 @@ async fn a_workspace_member_no_contract_writes_is_refused_then_accepted_when_one
     assert_eq!(prompts.len(), 2, "one ask, one re-ask");
 }
 
-/// Round 8 greenfield: the root contract runs `cargo test -p wcl-core`, and
+/// A new workspace: the root contract runs `cargo test -p wcl-core`, and
 /// cargo loads every member manifest for `-p` too, so it could never pass.
 /// The edge to the binary contract would be a cycle, so kGraf makes the
 /// remedy the refusal names: the root contract writes the member manifest

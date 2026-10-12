@@ -1744,7 +1744,7 @@ mod tests {
 
     const STUB: &str = "use catalog::flags_for;\n\npub struct DiscountClearance;\n\nimpl Discount for DiscountClearance {\n    fn discount_cents(&self) -> i64 {\n        todo!(\"discount_clearance contract: implement\")\n    }\n}\n";
 
-    /// Round evidence (conflicts-tier2): the plan gave the clearance work to a
+    /// A model's plan gave the clearance work to a
     /// contract that wrote only `catalog/src/lib.rs`; no contract wrote the
     /// stub `discount_clearance/src/lib.rs`, and the worker was held at it.
     #[test]
@@ -1890,7 +1890,7 @@ pub fn f() {}
         assert!(why.contains("`crates/h/src/real.rs`"), "{why}");
     }
 
-    /// Round evidence (greenfield, first plan): c1 writes `Cargo.toml` listing
+    /// A model's first plan for a new workspace: c1 writes `Cargo.toml` listing
     /// members `wcl-core` and `wcl` and accepts on `cargo test --workspace`;
     /// `wcl` is written only by c2, which c1 does not depend on. The attempt
     /// could not pass.
@@ -1919,7 +1919,7 @@ pub fn f() {}
     /// `cargo test -p wcl-core`; `wcl/Cargo.toml` belongs to c2-bin, which
     /// depends on c1-core. Cargo loads `wcl/Cargo.toml` for `-p wcl-core`
     /// too, so neither attempt of c1-core could pass.
-    fn round8_second_plan() -> [ContractSpec; 2] {
+    fn second_new_workspace_plan() -> [ContractSpec; 2] {
         [
             spec(
                 "c1-core",
@@ -1957,7 +1957,7 @@ pub fn f() {}
     /// The round 8 fault: the `-p` form loads every member as well.
     #[test]
     fn the_package_form_with_a_member_a_later_contract_writes_is_refused() {
-        let why = reason(refusal(&round8_second_plan(), &[], &Fake::default()));
+        let why = reason(refusal(&second_new_workspace_plan(), &[], &Fake::default()));
         assert!(why.contains("`c1-core`"), "{why}");
         assert!(why.contains("`cargo test -p wcl-core`"), "{why}");
         assert!(why.contains("`wcl/Cargo.toml`"), "{why}");
@@ -1996,7 +1996,7 @@ pub fn f() {}
             "cargo fmt --all -- --check",
             "cargo build -p wcl-core 2>&1 | tail -n 5",
         ] {
-            let mut specs = round8_second_plan();
+            let mut specs = second_new_workspace_plan();
             specs[0].acceptance = acceptance.into();
             let why = reason(refusal(&specs, &[], &Fake::default()));
             assert!(why.contains("`wcl/Cargo.toml`"), "{acceptance}: {why}");
@@ -2011,7 +2011,7 @@ pub fn f() {}
             "cd /tmp/elsewhere && cargo test",
             "cd .. && cargo test",
         ] {
-            let mut specs = round8_second_plan();
+            let mut specs = second_new_workspace_plan();
             specs[0].acceptance = acceptance.into();
             assert!(
                 refusal(&specs, &[], &Fake::default()).is_none(),
@@ -2025,7 +2025,7 @@ pub fn f() {}
     /// Both are accepted, and both build with cargo
     /// (`the_check_agrees_with_cargo`).
     fn remedy_stub_members() -> [ContractSpec; 2] {
-        let [mut c1, mut c2] = round8_second_plan();
+        let [mut c1, mut c2] = second_new_workspace_plan();
         c1.writes.extend(
             ["wcl/Cargo.toml", "wcl/src/main.rs"]
                 .iter()
@@ -2039,7 +2039,7 @@ pub fn f() {}
     }
 
     fn remedy_members_add_themselves() -> [ContractSpec; 2] {
-        let [mut c1, mut c2] = round8_second_plan();
+        let [mut c1, mut c2] = second_new_workspace_plan();
         c1.instruction =
             "Write `Cargo.toml` as:\n[workspace]\nmembers = [\"wcl-core\"]\n\nand the `wcl-core` crate."
                 .into();
@@ -2069,7 +2069,7 @@ pub fn f() {}
     /// specified in the manifest"), measured with cargo 1.95.
     #[test]
     fn a_member_manifest_with_no_source_in_time_is_refused() {
-        let [mut c1, c2] = round8_second_plan();
+        let [mut c1, c2] = second_new_workspace_plan();
         c1.writes.push(WriteTarget {
             path: "wcl/Cargo.toml".into(),
             node: None,
@@ -2096,7 +2096,7 @@ pub fn f() {}
         assert!(!why.contains("depend on `"), "{why}");
     }
 
-    /// Round 10 greenfield, the accepted plan verbatim: the root contract's
+    /// A new workspace, the accepted plan verbatim: the root contract's
     /// instruction states the member list in prose. The check read no
     /// member, accepted the plan, and `c1` failed its first attempt on
     /// "failed to load manifest for workspace member `wcl`"; its retry
@@ -2658,7 +2658,7 @@ pub fn f() {}
     /// contract that runs first writes, does not.
     #[test]
     fn a_member_manifest_a_later_contract_writes_holds_for_a_replan() {
-        let [s1, s2] = round8_second_plan();
+        let [s1, s2] = second_new_workspace_plan();
         let mut c1 = open(
             "c1-core",
             "cargo test -p wcl-core && echo SUCCESS",
@@ -2764,13 +2764,13 @@ pub fn f() {}
 
     /// The check's verdict on each contract is cargo's: every contract the
     /// check refuses fails in a real cargo run over the files it can count
-    /// on, and every contract it accepts passes. Covers the round 8 plan,
+    /// on, and every contract it accepts passes. Covers the second new-workspace plan,
     /// both remedies, the manifest with no source, the root manifest that
     /// comes later, and a member built alone from its manifest.
     #[cfg(unix)]
     #[test]
     fn the_check_agrees_with_cargo() {
-        let mut no_source = round8_second_plan();
+        let mut no_source = second_new_workspace_plan();
         no_source[0].writes.push(WriteTarget {
             path: "wcl/Cargo.toml".into(),
             node: None,
@@ -2797,7 +2797,11 @@ pub fn f() {}
                 commands(unlisted_member_remedy()),
                 false,
             ),
-            ("round 8 plan", round8_second_plan().to_vec(), true),
+            (
+                "second new-workspace plan",
+                second_new_workspace_plan().to_vec(),
+                true,
+            ),
             ("stub members", remedy_stub_members().to_vec(), false),
             (
                 "members add themselves",
@@ -2981,11 +2985,11 @@ pub fn f() {}
         c.writes.iter().map(|w| w.path.as_str()).collect()
     }
 
-    /// Canary round17e greenfield, the third refusal's shape: c1 writes the
+    /// A new workspace, the third refusal's shape: c1 writes the
     /// root manifest, `wcl-core` and `wcl/Cargo.toml` but no source under
     /// `wcl/`, and runs `cargo check -p wcl-core`; c2 writes
     /// `wcl/src/main.rs` after c1.
-    fn round17e_third_plan() -> [ContractSpec; 2] {
+    fn third_refusal_plan() -> [ContractSpec; 2] {
         [
             spec(
                 "c1",
@@ -3010,10 +3014,10 @@ pub fn f() {}
         ]
     }
 
-    /// Canary round17e greenfield, the second refusal's shape: c1 runs
+    /// A new workspace, the second refusal's shape: c1 runs
     /// `cargo test -p wcl-core` at the root, and only c3, which runs after
     /// c1, writes the root manifest.
-    fn round17e_second_plan() -> [ContractSpec; 2] {
+    fn second_refusal_plan() -> [ContractSpec; 2] {
         [
             spec(
                 "c1",
@@ -3037,7 +3041,7 @@ pub fn f() {}
     /// `main.rs`, and c2, which runs after c1, writes it again.
     #[test]
     fn a_member_manifest_with_no_source_gets_a_minimal_source_from_its_writer() {
-        let specs = round17e_third_plan();
+        let specs = third_refusal_plan();
         let repo = Fake::default();
         let why = reason(refusal(&specs, &[], &repo));
         assert!(
@@ -3064,7 +3068,7 @@ pub fn f() {}
     /// c1 writes the root manifest too, and c3 rewrites it after c1.
     #[test]
     fn a_workspace_manifest_a_later_contract_writes_moves_to_the_contract_that_needs_it() {
-        let specs = round17e_second_plan();
+        let specs = second_refusal_plan();
         let repo = Fake::default();
         let why = reason(refusal(&specs, &[], &repo));
         assert!(why.contains("Make `c1` write `Cargo.toml`"), "{why}");
@@ -3115,12 +3119,12 @@ pub fn f() {}
         assert!(remedies.len() <= MAX_REPAIRS);
     }
 
-    /// The round 8 plan: the edge to c2-bin would be a cycle, so c1-core
+    /// The second new-workspace plan: the edge to c2-bin would be a cycle, so c1-core
     /// writes `wcl/Cargo.toml` and then a minimal `wcl/src/main.rs`. The
     /// result is the remedy a planner wrote, which cargo builds.
     #[test]
     fn an_edge_that_makes_a_cycle_is_never_made() {
-        let specs = round8_second_plan();
+        let specs = second_new_workspace_plan();
         let edge = Remedy::DependOn {
             contract: "c1-core".into(),
             on: "c2-bin".into(),
@@ -3153,7 +3157,7 @@ pub fn f() {}
     /// and the plan is asked for again with the unchanged refusal.
     #[test]
     fn a_write_a_concurrent_contract_declares_is_never_made() {
-        let [c1, mut c2] = round17e_third_plan();
+        let [c1, mut c2] = third_refusal_plan();
         c2.depends_on.clear();
         c2.acceptance = "true".into();
         let specs = [c1, c2];
@@ -3180,7 +3184,7 @@ pub fn f() {}
         assert!(refusal(&nobody, &[], &repo).is_some());
         assert!(repaired(&nobody, &[], &repo).is_none());
 
-        let [mut c1, _] = round17e_second_plan();
+        let [mut c1, _] = second_refusal_plan();
         c1.instruction = "Write the `wcl-core` library crate.".into();
         let no_root = [
             c1,
@@ -3197,8 +3201,8 @@ pub fn f() {}
 
         let stub = Fake::with(&[("discount_clearance/src/lib.rs", STUB)]);
         let named = vec!["discount_clearance/src/lib.rs".to_owned()];
-        assert!(refusal(&round17e_third_plan(), &named, &stub).is_some());
-        assert!(repaired(&round17e_third_plan(), &named, &stub).is_none());
+        assert!(refusal(&third_refusal_plan(), &named, &stub).is_some());
+        assert!(repaired(&third_refusal_plan(), &named, &stub).is_none());
 
         assert!(repaired(&remedy_stub_members(), &[], &repo).is_none());
     }
@@ -3233,9 +3237,9 @@ pub fn f() {}
     fn repaired_plans_pass_with_cargo() {
         let repo = Fake::default();
         for (name, specs) in [
-            ("round17e third", round17e_third_plan().to_vec()),
-            ("round17e second", round17e_second_plan().to_vec()),
-            ("round 8", round8_second_plan().to_vec()),
+            ("third refusal", third_refusal_plan().to_vec()),
+            ("second refusal", second_refusal_plan().to_vec()),
+            ("round 8", second_new_workspace_plan().to_vec()),
         ] {
             let (fixed, remedies) = repaired(&specs, &[], &repo).expect(name);
             for c in &fixed {

@@ -88,7 +88,7 @@ async fn openai_responses_sends_openai_style_rate_limit_headers() {
             Protocol::Inclusive,
             model,
             "live-rate-headers",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let mut request = Request::new(model, "placeholder", 16);

@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Amends the diagnosis in decision 0045. Superseded in part by decision
 0047.
+**Amended by:** 0047
 **Related:** decisions 0042, 0044, 0045
 
 This record exists because decision 0045 attributed its negative result to a mismatch

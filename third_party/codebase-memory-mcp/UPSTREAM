@@ -55,7 +55,7 @@ Ported (logic translated to Rust) into the galaxy renderer:
       (constants from crates/kgraf-graph/src/layout/density.rs)
     -> crates/kgraf-galaxy/src/selection.rs
     - camera constants and fly-to-centroid (distance max of 3x spread or a floor,
-      lerp 0.08 per frame, pivot moved in step), via the evidence file
+      lerp 0.08 per frame, pivot moved in step)
     -> crates/kgraf-galaxy/src/camera.rs
 
   src/ui/layout3d.c

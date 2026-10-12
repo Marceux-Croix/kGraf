@@ -10,8 +10,8 @@
 //! highlighted to 0.04 scaled by density. The constants are
 //! `kgraf_graph::layout::density`'s, used directly (no copy).
 //! Changes: no glow boost (no bloom pass yet); selection kept as a mask, not a set;
-//! edges touching an agent or work item (the overlay) use the 0.85 the evidence
-//! reserves for those links (recommendation 3) when both ends are highlighted, and
+//! edges touching an agent or work item (the overlay) use the 0.85 the reference design
+//! reserves for those links when both ends are highlighted, and
 //! their own intensity, never density-scaled, when nothing is selected.
 
 use bytemuck::{Pod, Zeroable};

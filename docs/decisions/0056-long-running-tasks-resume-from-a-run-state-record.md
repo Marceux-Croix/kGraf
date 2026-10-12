@@ -1,6 +1,7 @@
 # Decision 0056: Long-running tasks resume from a run-state record, and the graph is the memory
 
 **Status:** Accepted
+**Amended by:** 0057 (replaces its planned compaction method)
 **Related:** decisions 0015, 0026, 0028, 0030, 0036, 0043, 0052, 0055
 
 This record exists so the long-running task design is not re-argued. If a contributor asks

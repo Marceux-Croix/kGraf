@@ -36,7 +36,7 @@ pub const ZOOM_SPEED: f32 = 1.5;
 pub const FLY_LERP: f32 = 0.08;
 /// Fly-to distance is `max(FLY_SPREAD_FACTOR * spread, FLY_MIN_DISTANCE)`.
 pub const FLY_SPREAD_FACTOR: f32 = 3.0;
-/// The evidence records "a floor" without its value. 120 world units frames a single
+/// The reference design uses "a floor" without giving its value. 120 world units frames a single
 /// node (core radius 4 to 20) with its immediate cluster; chosen, not measured.
 pub const FLY_MIN_DISTANCE: f32 = 120.0;
 /// Wheel zoom: distance factor per point of scroll, before `ZOOM_SPEED`. Chosen so one

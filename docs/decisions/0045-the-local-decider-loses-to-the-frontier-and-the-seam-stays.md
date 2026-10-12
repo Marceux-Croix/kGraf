@@ -1,6 +1,8 @@
 # Decision 0045: The local decider loses on this task; the seam stays and no weights ship
 
 **Status:** Accepted. Amended by decisions 0046 and 0047.
+**Superseded by:** 0047 (in part: the robustness argument)
+**Amended by:** 0046 (the diagnosis)
 **Related:** decisions 0022, 0023, 0030, 0031, 0033, 0042, 0044
 
 ## Decision

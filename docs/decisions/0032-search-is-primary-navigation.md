@@ -1,6 +1,7 @@
 # Decision 0032: Search is a primary navigation mode, modeled on Gmail, and its results are a graph selection
 
 **Status:** Accepted.
+**Amended by:** 0034 (result presentation)
 **Related:** decisions 0003, 0007, 0010, 0013, 0014, 0026, 0027, 0028
 
 ---

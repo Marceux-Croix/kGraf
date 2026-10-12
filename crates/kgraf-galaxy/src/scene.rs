@@ -32,7 +32,7 @@ pub struct NodeInput {
 pub struct EdgeInput {
     pub source: u32,
     pub target: u32,
-    /// sRGB color, each channel 0..=1 (the evidence colors edges by type).
+    /// sRGB color, each channel 0..=1 (the reference design colors edges by type).
     pub color: [f32; 3],
     /// Base intensity 0..=1 before density scaling. The evidence uses 0.25 within a
     /// cluster and 0.06 across; a call edge's confidence belongs here too (0010).
@@ -41,7 +41,7 @@ pub struct EdgeInput {
 
 /// Which population a node belongs to. Each has its own visual channel: code nodes
 /// are stellar discs colored and sized by degree; agents and work items must not
-/// reuse that encoding (evidence 2026-09-24, recommendation 3), so they get their own
+/// reuse that encoding (the reference design keeps the encodings apart), so they get their own
 /// sprite shape and a fixed palette outside the stellar table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Population {

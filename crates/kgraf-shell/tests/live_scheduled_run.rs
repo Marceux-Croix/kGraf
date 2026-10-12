@@ -109,7 +109,7 @@ fn scratch_repo() -> tempfile::TempDir {
     dir
 }
 
-/// Prices from the same fixture the phase4-live and steer-live evidence use.
+/// Prices from the same fixture the other live tests use.
 fn prices_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prices.json")
 }

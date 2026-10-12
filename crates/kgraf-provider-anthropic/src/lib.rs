@@ -637,7 +637,7 @@ impl AnthropicAdapter {
         // Reasoning is billed inside `output_tokens`. Anthropic itself does not report
         // the share separately; Moonshot's Anthropic route does, in
         // `output_tokens_details.thinking_tokens`, as its first live call showed
-        // (evidence fixture `2026-09-26-kimi-anthropic-live-call.json`). Where it is
+        // (recorded in a live-call fixture). Where it is
         // reported it is carved out, so text and reasoning sum back to output; where
         // it is not, reasoning stays zero rather than being invented.
         let output = field("output_tokens");

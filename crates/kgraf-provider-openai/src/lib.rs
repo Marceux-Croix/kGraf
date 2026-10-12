@@ -184,7 +184,7 @@ mod http_error_tests {
         }
     }
 
-    /// Round evidence: call 14 of a planning run answered HTTP 500 with this
+    /// Observed case: a call of a planning run answered HTTP 500 with this
     /// body, and the attempt failed with no retry.
     #[test]
     fn a_bare_eof_error_message_is_malformed_output() {

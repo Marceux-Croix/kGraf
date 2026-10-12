@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Closes the open question in decision 0031 on whether an
 agent can state what it assumes will not change.
+**Amended by:** 0067 (a change notice arrives mid-run)
 **Related:** decisions 0007, 0018, 0019, 0020, 0022, 0026, 0031
 
 ---

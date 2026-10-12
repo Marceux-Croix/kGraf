@@ -4706,7 +4706,7 @@ async fn a_producer_no_test_reaches_is_asked_once_for_a_reference_and_a_test_onl
     );
 }
 
-/// A compile command that does not build the test file fails the canary check.
+/// A compile command that does not build the test file fails the broken-file check.
 /// kGraf replaces it with the derived command and checks again; the planner
 /// is not asked about it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

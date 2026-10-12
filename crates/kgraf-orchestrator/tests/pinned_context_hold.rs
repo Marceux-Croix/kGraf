@@ -3,7 +3,7 @@
 //! way on every attempt. The contract is held at once with the remedy, not
 //! retried until the failure count runs out.
 //!
-//! Round evidence: a worker's pinned context of 21,001 tokens against a stop
+//! Observed case: a worker's pinned context of 21,001 tokens against a stop
 //! point of 11,468 failed an attempt and was retried as a second attempt with
 //! the same result.
 

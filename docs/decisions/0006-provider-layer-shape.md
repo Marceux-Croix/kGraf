@@ -1,6 +1,7 @@
 # Decision 0006: Hand-rolled provider clients, a thin core trait with opt-in capabilities, and per-protocol accounting
 
 **Status:** Accepted
+**Amended by:** 0041 (extends it and corrects an over-reading of it)
 **Related:** decisions 0001, 0005
 
 ## Context

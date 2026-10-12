@@ -1,6 +1,7 @@
 # Decision 0093: A worker reports a permission or instruction shortfall, and the orchestrator grants within the operator's ceiling, amends, or asks the user
 
 **Status:** Accepted
+**Superseded by:** 0094 (in part: the operator ceiling becomes the permission mode)
 **Related:** decisions 0004, 0009, 0027, 0029, 0035, 0053, 0083, 0084, 0086
 
 ## Context

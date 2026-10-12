@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Closes the expectation-failure gap flagged in decisions
 0024 and 0026.
+**Amended by:** 0030 (the detection path)
 **Related:** decisions 0004, 0009, 0012, 0024, 0026, 0027
 
 ---

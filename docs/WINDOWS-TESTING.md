@@ -1,81 +1,89 @@
 # Testing kGraf on Windows
 
-The Windows sandbox (decisions 0011 and 0097) and the worker's shell on Windows are built
-and compile-checked from macOS. The self-test bundle (section 0) has run them on a hosted
-Windows Server 2025 runner, and its last full run read clean except for one named gap
-(see "Results of the confirmation campaign" below). Nothing has run on a standard-user
-Windows 11 machine, on ARM64, or without Git for Windows installed. These steps test them
-on a fresh Windows 11 machine, on x86_64 (Intel or AMD) and on ARM64 (Snapdragon). They
-take about an hour, most of it the first build.
+## 1. Purpose and reader
+
+This guide tests kGraf's Windows sandbox and the worker's shell on Windows, and says what to
+send back. It is for a person with a Windows machine who can use PowerShell and run a
+downloaded program. The bundle path needs no Rust knowledge. The manual path needs a Rust
+build. Decisions 0011 and 0097 give the design; 0097 replaces the restricted-token design of
+0011 with dedicated sandbox users.
+
+Four terms recur:
+
+- The **token sandbox** is the backend kGraf uses when no sandbox user exists. A command runs
+  with a restricted copy of the owner's own Windows token. It needs no administrator rights.
+  It cannot deny network access, and Git Bash and some build tools fail under it.
+- A **sandbox user** is a dedicated local Windows account that `kgraf sandbox setup` creates
+  once, with administrator rights. A sandboxed command runs as that account. Setup makes two
+  accounts per worker **slot** (one with network access, one without), so that two worktrees
+  run as two different users.
+- The **baseline** is the first full pass of the test suite, with no sandbox user set up.
+- A **Windows Filtering Platform (WFP) filter** is a rule in the Windows network stack.
+  Setup adds seven: four that block loopback connections outside kGraf's proxy ports, and
+  three that are meant to block name lookups (DNS). kGraf's **egress proxy** is the local
+  proxy that is the only network path a sandboxed command without network access may use.
+- The **launcher service** is a Windows service that setup installs. It starts each
+  sandboxed command in session 0 (the non-interactive Windows session), where cargo and
+  rustc can create the named objects (semaphores, mutexes) they need.
+
+State as of 2026-10-11 (run 22, section 4):
+
+- The self-test bundle has run on a GitHub-hosted runner: Windows Server 2025 on x86_64, with
+  Git for Windows, as an administrator. Its last full run read clean except for one named
+  gap: DNS is not confined on Windows Server 2025 (section 5).
+- Nothing has run on a standard-user Windows 11 machine, on ARM64, on a Windows version
+  other than Server 2025, or on a machine without Git for Windows. The ARM64 notes in
+  section 6 are written but untested.
+- The bundle is the first choice. It takes about two hours on the hosted runner, and less
+  on a local machine without the sandbox user phase.
 
 Run every command in **Windows PowerShell or PowerShell 7, as a normal user** (not "Run as
-administrator"): the sandbox is made for a user without administrator rights, and an
-elevated shell would test something else.
+administrator"), except where a step says it needs administrator rights. The sandbox is made
+for a user without administrator rights, and an elevated shell tests something else.
 
-## 0. The self-test bundle (the first choice)
+## 2. The bundle: build, run, read the report
 
-Most of the steps below are automated in one program, `kgraf-wintest.exe`, shipped in a zip
-with kGraf's test binaries cross-built for Windows. It needs Git for Windows and nothing
-else: no Rust, no build tools, no API key, no administrator rights. It installs nothing.
+`kgraf-wintest.exe` is one program, shipped in a zip with kGraf's test binaries built for
+Windows. It needs Git for Windows and nothing else: no Rust, no build tools, no API key. It
+installs nothing.
 
-1. Build the zip on macOS (or Linux) with `scripts/package-wintest.sh`. It writes
-   `dist/wintest/kgraf-wintest-<version>-<commit>-windows-x86_64.zip`.
-2. On the Windows machine: unblock the zip (Properties, "Unblock"), unzip it, double-click
-   `kgraf-wintest.exe`, answer whether to run the extended set (or wait 20 seconds for yes).
+1. Build the zip on macOS or Linux with `scripts/package-wintest.sh`. It writes
+   `dist/wintest/kgraf-wintest-<version>-<commit>-windows-x86_64.zip`. On Windows, the
+   GitHub workflow (section 3) builds the same zip natively.
+2. On the Windows machine, unblock the zip (Properties, "Unblock"). Unzip it to a folder
+   such as `C:\kgraf-wintest`, not to Downloads or the Desktop (the sandbox users must be
+   able to read it). Double-click `kgraf-wintest.exe`. Answer whether to run the extended
+   set, or wait 20 seconds for yes.
 3. Send back the one report it writes to the Desktop,
    `kgraf-wintest-report-<date>-<time>.md`. Delete the unzipped folder.
 
-What it runs, in this order: the machine facts (Windows build and edition, architecture and
-emulation, processor, memory, Git for Windows and Git Bash, winget, Defender, SmartScreen
-and Smart App Control, locale); the core set (every kgraf-sandbox test binary, the
-`windows` tests of kgraf-tools, the network notice, dependency link and check input tests
-of kgraf-host, the orchestrator's network notice test); end-to-end checks with the real
-`kgraf.exe` (sections 5, 6 and 6a below, with a scripted model on 127.0.0.1 in place of a
-provider); then, if chosen, the extended set (every other test binary of the workspace that
-runs without Rust, a model, Docker or the internet). Each test binary runs with
-`--test-threads=1`. The report has a summary table first, then every failure with its
-output, the per-binary counts and times, what was not run and why, and the same data as
-JSON at the end. The report replaces the user name and computer name, and records no
-environment variables.
+What it runs, in order:
 
-libtest prints a failed test's panic and captured output only at the end of a binary's run,
-so a binary that hangs (killed at its time limit) or crashes loses it. The runner then runs
-each test the binary reported FAILED, and the test that was running, alone again
-(`<binary> --exact <name> --test-threads=1`, same environment and working folder). Each
-re-run has five times the binary's expected seconds per test as its limit, at least 120
-seconds (`SOLO_RERUN_SECS`) and at most 600 (`solo_limit_for`); a binary gets at most 30 re-runs
-(`MAX_SOLO_RERUNS`) and 10 minutes of re-runs in all (`SOLO_RERUN_BUDGET_SECS`), the running
-test first. The report uses that output as the test's tail, says it came from a solo re-run,
-and says whether the re-run passed, failed or hung (JSON: `solo` on each failure,
-`open_test_solo`). The test's outcome from the first run is not changed. Tests over the cap
-or the time budget are listed under "not re-run alone" (JSON: `rerun_skipped`).
+1. The machine facts: Windows build and edition, architecture, processor, memory, Git for
+   Windows and Git Bash, winget, Defender, SmartScreen, locale.
+2. The core set: every `kgraf-sandbox` test binary, the `windows` tests of `kgraf-tools`,
+   and the network notice, dependency link and check input tests of `kgraf-host` and the
+   orchestrator.
+3. End-to-end checks with the real `kgraf.exe`, with a scripted model on 127.0.0.1 in place
+   of a provider.
+4. If chosen, the extended set: every other test binary that runs without Rust, a model,
+   Docker or the internet.
 
-How it runs tests built on another machine: a test binary holds its package folder as the
-build machine spelled it (`env!("CARGO_MANIFEST_DIR")`) and reads fixtures and starts
-programs (`CARGO_BIN_EXE_*`) under it. The runner copies the sources and programs into its
-work folder at that same relative path, maps a free drive letter there with `subst`, and
-runs each binary on that drive, so those paths resolve with no change to the tests. Tests
-that build a helper with cargo at run time, need a model key or Docker, or read the
-repository's git history are left out; the manifest in the zip lists each with its reason.
+Each test binary runs with `--test-threads=1`. The test binaries were built on another
+machine, so the runner copies the sources into a work folder at the build machine's relative
+path and maps a free drive letter to it with `subst`. Tests that build with cargo at run
+time, need a model key or Docker, or read git history are left out. The manifest in the zip
+lists each with its reason.
 
-What it leaves behind: the report only. Every file the run makes (the sources, the test
-processes' `TEMP`, kGraf's diagnostics and settings files, the end-to-end repositories, the
-folders the sandbox labels) is in one work folder under `%TEMP%`. At the end, also after
-Ctrl+C, it removes the drive letter and the work folder (resetting permissions and retrying
-once if needed; links are removed, never followed), then checks that both are gone, that no
-`kgraf-escape-*` file or Run key value from an escape test remains, and that no kGraf folder
-appeared under `%APPDATA%` or `%LOCALAPPDATA%`; the report lists what was created and
-removed. It offers to delete the unzipped folder after it exits.
+The report has a summary table, then every failure with its output, the counts and times per
+binary, what was not run and why, and the same data as JSON. It replaces the user name and
+computer name and records no environment variables. When a binary hangs or crashes, the
+runner runs each failed test again alone and puts that output in the report, marked as a solo
+re-run. A solo re-run never changes the first run's result.
 
-What stays manual: installing the prerequisites and building from source (sections 2 and
-3), the winget install itself and its question in the app and on a terminal (section 6a
-cases 1 to 3; the runner simulates a missing Git Bash with `KGRAF_GIT_BASH_PATH` naming a
-missing file and with `winget` taken off `PATH`, and marks those checks SIMULATED), the
-different Git install locations (case 4), the sandboxed dependency install (section 7, which
-needs npm and the internet), the desktop app window and installer, and the
-Windows Firewall test in `MANUAL-NETWORK-TEST.txt` in the zip. For manual tests,
-`kgraf-wintest.exe sandbox-run -- <program> [args...]` runs one program inside kGraf's
-sandbox in a temporary folder and prints its exit code.
+The runner leaves only the report. Every other file is in one work folder under `%TEMP%`,
+which it removes at the end, also after Ctrl+C. It then checks that the drive letter and the
+folder are gone and that no kGraf folder appeared under `%APPDATA%` or `%LOCALAPPDATA%`.
 
 Zip layout:
 
@@ -90,15 +98,97 @@ kgraf-wintest-<version>-<commit>-windows-x86_64/
   src\                     the sources and fixtures the tests read
 ```
 
-The bundle is built for x86_64 only; on ARM64 it runs under emulation, and the report says
-so. The steps below remain the fallback, and the way to test a native ARM64 build.
+The bundle is built for x86_64 only. On ARM64 it runs under emulation and the report says so.
 
-### Running the bundle in GitHub Actions
+**What stays manual:** installing the prerequisites and building from source (section 6);
+the Git for Windows install offer (case 6a); the dependency install (case 7); the desktop
+window and the installer; and the Windows Firewall test in `MANUAL-NETWORK-TEST.txt`. For
+manual tests, `kgraf-wintest.exe sandbox-run -- <program> [args...]` runs one program inside
+kGraf's sandbox in a temporary folder and prints its exit code.
 
-The `wintest.yml` workflow builds the bundle natively on a GitHub-hosted Windows runner
-(`KGRAF_WINTEST_NATIVE=1 scripts/package-wintest.sh`), runs `kgraf-wintest.exe --all
---no-wait` (with `--sandbox-user` by default, see below), and runs the Windows Firewall test (`scripts/wintest-firewall.ps1`). It has a
-manual trigger only:
+### The sandbox user phase
+
+The flag `--sandbox-user` adds a phase after the baseline. It needs administrator rights:
+start the runner from an elevated prompt or accept the UAC prompt. The hosted runner is
+already elevated.
+
+| Step | Command | What it checks |
+|---|---|---|
+| Before setup | `kgraf sandbox selfcheck` | For comparison. On the token sandbox it passes with a gap: the `network:` and `dns:` lines read "not confined". |
+| Setup | `kgraf sandbox setup --slots 4` | Creates the sandbox users, the group, the firewall rules and the seven WFP filters. A filter Windows refuses does not stop setup. A `refused` line names it, and a closing notice says DNS, loopback connections or both are not confined on this machine. |
+| Status | `kgraf sandbox status` | Every kGraf item is present, and every stored password logs on. A refused filter shows as `FAILED` with the reason. |
+| Selfcheck | `kgraf sandbox selfcheck` | The check that decides the phase. It must exit 0, print `sandbox selfcheck: ok` and name the backend `Windows sandbox user`. |
+| Re-run | the test binaries again | See below. Runs with `KGRAF_REQUIRE_SANDBOX_USER=1`. |
+| Remove | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf item must read `MISSING`, the launcher service included. |
+
+If selfcheck passes on the token sandbox, setup did not take effect, and the phase stops. If
+it fails on its `dns:` line alone, the phase goes on, and the summary says `DNS FAILED`. Any
+other failure stops the phase.
+
+If the Windows user who runs the phase already has a sandbox user, the phase does not start,
+because its last step would remove it. Run `kgraf sandbox remove` first.
+
+The re-run runs the sandbox test binaries whole. Of every other baseline binary whose
+failures name a token sandbox limit, it runs only the tests that failed. It also re-runs the
+end-to-end checks. With `KGRAF_REQUIRE_SANDBOX_USER=1`, a test that would take the token
+sandbox branch, or skip, fails instead. Without the switch, a machine where setup did not take
+effect passes every test and measures nothing. The runner sets the switch only for the re-run.
+
+**How the verdict counts failures.** The verdict line counts four things: every baseline
+failure not classed as expected; every failed test and every hung or crashed binary of the
+re-run; every failed end-to-end check; and any item the time budget left unrun.
+
+A baseline failure is **expected under the token sandbox** only when both hold: the same test
+passed in the re-run, and its own baseline output names a known token limit. The known
+limits are the cargo jobserver (cargo's shared build-slot semaphore), Git Bash (msys),
+`NtCreateDirectoryObject`, the signal pipe, Schannel (Windows' own TLS library), and
+`STATUS_DLL_INIT_FAILED` (0xC0000142). Expected failures are not in the
+verdict. A section "Expected under the token sandbox (N)" lists each with its binary, its
+test and its marker. A failure without a marker, or one whose re-run failed, hung or did not
+run, still counts. An end-to-end check follows the same rule: `shell.git_bash` is the known
+case.
+
+When selfcheck failed on `dns:`, a line `Known gap: DNS is not confined on this machine ...`
+follows the verdict. The DNS test of the re-run
+(`kgraf-sandbox/test/dns_windows :: an_offline_lookup_does_not_reach_the_dns_client_service`)
+then fails. It is listed under "Known gaps" and not counted, only when selfcheck failed on DNS
+alone and the test's own output says "This is the recorded gap". A leak with every filter in
+place prints "a defect of the filters", and counts.
+
+### The time budget
+
+A host that kills a job at a fixed limit leaves no report. `kgraf-wintest.exe --budget-mins
+<N>` gives the run N minutes, counted from the runner's start, for everything including the
+removal and the report. The runner does not start an item whose expected time exceeds the
+time left, and it cuts a running item's limit to the time left. It keeps a reserve at the end
+(540 s with the sandbox user phase) for removal, cleanup and the report. The verdict reads
+`INCOMPLETE` as soon as one item did not run or was stopped, and the runner exits 1.
+
+The workflow computes the budget as the job limit (165 minutes), less the minutes already
+used, less 12 for the steps after the bundle, less 1. On the measured runs the budget was
+about 130 minutes. A full run took 94 to 103 minutes in the bundle and 118 to 127 minutes in
+the job. The 165 minute limit leaves a margin of at least 38 minutes.
+
+### Running only some tests
+
+`kgraf-wintest.exe --only <filter>` runs only what the filter names, in the baseline and in
+the re-run. The filter is a comma-separated list:
+
+- `<run id>`: one test binary, whole. Run ids are in the report's "Test binaries" table, for
+  example `kgraf-sandbox/test/escape_windows`.
+- `<run id>::<test name>`: one test, by the full name the report prints.
+- `e2e`: every end-to-end check. `e2e::<check id>`, for example `e2e::shell.git_bash`,
+  keeps one.
+
+An item that names nothing in the bundle stops the runner before it starts. With a filter,
+the runner asks nothing about the extended set. The report states the filter above the
+verdict.
+
+## 3. Workflow inputs
+
+The `wintest.yml` workflow builds the bundle natively on a GitHub-hosted Windows runner,
+runs `kgraf-wintest.exe --all --no-wait`, runs the Windows Firewall test
+(`scripts/wintest-firewall.ps1`) and uploads one artifact. It has a manual trigger only:
 
 ```
 gh workflow run wintest.yml
@@ -106,1146 +196,237 @@ gh run watch
 gh run download <run id> -n kgraf-windows-selftest
 ```
 
-The artifact holds `report\kgraf-wintest-report-*.md` and `firewall.txt`. The upload step
-runs whatever happened before it (`if: always()`), so a job that is cancelled or reaches its
-limit still uploads the partial results it has. It bills Windows minutes (twice the Linux
-rate on a private repository). The job stops after 165 minutes; the runner stops starting
-work earlier than that (see "The time budget" below). A failing test does not fail the
-job; a missing report file does. Two things differ from a standard user's machine: the
-runner account is an administrator, so the sandbox and firewall checks run elevated, and
-the runner has Git for Windows, so the worker shell finds `sh`. A result from the runner
-does not replace a run on a standard-user machine without Git for Windows.
+The artifact holds `report\kgraf-wintest-report-*.md`, `firewall.txt` and, when the probe
+ran, `appcontainer-dns.md` with raw captures. The upload runs after a cancel or a timeout, so
+a partial result survives. A failing test does not fail the job. A failed build or a missing
+report file does.
 
-Before the run, the workflow does three things, and each one fails the job if it does not
+The workflow has four inputs, set with `-f name=value`:
+
+| Input | Type, default | Meaning |
+|---|---|---|
+| `sandbox_user` | boolean, `true` | Adds `--sandbox-user`: after the baseline, set up the sandbox users, check them, re-run the tests as them, and remove them. Set `false` for the baseline alone. |
+| `only` | string, empty | Passed to the runner as `--only <value>`. Empty runs everything. |
+| `appcontainer_dns` | boolean, `true` | After the bundle, runs `scripts/wintest-appcontainer-dns.ps1`, a probe of whether a Windows AppContainer (a low-privilege process container) confines DNS. It never fails the job. |
+| `probe_only` | boolean, `false` | Runs only that probe and the upload. It checks out the `scripts` folder, installs no Rust and builds nothing. The bundle, the tests, the sandbox user phase and the firewall test are skipped. |
+
+Examples:
+
+```
+gh workflow run wintest.yml -f sandbox_user=false
+gh workflow run wintest.yml -f only='kgraf-sandbox/test/escape_windows'
+gh workflow run wintest.yml -f probe_only=true
+```
+
+Before the bundle runs, the workflow does three things. Each fails the job if it does not
 work:
 
-- It copies the bundle to `C:\kgraf-wintest` and gives that folder a protected access
-  list: full control for SYSTEM and Administrators, read and execute for Users. The
-  sandbox users cannot read the runner account's profile. The checkout folder
-  (`GITHUB_WORKSPACE`, on the hosted image usually under `D:\a\`) is not in the profile,
-  but its access list comes from the image. The step logs both paths, whether the build
-  folder is inside the profile, and the `icacls` lists of the build folder and of the copy.
-  The baseline and the sandbox user phase both run from the copy.
-- It starts the OpenSSH agent service (`Set-Service ssh-agent -StartupType Manual`, then
-  `Start-Service ssh-agent`). The service is off on the hosted image, and an escape test
+- It copies the bundle to `C:\kgraf-wintest` with a protected access list (full control for
+  SYSTEM and Administrators, read and execute for Users). The sandbox users cannot read the
+  runner account's profile, and the checkout's access list comes from the image.
+- It starts the OpenSSH agent service, which is off on the hosted image. An escape test
   probes its pipe.
-- It checks that Git for Windows is installed (`C:\Program Files\Git\bin\bash.exe`).
+- It checks that Git for Windows is installed.
 
-#### The sandbox user phase
+Two things differ from a standard user's machine. The runner account is an administrator, and
+the runner has Git for Windows. A hosted run does not replace a run on a standard-user
+machine without Git for Windows.
 
-The workflow has two inputs. `sandbox_user`, on by default, adds `--sandbox-user` to the
-runner. Turn it off with `gh workflow run wintest.yml -f sandbox_user=false`. A person can
-add the same flag on any Windows machine: `kgraf-wintest.exe --all --sandbox-user`. `only`,
-empty by default, is passed to the runner as `--only <value>` when it is set (see "Running
-only some tests" below).
+**Cost.** GitHub-hosted standard runners are free and unlimited for public repositories. A
+private repository bills Windows minutes at twice the Linux rate. The job stops after 165
+minutes in both cases. A public repository also gets a larger standard Windows runner
+(4 vCPU and 16 GB, against 2 vCPU and 8 GB for private) according to
+[GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+The times in this guide were measured on the 2 vCPU runner; times on the larger one are not
+measured.
 
-The suite runs first, exactly as without the flag, with no sandbox user set up. That is the
-baseline, and it stays comparable with earlier runs. Then the phase runs these steps:
+## 4. What a clean run looks like
 
-| Step | Command | What it checks |
-|---|---|---|
-| (b0) | `kgraf sandbox selfcheck` | Before setup, for comparison only. On the token sandbox it passes with a network line and a `dns:` line that are not a pass. |
-| (b) | `kgraf sandbox setup --slots 4` | Creates the sandbox users (two per worker slot, one without the network and one with it, plus the two fixed users), the group, the firewall rules and seven WFP filters (three DNS filters and four loopback filters), with no tag. The output lists a received password for every one of these users. A filter Windows refuses does not stop setup: a `refused` line names it with Windows' error and a `probe:` reading, the WFP step's line says `partial`, and setup exits 0 with a closing notice that DNS, loopback connections, or both are not confined on this machine. |
-| (c) | `kgraf sandbox status` | Every kGraf line is present, for both users of every slot, the three DNS filter lines and the four loopback filter lines included, except a filter Windows refused at setup, which is `FAILED` with the reason; status then ends with "DNS is not confined on this machine" (or "loopback connections are", or both) and exits 1, and the report lists the `FAILED` line as a problem. Every stored password logs on. |
-| (d) | `kgraf sandbox selfcheck` | The gate. It passes only if selfcheck exits 0, prints `sandbox selfcheck: ok` and names the backend `Windows sandbox user`. A pass on the token sandbox means setup did not take effect, so it stops the phase too. If selfcheck failed only on its `dns:` line (every other line passed on the sandbox user), step (e) still runs, and the summary says `DNS FAILED`; `dns: not proved` counts as a failure there, like `dns: not confined`. If selfcheck failed on the sandbox user and printed no result lines (its error names that backend and stops at the probe), step (e) still runs so its tests show which programs start as the sandbox user, and the summary says `GATE FAILED: selfcheck failed on the sandbox user and printed no result lines`. The report then says which of two cases the error line shows: the probe ran and failed the step the line names (an earlier run: "a direct connection to the origin worked"), or the probe did not finish its steps (the line gives only an exit status, for example because Git Bash did not start as that user). Any other failure stops the phase: step (e) does not run. |
-| (b2) to (b4) | the fallback grant, `kgraf sandbox-named-object-probe --launch`, `kgraf sandbox status` | Only where the probe in (b) was refused (`session0::Proof::Refused`) and the window is elevated. The phase runs the fallback's elevated action itself, probes again through the fallback and reads the status. See "Named objects" below. |
-| (e) | re-run | The sandbox test binaries, whole; of each other baseline binary whose failures name a token sandbox limit (the cargo jobserver, Git Bash, msys, Schannel, `STATUS_DLL_INIT_FAILED`), only the tests that failed and the test it was running when it ended, by full name (libtest `--exact`); and the end-to-end checks, with the sandbox user active. A list of names longer than 24,000 characters re-runs the whole binary. A re-run of only some tests is expected to take their share of the binary's expected time, but its time limit is the whole binary's (`limit_for` of its expected time): those tests failed fast in the baseline and are slow when they run to the end. The runner sets `KGRAF_REQUIRE_SANDBOX_USER=1` and `--show-output` for these binaries (see the rules below). |
-| (f) | `kgraf sandbox remove`, then `kgraf sandbox status` | Always runs, also after a failure or Ctrl+C. Every kGraf line must be MISSING, the launcher service line and the fallback grant line included. A service or a grant that is still there is a failure. |
+A **confirmation run** is a full run (no `only`) with the sandbox user phase. It reads clean
+when all six hold:
 
-Rules of the phase:
-
-- It uses the sandbox user of the Windows user who runs it (no tag). If that user already has
-  a stored sandbox user, the phase does not start, because step (f) would remove it. Run
-  `kgraf sandbox remove` first.
-- Setup needs administrator rights. The hosted runner is elevated. On another machine, start
-  the runner from an elevated prompt, or accept the UAC prompt. The report says so when the
-  window is not elevated and a step fails.
-- `kgraf-sandbox-runner.exe` must be in `programs\` of the bundle. The phase puts a copy in
-  `tests\` for the test binaries, and removes it at the end.
-- The sandbox users must be able to read and run the programs in `tests\`. Before setup,
-  the phase checks that `tests\` is not inside the profile of the user who runs it, and
-  that each program there grants read and execute to Everyone, Authenticated Users or
-  Users with no deny entry before that grant. If not, the phase does not start, and the
-  report names the sandbox group (`kgraf-sandbox-<hex>`), the folder and the reason. Unzip
-  the bundle to a folder such as `C:\kgraf-wintest`, not to Downloads or the Desktop.
-- Setup gets `--slots 4` (the default, passed explicitly). The escape tests need two slot
-  users or more to check that two worktrees run as two users.
-- `KGRAF_SANDBOX_SETUP_TEST=1` stays only for the tagged setup test in the baseline. The
-  phase does not use a tag.
-- Step (e) sets `KGRAF_REQUIRE_SANDBOX_USER=1`; the baseline suite does not. The runner
-  keeps every `KGRAF_` variable of its own environment from the test binaries and sets
-  this one only in the environment of the re-run, so a value in the shell that started
-  the runner reaches neither half. The baseline is the token sandbox on purpose. With the switch set to 1, a test in `escape_windows.rs`,
-  `runner_windows.rs` or `tls_windows.rs` that would take the token sandbox branch, or skip,
-  fails instead, and its message says to run `kgraf sandbox setup`. The switch takes `1` or
-  `0`. Any other value is an error. Without it, a machine where setup did not take effect
-  passes every test and measures nothing.
-- The escape tests (`escape_windows`) run with a console of their own, in the baseline and
-  in the re-run: the runner starts that binary with `CREATE_NEW_CONSOLE` and still reads
-  its output through pipes. `the_sandbox_cannot_attach_to_the_host_console` measures that
-  a command cannot attach to its host's console, and a redirected run has no console to
-  attach to. In the re-run, with the switch set, that test fails if the binary still has
-  no console; it never passes without the measurement. On a desktop an empty console
-  window opens while the binary runs.
-- The status command prints no words "logon works". A stored password line that is
-  `present` means that a real logon with that password worked, and the report counts them.
-
-What the report part "Sandbox user phase" shows:
-
-- A summary line in the first table: it ran to the end, or it stopped at the gate, and
-  whether the sandbox user is gone.
-- The commands of (b), (c), (d) and (f) with their full output. If the gate fails, the full
-  selfcheck output is there and the report says that the phase stopped at the gate.
-- A table with the baseline and the sandbox user side by side for each re-run binary. For a
-  binary re-run for its failures, the sandbox user columns count only the tests that ran
-  again. A second table lists each test that failed in the baseline and ran again:
-  `passed`, `failed`, `hung` or `not reached`. The tail of each is below the table.
-- "Measurements of the re-run": every output line of the re-run that starts with
-  `measurement:`, with its binary, its test and the test's time. The runner measures that
-  time from the result of the test before it, or from the start of the binary, to the
-  test's own result: with one test thread a test starts when the one before it ends. The re-run passes `--show-output`, so libtest prints
-  the output of passing tests in its summary. A binary that hung or crashed never prints
-  that summary: the section names each such binary, because the lines of its passing
-  tests are missing.
-- The end-to-end checks with the baseline status and the sandbox user status.
-- The confirmation after (f). If anything is left, the runner exits with a non-zero code.
-
-The "Tests" and "End-to-end checks" rows of the first table count the baseline. The verdict
-line counts both halves (`report::headline`):
-
-- every baseline failure, except those listed in "Expected under the token sandbox";
-- every failed test and every hung or crashed binary of the re-run (e), except the DNS
-  test's failure that "Known gaps" lists (see below);
-- every failed end-to-end check of the sandbox user, and every failed end-to-end check of
-  the baseline except those listed in "Expected under the token sandbox".
-
-A baseline failure is expected under the token sandbox only when both hold: the same test
-passed in the re-run (a pass in the binary's first run; a pass only in a solo re-run does
-not count), and its own baseline output names a token sandbox limit. The limits, the same
-markers that select a binary for the re-run, are the cargo jobserver, Git Bash, msys,
-`NtCreateDirectoryObject`, the signal pipe, Schannel and `STATUS_DLL_INIT_FAILED`
-(0xC0000142, also printed as -1073741502 or 3221225794), with which Git Bash's programs
-and rustc end under the token sandbox. Those failures are not in the verdict; the section
-"Expected under the token sandbox (N)" lists each with its binary, its test and the marker,
-and the verdict says how many it listed apart. A baseline failure without a marker in its
-own output, or one whose test failed, hung or was not reached in the re-run, still counts,
-as does a failure in a binary the re-run did not take. The Failures section also lists each
-failure of the re-run, with its output, under `sandbox user:`. A baseline test that the cap
-on solo re-runs left out is named under "not re-run alone (cap reached)" only while it
-counts: one listed apart needs no solo re-run, since the sandbox user's run is its evidence.
-
-A baseline end-to-end check is expected under the token sandbox by the same rule: the check
-with the same id passed in the sandbox user's end-to-end checks, and its own baseline detail
-or output carries one of the markers above. `shell.git_bash` is the case: under the token
-sandbox Git Bash ends with `NtCreateDirectoryObject(...): 0xC0000022` and exit status
--1073741502, and as the sandbox user the same check passes. The section lists such a check
-as `end-to-end check` with its id and marker. A check the sandbox user failed, skipped or
-did not run, or one without a marker in its own output, still counts.
-
-When selfcheck (d) failed on its `dns:` line, a line `Known gap: DNS is not confined on this
-machine ...` follows the verdict, with selfcheck's words. It is not a pass. While the gap
-stands, the DNS test of the re-run (`kgraf-sandbox/test/dns_windows ::
-an_offline_lookup_does_not_reach_the_dns_client_service`) fails, and its failure is listed
-under "Known gaps" with its output, and named in that line, instead of being counted, only
-when all of these hold: the gate failed on DNS alone, the failure is that test's, and its
-own output says "This is the recorded gap" (the test prints that only when a name
-resolution cache filter is absent or disabled, the gap setup records). A leak with every
-filter in place prints "a defect of the filters", and counts; so does any other failure of
-that binary.
-
-#### The time budget (`--budget-mins`)
-
-A job that a host kills at a fixed limit leaves no report. `kgraf-wintest.exe --budget-mins
-<N>` gives the run N minutes of wall-clock time, counted from the start of the runner, for
-everything: the baseline, the sandbox user phase, the removal of the sandbox user, the cleanup
-and the report. Without the option there is no budget.
-
-How the runner keeps to it:
-
-- Before it starts an item, in the baseline, in the sandbox user phase and in the re-runs, it
-  compares the item's expected seconds (the manifest's measured rate, the same number the
-  progress estimate uses) with the time left. An item that does not fit is not started. The
-  report lists it under "Not run" as `not run: budget (expected about N s, M s left)`. The
-  end-to-end checks and the whole sandbox user phase are items too. The phase needs 300 s
-  (`PHASE_START_SECS`) for setup and the gate; with less left it does not start, and nothing
-  is changed on the machine.
-- The time limit of a running item is cut to the time left. When the budget ends the item,
-  the existing kill path ends its process tree, and the report records it as `stopped at the
-  budget` (JSON: `budget_stopped`; it is not `timed_out`, because the item's own limit was not
-  the cause). No solo re-run follows a stop. A solo re-run that the budget ends reads
-  `stopped at the budget`, not `hung`.
-- A reserve is kept free at the end: 540 s with a sandbox user phase (the removal's limit of
-  300 s, the status check's 120 s, and 120 s for the cleanup and the report), 120 s without.
-  Work never uses it. The removal, the cleanup and the report run after the budget is spent,
-  and the removal runs even when the budget ended the phase early.
-- The verdict reads `INCOMPLETE: the time budget of N min ran out; ...` as soon as one item did
-  not run or was stopped. It never reads `ALL PASSED`; the failures that did happen are still
-  counted in the same line. The summary has a "Time budget" row, and the runner exits 1.
-
-The workflow computes the budget from the job: the job limit (165 minutes), less the minutes
-used when the bundle step starts, less 12 minutes for the steps after it, less 1. The steps
-before the bundle took 20 to 22.5 minutes and the steps after it 2.5 to 9 (the cache save alone
-7 minutes, when it runs), so the runner gets about 130 minutes, and the budget line is printed
-in the step's log.
-
-What a full run needs, measured on the run of 2026-10-11 (Windows Server 2025, the hosted
-runner): the bundle took 102.5 minutes, of which the sandbox user phase took 2,668 s, and the
-budget of 115 minutes did not admit the re-run of `contract_checks` (expected 1,242 s, 762 s
-left). Whole re-runs took 2,489 s of that phase: `kgraf_host#rest` 933 s for its 89 baseline
-failures among 448 tests, the bench-briefs library 677 s for 21 among 70, `contract_flow`
-512 s for 1 among 72. The re-run now runs only the failed tests of such a binary. Timed per
-test on a development machine with one test thread, the failed tests are 66 % of
-`kgraf_host#rest`'s time, 93 % of the bench-briefs library's, 18 % of `contract_flow`'s, 74 % of
-`contract_checks`' and 14 % of `kgraf_shell`'s. Applied to the Windows times, the phase saves
-about 820 s and the `contract_checks` re-run adds 440 to 1,080 s (its whole re-run measured
-600 s and 1,463 s on two runs), so a complete bundle run projects to 97 to 107 minutes and the
-job to 122 to 139 minutes. The job limit is 165 minutes, which leaves about 20 minutes in the
-slower case; a job bills only the minutes it runs, at twice the Linux rate.
-
-#### Reading the progress line
-
-A step that runs a named item shows the item in place of the step name, without the bar and
-the estimate: `<percent> <done>/<total> <clock> | re-run <binary id> test 3 of 12 | ...`.
-Each re-run in the sandbox user phase shows `re-run <binary id>`, and a solo re-run shows
-`solo <binary id>::<test name>` (in the baseline and in the phase). The log also gets a line
-`sandbox user: running <binary id> again` when a re-run starts and `solo re-run
-<binary id>::<test name>` for a solo re-run, so a stall is attributable from the log alone.
-
-#### Running only some tests (`--only`)
-
-`kgraf-wintest.exe --only <filter>` runs only what the filter names, in the baseline suite
-and in the sandbox user re-run alike. The filter is a comma-separated list of items:
-
-- `<run id>`: one test binary, whole. Run ids are the ones in the report's "Test binaries"
-  table, for example `kgraf-sandbox/test/escape_windows`. An id without its `#core` or
-  `#rest` part names both parts.
-- `<run id>::<test name>`: one test of that binary, by its full name as the report prints
-  it, for example
-  `kgraf-bench-briefs/lib/kgraf_bench_briefs::check::tests::verify_fails_when_a_protected_file_changed`.
-  The named tests of one binary run together with libtest `--exact`. Name the part
-  (`#core` or `#rest`) of a split binary to run a test once.
-- `e2e`: every end-to-end check. `e2e::<check id>` (for example `e2e::shell.git_bash`)
-  keeps that check; the checks run in groups that share one worker run, so its group runs
-  and only the named check is reported. Without an `e2e` item no end-to-end check runs.
-
-An item that names no binary of the bundle stops the runner before it starts anything, and a
-named end-to-end check that did not run is reported as a failed check. With a filter, the
-runner asks nothing about the extended set, and in the sandbox user phase every binary the
-filter named runs again, whatever the baseline found. The report states the filter in a
-line above the verdict and in the "Mode" row. An empty value is the full run, so the
-workflow passes its `only` input through as it is:
-
-```
-gh workflow run wintest.yml -f only='kgraf-sandbox/test/escape_windows::send_input_reaches_nothing_of_the_owners'
-```
-
-#### Results of the confirmation campaign (2026-10-11)
-
-The campaign ran the self-test bundle on GitHub-hosted runners (Windows Server 2025
-Datacenter 24H2, build 26100.33438, x86_64, 2 cores, 8 GiB memory, Git for Windows
-2.55.0.windows.5, cargo 1.99.0) until a full run with the sandbox user phase read clean.
-All runs were `workflow_dispatch` runs of `wintest.yml`. The last run before the campaign
-is listed first, for comparison. "Pin" is the commit the bundle was built from, as the
-report's `kGraf` row prints it. "Counted" is what the verdict line counted; "apart" is the
-number of baseline failures listed under "Expected under the token sandbox".
-
-| # | GitHub run | Pin | Verdict | Counted | Apart | Bundle time | Job time |
-|---|---|---|---|---|---|---|---|
-| 15 | 38086805879 | `384a104d` | FAILURES | 143 tests, 1 end-to-end check (no classification yet) | 0 | 1:17:48 | not recorded |
-| 16 | 38101426277 | `056ec4b3` | ALL PASSED (filtered: 8 items) | 0 | 17 | 31:40 | 62.7 min |
-| 17 | 38104966373 | `ea643ad9` | cancelled at the 120 minute job limit; no report | none | none | not written | 120.3 min |
-| 18 | 38112396765 | `3af966b0` | INCOMPLETE (budget 115 min) | 46 tests, 1 end-to-end check | 103 | 1:42:28 | 127.8 min |
-| 19 | 38124181868 | `f0ebf25d` | FAILURES | 2 tests | 143 | 1:34:26 | 117.6 min |
-| 20 | 38134080482 | `3a1117c2` | FAILURES | 2 tests | 144 | 1:34:37 | 117.8 min |
-| 21 | 38149445796 | `300ef853` | FAILURES | 9 tests, 1 binary hung | 135 | 1:43:10 | 126.8 min |
-| 22 | 38163271605 | `69d798cb` | ALL PASSED, known gap: DNS only | 0 | 144 | 1:36:25 | 119.7 min |
-
-Runs 18 to 22 are full runs with the sandbox user phase. The job times are the workflow
-job's start to its end, from the Actions record. The seven jobs of the campaign (16 to 22)
-ran 792.7 minutes in all.
-
-What each run showed, and what the next one changed:
-
-- **Run 16** ran only the eight tests the earlier fixes address (the `only` value in "What a
-  confirmation run must show"). All of them passed as the sandbox user. This run also
-  made the first AppContainer DNS probe (see below). The probe's third phase failed on a
-  script bug: PowerShell objects were passed to the container's environment where strings
-  were needed, and the script now passes strings.
-- **Run 17** was the first full run with that probe fix. The job reached its 120 minute
-  limit while the bundle step was still running (99.2 minutes into it), and the platform
-  cancelled the job. The upload step skipped on the cancel, so no report exists. This
-  led to the time budget, the named progress items and the upload that runs after a
-  cancel ("The time budget" above), and to a job limit of 150 minutes.
-- **Run 18** was the first full run that wrote a report. The budget of 115 minutes did not
-  admit the re-run of `contract_checks` (expected 1,242 s, 762 s left), so the verdict read
-  INCOMPLETE. Of what ran, 42 baseline failures and 4 sandbox user failures counted, and 1
-  end-to-end check (`shell.git_bash`). The bundle step took 102.6 minutes, 2,668 s of it in
-  the sandbox user phase, of which 2,489 s were whole re-runs. This led to the triage set:
-  portable tests, own-file paths read on Windows, causes printed in the tests' own output,
-  re-runs of failed tests alone, the two named exemptions (`shell.git_bash` and the DNS
-  test), and a job limit of 165 minutes.
-- **Run 19** (the triage set) counted 2 tests. The own-file test
-  `a_failure_naming_a_file_the_contract_wrote_is_not_deferred` echoed a command so long
-  that the 300 characters a deferred notice quotes held none of the sandbox status, so the
-  run counted a limit of the token sandbox as a defect. The lease test
-  `a_lease_lost_just_before_acceptance_voids_the_result` timed out on a run that was slow,
-  not lost: its file ran about six times slower than usual on the runner. The command is
-  shorter now, with a compile-time bound, and every run timeout in the plan and lease
-  guards is a hang guard of 90 s.
-- **Run 20** counted 2 tests of `scheduler_loop`
-  (`one_schedule_unable_to_claim_does_not_stop_another_from_firing` and
-  `probe_p2_a_claim_committed_by_tick_schedule_then_crash_is_reclaimed`). Each passed when
-  re-run alone in 0.5 s. The drain helper gave up after 200 ticks, about one second, and
-  a loaded runner took longer. The drain and the transcript reopen in `worker_e2e` now wait
-  by wall clock (60 s and 30 s) as hang guards.
-- **Run 21** counted 9 tests of `kgraf_host#rest` and one hung binary. The sandbox user
-  re-run of that binary (89 tests chosen for their baseline failures) was cut off at its
-  limit of 625.2 s after 80 tests had passed; the other 9 were never judged, so their
-  baseline failures counted. The limit came from the tests' share of the binary's
-  expected time (125 s, five times that), but the tests a re-run selects failed fast in
-  the baseline and run to the end as the sandbox user. They had taken 526 s to 538 s on
-  two earlier runners. A re-run of some tests of a binary now gets the whole binary's
-  limit; the expected time used for the budget stays the share.
-- **Run 22** read `ALL PASSED` with the known DNS gap named. It is the confirmation run.
-
-Run 22 in numbers (the report's own figures):
-
-- 181 test binaries run, 170 clean, 0 hung or crashed. 5,577 tests passed, 143 failed in
-  the baseline, 11 ignored. 14 end-to-end checks passed and 1 failed in the baseline.
-- The 144 baseline failures (143 tests and the end-to-end check `shell.git_bash`) are all
-  listed under "Expected under the token sandbox (144)", and every one passed when it ran
-  again as the sandbox user. Their markers: 77 `STATUS_DLL_INIT_FAILED` (0xC0000142), 34
-  cargo jobserver, 31 Git Bash (msys) plus the one end-to-end check named Git Bash, and 1
-  Schannel (`SEC_E_NO_CREDENTIALS`). The binaries: `kgraf_host#rest` 89,
-  `kgraf_bench_briefs` 21, `contract_checks` 15, `kgraf_tools#core` 4, `kgraf_shell` 3,
-  `startup_windows` 3, `shell_windows` 3, `worker_e2e` 2, and 1 each in `tls_windows`,
-  `escape_windows` and `contract_flow`.
-- In the sandbox user re-run, 15 binaries ran. All passed in full except `dns_windows`
-  (3 passed, 1 failed), whose failure is the known gap. `escape_windows` passed 45 of 45,
-  `kgraf_sandbox` 488 of 488, `runner_windows` 11 of 11 and `stdio_windows` 8 of 8.
-  The re-run of `kgraf_host#rest` took 519.9 s and `contract_checks` 1,283.9 s. The
-  sandbox user phase took 3,022 s.
-- The runner process was in Windows session 2. The launcher service made a window station
-  `kgraf-cmd-<hex>` per sandbox user in session 0, and the probe in setup read `Proved`: a
-  sandbox user made a named semaphore and an unprefixed named mutex through the
-  session-0 path. The fallback grant was not needed and did not run. Selfcheck (d) printed
-  `network: only the egress proxy was reachable`.
-- Step (f) removed everything: "Launcher service after the removal: gone. Fallback grant
-  after the removal: gone." and "Confirmed: nothing of the sandbox user is left".
-- The time budget was 131 minutes and was not reached. Nothing under "Not run" says
-  `not run: budget`. The entries there are tests that need a model provider, Docker,
-  Rust at run time or the full git checkout, and parts that run in the core set.
-
-The known gap, as run 22 printed it. The filter on the user-mode RPC layer is present. The
-filters on the name resolution cache layer, IPv4 and IPv6, are absent: Windows Server 2025
-refused them at setup with `FWP_E_OUT_OF_BOUNDS`. The offline sandbox user's lookup then
-got a DNS server's answer (status 9003, `DNS_ERROR_RCODE_NAME_ERROR`): lookups leave the
-machine. `selfcheck` fails on its `dns:` line alone, and
-`kgraf-sandbox/test/dns_windows :: an_offline_lookup_does_not_reach_the_dns_client_service`
-fails with "This is the recorded gap". Both are named in the `Known gap:` line, and the test
-is listed under "Known gaps" with its output, not counted. All six full or filtered runs
-from 16 to 22 that wrote a report show the same gap. Every other part of the network
-confinement passed: the loopback filters and the egress proxy line.
-
-Run times for planning. The job takes 17 to 19 minutes to build the bundle and 1.4 to 2.3
-minutes for the AppContainer probe. On runs 19 to 22 the bundle step took 94.5 to 103.2
-minutes, the sandbox user part 2,951 to 3,050 s, and the job 117.6 to 126.8 minutes, inside
-the projection of 122 to 139 minutes and 38 minutes or more under the 165 minute limit. The
-budget the workflow computed was 131 minutes. Run 18, on the 115 minute budget, is the
-case a short budget gives.
-
-The AppContainer DNS probe. The workflow runs `scripts/wintest-appcontainer-dns.ps1`
-after the bundle, as the runner account. It makes an AppContainer profile with no
-capabilities, captures ports 53 and 853 with `pktmon` in each phase, flushes the DNS Client
-cache before each phase, and tries three things. Phase A looks up a name inside the container.
-Phase B looks it up outside, as a control. Phase C runs git and cargo inside the container,
-with read and execute granted on the cargo home, the rustup home and Git for Windows. It
-never fails the job, and writes `appcontainer-dns.md` to the artifact. Runs 16 to 22 used
-the first version of the probe, which gave a verdict from packet counts. The table below
-is from that version.
-
-The probe now saves raw data and decides by name. It differs from that version in four
-ways:
-
-- **Probe-only mode.** Dispatch the workflow with `probe_only=true` to run only the probe
-  and the upload. The job installs no Rust and builds nothing, and it skips the bundle, the
-  tests, the sandbox user phase and the firewall test. It checks out only the `scripts`
-  folder. The upload step still runs after a failure or a cancel. The command is:
-
-  ```
-  gh workflow run wintest.yml -f probe_only=true
-  ```
-
-  The probe alone took 1.4 to 2.3 minutes in runs 16 to 22. Job set-up and the checkout
-  add to that. Expect a few minutes in all. This mode has not been timed yet.
-- **Two real lookups.** The probe looks up `example.com` with getaddrinfo
-  (`Dns.GetHostAddresses`) and with `DnsQuery_W`, called through `Add-Type` C# in Windows
-  PowerShell inside the container. `DnsQuery_W` is the DNS Client service API that
-  `Resolve-DnsName -DnsOnly` uses. `Resolve-DnsName` itself cannot run in the container:
-  the DnsClient module is built on CIM, which needs WMI. The same two lookups run in the
-  control phase. If `Add-Type` cannot compile in the container, the line reads `NOT-RUN`,
-  not `REFUSED`, and the verdict is INCONCLUSIVE unless a packet or an answer decides it.
-  The probe name is `example.com`. A name made up for each run does not resolve, so a
-  leaked lookup would return "no such host" and look the same as a refused one. The
-  packets are matched on the exact name instead, and the DNS Client log names the process.
-- **Raw files.** The artifact folder `appcontainer-dns-raw/` holds, per phase, the pktmon
-  `.etl`, its text form (`.txt`) and a `.pcapng` from `pktmon etl2pcap` (`cap-A.*` is the
-  container phase, `cap-B.*` the control). It also holds `dns-client-operational.evtx`, an
-  export of the `Microsoft-Windows-DNS-Client/Operational` log for the probe window. The
-  probe enables that log if it is off and restores its state at the end. Open the
-  `.pcapng` in Wireshark and the `.evtx` in Event Viewer to check the markdown.
-- **Detail in `appcontainer-dns.md`.** Each phase lists every DNS packet with its time,
-  direction, frame size in bytes, protocol, addresses, kind (query or response), type and
-  decoded name. One packet is logged at several points of the network stack, so copies
-  with the same DNS ID, kind, name, type and ports within 100 ms count as one; the line
-  above the table gives how many were removed. A packet that does not decode, and any
-  packet on port 853 (DNS over TLS), is listed as `(not decoded)`. A table of DNS Client
-  events follows, with time, phase, event ID, query name, process ID and status. The
-  report also gives the process IDs of the in-container processes the probe started (phase
-  A lookups, and the tools in phase C).
-
-The verdict rule, in this order:
-
-| Verdict | Condition |
-|---|---|
-| LEAK-SERVICE | a lookup inside the container returned an address |
-| FALLBACK-SENT | a phase A packet carries the name `example.com` (exact match, no count) |
-| CONFINED | no phase A packet carries the name; every phase A packet decoded; both lookups ran; the control sent the name; the event log was read; and no event for the name has status 0 from an in-container process ID |
-| INCONCLUSIVE | anything else; the line names the reason (packet list missing, a packet that did not decode, a lookup that did not start or build, a control that sent nothing, an event log that could not be read, or an event that disagrees with the lookups) |
-
-The capture sees the whole machine, so a phase A packet with the name may come from
-another process. The event table gives the process ID. The log may report the DNS Client
-service's process ID in its header, not the caller's; if no event process ID matches an
-in-container process ID, attribution rests on the timing and the packets. The earlier
-verdicts follow:
-
-| Run | Verdict | Packets on 53 or 853 in phase A | Control packets (phase B) |
-|---|---|---|---|
-| 16 | CONFINED | 0 | 18 |
-| 17 | no output (job cancelled) | none | none |
-| 18 | FALLBACK-SENT | 6 | 18 |
-| 19 | FALLBACK-SENT | 12 | 18 |
-| 20 | FALLBACK-SENT | 6 | 18 |
-| 21 | FALLBACK-SENT | 8 | 24 |
-| 22 | CONFINED | 0 | 18 |
-| probe-only (38179466993) | CONFINED, by name and by process | 0 (no DNS packet at all) | 4 named `example.com` |
-
-The probe-only run (GitHub run 38179466993, kGraf b05fcc2e, 2026-10-11, about one minute of
-job time) used the per-packet and per-query records and settles the attribution:
-
-- Inside the container, both lookups were refused: getaddrinfo with "No such host is known"
-  and `DnsQuery_W` with status 87. The DNS Client log names the caller in each event header:
-  the container's two processes asked for `example.com` (event 3006), and each request ended
-  in about 2 ms with status 87 (event 3008). No event shows the DNS Client service sending
-  the query or receiving an answer (events 3009 to 3011, process 1324 in the control phase).
-- The capture of the container phase holds no DNS packet at all, for any name.
-- In the control phase, the same two calls answered, and the capture holds the query and the
-  answer for `example.com` (71-byte query frames, 103-byte answers, to 168.63.129.16).
-- The earlier runs' extra packets were 109 and 121 bytes, the size of a query for a longer
-  name, not of an `example.com` query (71 bytes), so they were other traffic on the machine.
-
-So, on Windows Server 2025, the DNS Client service refuses a lookup from an AppContainer that
-has no network capability, before anything is sent, and the caller does not fall back to a
-query of its own. The run was as the runner account, not a sandbox user. Git and `cargo build`
-still did not run in the container (the same errors as before).
-
-What the probe found, and what it does not show:
-
-- In all six runs, `Dns.GetHostAddresses` (getaddrinfo) inside the container failed with
-  "No such host is known", and the same call outside it answered. `Resolve-DnsName` did
-  not run inside the container at all: PowerShell reported the cmdlet as not recognized.
-  That is a missing command, not a refused lookup, so it says nothing about DNS.
-- The packet count differs between runs with the same code: 0, 6, 12, 6, 8 and 0. The
-  script counts every packet on ports 53 and 853 in the capture window on the machine, not
-  only the container's, and the report cannot tell the container's packets from the
-  machine's own. Two runs read CONFINED and four read FALLBACK-SENT. Those runs alone
-  could not show whether an AppContainer confines DNS; the probe-only run above settles
-  it by name and by process.
-- Git does not run in the container: `fatal: could not open '/dev/null' for reading and
-  writing: Permission denied`, for `git --version` and `git status`, with the read grant on
-  Git for Windows in place. `cargo --version` runs (exit 0). `cargo build` exits 101:
-  cargo could not execute `rustc.exe -vV` ("never executed") even with read and execute
-  granted on the rustup home. A tool in an AppContainer needs access grants that the
-  sandbox user design does not need, and these two tools did not work with the grants the
-  probe gave.
-- The probe ran as the runner account, an administrator, with a profile made for the
-  probe. It did not run as a sandbox user, through the launcher service, or on a standard
-  user's machine. No part of the sandbox uses an AppContainer. Decision 0097 keeps the
-  dedicated sandbox user and records the DNS gap.
-
-What the campaign does not prove:
-
-- DNS confinement. Windows Server 2025 refuses the name resolution cache filters, and the
-  DNS Client service sends the query itself, so a filter on the caller cannot stop it.
-  Another Windows version may take those filters; none was tested.
-- A standard-user Windows 11 machine, ARM64, and a machine without Git for Windows. The
-  runner is an administrator account on Server 2025 with Git for Windows installed, and
-  its process runs in session 2.
-- That a test which passed in the baseline also passes as the sandbox user, outside the
-  sandbox test binaries. A re-run of another binary runs only its baseline failures.
-- The fallback grant on a real run. The probe through session 0 read `Proved` in every
-  full run that wrote a report, so the fallback never ran.
-
-How to read a verdict from here: `ALL PASSED` with a `Known gap: DNS ...` line is the clean
-result while the gap stands. A verdict that names any other counted test, a hung binary, an
-end-to-end failure, a `not run: budget` item or a non-empty status after step (f) is not
-clean. The count in "Expected under the token sandbox" is the number of baseline failures
-the sandbox user re-run explained: 143 on run 19, 144 on runs 20 and 22, and 135 on run 21,
-where 9 were never judged because the re-run timed out.
-
-#### What a confirmation run must show
-
-A confirmation run is a full run (no `only`) with the sandbox user phase. It reads clean
-when:
-
-- The verdict line reads `ALL PASSED` and counts no failed test, no hung or crashed binary
-  and no failed end-to-end check. While the DNS gap stands, the `Known gap: DNS ...` line
-  follows it and names the re-run's
-  `dns_windows::an_offline_lookup_does_not_reach_the_dns_client_service`, which "Known gaps"
-  lists with its output.
+- The verdict line reads `ALL PASSED`, with no failed test, no hung or crashed binary and no
+  failed end-to-end check. While the DNS gap stands, a `Known gap: DNS ...` line follows it.
 - "Expected under the token sandbox (N)" lists the baseline's Git Bash, jobserver and
-  0xC0000142 failures, and the end-to-end check `shell.git_bash`, and each one's sandbox
-  user status is `passed`.
-- The time budget is not reached: no item under "Not run" says `not run: budget`.
-- In (d): `launch: kGraf's launcher service made window station kgraf-cmd-... and desktop
-  Default for the command of sandbox user ... in session 0`, and a `launch: the session-0
-  path started a command: ... for a command on kgraf-cmd-...\Default` line for each command.
-- In (e): `escape_windows` (`send_input_reaches_nothing_of_the_owners`,
-  `the_command_runs_on_its_own_desktop_without_a_console`,
-  `user_interface_objects_are_shared_the_way_the_backend_shares_them`),
-  `runner_windows::the_command_runs_on_a_desktop_the_owner_made`,
-  `startup_windows::a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only`,
-  `kgraf_bench_briefs` `check::tests::verify_fails_when_a_protected_file_changed`,
-  `kgraf_host#rest` `tests::everything_a_check_creates_is_removed_and_nothing_outside` and
-  every test of `contract_checks` that failed in the baseline pass, and no binary of the
-  re-run timed out.
-- (f) leaves nothing.
+  0xC0000142 failures and the end-to-end check `shell.git_bash`, and each one passed as the
+  sandbox user.
+- The time budget was not reached: no item under "Not run" says `not run: budget`.
+- Selfcheck prints `launch:` lines that show the launcher service made a window station
+  `kgraf-cmd-...` for each command in session 0, and `network: only the egress proxy was
+  reachable`.
+- In the re-run, every test that failed in the baseline for a token sandbox limit passes,
+  and no binary timed out. These include the `escape_windows` tests of the command's desktop,
+  `runner_windows`, `startup_windows`, and the failed tests of `kgraf_host`,
+  `kgraf_bench_briefs` and `contract_checks`.
+- Removal leaves nothing: "Launcher service after the removal: gone", "Fallback grant after
+  the removal: gone", and "Confirmed: nothing of the sandbox user is left".
 
-To re-run only the tests these fixes address, pass this `only` value:
+A verdict that counts any other test, a hung binary, an end-to-end failure, a
+`not run: budget` item or a non-empty status after removal is not clean.
 
-```
-kgraf-sandbox/test/escape_windows::send_input_reaches_nothing_of_the_owners,kgraf-sandbox/test/escape_windows::the_command_runs_on_its_own_desktop_without_a_console,kgraf-sandbox/test/escape_windows::user_interface_objects_are_shared_the_way_the_backend_shares_them,kgraf-sandbox/test/runner_windows::the_command_runs_on_a_desktop_the_owner_made,kgraf-sandbox/test/startup_windows::a_cleared_environment_keeps_the_base_and_the_sandbox_settings_only,kgraf-orchestrator/test/contract_checks,kgraf-bench-briefs/lib/kgraf_bench_briefs::check::tests::verify_fails_when_a_protected_file_changed,kgraf-host/lib/kgraf_host#rest::tests::everything_a_check_creates_is_removed_and_nothing_outside
-```
+### Campaign summary
 
-What the phase collects about the launch path, in the output of selfcheck (b0) and (d):
-after the report lines, selfcheck prints its launch record on standard error, each line
-starting with `  launch:`. On the sandbox user (d) they are: one line for each window
-station and desktop kGraf made (`made window station kgraf-run-... and desktop Default for
-the runner of sandbox user S-1-5-21-...` and the same with `kgraf-cmd-...` for the
-command; on the session-0 path, `kGraf's launcher service made window station kgraf-cmd-...
-and desktop Default for the command of sandbox user S-1-5-21-... in session 0`), the logon calls (`CreateProcessWithLogonW calls N (F failed): last ..., mean ...,
-longest ...; spawn lock wait before them: ...`), and the spawn lock (`spawn lock, every
-spawn in this process: taken N, waits that ran out T; wait mean ..., longest ...; longest
-hold ...`). The report keeps them with the rest of the output. Read the station lines
-first when the gate fails: a missing `kgraf-cmd-` line with an error naming
-`CreateWindowStationW` or `CreateDesktopW` and a Win32 error means the command's station
-could not be made; an error naming `OpenWindowStationW` means the runner could not open it.
-The longest logon call is what every other spawn may wait for. `runner_windows` and
-`stdio_windows` are not among the binaries the phase re-runs; run them by hand (3b, 3c)
-to collect their lines.
+The campaign ran the bundle on hosted runners (Windows Server 2025 Datacenter 24H2, build
+26100.33438, x86_64, 2 cores, 8 GiB, Git for Windows 2.55.0, cargo 1.99.0) on 2026-10-10 and
+2026-10-11, until a full run with the sandbox user phase read clean. Each run fixed what the
+one before it showed.
 
-What the phase collects about the loopback filters, the jobserver and git, and what to read
-in the report (each came from the first self-test run whose re-run ran as the sandbox user):
+| Run | Verdict | Bundle time | Job time |
+|---|---|---|---|
+| 15 | FAILURES (143 tests, 1 end-to-end check; before classification) | 1:17:48 | not recorded |
+| 16 | ALL PASSED (filtered to 8 tests) | 31:40 | 62.7 min |
+| 17 | cancelled at the 120 minute job limit; no report | not written | 120.3 min |
+| 18 | INCOMPLETE (115 minute budget) | 1:42:28 | 127.8 min |
+| 19 | FAILURES (2 tests) | 1:34:26 | 117.6 min |
+| 20 | FAILURES (2 tests, both timing) | 1:34:37 | 117.8 min |
+| 21 | FAILURES (9 tests, 1 binary hung) | 1:43:10 | 126.8 min |
+| 22 | ALL PASSED, known gap: DNS only | 1:36:25 | 119.7 min |
 
-- Loopback. That run had the firewall rule `block-loopback-tcp` present, and the offline slot
-  user still reached a listener on 127.0.0.1 outside kGraf's proxy ports: selfcheck (d)
-  failed with "a direct connection to the origin worked", and
-  `a_command_without_the_network_reaches_the_proxy_ports_and_nothing_else` failed with
-  "reached a local listener ... connected". Windows Firewall rules do not act on that
-  loopback traffic. Setup now adds four filters at the connect layers
-  (`FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `_V6`): one per IP version for every port outside
-  the proxy ports, one per IP version for UDP. Expect in (b) a `created` WFP step line and no
-  `refused` line for a loopback filter; in (c) four lines `present  loopback filter on the
-  connect layer, IPv4 ...` and `..., IPv6 ...`; in (d) the line `network: only the egress
-  proxy was reachable`; and in (e) that escape test passing. A `refused` line or a `FAILED`
-  loopback line means Windows refused that filter shape: send the line whole with its
-  `probe:` reading.
-- The jobserver. That run stopped every cargo build as the sandbox user at rustc's start
-  ("failed to create jobserver: Os { code: 5 }", exit 0xC0000409): rustc could not create
-  its named semaphore in the session. kGraf now makes one per command and names it in
-  `CARGO_MAKEFLAGS`. Expect in (d) a launch line `made jobserver semaphore kgraf-jobserver-...
-  with N tokens for a command of sandbox user ...`. The next run refused the open of that
-  semaphore too; see "Named objects" below for the launcher service that is meant to fix
-  this, and for what (e) must show now. The cargo test prints cargo's own lines. A line
-  `warn: could not canonicalize path C:\Users\<user>` from rustup is expected: rustup looks for
-  a toolchain override in each folder above the command's folder, and the owner's profile
-  folder is not readable to the sandbox user. It is a warning, not a failure.
-- Git. That run's `git status` as the sandbox user failed with "detected dubious ownership":
-  the worktree belongs to the account that runs kGraf. A command that runs as the sandbox user now gets
-  `safe.directory` entries for its roots through `GIT_CONFIG_COUNT`. Expect the end-to-end
-  check `shell.git` and `a_worker_runs_end_to_end_on_the_real_tools_transcript_masking_mcp_and_ledger`
-  to pass in (e).
-- The read grant on a repository's `.git`. That run's notes said "the read grant on
-  ...\.git reached N of its files and folders; ... could not be opened or written",
-  each an object file git writes read-only. Such a file now gets a second, minimal open and a
-  lone write. Expect no such note in (e); a note that remains names the step that failed
-  (`open:`, `read:`, `write (SetSecurityInfo):` or `write (lone):`), which decides the next
-  change.
-- The worktree hold. `a_worktree_the_worker_still_writes_is_not_snapshotted` must fail the
-  verification with "still runs": kGraf now lists each command it started in a worktree by
-  its job, and quiesce is busy while one still holds a process.
+Run 17 led to the time budget and to the upload that runs after a cancel. Run 18 led to
+re-running only the failed tests of a binary and to the expected-failure classification. Runs
+19 to 21 fixed tests that depended on a fast machine or a short command. Run 22 in numbers:
+181 test binaries, none hung or crashed; 5,577 tests passed, 143 failed in the baseline and
+11 were ignored; 144 baseline failures (143 tests and `shell.git_bash`) were all expected
+under the token sandbox, and every one passed as the sandbox user (77 `STATUS_DLL_INIT_FAILED`,
+34 jobserver, 32 Git Bash, 1 Schannel). The re-run took 15 binaries; all passed except
+`dns_windows` (3 passed, 1 failed, the known gap). The sandbox user phase took 3,022 s and
+the budget (131 minutes) was not reached. The launcher service path started every command in
+session 0, and the fallback grant did not run. Per-run detail is in the development
+records, not published.
 
-What the phase collects about named objects, git's ref writes, the junction test and DNS,
-and what to read in the report (each came from the second self-test run whose re-run ran as
-the sandbox user; none of the changes has run on Windows since):
+## 5. Known gaps
 
-- Named objects. The second self-test run proved that a sandbox user's command in the
-  owner's session can neither make nor open a named object: "measurement: a named semaphore
-  in the session as the slot user without the network: exit 5, denied", and cargo's "cannot
-  open path or name kgraf-jobserver-... Access is denied (os error 5)". rustc then aborted
-  with "failed to create global mutex named `rustc_errors`" and exit 0xC0000409. About forty
-  cargo tests failed this way (bench-briefs, contract checks, contract flow, four
-  kgraf_host tests, the cargo escape test). The cause, as far as the evidence goes:
-  `kernelbase.dll` opens the session's object directory itself, with explicit rights,
-  before it looks up any name, and that directory admits the session's logon SID, which the
-  command holds deny-only. kGraf now starts a sandboxed command in session 0 through a
-  launcher service that setup installs, and keeps a recorded grant on the owner's session
-  object directory as the fallback (decision 0097, the last amendment). The probe decides
-  which path is active. Nothing of this has run on Windows. The next run must show the
-  following, in this order. Send each line whole.
-  1. The Windows session of the process that runs kGraf. It is the first line of the sandbox
-     user phase in the report, before any verdict, and it is read with
-     `ProcessIdToSessionId`. On a hosted machine that process may be in session 0. Then both
-     paths name the same machine-wide object directory, and every result below must be read
-     that way: a named object made there does not show that a command works from an
-     interactive session.
-  2. The launcher service. Setup (b) installs it. Status (c) has a line `present  launcher
-     service kgraf-launcher-<hash> (installed, stopped; started when a command needs it)`,
-     and the description of the service reads back as kGraf's. A stopped service between
-     commands is normal: it starts on demand and is not a gap.
-  3. The `launch:` lines. Each ask of the service gives a line `launch: the session0 path
-     started a command: ... (at ...)` that names the path that started the command and, for
-     a logon that failed, its logon type and Win32 error. The report lists these lines, and
-     the `named objects:` lines, in the "Launch path" section.
-  4. The `named objects:` line in (b), (c) and (d). It names the active path, why that path
-     is the active one, and what the probe found. A probe that made a named semaphore and an
-     unprefixed mutex says "Proved". A probe that ran and was refused says "The proof
-     failed, a named object was refused". A probe that could not run says so, and that it
-     says nothing about named objects.
-  5. The `measurement:` lines for a named semaphore and for an unprefixed mutex, each made
-     by a sandbox user through the active path, and the jobserver opened under its `Global\`
-     name (`Global\kgraf-jobserver-<hex>` on the session-0 path). The test
-     `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured` must pass, or fail
-     with a message that names the cause.
-  6. cargo and rustc running as a sandbox user. The tests that failed on the named object
-     (the cargo tests listed above) must pass now, or fail for a reason that is named. The
-     environment of a command comes from `CreateEnvironmentBlock` and the user profile is not
-     loaded, so what a build reads from `HKEY_CURRENT_USER` is not available. The run shows
-     whether cargo, rustc or a toolchain lookup needs it. A failed cargo command's output
-     still ends with a `[sandbox]` line that names the cause where cargo cannot run.
-  7. No change in what the launcher touches: standard input and output, the exit status, the
-     kill when the command is dropped, the time limits, the job, the egress proxy and the
-     network filters (the WFP filters match by user SID). The tests for these must pass as
-     they did before.
-  8. A clean remove (f). The service is stopped and deleted, the fallback grant is taken off
-     where it was made, and nothing of kGraf's is left. The status after the removal has the
-     line `MISSING  launcher service ...` and a `MISSING` line for the fallback grant. The
-     report says "Launcher service after the removal: gone. Fallback grant after the
-     removal: gone." A service or a grant that is still there, or a status that prints
-     neither line, makes the removal check fail.
-  9. If the probe in (b) was refused, the phase exercises the fallback by itself, with no
-     person at the keyboard. After setup it runs the elevated action
-     `kgraf sandbox elevated --action grant-named-objects` (step (b2), started from the
-     runner the way setup starts its own elevated step), probes again through the fallback
-     (step (b3), `kgraf sandbox-named-object-probe --launch`) and reads the status (b4). The
-     report section "Named objects: the fallback and the path chosen" prints, in this order:
-     the Windows session the elevated step ran in; the access list of that session's object
-     directory before the grant and after it; the path chosen (session 0, the fallback grant,
-     or neither); and the probe outcome for each path tried, in the words of
-     `session0::Proof` (`Made`, `Refused`, `CouldNotRun`). Where the fallback is the active
-     path, the whole list above must hold through it, and the risk line must be in setup,
-     status, selfcheck and the report: a sandboxed command can then put a named object in
-     the directory the owner's own programs read. The grant is gone at the next sign-out in
-     any case, and remove takes it off as well. If the first probe was not refused, the
-     report says the fallback did not run.
-  10. Commands from a program other than `programs\kgraf.exe`. A test binary in `tests\`
-     starts its commands through the runner the launcher service was installed with, which
-     the owner's side reads from the service's image path: the one in `programs\`, never the
-     copy the phase puts beside the test binaries (that copy serves the owner-session path
-     alone). The sandbox user re-run of the shell, startup, escape, runner, stdio and
-     contract tests must not fail with "check where kGraf's launcher service starts its
-     program from". Where the service is missing, unreadable or set up for another user or
-     pipe, every command fails with one line that names the service and ends "run `kgraf
-     sandbox setup` again", and no command runs on another path. A refused launch says
-     "sandbox setup failed at" and "refusing to run unconfined" once each. The sandbox crate
-     tests `the_pipes_access_list_is_accepted_by_windows` and
-     `the_creation_attributes_bound_inheritance_and_join_the_job` pass: a test runs as the
-     owner, and the owner is refused another instance of the launcher pipe with error 5,
-     which is the result the first of them expects.
-  If the process that runs kGraf is in session 0, items 4, 5 and 9 describe one machine-wide
-  directory and prove less than they do from an interactive session. Say so when you send the
-  report.
-- Git's ref writes. That run's `everything_a_check_creates_is_removed_and_nothing_outside`
-  failed in a check that ran `git init` in a tree in the owner's profile: "cannot lock ref
-  'HEAD': unable to create directory for .../nested/.git/HEAD". Git stats each folder of
-  the repository's absolute path from the drive root before it writes a ref, and the sandbox
-  user cannot read the attributes of a folder in the owner's profile. Expect the test to
-  fail the same way, and in (e) the line `measurement: the attributes of each folder above
-  the tree ...: exit 5, denied ...<the first folder that refuses>` from
-  `the_attributes_of_each_folder_above_the_tree_are_measured`. Exit 0 there with the test
-  still failing means the cause is another one: send the test's tail whole.
-- The junction test. It now checks both halves of the link walk: beside the junction its
-  probe planted, the next command of the same user starts (that user's entry is already on
-  the tree, so nothing is written and nothing can be carried through the link) and the
-  target's access list is unchanged; on a fresh tree holding a junction out of it, the first
-  grant for each user is refused with "holds the link ... nothing was written". Expect
-  `a_junction_inside_the_root_cannot_escape` to pass.
-- The worker end-to-end test now expects Git Bash's "Permission denied" for the denied read
-  on Windows. Expect
-  `a_worker_runs_end_to_end_on_the_real_tools_transcript_masking_mcp_and_ledger` to pass.
-- DNS. `an_offline_lookup_does_not_reach_the_dns_client_service` still fails while Windows
-  refuses the name resolution cache filters. Its message now says "This is the recorded
-  gap" when a name resolution cache filter is absent or disabled, and calls the leak a
-  defect of the filters when every one is present and running.
+**DNS is not confined on Windows Server 2025.** Of the three DNS filters setup adds, the one
+on the user-mode RPC layer is accepted. The two on the name resolution cache layers (IPv4
+and IPv6) are refused with `FWP_E_OUT_OF_BOUNDS`. The offline sandbox user's lookup then
+reaches a DNS server and gets an answer (status 9003, `DNS_ERROR_RCODE_NAME_ERROR`). So:
 
-What the phase collects about the DNS filter, and what to read in the report:
+- `kgraf sandbox selfcheck` fails on its `dns:` line alone. Every other line passes,
+  including the loopback filters and the egress proxy line.
+- `dns_windows :: an_offline_lookup_does_not_reach_the_dns_client_service` fails with "This
+  is the recorded gap".
+- All runs from 16 to 22 that wrote a report show the same gap.
 
-- The `dns:` line of selfcheck before setup (b0) and after it (d). Before: `dns: not
-  confined (token sandbox; ...)`. After: `dns: confined (...)`. Any other line after setup
-  means the filters are not proved on that machine; the summary then says `DNS FAILED`.
-  A `dns: not proved` line names the status the probe got: a timeout, a status the check
-  does not know, or output cut off before the probe's `KGRAF-DNS-END` line. Send that
-  status back; it decides whether the next change is a longer wait or another layer.
-- The three DNS filter lines of status (c) and of status after removal (f): `present`
-  (or `FAILED`, for a filter Windows refused at setup), then `MISSING`. There is one line
-  per filter, each naming its layer (the user-mode RPC layer, and the name resolution cache
-  layer for IPv4 and for IPv6) and its own key.
-- For each refused filter, the `refused` line of setup (b). Its reason carries Windows'
-  status (Windows Server 2025 answered `FWP_E_OUT_OF_BOUNDS` for the IPv4 name resolution
-  cache filter) and, for a name resolution cache layer, a `probe:` reading: setup added two
-  permit filters at that layer, one with no condition and one with kGraf's user condition,
-  each in a transaction it aborted, and the reading says which of them Windows took. It
-  tells whether the layer refuses any static filter, the user condition, or the block
-  action. Send the line whole; it decides what the next change to the DNS filter is.
-- The test binary `dns_windows`, in the baseline (each test returns at once, because no
-  sandbox user is set up) and in the re-run (e). In the re-run it checks the
-  `netsh wfp show filters` entry of each filter that exists (name, layer
-  `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4`, `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`,
-  `FWPM_LAYER_ALE_AUTH_CONNECT_V4` or `FWPM_LAYER_ALE_AUTH_CONNECT_V6`, block), with a
-  `measurement:` line for each filter it does not look for: one Windows refused at setup,
-  and the filter on `FWPM_LAYER_RPC_UM`, which netsh does not list (an earlier run: present by
-  kGraf's own reading, absent from the netsh list). Then the cache check: after
-  `Clear-DnsClientCache`, a lookup by the offline user fails and `Get-DnsClientCache` does
-  not list its name, while the online user and the owner still resolve. That test prints a
-  `measurement:` line per DNS filter (present, absent or disabled) and judges by the lookup
-  alone: on a machine that refused the name resolution cache filters (Windows Server 2025)
-  the lookup leaves the machine and the test fails on it, which is the recorded gap. A
-  failure message carries the netsh entry or the lookup status.
-- Read the failed tests of `dns_windows` in the re-run table before the selfcheck verdict:
-  they say which part did not hold (the filter's listing, the offline lookup, or the
-  online one).
+Another Windows version may accept those filters. None was tested. A run on one is the most
+useful new result.
 
-## 1. Find out which machine you have
+**The AppContainer probe.** AppContainer was examined as a replacement for the DNS filters.
+A probe-only run on 2026-10-11 found that, on Windows Server 2025, the DNS Client service
+refuses a lookup from an AppContainer that has no network capability, before anything is
+sent: no DNS packet appears in the container phase, and the control phase answers. Git and
+`cargo build` did not run inside the container with the access grants the probe gave. The
+probe ran as the runner account, not as a sandbox user. No part of the sandbox uses an
+AppContainer. Decision 0097 keeps the sandbox user and records the DNS gap.
 
-```powershell
-$env:PROCESSOR_ARCHITECTURE
-```
+**Not tested:**
 
-`AMD64` is an x86_64 machine. `ARM64` is an ARM64 machine. Steps that differ say so.
+- A standard-user Windows 11 machine, ARM64, and a machine without Git for Windows.
+- A Windows version other than Server 2025.
+- The fallback grant on a real run. It exists for the case where the session-0 launcher
+  cannot make named objects. The launcher path proved in every full run, so the fallback
+  never ran.
+- A test that passed in the baseline, run again as the sandbox user, outside the sandbox
+  test binaries. The re-run of any other binary covers only its baseline failures.
 
-## 2. Install the prerequisites
+## 6. Manual fallback
 
-Each `winget` command installs one program. Accept the prompts. Close and reopen
-PowerShell after the last one, so that it sees the new `PATH`.
+Use these steps to test a native build, to test ARM64, or when the bundle cannot run. A first
+build takes 10 to 30 minutes.
 
-**Git for Windows** (it also provides Git Bash, which kGraf uses to run `sh` and `bash`
-commands). `winget` picks the native build for your machine, ARM64 included:
+**Machine.** `$env:PROCESSOR_ARCHITECTURE` prints `AMD64` (x86_64) or `ARM64`.
+
+**Prerequisites.** Each `winget` command installs one program. Close and reopen PowerShell
+after the last.
 
 ```powershell
 winget install --id Git.Git -e --source winget
-```
-
-**The Microsoft C++ build tools and the Windows SDK** (the Rust MSVC toolchain links with
-them). This is the command the Rust installer's own documentation gives; it adds the x64 and
-the ARM64 compilers on either machine:
-
-```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools --source winget --force --override "--wait --passive --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --addProductLang En-us"
-```
-
-The two `Llvm.Clang` components are for ARM64: one of kGraf's dependencies (`aws-lc-sys`,
-the TLS library) compiles its C code with `clang-cl` there. If `winget` reports that a newer
-Visual Studio replaced 2022, run `winget search Microsoft.VisualStudio` and use the
-`BuildTools` id it lists with the same `--override` text.
-
-**NASM** (x86_64 only: `aws-lc-sys` assembles its x86_64 code with it):
-
-```powershell
 winget install --id NASM.NASM -e --source winget
-```
-
-If NASM cannot be installed, set `$env:AWS_LC_SYS_PREBUILT_NASM = "1"` in the PowerShell
-window before you build instead; `aws-lc-sys` then uses its checked-in prebuilt objects.
-
-**Rust**, through rustup:
-
-```powershell
 winget install --id Rustlang.Rustup -e --source winget
 ```
 
-Reopen PowerShell, then check each tool:
+- Git for Windows provides Git Bash, which kGraf uses for `sh` and `bash` commands.
+- The Build Tools command installs the C++ linker and the Windows SDK. The two `Llvm.Clang`
+  components are for ARM64, where `aws-lc-sys` (a TLS library) compiles C with `clang-cl`. If
+  winget reports a newer Visual Studio, run `winget search Microsoft.VisualStudio` and use the
+  `BuildTools` id it lists.
+- NASM is for x86_64 only. If it cannot be installed, set
+  `$env:AWS_LC_SYS_PREBUILT_NASM = "1"` before building.
+
+Check: `rustup show` names `stable-x86_64-pc-windows-msvc` (or `stable-aarch64-pc-windows-msvc`
+on ARM64); `cargo --version` is 1.95 or later (else `rustup update`);
+`& "$env:ProgramFiles\Git\bin\bash.exe" -c "uname -a"` prints a line starting with
+`MINGW64_NT` or `CLANGARM64_NT`.
+
+**Build.** Use a folder on an NTFS drive: the sandbox works through file permissions and
+refuses FAT and exFAT.
 
 ```powershell
-rustup show
-cargo --version
-git --version
-& "$env:ProgramFiles\Git\bin\bash.exe" -c "uname -a"
-```
-
-`rustup show` names the default toolchain: `stable-x86_64-pc-windows-msvc` on x86_64,
-`stable-aarch64-pc-windows-msvc` on ARM64. kGraf needs Rust 1.95 or later; if `cargo
---version` is older, run `rustup update`. The last line prints a line starting with
-`MINGW64_NT` (x86_64) or `CLANGARM64_NT` or `MINGW64_NT` (ARM64): that is Git Bash.
-
-## 3. Get the code and build it
-
-```powershell
-mkdir C:\src -Force
-cd C:\src
+mkdir C:\src -Force; cd C:\src
 git clone https://github.com/Marceux-Croix/kGraf.git
 cd kGraf
 cargo build -p kgraf-cli
-```
-
-Keep the project in a folder on an NTFS drive (`C:` is): the sandbox works through file
-permissions and refuses a folder on a FAT or exFAT drive. The first build takes 10 to 30
-minutes.
-
-**ARM64 only: also build for x86_64.** ARM64 Windows runs x86_64 programs through
-emulation, and many users run x86_64 tools there. The native target is
-`aarch64-pc-windows-msvc`, which the steps below use by default. To test the emulated
-x86_64 build as well, add its target once and repeat every `cargo test` command in step 4
-with `--target x86_64-pc-windows-msvc` after `cargo test`:
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-cargo build -p kgraf-cli --target x86_64-pc-windows-msvc
-```
-
-## 4. Run the tests
-
-Make a folder for the results first; every command below writes its output there too:
-
-```powershell
 mkdir C:\src\kgraf-results -Force
 $r = "C:\src\kgraf-results"
 ```
 
-Run each command and let it finish, even when an earlier one failed. None of these tests
-is marked `#[ignore]`: the Windows-only test files compile only on Windows, so a plain
-`cargo test` runs them there. `--test-threads=1` is needed because some tests change the
-process environment.
+On ARM64 the native target is `aarch64-pc-windows-msvc`. To test the emulated x86_64 build
+too, run `rustup target add x86_64-pc-windows-msvc`, build with
+`--target x86_64-pc-windows-msvc`, and repeat each `cargo test` command below with that
+option. The ARM64 path has not been run.
 
-1. The sandbox's unit tests (the Git Bash search, the argument transport, the network
-   decision, and which token property makes Schannel refuse a TLS credential):
+**Tests.** Run each command to the end, even when an earlier one failed. None is marked
+`#[ignore]`. A passing binary ends with `test result: ok.`; write down every `FAILED` line.
+Without a sandbox user, some Git Bash and cargo tests fail with status `-1073741502`
+(0xC0000142), `couldn't create signal pipe` or `failed to create jobserver`. These are the
+token sandbox limits listed in section 2. They pass as the sandbox user, so run steps 2 to 3c
+again after `kgraf sandbox setup` (case 6b) with `$env:KGRAF_REQUIRE_SANDBOX_USER = "1"`.
 
-   ```powershell
-   cargo test -p kgraf-sandbox --lib -- --nocapture 2>&1 | Tee-Object "$r\1-sandbox-lib.txt"
-   ```
+| Step | Command | Pass line |
+|---|---|---|
+| 1. Sandbox unit tests | `cargo test -p kgraf-sandbox --lib -- --nocapture 2>&1 \| Tee-Object "$r\1-sandbox-lib.txt"` | `test result: ok.`; send every line containing `MEASURE` |
+| 2. `sh` and `bash` in the sandbox | `cargo test -p kgraf-sandbox --test shell_windows -- --test-threads=1 2>&1 \| Tee-Object "$r\2-shell.txt"` | ok as sandbox user |
+| 2a. Programs that load `user32.dll`, `cmd`, a cleared environment | `cargo test -p kgraf-sandbox --test startup_windows -- --test-threads=1 2>&1 \| Tee-Object "$r\2a-startup.txt"` | ok as sandbox user |
+| 3. Escape tests | `cargo test -p kgraf-sandbox --test escape_windows -- --test-threads=1 --show-output 2>&1 \| Tee-Object "$r\3-escape.txt"` | ok (45 tests on the last run); send every line starting with `measurement:` |
+| 3a. HTTPS in the sandbox, listener on 127.0.0.1 | `cargo test -p kgraf-sandbox --test tls_windows 2>&1 \| Tee-Object "$r\3a-tls.txt"` | ok; System32 `curl.exe` fails inside the sandbox with `SEC_E_NO_CREDENTIALS`, and the test expects that |
+| 3b. What a command can do to its runner | `cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 --nocapture 2>&1 \| Tee-Object "$r\3b-runner.txt"` | ok (11 tests on the last run), no "skipped" line; send the `launch:` lines |
+| 3c. Standard handles | `cargo test -p kgraf-sandbox --test stdio_windows -- --test-threads=1 --nocapture 2>&1 \| Tee-Object "$r\3c-stdio.txt"` | ok (8 tests on the last run); send the `launch:` lines |
+| 4. Worker shell tool | `cargo test -p kgraf-tools --lib windows -- --test-threads=1 2>&1 \| Tee-Object "$r\4-tools.txt"` | ok |
+| 5. Run-start notices | `cargo test -p kgraf-host --lib network_notice 2>&1 \| Tee-Object "$r\5-notices.txt"` | ok |
+| 6. Optional: all four packages | `cargo test --no-fail-fast -p kgraf-sandbox -p kgraf-tools -p kgraf-host -p kgraf-bench-briefs -- --test-threads=1 2>&1 \| Tee-Object "$r\6-four.txt"` | a failure not in steps 1 to 5 is worth reporting |
 
-   `--nocapture` is needed for the `MEASURE` lines. Search this file for `MEASURE` and
-   send every line. Four questions ride on them, all about the access entries kGraf
-   writes on a tree it grants a sandbox user:
+Notes for steps 3 to 3c:
 
-   - `MEASURE maximum-allowed-suppresses-propagation: suppressed true|false`. kGraf
-     writes a folder's own list through a handle opened with `MAXIMUM_ALLOWED`, which
-     Microsoft documents as not propagating entries to children, and then writes each
-     existing child itself. A `false` here means Windows propagated anyway on this build,
-     so kGraf's entries reach children twice (harmless) but a hard-linked file gets the
-     entry after all (not harmless: the gap this closes).
-   - `MEASURE grant-propagation-follows-junction: target folder ... file in it ...`. A
-     `true` means Windows' own propagation enters a junction, which is what the link walk
-     in front of every write exists to stop.
-   - `MEASURE first-grant-pass: ... folders, ... files, ... children written, ... ms`. The
-     cost of kGraf's own pass. The kernel's propagation opens each child too, so the pass
-     replaces that cost rather than adding one; this line says what it is on real
-     hardware. A worktree with a built `target` folder holds far more files than this
-     test's tree, so scale the number.
-   - The tests `a_hard_linked_file_in_the_tree_never_gets_the_grant` and
-     `the_removal_takes_the_entry_off_every_existing_child` run only here. The first says
-     whether a hard-linked file keeps its own list, so a command cannot write it; the
-     second whether a removal takes kGraf's entry off every child. Send both results, and
-     any note that names a file a grant left alone: a build that writes such a file in
-     place fails with an access error.
-   - The tests `a_lone_write_on_a_held_folder_changes_no_child`,
-     `a_grant_and_a_revoke_succeed_with_folders_held_without_delete_sharing` and
-     `a_revoke_through_a_lone_write_drops_the_inherited_copy` open a folder of the tree
-     themselves with a handle that does not share delete (`CreateFileW`,
-     `FILE_FLAG_BACKUP_SEMANTICS`), as other programs held `C:\` and `C:\Windows\Tasks`.
-     A process's current folder does not do this: on Windows Server 2025 a folder that
-     `ping.exe` had as its current folder still opened with `MAXIMUM_ALLOWED`. Each
-     first checks that an open with `MAXIMUM_ALLOWED` is refused there with os error 32;
-     a panic that says "the condition under test is absent" means this build does not
-     refuse it, and the other results say nothing. Otherwise the first says whether the
-     write that replaces the refused open changes no child, the second whether a grant
-     and a revoke succeed with the root and a folder below it held, and the
-     third whether a revoke on such a folder also drops the entry it had inherited.
-   - The tests `closing_a_folder_changes_no_child_and_keeps_the_protection` and
-     `a_protected_folder_keeps_its_protection_and_its_list` write a folder's list alone and
-     read it back. On Windows Server 2025 both failed with "protection bits 0x0400 before,
-     0x0000 after" and "0x1400 before, 0x1000 after": the write dropped the
-     auto-inherited bit. The write now also sets `SE_DACL_AUTO_INHERIT_REQ` for a folder
-     that had the bit. A pass says that keeps it; the same failure says it does not, and
-     the step stays refused with the old list written back where Windows allows it. A
-     failed precondition in the third ("the folder holds an inherited copy") means a
-     folder written by the grant pass took in no inherited entry on this build; send
-     the line.
+- The escape tests use the test binary itself as the probe, and a sandbox user cannot read
+  the owner's profile. Set `$env:CARGO_TARGET_DIR = "C:\kgraf-target"` (outside the profile)
+  before building and running them. A test fails with a message that names
+  `CARGO_TARGET_DIR` if the binary is under the profile.
+- Many escape tests report a measurement and not only a block, such as whether a sandbox
+  user can write an Everyone-writable folder under ProgramData, read a file there, or open
+  the SSH agent's pipe. libtest prints a passing test's output only with `--show-output`, so
+  add it and copy every `measurement:` line.
+- With `KGRAF_REQUIRE_SANDBOX_USER=1`, a test fails where a thing it probes is absent, and
+  does not skip. Start the OpenSSH agent (`Start-Service ssh-agent`), run from a PowerShell
+  window (the test needs a console), have Git for Windows installed, and set up at least two
+  slots (`kgraf sandbox setup --slots 2`).
+- Run step 3c once before `kgraf sandbox setup` and once after.
+- If a wait ends with `the sandboxed command (process N): did not exit within ...` or
+  `waited ... for the process spawn lock and gave up`, send the full text.
 
-2. `sh` and `bash` through Git Bash inside the sandbox:
+## 7. Cases that need the real app
 
-   ```powershell
-   cargo test -p kgraf-sandbox --test shell_windows -- --test-threads=1 2>&1 | Tee-Object "$r\2-shell-windows.txt"
-   ```
+Cases 5 and 6 need one model route: a hosted provider with its key in the window (for
+example `$env:KGRAF_OPENAI_API_KEY = "<key>"` with `--provider openai`) or a local server
+such as Ollama (`--provider ollama`). Cases 6a, 6b and 7 do not.
 
-   **2a.** Programs that load `user32.dll` (`whoami.exe`, `where.exe`, PowerShell), `cmd`,
-   `sh` and `bash`, and a cleared environment, inside the sandbox:
-
-   ```powershell
-   cargo test -p kgraf-sandbox --test startup_windows -- --test-threads=1 2>&1 | Tee-Object "$r\2a-startup-windows.txt"
-   ```
-
-   Expected: every test passes except `sh_dash_c_echo_ok_prints_ok` and
-   `bash_dash_c_exit_3_returns_3`, and the `sh` and `bash` tests of step 2. Those fail until
-   decision 0011 (amendment "Desktop and environment") settles how MSYS2 programs run: their
-   output should show `couldn't create signal pipe, Win32 error 5`. If they still show only
-   exit `-1073741502` with no message, the desktop fix is not enough: report it, with the
-   output of `dumpbin /imports "C:\Program Files\Git\bin\bash.exe"` if Visual Studio is
-   installed. The `msys_pipe` and `desktop_access` tests in step 1 measure both causes, so keep
-   the step 1 output too.
-
-3. The sandbox escape tests (writes outside the worktree, the user profile, another
-   sandbox's process, the registry, a junction, and a real cargo build inside the sandbox):
-
-   ```powershell
-   cargo test -p kgraf-sandbox --test escape_windows -- --test-threads=1 2>&1 | Tee-Object "$r\3-escape-windows.txt"
-   ```
-
-   The probe is the test binary itself. A sandbox user cannot read the owner's profile, so
-   the build output must be outside it, or every probe dies with no result. Set
-   `CARGO_TARGET_DIR` to a folder outside the profile (for example `C:\kgraf-target`) before
-   you build and run the Windows test binaries, here and in steps 3a and 3b:
-
-   ```powershell
-   $env:CARGO_TARGET_DIR = "C:\kgraf-target"
-   ```
-
-   The tests fail loud with a message that names `CARGO_TARGET_DIR` when the binary is under
-   the profile. To test the sandbox user (after `kgraf sandbox setup`), also set
-   `$env:KGRAF_REQUIRE_SANDBOX_USER = "1"`. Leave it unset for the token sandbox.
-
-   The tests branch on the backend in use. Several report a measurement, not the block of an
-   attack. A run must collect these:
-
-   - `the_strength_indicator_matches_the_backend_in_use`: which backend the run measured.
-   - `a_write_into_an_everyone_writable_directory_matches_what_the_backend_claims`: whether a
-     sandbox user can write an Everyone-writable folder under ProgramData. The gaps text of
-     the sandbox user backend says it can. A denial means the claim must be narrowed.
-   - `reads_outside_the_workspace_are_not_confined`: whether a sandbox user reads a file
-     under ProgramData (outside the owner's profile).
-   - `a_command_without_the_network_reaches_the_proxy_ports_and_nothing_else`: three
-     results, in this order. A listener on a port outside 47100-47131 is unreachable. A
-     listener on a port inside that range is reachable (the positive control: without it the
-     first result proves nothing). An address outside loopback (192.0.2.1:80, TEST-NET-1) is
-     unreachable.
-   - `a_unc_path_outside_loopback_is_measured_not_blocked`: a measurement, not a block. The
-     test prints lines that start with `measurement:` for `\\192.0.2.1\x` and
-     `\\192.0.2.1@80\x`. Record those lines with how long the test took. Traffic
-     that the kernel's SMB client or the WebClient service sends does not run as the sandbox
-     user, so the firewall rules scoped to that user do not cover it. Nothing in the test
-     watches the wire.
-   - `one_sandbox_cannot_open_another_sandboxs_process_for_write`: three outcomes, each with
-     its own meaning. Access denied: the two folders ran as different users. The open
-     succeeded: a defect. The second command was refused a sandbox user of its own because
-     setup made no slot users: also confinement.
-
-   - `the_command_runs_on_its_own_desktop_without_a_console` and
-     `user_interface_objects_are_shared_the_way_the_backend_shares_them`: the window station
-     name of each command. As a sandbox user kGraf's process makes one station for the
-     commands of each sandbox user, `kgraf-cmd-<hex>`, with one desktop called `Default` on
-     it: two commands in one worktree run as one user and share it, two worktrees run as two
-     users on two stations.
-   - `send_input_reaches_nothing_of_the_owners`: how many events `SendInput` injected, and
-     the station it ran on, in one line from one command. A count above zero on a private
-     station reaches nothing, so the count is a measurement there, not a failure.
-   - `the_ssh_agent_pipe_cannot_be_opened`: whether a command opened the agent's pipe. As a
-     sandbox user that is a measurement: the pipe admits authenticated users, and the gaps
-     text concedes that named objects every user may write are not closed. Start the agent
-     service first, or the test fails with the switch set.
-   - `a_hard_link_to_an_outside_file_cannot_escape`,
-     `a_junction_inside_the_root_cannot_escape` and
-     `the_owner_cannot_rewrite_the_dacl_of_an_outside_file`: each runs a second phase
-     against an Everyone-writable folder under ProgramData, where the target's own access
-     list decides and not the owner's profile, and prints a `measurement:` line. The
-     junction test also checks, as a sandbox user, that the next command of the same user
-     beside the planted junction starts with the target's access list unchanged, and that
-     on a fresh tree holding a junction the first grant for each user is refused before any
-     access entry is written ("holds the link ... nothing was written").
-   - `the_sandbox_user_opens_its_jobserver_and_named_objects_are_measured`: a sandbox user
-     opens the jobserver kGraf made for its command; `measurement:` lines give the owner's
-     reading of the session's object directory and of its `Restricted` subdirectory, and
-     per kind whether a named semaphore of the command's own may be made in the session and
-     in the global namespace, and whether the directory opens with the rights
-     `kernelbase.dll` asks for and for traversal alone.
-   - `the_attributes_of_each_folder_above_the_tree_are_measured`: a `measurement:` line per
-     kind naming the first folder above the tree whose attributes the sandbox user cannot
-     read, which git needs before it writes a ref.
-
-   In a manual run, add `--show-output` to the command above (libtest prints the output of
-   a passing test only then) and copy every line that starts with `measurement:` into the
-   report. The self-test runner does this in the re-run of its sandbox user phase (section
-   0). The tests fail where a thing they probe is absent and `KGRAF_REQUIRE_SANDBOX_USER=1`
-   is set: the OpenSSH agent service (`Start-Service ssh-agent`), a console window for the
-   test binary (run it from a PowerShell window, not with its output redirected by a
-   program that gives it no console), Git for Windows for the TLS test, and two offline
-   slot users for the linked-dependency test (`kgraf sandbox setup --slots 2` or more).
-   Start or install each one before the run instead of reading a skip as a pass.
-
-   The probes run under both kinds of sandbox user where it matters (the slot user without
-   the network and the one with it), so a failure message names which kind. The runner tests
-   (step 3b) check `PROCESS_VM_READ` and `PROCESS_VM_WRITE` against the runner process, so
-   the escape tests do not repeat them.
-
-   **3a.** HTTPS inside the sandbox, with a listener on 127.0.0.1 (no internet needed). The
-   test runs three checks: `curl.exe` from System32 (Schannel) outside the sandbox, the curl of
-   Git for Windows (`mingw64\bin\curl.exe`, OpenSSL) inside it, and `curl.exe` from System32
-   inside it:
-
-   ```powershell
-   cargo test -p kgraf-sandbox --test tls_windows 2>&1 | Tee-Object "$r\3a-tls-windows.txt"
-   ```
-
-   Expected: all three pass. The Git for Windows test prints a "skipped" line and passes if
-   Git for Windows is not found. The System32 test passes because `curl.exe` still fails inside
-   the sandbox with `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`: Schannel
-   refuses a client credential to a restricted token, which every sandboxed command runs with
-   (decision 0011, amendment "Schannel"). The sandbox sets `CURL_SSL_BACKEND=openssl` and
-   `http.sslBackend=openssl` for git, so git and the curl of Git for Windows work; tools
-   whose only TLS stack is Schannel (System32 `curl.exe`, PowerShell, .NET) still fail. If the
-   System32 test fails because a handshake arrived, the gap is closed: report it. The four
-   `schannel` tests in step 1 measure which token property causes it, so keep the step 1
-   output too.
-
-   **3b.** What a command can do to its runner, once `kgraf sandbox setup` has run (the
-   sandbox user backend). The command must not open the runner's process, any of its
-   threads, or its token for more than waiting and reading; the runner must have no console
-   host; the command must still open its own token; standard input and output must pass
-   through the runner; and the command must run on a window station and desktop that
-   kGraf's own process made for it (the runner makes none):
-
-   ```powershell
-   cargo test -p kgraf-sandbox --test runner_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\3b-runner-windows.txt"
-   ```
-
-   Expected: all seven pass, and none prints a "skipped" line (a skipped line means the
-   backend is not the sandbox user: send the output of `kgraf sandbox status`).
-   `the_command_runs_on_a_desktop_the_owner_made` prints the launch record, lines that
-   start with `launch:`. Send them all:
-   `launch: made window station kgraf-run-... and desktop Default for the runner ...` and
-   `... kgraf-cmd-... for the command ...` (one each per sandbox user: the stations kGraf
-   made, and that each creation worked), `launch: CreateProcessWithLogonW calls N (F
-   failed): last ..., mean ..., longest ...; spawn lock wait before them: ...` (how long the
-   logon call takes on this machine; every other spawn of the process waits for it), and
-   `launch: spawn lock, every spawn in this process: ...` (the longest wait of any spawn for
-   the lock; one near 60 s means spawns queue behind logons for too long). If the command's
-   station cannot be made, the error names the call and the Win32 error, for example
-   `make the command's window station (CreateWindowStationW): Access is denied. (os error
-   5)`; if the runner cannot open it, `open the command's window station
-   (OpenWindowStationW)` with the error. Send the full text.
-   `the_runners_lists_are_written_before_it_runs_and_read_back` prints one line,
-   `runner lists before resume: ...`. `Some(Ok(()))` means kGraf wrote the protected
-   access lists on the runner's process and main thread while it was still suspended,
-   and read them back. `Some(Err(...))` is a measurement, not only a failure: it holds the
-   step and the Win32 error of that write on this machine (the rights of the handles
-   `CreateProcessWithLogonW` returns are not documented). The command still ran, with the
-   runner protecting itself as its first step. Send the line either way. When a
-   command cannot start as the sandbox user, the error names the step and, where the
-   runner ended before it connected, its exit code with its meaning: `0xC0000142` (a DLL
-   failed to start, most likely the window station or desktop), `0x2B470005` (the runner
-   could not protect its own process, threads or token), `0x2B470002` (the runner could not
-   open its pipe). A failure to put the runner in kGraf's job prints
-   `IsProcessInJob(runner) = ...`. Send the full text of any such error.
-
-   **3c.** A command's standard handles, on whichever backend is active. Run it before
-   `kgraf sandbox setup` (token sandbox) and again after it (sandbox user):
-
-   ```powershell
-   cargo test -p kgraf-sandbox --test stdio_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\3c-stdio-windows.txt"
-   ```
-
-   Expected: all four pass.
-   `a_concurrent_tokio_spawn_leaks_no_pipe_into_a_sandboxed_commands_start` starts three
-   sandboxed commands that live about 12 seconds while a thread starts short tokio children
-   through the spawn lock, and prints `3 sandboxed commands beside N tokio spawns; slowest
-   ...` and the `launch:` lines. Send them. A failure (`an unrelated tokio child took ...`)
-   means a sandboxed process, on the sandbox user the runner, took a copy of that child's
-   pipe end during its start.
-   `a_concurrent_unrelated_spawn_does_not_hold_a_sandboxed_commands_output` runs 20
-   sandboxed commands while four threads start unrelated processes that live about five
-   seconds each, and prints `20 sandboxed commands beside N unrelated spawns; slowest
-   ...`. Send that line. A failure names a command whose output pipe stayed open after it
-   ended: an unrelated process took a copy of its pipe end. `a_commands_standard_input_is_never_a_console`
-   and `an_inherited_console_as_standard_input_is_refused` check that a command never gets
-   a console as its standard input; the second briefly opens a console window of its own.
-
-   Every wait for a sandboxed command now ends. If a test or a kGraf run stops with one of
-   these errors, send its full text: `the sandboxed command (process N): did not exit
-   within ...`, `... a process it started was still running ... after its tree was
-   ended`, or `waited ... for the process spawn lock and gave up`. If a kgraf-host test
-   stops making progress, its harness prints what it waits on (lock waits and running
-   children, with their age); send that output too.
-
-4. The worker's shell tool on Windows (a plain program and a `sh -c` line run and return
-   their output, the network notice comes once under the token sandbox and never under the
-   sandbox user, an exit status comes back, a timeout and a cancel end the whole process
-   tree), and its pure decisions:
-
-   ```powershell
-   cargo test -p kgraf-tools --lib windows -- --test-threads=1 2>&1 | Tee-Object "$r\4-tools-windows.txt"
-   ```
-
-5. The run-start notices:
-
-   ```powershell
-   cargo test -p kgraf-host --lib network_notice 2>&1 | Tee-Object "$r\5-host-notices.txt"
-   ```
-
-6. Optional, longer: every test of the four packages. Some of their tests were written
-   for macOS and Linux only and are skipped on Windows; a failure here that is not in
-   steps 1 to 5 is still worth reporting.
-
-   ```powershell
-   cargo test --no-fail-fast -p kgraf-sandbox -p kgraf-tools -p kgraf-host -p kgraf-bench-briefs -- --test-threads=1 2>&1 | Tee-Object "$r\6-four-packages.txt"
-   ```
-
-What to expect: each command ends with `test result: ok.` for each test binary. Write down
-any `FAILED` line. A failure in steps 2 to 4 is most useful with its full text, which the
-result files keep.
-
-## 5. A short kGraf run that uses the worker shell
-
-This needs one model route. Use any provider you have: a hosted one with its API key in
-the PowerShell window (for example `$env:KGRAF_OPENAI_API_KEY = "<key>"` with
-`--provider openai`), or a local server such as Ollama for Windows (`--provider ollama`).
-The run asks you to approve the shell commands, so stay at the window.
-
-Make a small project to work in:
+### Case 5: a short run that uses the worker shell
 
 ```powershell
-cd C:\src
-cargo new kgraf-smoke
-cd kgraf-smoke
+cd C:\src; cargo new kgraf-smoke; cd kgraf-smoke
 git add -A
 git -c user.name=smoke -c user.email=smoke@example.invalid commit -m "start"
 $kgraf = "C:\src\kGraf\target\debug\kgraf.exe"
 & $kgraf index
-```
-
-On ARM64, the emulated x86_64 build is `C:\src\kGraf\target\x86_64-pc-windows-msvc\debug\kgraf.exe`;
-run this step once with each.
-
-Write the brief and run one worker:
-
-```powershell
 @'
 Use the shell tool for each of these, one call each, then stop and report each output:
 1. ["cargo", "--version"]
@@ -1257,31 +438,17 @@ Do not change any file.
 & $kgraf worker --provider <provider> --model <model-id> --brief brief.txt --events "$r\smoke-events.jsonl" 2>&1 | Tee-Object "$r\7-smoke-run.txt"
 ```
 
-Answer "allow" when it asks about a command. What to expect:
+Answer "allow" to each command. Pass: command 2 prints `hello from git bash`, a line
+starting with `MINGW64_NT` or `CLANGARM64_NT`, and `a b|c|`; command 3 prints nothing or a
+short status; command 4 builds and runs zero tests with `test result: ok`. Without a sandbox
+user, the first result ends with a `[sandbox] network not blocked` notice, once. With one,
+the notice does not appear. If Git Bash is missing, command 2 fails with a message naming Git
+for Windows and `KGRAF_GIT_BASH_PATH`; report it only if Git for Windows is installed.
 
-- The first shell result ends with `[sandbox] network not blocked: the Windows sandbox
-  cannot deny network access without administrator rights (decision 0011); shell commands
-  run with the network open; run `kgraf sandbox setup` once, with administrator rights, to
-  block it (decision 0097)`. Later results do not repeat it. After step 6b, this notice does
-  not appear: commands run as the sandbox user.
-- Command 2 prints `hello from git bash`, a line starting with `MINGW64_NT` or
-  `CLANGARM64_NT`, and `a b|c|`.
-- Command 3 prints nothing or a short status, and no error about the git configuration.
-- Command 4 builds and runs the new crate's tests (zero tests, `test result: ok`).
+### Case 6: cmd and PowerShell scripts under a rule
 
-If Git Bash is missing, command 2 fails with a message that names Git for Windows and
-`KGRAF_GIT_BASH_PATH`; that is the intended behavior, but report it if Git for Windows is
-installed.
-
-## 6. cmd and PowerShell scripts under a rule
-
-This checks that a cmd or PowerShell script kGraf cannot read as plain text asks, and that
-a plain one runs on its grants. The pure parts (which scripts are unreadable, and that the
-text kGraf checks is the text the interpreter gets from the command line) are already in
-step 4 of section 4. This step runs the real `cmd.exe` and `powershell.exe`. It needs the
-model route and the `kgraf-smoke` project of section 5.
-
-Make a permissions file outside the project for this run only, in Auto with an ask rule:
+This case checks that kGraf asks about a command it cannot read as plain text, and runs a
+plain one on its grants. Write a permissions file for this run only, then run six commands:
 
 ```powershell
 cd C:\src\kgraf-smoke
@@ -1307,73 +474,52 @@ Do not change any file.
 Remove-Item Env:KGRAF_PERMISSIONS_PATH
 ```
 
-Answer "deny" to every question. What to expect:
+Answer "deny" to every question. Pass: commands 1 to 3 run with no question. Commands 4 to 6
+each ask, because each holds a quote character that kGraf cannot check against the rule
+`shell(curl*)`. If the model changes an argv, note which commands it changed.
 
-- Commands 1, 2 and 3 run without a question: they print `plain-cmd`, then `plain-cmd` and
-  `second`, then the folder.
-- Commands 4, 5 and 6 each ask, even though every program they name is granted. The
-  question says the command cannot be checked against your ask rule `shell(curl*)` and
-  why: 4 holds `"`; 5 is one quoted string with no operator; 6 holds `'`.
-- If the model changes an argv (for example it splits command 5 into separate words), the
-  result does not test that case; note which ones.
+### Case 6a: the Git for Windows check and install offer
 
-## 6a. The Git for Windows check and install offer
+Use a fresh Windows 11 machine or virtual machine with the built `.msi` or `.zip`, as a normal
+user. `winget` needs Windows 10 1809 or later with App Installer. Write what each case
+showed into `$r\6a-git-check.txt`.
 
-Test this on a machine (or a fresh Windows 11 virtual machine) with the built `.msi` or
-`.zip`, as a normal user. Each case below starts kGraf and writes what it saw into
-`$r\6a-git-check.txt`. `winget` needs Windows 10 1809 or later with App Installer.
+1. **No Git, winget present.** Confirm `git --version` and `reg query
+   HKLM\SOFTWARE\GitForWindows` both fail. Start `kgraf-app.exe`. Pass: one window offers to
+   install Git for Windows with winget and shows the full `winget install --id Git.Git ...
+   --scope user ...` line. Answer Yes. No administrator prompt appears, and kGraf opens
+   without a restart.
+2. **Same, answer No.** First `winget uninstall --id Git.Git`. Pass: an error window gives
+   the download link, the winget command and `KGRAF_GIT_BASH_PATH`, and kGraf exits.
+3. **Same, command line.** Reset. Run `kgraf.exe index`. Pass: the same question with
+   `[y/N]`. With input redirected (`echo | kgraf.exe index`) it must not ask, and must stop
+   with the same fix text.
+4. **With Git.** Install Git by hand. Pass: no question and no delay. Repeat for an
+   all-users install (`HKLM`), a per-user install (`HKCU`), and an install on another drive
+   that is not on `PATH`.
+5. **No winget.** Rename `$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe` to `winget.off`,
+   with Git not installed. Pass: an error window says winget is not available and gives the
+   link and `KGRAF_GIT_BASH_PATH`, with no question. Rename it back.
+6. **Bad override.** Set `KGRAF_GIT_BASH_PATH` to a file that does not exist. Pass: an error
+   that names the variable and the file, and no offer to install.
 
-1. **Fresh Windows, no Git, winget present.** Confirm: `git --version` and
-   `reg query HKLM\SOFTWARE\GitForWindows` both fail. Start `kgraf-app.exe` from the Start
-   menu. Expected: one window asks to install Git for Windows with winget and shows the full
-   `winget install --id Git.Git ... --scope user ...` line. Answer Yes. Expected: no
-   administrator prompt; the install ends; kGraf opens without a restart. Then
-   `reg query HKCU\SOFTWARE\GitForWindows /v InstallPath` shows a folder with
-   `bin\bash.exe` in it.
-2. **Same, answer No.** Reset first: `winget uninstall --id Git.Git`. Start kGraf, answer
-   No. Expected: an error window with the download link, the winget command and
-   `KGRAF_GIT_BASH_PATH`, and kGraf exits. Nothing was installed.
-3. **Same, command line, with a terminal.** Reset. Run `kgraf.exe index` in PowerShell.
-   Expected: the same question on the terminal with `[y/N]`; `y` installs and the command
-   runs. Run it again with input redirected (`echo | kgraf.exe index`): it must not ask, and
-   must stop with the same fix text.
-4. **With Git.** Install Git for Windows by hand. Start kGraf. Expected: no question and
-   no delay. Repeat with Git installed for all users (`HKLM` key) and with a per-user
-   install (`HKCU` key). Repeat with Git installed on a drive other than `C:` and not on
-   `PATH`: the registry entry must be enough.
-5. **Without winget.** Rename the winget stub for the test:
-   `Rename-Item "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe" winget.off`, with Git
-   not installed. Start kGraf. Expected: an error window that says winget is not available
-   and gives the download link and `KGRAF_GIT_BASH_PATH`; no question. Rename it back.
-   Then install Git from the link and start kGraf again: it starts.
-6. **Bad override.** Set `KGRAF_GIT_BASH_PATH` to a file that does not exist. Expected: an
-   error that names the variable and the file, and no offer to install.
+### Case 6b: the sandbox user setup
 
-Report, for each case, what the window or terminal said and whether kGraf started.
-
-## 6b. The sandbox user setup
-
-Run in a normal (not administrator) PowerShell:
+Run in a normal PowerShell. Setup and remove ask for administrator rights through a User Account Control (UAC)
+prompt.
 
 ```
-kgraf sandbox status    # before: expect the users and rules to be missing
-kgraf sandbox setup     # click Yes in the UAC prompt; each step prints its outcome
-kgraf sandbox status    # after: every line present, "logon works" for both users
-kgraf sandbox setup     # again: users updated (passwords reset), rules refreshed
-kgraf sandbox remove    # UAC again; every item removed
-kgraf sandbox status    # everything missing again
+kgraf sandbox status      # before: users and rules MISSING
+kgraf sandbox selfcheck   # before setup
+kgraf sandbox setup       # click Yes; each step prints its outcome
+kgraf sandbox status      # after: every line present
+kgraf sandbox selfcheck   # after setup
+kgraf sandbox setup       # again: passwords reset, rules refreshed
+kgraf sandbox remove      # every item removed
+kgraf sandbox status      # everything MISSING again
 ```
 
-Run the sandbox check before `setup` and after it (Git for Windows must be installed):
-
-```
-kgraf sandbox selfcheck    # before setup
-kgraf sandbox setup
-kgraf sandbox selfcheck    # after setup
-```
-
-Expected before `setup` (token sandbox). The network line is not a pass, and the exit code
-is 0:
+Before `setup` (token sandbox), the exit code is 0 and the output is:
 
 ```
 sandbox selfcheck: passed with a gap
@@ -1384,253 +530,62 @@ sandbox selfcheck: passed with a gap
   tree: writable
 ```
 
-Expected after `setup` (sandbox user). The direct connection to the local origin is blocked
-(the loopback filters), the DNS filters refuse the sandbox user's lookup, and the exit code
-is 0:
+After `setup` (sandbox user), the result depends on the machine, so there are two outcomes
+for the `dns:` line:
 
-```
-sandbox selfcheck: ok
-  backend: Windows sandbox user
-  network: only the egress proxy was reachable
-  dns: confined (the sandbox user's lookup reached no DNS server, and the DNS Client service did not look the name up)
-  hidden folder: not writable
-  tree: writable
-```
+- **A machine whose WFP accepts all three DNS filters:**
 
-Both runs also print lines that start with `  launch:` on standard error (on the sandbox
-user, the window stations kGraf made, the duration of each logon call, and the spawn
-lock's use; see "The sandbox user phase" above). They are not part of the verdict; send
-them with the rest.
+  ```
+  sandbox selfcheck: ok
+    backend: Windows sandbox user
+    network: only the egress proxy was reachable
+    dns: confined (the sandbox user's lookup reached no DNS server, and the DNS Client service did not look the name up)
+    hidden folder: not writable
+    tree: writable
+  ```
 
-Any other output is a failure. A failure starts with `sandbox selfcheck failed (backend: ...)`
-and names the step. If only the `dns:` line failed, the first line is
-`sandbox selfcheck: failed` and the `dns:` line says why: `not confined (lookups leave the
-machine)` or `not proved`. Send back the full output of both runs.
+  "Confined" is correct only where a filter layer exists that blocks the lookup. Every
+  machine tested so far was Windows Server 2025, which does not give this result.
+- **Windows Server 2025** refuses the name resolution cache filters at setup (`refused` line,
+  `FAILED` in status). Selfcheck then prints `sandbox selfcheck: failed`, every line passes
+  except `dns:`, and that line reads `not confined (lookups leave the machine)` or
+  `not proved`. Setup exits 0 and says DNS is not confined on this machine. This is the
+  known gap of section 5, and it is the result to expect there.
 
-Also check by hand after `setup`: `Get-LocalUser kgraf-*` lists two users plus two per
-worker slot (ten with the default four slots: `kgraf-off-`, `kgraf-on-`, `kgraf-s00-` to
-`kgraf-s03-` and `kgraf-o00-` to `kgraf-o03-`), they are not on the sign-in screen, and
-`Get-NetFirewallRule -DisplayGroup "kGraf sandbox"` lists four block rules. The rules name
-`kgraf-off-` and every `kgraf-sNN-` user, and no `kgraf-oNN-` user. Send back the output of
-every command.
+Any other output is a failure. It starts with `sandbox selfcheck failed (backend: ...)` and
+names the step. Both runs also print `  launch:` lines on standard error. Send them with the
+rest. Send the full output of both runs.
 
-### The closed folders: the access lists before setup, after setup and after remove
+After `setup`, check by hand:
 
-The setup writes one deny entry for the sandbox group on each folder every local user may
-write: the root of each fixed drive whose file system keeps access lists, `C:\ProgramData`,
-`C:\Users\Public` and the folders directly in it, and `Temp`, `Tasks` and `tracing` under
-the Windows folder. Those entries are on the real machine, so this run has to settle what
-they change and what they leave alone.
+1. `Get-LocalUser kgraf-*` lists two users plus two per slot (ten with four slots:
+   `kgraf-off-`, `kgraf-on-`, `kgraf-s00-` to `kgraf-s03-`, `kgraf-o00-` to `kgraf-o03-`).
+   They are not on the sign-in screen. `Get-NetFirewallRule -DisplayGroup "kGraf sandbox"`
+   lists four block rules.
+2. In a sandboxed shell, `whoami` prints `kgraf-sNN-<hash>` (a command that needs the network
+   prints `kgraf-oNN-<hash>`). `dir C:\Users\<your name>` is denied.
+3. `C:\Windows\System32\curl.exe -sS -o NUL -w "%{http_code}" https://example.com` prints
+   `200` for a command with network access and fails to connect for one without.
+4. In a worktree (a separate checked-out copy of a repository), a sandboxed command can write inside the worktree and cannot write in a
+   sibling folder, a top-level `.git` entry or a hidden folder. Two worktrees with a
+   30 second command each print two different `kgraf-sNN-` users.
+5. After `kgraf sandbox remove`, `icacls <a worktree>` shows no `kgraf-` entry.
 
-Run this **three times**: before `kgraf sandbox setup`, after it, and after
-`kgraf sandbox remove`. Save each run to its own file and send all three back.
+Setup also writes one deny entry for the sandbox group on each folder that every local user
+may write (the root of each fixed drive, `C:\ProgramData`, `C:\Users\Public` and the folders
+directly in it, and `Temp`, `Tasks` and `tracing` under the Windows folder). `kgraf sandbox
+status` names every closed folder. Send its output before setup, after setup and after
+remove; after remove, each folder's `icacls` output must read as it did before setup. If
+setup cannot close a folder, the failure names it and the account that owns it.
 
-```powershell
-# Save as closed-acl.ps1 and run it as: .\closed-acl.ps1 before   (then: after, removed)
-param([Parameter(Mandatory=$true)][string]$When)
-$folders = @()
-# The root of every fixed drive that keeps access lists.
-Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
-  ForEach-Object { $folders += "$($_.DriveLetter):\" }
-$folders += $env:ProgramData
-$folders += $env:PUBLIC
-Get-ChildItem -LiteralPath $env:PUBLIC -Directory -Force |
-  ForEach-Object { $folders += $_.FullName }
-foreach ($child in 'Temp','Tasks','tracing') { $folders += (Join-Path $env:SystemRoot $child) }
+### Case 7: a dependency install in the sandbox
 
-$out = "closed-acl-$When.txt"
-"=== $When ===" | Out-File $out
-foreach ($f in $folders) {
-  "---- $f" | Out-File $out -Append
-  if (-not (Test-Path -LiteralPath $f)) { "  (does not exist)" | Out-File $out -Append; continue }
-  # 1. Every entry, in order, as icacls writes them.
-  (icacls $f 2>&1) | Out-File $out -Append
-  # 2. Whether the list is protected, and who owns it. The protected state is
-  #    the one the setup must leave exactly as it found it.
-  try {
-    $acl = Get-Acl -LiteralPath $f -ErrorAction Stop
-    "  AreAccessRulesProtected = $($acl.AreAccessRulesProtected)" | Out-File $out -Append
-    "  Owner = $($acl.Owner)" | Out-File $out -Append
-  } catch { "  Get-Acl failed: $_" | Out-File $out -Append }
-}
-
-# 3. Did any child of ProgramData or Public gain an entry? A write that
-#    propagated would have rewritten every child's list. Counted, and the
-#    first twenty listed with their entry counts, for comparison between the
-#    three runs.
-"---- children of ProgramData and Public" | Out-File $out -Append
-foreach ($parent in $env:ProgramData, $env:PUBLIC) {
-  Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue |
-    Select-Object -First 20 | ForEach-Object {
-      try {
-        $a = Get-Acl -LiteralPath $_.FullName -ErrorAction Stop
-        "  $($_.FullName): rules=$($a.Access.Count) protected=$($a.AreAccessRulesProtected)" |
-          Out-File $out -Append
-      } catch { "  $($_.FullName): Get-Acl failed" | Out-File $out -Append }
-    }
-}
-
-# 4. May Administrators rewrite the lists of the two Windows folders that are
-#    not theirs? `Tasks` and `tracing` are the ones a setup can fail on, and
-#    WRITE_DAC (`ChangePermissions`) is the right it needs.
-"---- WRITE_DAC for Administrators" | Out-File $out -Append
-foreach ($child in 'Tasks','tracing') {
-  $f = Join-Path $env:SystemRoot $child
-  if (-not (Test-Path -LiteralPath $f)) { "  $f (does not exist)" | Out-File $out -Append; continue }
-  try {
-    $a = Get-Acl -LiteralPath $f -ErrorAction Stop
-    "  $f owner=$($a.Owner)" | Out-File $out -Append
-    $a.Access | Where-Object { $_.IdentityReference -match 'Administrators' } |
-      ForEach-Object {
-        "    $($_.IdentityReference) $($_.AccessControlType) $($_.FileSystemRights)" |
-          Out-File $out -Append
-      }
-  } catch { "  $f Get-Acl failed: $_" | Out-File $out -Append }
-}
-"wrote $out"
-```
-
-How to read the three files:
-
-- **After setup**, each folder that exists must have gained exactly one deny entry, for a
-  SID starting with `S-1-5-21-`, and it must carry no `(I)` inheritance mark. Nothing else
-  on the folder may have changed: the entry order, every other entry, the owner, and
-  `AreAccessRulesProtected` must read the same as before, folder by folder.
-- **No child of ProgramData or Public** may have changed its rule count or its protected
-  state between the runs. A change there means the write propagated, which writing the
-  list with `SetKernelObjectSecurity`, on that folder alone, is there to prevent.
-- **After remove**, every folder must read exactly as it did before setup, byte for byte in
-  the `icacls` output.
-- **A folder setup could not close** is named in the failure, with the principal that owns
-  it. The `WRITE_DAC for Administrators` block says whether that was to be expected:
-  Administrators need `ChangePermissions` on `Tasks` and `tracing`, and on some installs
-  they do not have it. Send that block back whether the setup succeeded or not, because it
-  settles whether those two folders can be closed on a real machine at all.
-- `kgraf sandbox status` names every folder that is closed, so its output before, after and
-  after remove is part of the same evidence.
-
-### The DNS filter
-
-`kgraf sandbox setup` adds three Windows Filtering Platform (WFP) filters that are meant
-to make the DNS Client service refuse name lookups from the users the firewall rules block,
-and four more at the connect layers that block those users' loopback connections outside
-kGraf's egress proxy ports (one per IP version for every other port, one per IP version
-for UDP); the four have their own status lines (`loopback filter on the connect layer,
-IPv4 ...`), and selfcheck's `network:` line proves them. All seven name
-`kgraf-off-` and every slot user without the network (`kgraf-sNN-`). They never name
-`kgraf-on-`, a `kgraf-oNN-` user or the owner. Two sit on the name resolution cache layers
-(IPv4 and IPv6), which see the local caller; the third sits on the user-mode RPC layer,
-which sees a remote caller only. No Windows run has proved any of them yet, and it is not
-known whether a block at the name resolution cache layers makes a lookup fail or only
-keeps the service from its cache: that is what this run settles. These checks need an
-administrator PowerShell and a working network. Run them after `setup`:
+This case needs Node.js with npm (`winget install OpenJS.NodeJS.LTS`) and the network. It
+checks that kGraf runs a project's install in its sandbox, that the install script cannot
+write outside the project or into `.kgraf`, and that kGraf asks for consent.
 
 ```powershell
-# 1. The filter, its sublayer and its provider: every item whose name starts with "kGraf sandbox".
-netsh wfp show filters file="$r\wfp-filters.xml"
-Select-String -Path "$r\wfp-filters.xml" -Pattern "kGraf sandbox" -Context 3,40 | Out-File "$r\wfp-kgraf.txt"
-
-# 2. The status line of the filter.
-kgraf sandbox status | Out-File "$r\status-dns.txt"
-
-# 3. The cache check: clear the cache, run selfcheck, and list the probe names in the cache.
-Clear-DnsClientCache
-kgraf sandbox selfcheck 2>&1 | Out-File "$r\selfcheck-dns.txt"
-Get-DnsClientCache | Where-Object Entry -like "kgraf-probe-*" | Format-List | Out-File "$r\dns-cache.txt"
-
-# 4. The DNS test: offline user, online user and owner.
-cargo test -p kgraf-sandbox --test dns_windows -- --test-threads=1 --nocapture 2>&1 | Tee-Object "$r\dns-windows.txt"
-```
-
-What to expect:
-
-1. `wfp-kgraf.txt` shows three filters, each with the action block, less any filter
-   setup reported as refused (a `refused` line in its output, `FAILED` in status). One is on the layer
-   `FWPM_LAYER_RPC_UM`, with two conditions: the RPC interface
-   `45776b01-5956-4485-9f80-f428f7d60129` and the caller's token. One is on
-   `FWPM_LAYER_NAME_RESOLUTION_CACHE_V4` and one on `FWPM_LAYER_NAME_RESOLUTION_CACHE_V6`,
-   each with the single condition `FWPM_CONDITION_ALE_USER_ID`. It also shows the sublayer
-   and the provider; the sublayer's weight is 65535, so no other sublayer is decided before
-   it. Send back each entry whole: the condition the engine recorded, and
-   whether any filter carries `FWPM_FILTER_FLAG_DISABLED`, decide what the next change is.
-2. Three status lines start with `present  DNS filter on`, one per layer. A line that says
-   `WRONG` with "the Base Filtering Engine has it disabled" means the filter exists and
-   does not run. A line that says `FAILED` names a filter Windows refused at setup, with
-   its error and the probe reading: DNS is not confined on that machine, and step 3 and
-   the offline lookup of `dns_windows` are expected to fail there. The filter's netsh
-   check in `dns_windows` does not look for it, and says so in a `measurement:` line.
-3. `dns-cache.txt` lists one `kgraf-probe-...` name: the one your own process looked up.
-   A second name means the DNS Client service looked the sandbox user's name up: the
-   filter does not work. No name at all means the cache does not keep "does not exist"
-   answers on this machine, and the check proves nothing there.
-4. The three tests of `dns_windows` pass. One prints the status the offline user's
-   lookups got (`offline user: DnsQuery status ..., getaddrinfo ...`). That status is how
-   the filters' refusal looks to a program; send it back. Another prints each filter's
-   entry from `netsh wfp show filters` and checks its name, layer and action.
-5. **Restart the machine, then run steps 1 to 4 again, and send both sets back.** The
-   documentation contradicts itself on whether a provider that names no service has its
-   filters disabled at every start. One reboot settles which sentence is true. The case to
-   look for is a filter that carries `FWPM_FILTER_FLAG_DISABLED` after the restart, or a
-   `dns:` line that passed before it and does not pass after it. A status line that says
-   `WRONG ... disabled`, or the `dns_windows` test that fails on the disabled flag, is
-   that case.
-
-After `kgraf sandbox remove`, step 1 shows no item named `kGraf sandbox`, and the status
-lines of the filters are `MISSING`.
-
-After `setup` (run it again if you removed the users), check that commands now run as
-the sandbox user. Build kGraf with the runner: `kgraf-sandbox-runner.exe` must sit beside
-`kgraf.exe`. Without it, every sandboxed command fails with an error that says so.
-
-1. Run a check or a shell command. The run prints the backend name "Windows sandbox user".
-   The token sandbox name means setup did not take effect: send the output.
-2. In a sandboxed shell, run `whoami`. Expected: `kgraf-sNN-<hash>`, with the machine
-   name before it (`kgraf-off-<hash>` after `setup --slots 0`). A command that needs the
-   network (a dependency install) prints `kgraf-oNN-<hash>` (`kgraf-on-<hash>` without
-   slots).
-3. In a sandboxed shell, run `dir C:\Users\<your name>` (your own profile folder).
-   Expected: access denied.
-4. Network with the online user (a dependency install, or any command that runs with the
-   network allowed): `C:\Windows\System32\curl.exe -sS -o NUL -w "%{http_code}" https://example.com`
-   prints `200`. This uses Windows' own TLS (Schannel), which failed under the token sandbox.
-5. Network with the offline user (an ordinary shell command): the same `curl.exe` line
-   fails to connect. A lookup of a name must fail too (the DNS filters); the checks under
-   "The DNS filter" above prove whether it left the machine.
-6. In a project's worktree, a sandboxed command can write a file inside the worktree and
-   cannot write in a sibling folder, in a top-level `.git` entry, or in a hidden folder.
-7. `kgraf sandbox remove` revokes the folder grants it listed, then removes the users. The
-   lists are the `sandbox-credentials.grants` file and the `sandbox-credentials.slots`
-   folder beside the password store. Then `icacls <a worktree>` shows no entry for a
-   `kgraf-` user on the folders you granted, and the `.slots` folder is gone.
-8. Worker slots. In two worktrees, start a long command in each at the same time (for
-   example `sleep 30; whoami`). The two print different `kgraf-sNN-` users. While both
-   run, `icacls <the first worktree>` shows a write entry for the first user only. After
-   `setup --slots 0`, the second command waits up to 60 seconds, then fails with an error
-   that names `kgraf sandbox setup --slots`. It never prints the first command's user.
-9. Two dependency installs at the same time, in two projects, run as two different
-   `kgraf-oNN-` users.
-
-The escape tests check the same in the sandbox user phase:
-`two_workers_in_different_worktrees_run_as_different_users` (two workers, two users, and
-neither writes the other's worktree; with no slots, the second is refused) and
-`linking_dependencies_grants_only_the_worktrees_own_user` (a worktree with the checkout's
-dependencies linked is not writable by the user of another worktree).
-
-Send back each output, and the text of any error.
-
-## 7. A dependency install in the sandbox
-
-This checks that kGraf runs a project's missing install in its sandbox with the network
-open and says so, that the install's own script cannot write outside the project or into
-its `.kgraf` folder, and that the consent is asked for. It needs Node.js with npm on `PATH`
-(`winget install OpenJS.NodeJS.LTS`) and the network; no model route.
-
-Make a project with one public package and one local package whose install script tries
-to write where it may not:
-
-```powershell
-cd C:\src
-mkdir kgraf-install-check; cd kgraf-install-check
+cd C:\src; mkdir kgraf-install-check; cd kgraf-install-check
 git init -q
 mkdir probe
 @'
@@ -1647,7 +602,6 @@ fs.writeFileSync('probe-result.json', JSON.stringify(out));
 @'
 {"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0","probe":"file:probe"}}
 '@ | Set-Content package.json
-# Install the local package as a copy, not a link, so its script runs in node_modules\probe.
 "install-links=true" | Set-Content .npmrc
 & $kgraf deps status 2>&1 | Tee-Object "$r\9-deps-status.txt"
 & $kgraf deps install npm 2>&1 | Tee-Object "$r\10-deps-install.txt"
@@ -1656,27 +610,23 @@ Test-Path C:\src\kgraf-escape.txt | Tee-Object -Append "$r\11-probe-result.txt"
 Test-Path .kgraf\planted.txt | Tee-Object -Append "$r\11-probe-result.txt"
 ```
 
-What to expect:
+Pass:
 
-- `deps status` lists `install: npm install in the project root (npm)` with the stored
-  answer `unset`.
-- `deps install npm` prints `installing `npm install` ...`, then `installed  ran `npm
-  install` in the project root in kGraf's sandbox ...; network not limited: the Windows
-  sandbox cannot limit network access without administrator rights (decision 0011), so the
-  install ran with the network open, and its reads were not confined either; its writes
-  were still confined; run `kgraf sandbox setup` once, with administrator rights, to block
-  it (decision 0097)`. After step 6b, the install goes through kGraf's proxy instead and
-  carries no such notice.
-- `node_modules\left-pad` exists. `probe-result.json` shows `outside` and `state` as
-  `denied` with an error code (`EPERM` or `EACCES`), and both `Test-Path` lines print
-  `False`. A `written` or a `True` is a finding: send it.
-- Then check the question: delete `node_modules`, run `& $kgraf deps allow npm` and look
-  for `npm: allowed `npm install` in the project root`. `& $kgraf deps reset npm` forgets
-  it.
+- `deps status` lists `install: npm install in the project root (npm)` with the stored answer
+  `unset`.
+- `deps install npm` prints `installed  ran `npm install` in the project root in kGraf's
+  sandbox`. Without a sandbox user it adds that the network was open and reads were not
+  confined. With one, the install goes through kGraf's egress proxy and the notice is absent.
+- `node_modules\left-pad` exists. `probe-result.json` shows `outside` and `state` as `denied`
+  with `EPERM` or `EACCES`. Both `Test-Path` lines print `False`. A `written` or a `True` is a
+  finding: send it.
+- After deleting `node_modules`, `& $kgraf deps allow npm` prints `npm: allowed `npm
+  install` in the project root`, and `& $kgraf deps reset npm` forgets it.
 
 ## 8. What to send back
 
-Collect the machine facts into the results folder, then zip it:
+For the bundle, send the one report file. For the manual path, collect the machine facts and
+zip the results folder:
 
 ```powershell
 rustc -vV | Out-File "$r\versions.txt"
@@ -1688,7 +638,11 @@ Get-ComputerInfo -Property OsName, OsVersion, OsBuildNumber, OsArchitecture | Ou
 Compress-Archive -Path "$r\*" -DestinationPath C:\src\kgraf-windows-results.zip -Force
 ```
 
-Send `C:\src\kgraf-windows-results.zip`, and say which machine it came from (x86_64 or
-ARM64, and on ARM64 whether the run used the native or the x86_64 build). Check the files
-first: they hold the commands' output and paths on your machine, and the events file holds
-what the model wrote. No API key is in them, but look before you send.
+Send `C:\src\kgraf-windows-results.zip`. Say which machine it came from: Windows edition and
+build, x86_64 or ARM64 (and on ARM64, native or emulated build), whether it is a standard-user
+or administrator account, and whether Git for Windows was installed before the run. Look
+inside the files first. They hold the commands' output and paths on your machine, and the
+events file holds what the model wrote. No API key is in them.
+
+For any failure, the most useful evidence is the failing test's full output, the `launch:`
+and `measurement:` lines, and the output of `kgraf sandbox status`.

@@ -76,7 +76,7 @@ fn plain(p: &str) -> String {
 }
 
 /// Whether `path` is `folder` or inside it, on Windows path rules: case does
-/// not count, and `C:\Users\marcotest` is not inside `C:\Users\marco`.
+/// not count, and `C:\Users\alicetest` is not inside `C:\Users\alice`.
 pub fn inside(path: &str, folder: &str) -> bool {
     let (p, f) = (plain(path), plain(folder));
     !f.is_empty() && (p == f || p.starts_with(&format!("{f}\\")))

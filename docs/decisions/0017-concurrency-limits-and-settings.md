@@ -3,6 +3,7 @@
 **Status:** Accepted. Amends the scope of the no-second-surface rule from
 decision 0003 to state the boundary explicitly: settings holds
 configuration only.
+**Superseded by:** 0067 (in part: the starting concurrency numbers and fixed maximums), 0080 (in part: the spend-cap parts)
 **Related:** decisions 0003, 0008, 0014, 0016
 
 ## Context

@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     /// A session whose worker `w1` activated `read-only-audit`, which allows
-    /// only reading tools: the shape of a canary run where both the skill and
+    /// only reading tools: the shape of a run where both the skill and
     /// the permission mode refused a shell call.
     fn restricted() -> (Arc<SkillSession>, Arc<SkillDirectory>, impl Sized) {
         let skill = serde_json::from_value(serde_json::json!({
@@ -1648,7 +1648,7 @@ mod tests {
         assert!(answer.contains(judge), "{answer}");
     }
 
-    /// Round 16 greenfield: the answer named the contract's Acceptance line
+    /// A new workspace: the answer named the contract's Acceptance line
     /// (`[ -f Cargo.toml ] && ...`) as the judge, while the verifier judged
     /// the attempt by the run's cargo command. The answer quotes only what the
     /// verifier says judges the attempt, and names no judge when it says
@@ -1962,7 +1962,7 @@ mod tests {
         }
     }
 
-    /// The canary round where the worker activated the skill and ran a shell
+    /// A round where the worker activated the skill and ran a shell
     /// call in the same round: the call was judged before the skill applied,
     /// so the command policy's ask, denied unattended, is what the record
     /// holds (`sh`, scope command). A report of the shell tool is still held

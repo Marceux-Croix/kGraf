@@ -3,6 +3,8 @@
 **Status:** Accepted. The original renderer choice is superseded by a later
 decision; the server-computed, cached, anchored layout and the density rules
 stand.
+**Superseded by:** 0054 (in part: the renderer choice)
+**Amended by:** 0015 (the stability property), 0058 (the layout stays solver-free)
 **Related:** decisions 0002, 0003, 0007
 
 ## Context

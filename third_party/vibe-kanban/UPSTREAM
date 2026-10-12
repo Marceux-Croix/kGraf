@@ -16,11 +16,10 @@ base directory.
 
 What changed:
 - Every git operation shells out to the git CLI. Upstream validates worktrees
-  and creates branches through git2 (libgit2). The sandboxing evidence
-  (docs/decisions/evidence/2026-09-24-sandboxing-and-worktrees.md) rules that
+  and creates branches through git2 (libgit2). That is ruled
   out: git2 worktree validation reports success for a missing directory.
 - Worktrees are created locked with a kGraf-tagged reason. Orphan cleanup
-  keys on that reason plus owner-process liveness (evidence recipe). Upstream
+  keys on that reason plus owner-process liveness. Upstream
   does not lock.
 - Upstream logs cleanup failures at debug level and continues. Here a failure
   that leaves state behind is returned (SR-008 fail loud). The "not

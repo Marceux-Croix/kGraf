@@ -882,7 +882,7 @@ fn self_exe() -> PathBuf {
     if sandbox_user_mode() {
         let profile = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE"));
         // Compared as paths, each resolved first: a string prefix would read
-        // `C:\\Users\\marcotest` as inside `C:\\Users\\marco`, and would miss a
+        // `C:\\Users\\alicetest` as inside `C:\\Users\\alice`, and would miss a
         // verbatim `\\\\?\\C:\\...` form of one side.
         let plain = |p: &Path| kgraf_core::plain_path::canonicalize(p).unwrap_or(p.to_path_buf());
         let under = plain(&exe).starts_with(plain(&profile));

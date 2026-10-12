@@ -2057,7 +2057,7 @@ mod tests {
         (out.map(|o| o.render()).map_err(|e| e.to_string()), dir)
     }
 
-    /// Round evidence: a worker ended its patch with `***/ End Patch`, and a
+    /// Observed case: a worker ended its patch with `***/ End Patch`, and a
     /// patch with no end line at all was refused with "last line must be".
     #[tokio::test]
     async fn a_missing_or_mangled_end_line_is_applied_and_the_result_says_so() {
@@ -2086,7 +2086,7 @@ mod tests {
         assert_eq!(read(&dir, "a.md"), "one\ntwo  \nthree  \n");
     }
 
-    /// Round evidence (conflicts-tier2, greenfield): `*** Delete File: x`
+    /// Observed case: `*** Delete File: x`
     /// then `*** Add File: x` was refused 24 times as one path in two hunks.
     #[tokio::test]
     async fn a_delete_and_an_add_of_one_path_is_a_replace_with_a_note() {
@@ -2117,7 +2117,7 @@ mod tests {
         assert!(out.expect_err("refused").contains("more than one hunk"));
     }
 
-    /// Round evidence (round20, loyalty): `@@-//! Contract: x` and `@@! Contract: x`
+    /// Observed case: `@@-//! Contract: x` and `@@! Contract: x`
     /// were refused as unexpected lines. The marker with no space reads as
     /// `@@ text`, and one stray `-` or `+` on the text is dropped only when the
     /// file has the text without it.
@@ -2231,7 +2231,7 @@ fn a() {
         );
     }
 
-    /// Round evidence (pricing_engine): the whole-file route was followed, but
+    /// Observed case: the whole-file route was followed, but
     /// the Add File body was written without `+`. The body is read as content.
     #[tokio::test]
     async fn an_unprefixed_add_file_body_after_a_delete_replaces_the_file() {
@@ -2457,7 +2457,7 @@ fn a() {
         assert!(!dir.path().join("n.txt").exists());
     }
 
-    /// Round evidence (pricing_engine): `@@ -1,4 +1,4 @@` and
+    /// Observed case: `@@ -1,4 +1,4 @@` and
     /// `@@ -14,28 +14,4 @@ use tax_us::TaxUs;` headed update chunks.
     #[tokio::test]
     async fn a_unified_diff_hunk_header_is_stripped_and_the_result_says_so() {
@@ -2512,7 +2512,7 @@ fn a() {
         }
     }
 
-    /// Round evidence (greenfield): an Update File of only `+` lines was
+    /// Observed case: an Update File of only `+` lines was
     /// applied as an append, three times, and each said "Success".
     #[tokio::test]
     async fn an_anchorless_addition_through_the_tool_is_refused_and_writes_nothing() {
@@ -2557,7 +2557,7 @@ fn a() {
         std::fs::read_to_string(dir.path().join(name)).expect("read")
     }
 
-    /// Recorded evidence: a worker's patch to a Python stub module wrote
+    /// Observed case: a worker's patch to a Python stub module wrote
     /// every unchanged line with one extra space after its ` ` prefix, while
     /// its `-` and `+` lines were exact. It matched only after ignoring
     /// whitespace and was written back as the patch's text, so line 1 of the

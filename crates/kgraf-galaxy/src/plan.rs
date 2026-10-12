@@ -162,7 +162,7 @@ impl BlockKind {
     }
 }
 
-/// Intensity of a blocking edge: the evidence's 0.85 for links outside the field.
+/// Intensity of a blocking edge: the reference design's 0.85 for links outside the field.
 pub const BLOCK_EDGE: f32 = 0.85;
 
 /// One work node as the run record describes it.

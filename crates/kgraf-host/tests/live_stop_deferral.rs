@@ -3,7 +3,7 @@
 //! (`crates/kgraf-orchestrator/tests/sessions_restart.rs`,
 //! `crates/kgraf-orchestrator/tests/coordination.rs`) but never shown live,
 //! shown together in **one** run so decomposition is paid for once, not
-//! twice (see the evidence file for what it actually cost live).
+//! twice.
 //!
 //! 1. `stop_session` on a running worker, then `resume_session` continuing
 //!    from its transcript with no repeated paid round, then a `Redirect` the
@@ -58,8 +58,8 @@ impl kgraf_runtime::AskResolver for AllowAll {
     }
 }
 
-/// Same fixture `live_sessions.rs` and the phase4-live evidence price from disk,
-/// so every evidence file in this window prices identically.
+/// Same fixture `live_sessions.rs` prices from disk, so the live tests price
+/// identically.
 fn prices_path() -> PathBuf {
     match std::env::var("KGRAF_LIVE_PRICES_FILE") {
         Ok(path) => PathBuf::from(path),
@@ -185,7 +185,7 @@ const REDIRECT_TEXT: &str = "Redirect from the user: do not append \"beta\". Ins
     short sentence saying you are done.";
 
 /// Reports the ledger's rows and their priced cost. Returns the total in
-/// micro-dollars; does not assert, since this run's own real-spend ceiling is
+/// micro-dollars; does not assert, since the run's spend limit is
 /// enforced once, at the end, against the combined total (see `main`'s single
 /// test function below).
 fn report_spend(host: &Host, label: &str) -> i64 {
@@ -218,7 +218,7 @@ fn report_spend(host: &Host, label: &str) -> i64 {
 /// never shown live, in one run against real Kimi and OpenAI routes: a live
 /// stop/resume/redirect of a running worker, and a live write-set collision
 /// deferred on the lease. One decomposition call for both, so debugging this
-/// harness live (see the evidence file) did not pay for it twice per attempt;
+/// harness live did not pay for it twice per attempt;
 /// a real single-round call on this project turned out to cost only a few
 /// thousandths of a dollar, well under the sizing this comment once assumed
 /// before that was measured.
@@ -250,19 +250,15 @@ async fn live_stop_redirect_resume_and_write_set_collision() {
         routes.push("openai:gpt-6-luna".to_owned());
     }
 
-    // Sizing: this run's own hard ceiling is its share of the $0.80 total,
-    // net of every prior attempt's real spend on this same harness while it
-    // was being debugged live (about $0.37 combined; see the evidence file
-    // for the per-attempt breakdown), leaving about $0.43. `cap_run` binds
-    // below that with margin: it refuses a reservation before it is sent
-    // once this run's own real-plus-held spend would cross it
-    // (`BudgetBook::reserve`), which is this task's own "stop if it would go
-    // over" requirement enforced by the mechanism itself, not only by a
+    // Sizing: `cap_run` binds the run's own spend: it refuses a reservation
+    // before it is sent once the run's real-plus-held spend would cross it
+    // (`BudgetBook::reserve`), so "stop if it would go over" is enforced by
+    // the mechanism itself, not only by a
     // post-hoc assertion. `steps`/`max_tokens` are held small (`stopper`
     // needs two dispatches: an initial attempt and a fresh one after
     // `resume_session`; `lease-one`/`lease-two` need one dispatch each), a
     // real single-round call on this project was observed to cost a few
-    // thousandths of a dollar (see the evidence file), so even a dozen
+    // thousandths of a dollar, so even a dozen
     // rounds across four dispatches stays well under $0.10.
     let mut config = RunConfig::new(root.clone(), routes, prices_path());
     config.cap_task = Some(0.20);

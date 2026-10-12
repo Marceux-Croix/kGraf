@@ -1,6 +1,7 @@
 # Decision 0004: A single orchestrator holds full directional control
 
 **Status:** Accepted
+**Amended by:** 0026 (agent identity lifetime), 0067 (every agent is an addressable session)
 **Related:** decisions 0001, 0003
 
 ## Context

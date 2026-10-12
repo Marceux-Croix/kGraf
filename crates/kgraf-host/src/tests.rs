@@ -3831,7 +3831,7 @@ async fn a_whole_check_is_not_deferred_for_the_last_contract_or_without_a_root_g
     );
 }
 
-/// Round 16 greenfield, as planned: from a tree with only a README, `c0`
+/// A new workspace, as planned: from a tree with only a README, `c0`
 /// writes the workspace manifest and both member manifests, `c1` writes
 /// `wcl-core/src/lib.rs` and `c2` writes `wcl/src/main.rs`; the run's check is
 /// `cargo test --workspace --offline`. On `c0`'s tree the check narrows to
@@ -4915,7 +4915,7 @@ const MANIFEST_CHECK: &str = "[ -f Cargo.toml ] || { echo \"error: could not fin
 // `[exit code: 0xc0000142]` must fit in the 300 characters of the quote.
 const _: () = assert!(MANIFEST_CHECK.len() <= 265);
 
-/// The canary failure: the contract writes a root manifest cargo refuses.
+/// A new-workspace failure: the contract writes a root manifest cargo refuses.
 /// The check fails at the dispatch base too (no manifest, a different
 /// error) and the other contracts write the members, but the error names the
 /// contract's own file, so the attempt is judged failed and the worker gets
@@ -4989,7 +4989,7 @@ fn own_file_failure_reads_windows_paths_in_each_spelling() {
     let at_base = "error: could not find `Cargo.toml` in \
                    `C:\\Work\\TEMP~1\\.tmpA\\ws\\probe-1` or any parent \
                    directory";
-    // Round 16 greenfield, as cargo prints it on Windows: the error names
+    // A new workspace, as cargo prints it on Windows: the error names
     // the member manifest, which an open contract's source completes, so the
     // failure may be only that contract's missing work.
     let cargo = "error: failed to load manifest for workspace member \

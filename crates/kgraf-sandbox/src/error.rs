@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     /// The `git` binary is not on `PATH`. Worktrees go through the git CLI
-    /// (sandboxing evidence), so there is no fallback.
+    /// (git2 worktree validation reports success for a missing directory), so there is no fallback.
     #[error("git executable not found on PATH; worktree lifecycle requires the git CLI")]
     GitNotFound,
     /// A git command exited non-zero.

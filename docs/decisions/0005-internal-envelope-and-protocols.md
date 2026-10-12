@@ -1,6 +1,7 @@
 # Decision 0005: An internal Anthropic-shaped envelope, with no agent wire protocol in v1
 
 **Status:** Accepted
+**Amended by:** 0051 (hosted tool servers), 0067
 **Related:** decisions 0001, 0006
 
 ## Context

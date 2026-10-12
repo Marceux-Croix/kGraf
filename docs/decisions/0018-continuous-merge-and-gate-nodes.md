@@ -1,6 +1,7 @@
 # Decision 0018: Continuous merge, with quality gates as first-class work nodes
 
 **Status:** Accepted. Its gate cadence clause is refined by decision 0019.
+**Amended by:** 0019 (gate cadence), 0073 (merge conflict handling)
 **Related:** decisions 0009, 0012, 0013, 0014, 0015, 0016, 0017
 
 ## Context

@@ -1,6 +1,7 @@
 # Decision 0011: Per-platform sandboxing, honestly labeled, with no admin requirement
 
 **Status:** Accepted
+**Superseded by:** 0097 (in part: the Windows token design)
 **Related:** decisions 0002, 0009
 
 ## Context

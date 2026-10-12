@@ -40,7 +40,7 @@ impl Rng {
 
 /// A clustered ring galaxy of `n` nodes with about two edges per node: clusters seeded
 /// on a 500 to 750 ring, depth levels 50 apart on Z, 90% of edges inside a cluster at
-/// intensity 0.25 and the rest across at 0.06 (the evidence's values).
+/// intensity 0.25 and the rest across at 0.06 (the reference design's values).
 pub fn synthetic(n: usize, seed: u64) -> SceneInput {
     let mut rng = Rng(seed);
     let clusters = ((n as f32).sqrt() / 4.0).round().max(1.0) as usize;
@@ -116,7 +116,7 @@ pub fn synthetic(n: usize, seed: u64) -> SceneInput {
         .map(|((position, base), &d)| NodeInput {
             position,
             color: channels(stellar_color(d)),
-            // Base by label plus the degree boost (evidence).
+            // Base by label plus the degree boost (the reference design).
             size: base + degree_boost(d),
         })
         .collect();

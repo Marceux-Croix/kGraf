@@ -6,9 +6,7 @@ date verified: 2026-09-26
 
 Ported (logic translated to Rust, not copied verbatim) to
 crates/kgraf-graph/src/leases/schedule.rs, per ROADMAP Phase 1.6's build plan
-(decision 0055) and the evidence file
-docs/decisions/evidence/2026-09-24-reference-architectures.md ("The best idea in the
-repo for kGraf").
+(decision 0055).
 
 What was taken: the **layered topological sort** structure of `_schedule_tool_calls` --
 compute a dependency set per item, repeatedly pull every item whose dependencies are

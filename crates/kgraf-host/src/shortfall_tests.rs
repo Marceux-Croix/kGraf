@@ -197,7 +197,7 @@ const SIBLING_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: wri
 /// cannot pass on `a` alone.
 const DEPENDENT_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]},{"id":"b","instruction":"TASK-B: write b.txt","acceptance":"b.txt exists","writes":[{"path":"b.txt"}],"tools":[],"depends_on":["a"]}]}"#;
 
-/// The round 8 greenfield shape: the root manifest's contract accepts on
+/// A new-workspace shape: the root manifest's contract accepts on
 /// `-p core`, and the member `cli` comes from a contract that runs later.
 const MEMBER_PLAN: &str = r#"{"contracts":[{"id":"a","instruction":"TASK-A: write `Cargo.toml` with members = [\"core\", \"cli\"] and the core crate","acceptance":"cargo test -p core","writes":[{"path":"Cargo.toml"},{"path":"core/Cargo.toml"},{"path":"core/src/lib.rs"}],"tools":[]},{"id":"b","instruction":"TASK-B: write the cli crate","acceptance":"cargo test --workspace","writes":[{"path":"cli/Cargo.toml"},{"path":"cli/src/main.rs"}],"tools":[],"depends_on":["a"]}]}"#;
 

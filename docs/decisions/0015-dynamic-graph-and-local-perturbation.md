@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Refines decision 0010's stability property and
 decision 0014's expansion behavior. Neither is reversed.
+**Amended by:** 0058 (the layout stays solver-free)
 **Related:** decisions 0007, 0010, 0012, 0014
 
 ## Context

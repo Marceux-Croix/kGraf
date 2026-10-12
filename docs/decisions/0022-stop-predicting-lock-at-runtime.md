@@ -5,6 +5,7 @@ claim below that "33 percent of textually clean merges had build or test
 conflicts" is wrong. The correct figures are 33.3 percent of all conflicts and
 9.3 percent of clean merges. The source paper states its own finding
 incorrectly and the error propagated here.
+**Amended by:** 0023 (corrects a figure), 0049 (the acceptance criterion)
 **Related:** decisions 0009, 0012, 0016, 0017, 0018, 0019, 0020, 0021, 0023
 
 ---

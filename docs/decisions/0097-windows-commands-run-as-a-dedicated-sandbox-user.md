@@ -1,8 +1,8 @@
 # Decision 0097: On Windows, sandboxed commands run as a dedicated local sandbox user, set up once with administrator rights
 
-**Status:** Accepted (2026-10-08). Setup, the runner, the launch path and the ACL confinement are built and compile-checked for Windows; none has run on Windows yet.
+**Status:** Accepted (2026-10-08). Status as of 2026-10-11: setup, the runner, the launch path and the access-list confinement are built and have run on a GitHub-hosted Windows Server 2025 runner (x86_64, Git for Windows installed). The last full run passed except for one named gap: DNS is not confined on that Windows version. They have not run on a standard-user Windows 11 machine, on ARM64, or on another Windows version.
 **Deciders:** the project maintainer.
-**Related:** 0011 (sandboxing per platform; its Windows token design is superseded here once the later units land), 0084 (the build and test allowlist and read grants), 0087 (dependency installs and the egress proxy), 0083 (host writes never follow a link).
+**Related:** 0011 (sandboxing per platform; its Windows token design is superseded here), 0084 (the build and test allowlist and read grants), 0087 (dependency installs and the egress proxy), 0083 (host writes never follow a link).
 
 This record exists so the Windows sandbox model is not re-argued. If a future
 contributor asks "why does kGraf create Windows user accounts," the reasoning is here.
@@ -2120,8 +2120,8 @@ each bullet says what a Windows run must show.
   `a_refused_launch_says_what_to_do_on_one_line` and
   `a_carried_error_says_its_frame_and_refusal_once`.
 
-What a Windows run must show: item 10 of the named-objects list in `docs/WINDOWS-TESTING.md`.
-The sandbox user re-run of the shell, startup, escape, runner, stdio and contract tests no
+What a Windows run must show: the
+sandbox user re-run of the shell, startup, escape, runner, stdio and contract tests no
 longer fails on the trust check; the two pipe tests pass; and a refused launch, where one
 happens, is one line that says what to run.
 
@@ -2276,8 +2276,8 @@ A full Windows self-test with the sandbox user phase read `ALL PASSED` on GitHub
 38163271605 (pin `69d798cb`, started 18:18 UTC, ended 20:18 UTC; Windows Server 2025
 Datacenter 24H2, build 26100.33438). It names one known gap: DNS. This closes the campaign
 that began with the first filtered run of the fixes below. The numbers are from the reports
-of the runs; `docs/WINDOWS-TESTING.md`, "Results of the confirmation campaign", holds the
-full tables.
+of the runs; `docs/WINDOWS-TESTING.md`, "Campaign summary", holds the
+summary table.
 
 | GitHub run | Pin | Result |
 |---|---|---|

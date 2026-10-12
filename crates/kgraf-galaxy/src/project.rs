@@ -9,7 +9,7 @@
 //!   stellar classification); edges colored by kind at the density module's
 //!   same-cluster (0.25) or cross-cluster (0.06) intensity.
 //! - **Agents**: every worker holding a lease. Degree owns color and size for code, so
-//!   agents do not reuse either (evidence 2026-09-24, recommendation 3): a fixed teal
+//!   agents do not reuse either (the reference design keeps the encodings apart): a fixed teal
 //!   outside the stellar table, a fixed size, a diamond sprite, hovering
 //!   [`AGENT_LIFT`] above the centroid of what they act on. An agent's live edges run
 //!   to the nodes it holds (0.85) and has touched in its task (0.3), and to its task.
@@ -66,7 +66,7 @@ pub const CLUSTER_SIZE: f32 = 12.0;
 /// the agents.
 pub const CLUSTER_LIFT: f32 = 40.0;
 
-/// Edge intensity for a held lease and for an agent's task: the evidence's 0.85.
+/// Edge intensity for a held lease and for an agent's task: the reference design's 0.85.
 pub const LIVE_EDGE: f32 = 0.85;
 /// Edge intensity for something touched earlier in the task.
 pub const TRAIL_EDGE: f32 = 0.3;

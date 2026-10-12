@@ -25,7 +25,7 @@ dist/
 # macOS
 .DS_Store
 
-# Claude Code local state and campaign workspaces
+# Local tool state and scratch directories
 .claude/
 .claude_work/
 .claude_todo/
@@ -33,10 +33,11 @@ dist/
 # Python bytecode
 __pycache__/
 
-# Super canary rounds: dev evidence, never committed (canary/README.md)
+# Local test run output, never committed
 /canary/runs/
 
-# Super canary fixtures carry their own isolated home with a skills folder.
+# Local test fixtures carry their own isolated home with a skills folder;
+# recordings stay local.
 !/canary/fixtures/**/.claude/
 /canary/cassettes/
 !/canary/tests/fixtures/**/ledger.db

@@ -1178,7 +1178,7 @@ mod tests {
     }
 
     /// A run with contract checks reports what its interface call cost and
-    /// what that bought, beside the `contracts` line the canary reads: planner
+    /// what that bought, beside the `contracts` line that tools read: planner
     /// calls, seconds and output tokens, and the interfaces accepted by kind.
     /// The `contracts` line keeps its form.
     #[test]

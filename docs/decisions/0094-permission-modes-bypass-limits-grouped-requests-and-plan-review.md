@@ -1,6 +1,7 @@
 # Decision 0094: Permission modes set by the user, the limits Bypass keeps, grouped permission requests, and plan review before dispatch
 
 **Status:** Accepted
+**Supersedes:** 0093 (in part: the operator ceiling)
 **Related:** decisions 0004, 0017, 0027, 0029, 0035, 0053, 0063, 0084, 0093
 
 ## Context

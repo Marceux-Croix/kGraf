@@ -908,8 +908,8 @@ impl ChatCompletionsAdapter {
         };
 
         // Reported by some vendors in the details object. Moonshot's native route
-        // does, as its first live call showed (evidence fixture
-        // `2026-09-26-kimi-live-call.json`), which falsified this adapter's earlier
+        // does, as its first live call showed (recorded in a
+        // live-call fixture), which falsified this adapter's earlier
         // assumption that no Chat Completions vendor reports writes. Zero where it is
         // not reported: unreported, not known to be zero.
         let cache_write = match dialect {

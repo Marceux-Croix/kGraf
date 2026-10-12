@@ -812,7 +812,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"type":"authorized_user","client_id":"c.apps.googleusercontent.com",
-                "client_secret":"d-FL95Q19q7MQmFpd7hHD0Ty",
+                "client_secret":"example-client-secret-not-real",
                 "refresh_token":"1//0gExampleRefreshTokenValue-abcdefghij",
                 "quota_project_id":"my-billing-project"}"#,
         )

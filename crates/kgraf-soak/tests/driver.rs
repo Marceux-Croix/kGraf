@@ -1,5 +1,5 @@
 //! The driver end to end: it runs real orchestrations against its own stub server, and what it prints
-//! is what the canary's judge reads.
+//! is what a judge of the run reads.
 //!
 //! Replicate by hand: `kgraf-soak --repo DIR --work DIR --runs 2`, then read the JSON lines.
 

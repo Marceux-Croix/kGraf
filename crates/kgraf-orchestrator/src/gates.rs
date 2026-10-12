@@ -37,7 +37,7 @@
 //!
 //! Written new: the gate is this project's own design; no reference
 //! implementation models validation as a node in the work graph (searched: the
-//! 0055 reuse survey and the reference-architectures evidence).
+//! 0055 reuse survey).
 
 use crate::run_state::{OpenContract, VerifiedCommit, WriteTarget};
 use kgraf_tools::UntrustedText;

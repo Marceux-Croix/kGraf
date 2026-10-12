@@ -3,10 +3,10 @@
 //! desktop. No administrator rights, no installer, no service.
 //!
 //! **Mechanism (decision 0011).** Chosen over
-//! AppContainer because the evidence records that AppContainer breaks the
+//! AppContainer because AppContainer breaks the
 //! shell, Node, MSBuild, git and per-user toolchains without elevation, and
 //! it is the toolchain that must run here. Windows Sandbox, WSL2-as-sandbox
-//! and Hyperlight are ruled out by the same evidence.
+//! and Hyperlight are ruled out for the same reason.
 //!
 //! - **Token.** `CreateRestrictedToken` with `WRITE_RESTRICTED | LUA_TOKEN |
 //!   DISABLE_MAX_PRIVILEGE`. The restricting SIDs are one capability SID per

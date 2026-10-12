@@ -1,6 +1,7 @@
 # Decision 0042: A decider seam, CPU-first, aimed at a wire format, and accepted on calibration rather than accuracy
 
 **Status:** Accepted.
+**Superseded by:** 0047 (in part: the acceptance premise)
 **Related:** decisions 0002, 0006, 0008, 0020, 0022, 0025, 0031, 0039, 0041
 
 ---

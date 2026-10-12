@@ -130,7 +130,7 @@ it.
 
 Deliberate occurrences of the product's earlier name remain in the codebase: the compatibility
 constants and legacy-name handling code and its tests, the packaging compatibility lines, this
-record itself, and every historical record and evidence file from before the rename. The
+record itself, and every historical record and recorded exchange from before the rename. The
 project's GitHub repository keeps its earlier name until it is separately renamed.
 
 **Known limit: an in-flight worker does not resume across the rename.** A worker's system

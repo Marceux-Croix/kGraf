@@ -88,7 +88,7 @@ const ROUTE: &str = "kimi-anthropic:kimi-k3";
 /// Acceptance item 1: "pointed at kGraf's own repository, whose
 /// correct interpretation is known, the plan model it produces is compared
 /// against the actual roadmap, decisions and standing rules." The comparison
-/// itself is written up in the evidence file (a live model's prose does not
+/// itself is judged by reading the output (a live model's prose does not
 /// lend itself to a brittle automated assertion, per the existing readings);
 /// this test's job is to produce the reading and
 /// record its mechanics: one ledgered call, a non-empty reading, and the
@@ -263,7 +263,7 @@ async fn a_forbidden_path_constraint_binds_live() {
     } else {
         println!(
             "NOT DEMONSTRATED THIS RUN: the model did not name legacy/ as a forbidden \
-                   path (or named no legacy/ write to strike); see the evidence file for what \
+                   path (or named no legacy/ write to strike); see the model's output for what \
                    it did instead. The mechanism itself (`a_forbidden_path_constraint_strikes_\
                    the_write_before_seeding` in kgraf-interpret) is unit-tested and does not \
                    depend on this call's outcome."

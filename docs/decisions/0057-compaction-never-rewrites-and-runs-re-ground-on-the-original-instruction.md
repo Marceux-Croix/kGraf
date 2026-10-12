@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Refines decision 0056 and replaces its planned compaction method.
 Thresholds superseded by the addendum below.
+**Amended by:** 0095 (a worker may compact once, by the runtime)
 **Related:** decisions 0043, 0055, 0056
 
 This record exists so the compaction method and the drift-prevention guard are not

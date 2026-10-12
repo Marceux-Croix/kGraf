@@ -1,6 +1,6 @@
 //! Typed run-failure classes (decision 0052).
 //!
-//! Decision 0052 and evidence file §A7 (LibreChat's readiness-before-capacity design)
+//! Decision 0052 and LibreChat's readiness-before-capacity design)
 //! draw one line this module exists to keep: a failure that means the schedule cannot
 //! ever succeed as configured **disables** it and says why, while a failure that means
 //! this attempt did not succeed **counts** toward a threshold, and the two must never be

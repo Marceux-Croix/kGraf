@@ -1,7 +1,7 @@
 [package]
 name = "kgraf-soak"
 version.workspace = true
-description = "Soak driver: many orchestrations on one Host in one process, with the process's memory, descriptors, threads and children sampled after each. Used by the canary's memory-soak scenario. Never published, never packaged by dist."
+description = "Soak driver: many orchestrations on one Host in one process, with the process's memory, descriptors, threads and children sampled after each. Used by memory-soak tests. Never published, never packaged by dist."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

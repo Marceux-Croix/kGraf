@@ -3,7 +3,7 @@
 //! attempt; with no other route the contract waits for the route's probe and
 //! is held with the reason once the route has failed three times in a row.
 //!
-//! The round-1 canary's route-outage scenario saw three calls dropped on one
+//! A run saw three calls dropped on one
 //! route while neither the trace nor the run output named the route, and
 //! rotation kept handing it new contracts.
 

@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Closes the open question in decision 0026 on contract
 revision mid-flight.
+**Amended by:** 0030 (the classification test)
 **Related:** decisions 0003, 0009, 0014, 0018, 0024, 0026
 
 ---

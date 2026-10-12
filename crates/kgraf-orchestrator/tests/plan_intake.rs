@@ -261,7 +261,7 @@ async fn contracts_that_declare_no_writes_are_refused_and_asked_again() {
     assert_eq!(accepted_ids(&events), ["c1", "c2", "c3", "c4"]);
 }
 
-/// A Terminal-Bench run's second contracts answer (canary round 14): c1 writes
+/// A Terminal-Bench run's second contracts answer: c1 writes
 /// the package, c2 writes the server script, and `c3-install-verify` installs
 /// the package from the server and checks an import, declaring no writes. A
 /// contract that only installs and verifies changes no file, so the answer is

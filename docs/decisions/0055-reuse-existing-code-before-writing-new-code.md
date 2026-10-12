@@ -1,6 +1,8 @@
 # Decision 0055: Reuse existing code before writing new code
 
 **Status:** Accepted. Amended by the addendum below and by decision 0061.
+**Amends:** 0054 (the galaxy renderer)
+**Amended by:** 0061 (the Windows installer tool)
 **Related:** decisions 0051, 0054
 
 This record exists so the build method is not re-argued. If a future contributor asks why a

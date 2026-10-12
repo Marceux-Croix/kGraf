@@ -1452,7 +1452,7 @@ async fn an_answer_with_no_tool_call_still_completes_a_contract_that_writes_noth
     }
 }
 
-/// Round evidence (polyglot attempt 2): two `read_file` calls, then the turn
+/// Observed case: two `read_file` calls, then the turn
 /// ended as done with nothing written, and the attempt was recorded completed.
 /// A read is not a change, so the contract that writes gets the notices, and
 /// a read-only end past their bound fails the attempt.

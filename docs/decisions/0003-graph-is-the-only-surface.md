@@ -1,6 +1,7 @@
 # Decision 0003: The graph is the only work surface; no kanban
 
 **Status:** Accepted
+**Amended by:** 0017 (the scope of the no-second-surface rule: settings holds configuration only)
 **Related:** none
 
 ## Context

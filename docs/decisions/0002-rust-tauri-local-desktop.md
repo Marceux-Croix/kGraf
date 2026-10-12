@@ -2,6 +2,7 @@
 
 **Status:** Accepted. The original Tauri shell choice is superseded by a
 later decision; the Rust core, local-only, and all-platform parts stand.
+**Superseded by:** 0054 (in part: the shell choice)
 **Related:** decision 0001
 
 ## Context

@@ -83,7 +83,7 @@ async fn kimis_anthropic_compatible_endpoint_is_checked_for_anthropic_style_head
             Protocol::Additive,
             model,
             "live-rate-headers",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let mut request = Request::new(model, "placeholder", 5);
@@ -171,7 +171,7 @@ async fn anthropics_own_endpoint_is_checked_for_anthropic_style_headers() {
             Protocol::Additive,
             model,
             "live-rate-headers",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let mut request = Request::new(model, "placeholder", 5);

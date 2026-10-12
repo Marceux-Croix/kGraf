@@ -2,6 +2,8 @@
 
 **Status:** Accepted. Supersedes the shell choice and the renderer choice made earlier in the
 project.
+**Supersedes:** 0002 (the shell choice), 0010 (the renderer choice)
+**Amended by:** 0055 (the galaxy renderer, in its addendum)
 **Related:** decision 0052
 
 This record exists because the desktop shell's constraints were restated more precisely

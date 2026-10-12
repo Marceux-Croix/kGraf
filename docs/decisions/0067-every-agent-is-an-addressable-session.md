@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Supersedes:** decision 0017's starting concurrency numbers and its fixed maximums
 **Amends:** decisions 0004, 0005, 0033, 0034
+**Amended by:** 0095
 **Related:** decisions 0009, 0012, 0014, 0026, 0027, 0028, 0043, 0048, 0056, 0057, 0060, 0063
 
 ## Context

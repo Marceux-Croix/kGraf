@@ -108,7 +108,7 @@ async fn live_openai_responses_accepts_a_user_message_with_two_text_blocks() {
             Protocol::Inclusive,
             model,
             "live-two-blocks",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let response = adapter
@@ -150,7 +150,7 @@ async fn live_chat_completions_accepts_a_user_message_with_two_text_blocks() {
             Protocol::Inclusive,
             model,
             "live-two-blocks",
-            "sr-011",
+            "live-check",
         )
         .expect("begin");
     let response = adapter

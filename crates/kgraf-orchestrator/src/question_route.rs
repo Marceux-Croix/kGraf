@@ -846,7 +846,7 @@ mod tests {
             &offer_id,
             question_text,
             OfferResolution::Accepted {
-                new_project: "Flume".into(),
+                new_project: "Orchard".into(),
             },
         )
         .expect("resolved");
@@ -856,7 +856,7 @@ mod tests {
             .find(|n| n.id == offer_id)
             .expect("still there");
         assert!(resolved.body.contains("accepted"), "{}", resolved.body);
-        assert!(resolved.body.contains("Flume"), "{}", resolved.body);
+        assert!(resolved.body.contains("Orchard"), "{}", resolved.body);
         // Resolution updates the same node in place; it does not add a new one.
         assert_eq!(stored.iter().filter(|n| n.id == offer_id).count(), 1);
     }

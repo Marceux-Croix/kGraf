@@ -3,6 +3,7 @@
 **Status:** Accepted. Refines decision 0032's result presentation. Makes
 explicit where decision 0004's unabridged transcript promise actually
 renders.
+**Amended by:** 0063 (one live activity card), 0067
 **Related:** decisions 0003, 0004, 0010, 0014, 0026, 0028, 0032
 
 ---

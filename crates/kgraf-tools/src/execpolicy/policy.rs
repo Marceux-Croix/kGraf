@@ -1323,8 +1323,8 @@ mod tests {
 
     /// Decision 0094, amended 2026-10-02: in Auto, a script is granted when
     /// the allow set grants the program of every command, as Claude Code
-    /// allows a compound command when each subcommand is allowed. The round
-    /// a canary worker was denied: `mkdir` and `cp` allowed, both used.
+    /// allows a compound command when each subcommand is allowed. A worker
+    /// was denied a script of `mkdir` and `cp`, both allowed and both used.
     #[test]
     fn auto_grants_a_script_when_it_grants_every_command() {
         use crate::permissions::PermissionMode;

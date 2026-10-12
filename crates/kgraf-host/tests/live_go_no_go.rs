@@ -47,13 +47,11 @@
 //! `400*3/1e6 + 700*15/1e6` = $0.0012 + $0.0105 = **$0.0117 per call**. Each
 //! task costs 1 (solo) + 2 (peer) + 3 (orchestrator: 1 director + 2 workers)
 //! = 6 calls, **$0.0702 worst case per task**. At `TASK_COUNT` = 8 that is
-//! **$0.562 worst case for the whole run**, against a $4.00 cap -- headroom
-//! of roughly 7x, so `TASK_COUNT` was sized up from a minimal 3 to 8 for a
-//! less thin sample rather than down for budget. [`SPEND_CAP_USD`] is still
-//! enforced live, call by call, in case real usage runs far past this
-//! estimate, and the run stops and reports a partial result rather than
-//! exceeding it. (The actual run measured far below this worst case: see the
-//! evidence file this test's own run produced.)
+//! **$0.562 worst case for the whole run**, far below
+//! [`SPEND_CAP_USD`], so `TASK_COUNT` is 8 for a less thin sample rather than
+//! smaller for budget. [`SPEND_CAP_USD`] is still enforced live, call by
+//! call, in case real usage runs far past this estimate, and the run stops
+//! and reports a partial result rather than exceeding it.
 use kgraf_core::ModelPrice;
 use kgraf_core::cost::{Money, PriceTable};
 use kgraf_provider::accounting::Ledger;
@@ -62,8 +60,7 @@ use kgraf_provider::provider::Provider;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The real-spend ceiling for this whole run (task instructions: "$4.00 total
-/// from the ledger").
+/// The spend limit for this whole run, summed from the ledger.
 const SPEND_CAP_USD: f64 = 4.00;
 
 /// Number of tasks per arm. Sized in the module doc comment above.
@@ -116,8 +113,8 @@ fn set_route_credentials() -> (bool, bool) {
     (kimi.is_some(), openai.is_some())
 }
 
-/// Prices from the same fixture `live_sessions.rs` uses, so the two evidence
-/// records price identically.
+/// Prices from the same fixture `live_sessions.rs` uses, so the two tests
+/// price identically.
 fn prices_path() -> PathBuf {
     match std::env::var("KGRAF_LIVE_PRICES_FILE") {
         Ok(path) => PathBuf::from(path),
@@ -186,8 +183,7 @@ fn provider_for(route: Route) -> Result<Arc<dyn Provider>, String> {
 /// **What this narrows away, stated plainly.** This is not multi-file code,
 /// not a compiler, and not the full session/tool-loop `kgraf-host` runs in
 /// production; the fictional terms and facts are invented per task so no
-/// model's prior knowledge substitutes for reading the brief. A caveat this
-/// evidence file repeats.
+/// model's prior knowledge substitutes for reading the brief.
 struct Task {
     id: &'static str,
     existing: &'static str,
@@ -364,7 +360,7 @@ fn parse_note(text: &str) -> Option<String> {
 /// Task success: the two entries landed on two different numbers, each
 /// entry's term matches its assignment, and each definition contains its
 /// required keyword. Returns `(success, reasons)`; reasons are always filled
-/// in on failure, for the evidence record.
+/// in on failure, for the test output.
 fn grade(task: &Task, entry_a: Option<&Entry>, entry_b: Option<&Entry>) -> (bool, Vec<String>) {
     let mut reasons = Vec::new();
     let (Some(a), Some(b)) = (entry_a, entry_b) else {

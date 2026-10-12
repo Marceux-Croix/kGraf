@@ -38,7 +38,7 @@
 //!
 //! **Written new.** Searched: this crate's port of codex-rs `execpolicy`
 //! (prefix rules only; codex's own "known safe" list covers read-only commands
-//! and has no cargo argument rules), and this repository's evidence and reuse
+//! and has no cargo argument rules), and this repository's reuse
 //! candidates (decision 0055). No network search was made.
 
 use std::fmt;

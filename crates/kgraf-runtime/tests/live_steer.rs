@@ -267,7 +267,7 @@ async fn exchange(route: &str, model: &str, mode: InjectMode) -> Option<Money> {
         // The first lookup's result: cancelled while running (the case this
         // exchange aims at), or not run if the interrupt was armed before
         // the call started. Both close the tool use; which one
-        // happened is printed for the evidence record.
+        // happened is printed.
         let first = events
             .iter()
             .find_map(|e| match e {

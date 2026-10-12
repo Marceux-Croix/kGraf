@@ -923,7 +923,7 @@ impl Act for Thing {
         );
     }
 
-    /// Round 7, as the canary scripts it: the scaffold of `a/src/lib.rs` and the
+    /// As a scripted run builds it: the scaffold of `a/src/lib.rs` and the
     /// planner's instruction. Both contradictions are named: the struct (with
     /// the older wording) and the trait method.
     #[test]

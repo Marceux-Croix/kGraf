@@ -1,7 +1,6 @@
 //! Read-only worker tools: read a file, list a directory, search file contents.
 //!
-//! Novel code (nothing in the evidence directory or the reuse
-//! candidates covers a plain read/list/search triad; these are a few dozen
+//! Novel code (nothing in the reuse candidates covers a plain read/list/search triad; these are a few dozen
 //! lines each over [`crate::fs_safety`], not worth a separate dependency).
 //! Every path goes through [`crate::fs_safety`], not `std::fs`: a lexical
 //! escape check alone (what this module used at first)

@@ -1,8 +1,7 @@
 //! A scripted OpenAI-compatible model on 127.0.0.1, so a real `kgraf worker`
 //! run needs no model and no API key.
 //!
-//! It plays the canary's `script` mode (`canary/framework.py`,
-//! `script_reply`): with `n` tool results in the conversation it answers
+//! It plays a scripted-reply mode: with `n` tool results in the conversation it answers
 //! with tool call `n + 1` of the script, then with a plain "done". It keeps
 //! the text of every tool result it receives, by call id, which is what the
 //! end-to-end checks judge. One connection per request (`Connection: close`).

@@ -185,7 +185,7 @@ pub fn name_list(names: &[String]) -> String {
 }
 
 /// The collapsed hamburger's tooltip (CMP-BDG-4): the projects in the aggregate's
-/// state, by name, with the kinds that need input: "Show projects. Flume: 1
+/// state, by name, with the kinds that need input: "Show projects. Orchard: 1
 /// failed run; A and B are working". `projects` is (name, flags, signals). Pure.
 pub fn hamburger_words(projects: &[(String, Flags, Signals)]) -> String {
     let status = hamburger_status(projects.iter().map(|(_, f, _)| *f));
@@ -1415,8 +1415,8 @@ mod tests {
             ..Signals::default()
         };
         assert_eq!(
-            hamburger_words(&[row("Flume", fail), row("Ad Astra", work)]),
-            "Show projects. Flume: 1 failure, 2 questions"
+            hamburger_words(&[row("Orchard", fail), row("Harbor", work)]),
+            "Show projects. Orchard: 1 failure, 2 questions"
         );
         assert_eq!(
             hamburger_words(&[row("A", work), row("B", work), row("C", work)]),

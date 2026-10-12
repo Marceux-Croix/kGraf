@@ -489,7 +489,7 @@ mod tests {
         assert!(err.contains('f'));
     }
 
-    /// Regression, 2026-09-28: `claude-haiku-4-5-20251001`'s actual first
+    /// Regression: `claude-haiku-4-5-20251001`'s actual first
     /// attempt at the `refactor-parser` bench brief (captured live via
     /// `KGRAF_BENCH_KEEP_DIR`), reproduced against the brief's own fixture
     /// content. The `@@` anchor names only a fragment of the real function
@@ -547,7 +547,7 @@ mod tests {
         );
     }
 
-    /// Regression, 2026-09-28: the same brief's second failing attempt used a
+    /// Regression: the same brief's second failing attempt used a
     /// bare unified-diff hunk header (`@@ -5,11 +5,15 @@`) as a `@@` context
     /// line -- exactly the syntax the tool description warns against.
     #[test]

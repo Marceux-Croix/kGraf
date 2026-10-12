@@ -1,6 +1,7 @@
 # Decision 0014: Recursive work nodes, derived progress and blocking, and two execution modes
 
 **Status:** Accepted
+**Amended by:** 0015 (expansion behavior), 0025 (the recursion floor)
 **Related:** decisions 0003, 0004, 0007, 0010, 0012, 0013
 
 ## Context

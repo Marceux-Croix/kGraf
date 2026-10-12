@@ -8,7 +8,7 @@
 //! "cannot read `crates/kgraf-sandbox/src/error.rs`" tells the user exactly
 //! where to look. A path outside the project root usually passes through the
 //! user's home directory, which embeds the account name
-//! (`/home/marco/...`, `C:\Users\marco\...`); that name is not diagnostic
+//! (`/home/alice/...`, `C:\Users\alice\...`); that name is not diagnostic
 //! information, so it is hashed instead of shown.
 //!
 //! **The hash is keyed (`key.rs`), not plain BLAKE3.** An unkeyed hash of a
@@ -144,7 +144,7 @@ fn path_pattern() -> &'static Regex {
             r#"(?P<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'`\[\]\(\)\{\}<>]*)"#,
             r#"|"#,
             // Windows drive path. Spaces are allowed inside it (a Windows
-            // path routinely has one, e.g. "Marco Cross"); it still stops at
+            // path routinely has one, e.g. "Alice Example"); it still stops at
             // a quote, bracket or newline.
             r#"(?P<win>[A-Za-z]:[\\/][^"'`\[\]\{\}<>\r\n\t]+)"#,
             r#"|"#,
@@ -216,12 +216,12 @@ mod tests {
     use super::*;
 
     fn root() -> std::path::PathBuf {
-        std::path::PathBuf::from("/home/marco/kgraf")
+        std::path::PathBuf::from("/home/alice/kgraf")
     }
 
     #[test]
     fn inside_root_is_relative() {
-        let p = Path::new("/home/marco/kgraf/crates/kgraf-diag/src/scrub.rs");
+        let p = Path::new("/home/alice/kgraf/crates/kgraf-diag/src/scrub.rs");
         assert_eq!(
             scrub_path(p, Some(&root())),
             "crates/kgraf-diag/src/scrub.rs"
@@ -243,7 +243,7 @@ mod tests {
     /// cached `install_key`.
     #[test]
     fn the_hash_is_actually_keyed_not_plain_blake3() {
-        let p = Path::new("/home/marco/.ssh/id_ed25519");
+        let p = Path::new("/home/alice/.ssh/id_ed25519");
         let key_a = [0xAAu8; crate::key::KEY_LEN];
         let key_b = [0xBBu8; crate::key::KEY_LEN];
         let a = hash_path_with_key(p, &key_a);
@@ -259,71 +259,71 @@ mod tests {
 
     #[test]
     fn outside_root_is_hashed_and_stable_across_calls() {
-        let p = Path::new("/home/marco/.ssh/id_ed25519");
+        let p = Path::new("/home/alice/.ssh/id_ed25519");
         let a = scrub_path(p, Some(&root()));
         let b = scrub_path(p, Some(&root()));
         assert_eq!(a, b);
         assert!(a.starts_with("h:"));
-        assert!(!a.contains("marco"));
+        assert!(!a.contains("alice"));
     }
 
     #[test]
     fn no_root_hashes_absolute_paths() {
-        let p = Path::new("/home/marco/project/file.rs");
+        let p = Path::new("/home/alice/project/file.rs");
         assert!(scrub_path(p, None).starts_with("h:"));
     }
 
     #[test]
     fn text_scrubs_a_backtick_quoted_path_and_keeps_the_rest() {
-        let text = "cannot read `/home/marco/kgraf/Cargo.toml`: permission denied";
+        let text = "cannot read `/home/alice/kgraf/Cargo.toml`: permission denied";
         let out = scrub_text(text, Some(&root()));
         assert!(out.contains("Cargo.toml"));
-        assert!(!out.contains("/home/marco"));
+        assert!(!out.contains("/home/alice"));
         assert!(out.ends_with("permission denied"));
     }
 
     #[test]
     fn bracketed_path_keeps_its_brackets() {
-        let out = scrub_text("cannot open [/home/marco/secret.txt]", None);
+        let out = scrub_text("cannot open [/home/alice/secret.txt]", None);
         assert!(out.starts_with("cannot open [h:"));
         assert!(out.ends_with(']'));
     }
 
     #[test]
     fn path_after_equals_is_found() {
-        let out = scrub_text("path=/home/marco/secret.txt", None);
+        let out = scrub_text("path=/home/alice/secret.txt", None);
         assert!(out.starts_with("path=h:"));
     }
 
     #[test]
     fn file_url_keeps_its_scheme() {
-        let out = scrub_text("file:///home/marco/secret.txt", None);
+        let out = scrub_text("file:///home/alice/secret.txt", None);
         assert!(out.starts_with("file://h:"), "{out}");
     }
 
     #[test]
     fn windows_path_with_a_space_is_scrubbed_whole() {
-        let out = scrub_text(r"cannot read C:\Users\Marco Cross\secret.txt", None);
+        let out = scrub_text(r"cannot read C:\Users\Alice Example\secret.txt", None);
         assert!(out.starts_with("cannot read h:"), "{out}");
-        assert!(!out.contains("Marco Cross"));
+        assert!(!out.contains("Alice Example"));
     }
 
     #[test]
     fn a_tab_before_a_path_does_not_stop_the_match() {
-        let out = scrub_text("failed\t/home/marco/tab.txt", None);
+        let out = scrub_text("failed\t/home/alice/tab.txt", None);
         assert!(out.starts_with("failed\th:"));
     }
 
     #[test]
     fn a_multiline_leading_path_is_scrubbed() {
-        let out = scrub_text("error:\n/home/marco/.ssh/id_ed25519 missing", None);
+        let out = scrub_text("error:\n/home/alice/.ssh/id_ed25519 missing", None);
         assert!(out.contains("error:\nh:"), "{out}");
         assert!(out.ends_with("missing"));
     }
 
     #[test]
     fn a_json_embedded_path_is_scrubbed_and_the_json_survives() {
-        let out = scrub_text(r#"{"path":"/home/marco/x"}"#, None);
+        let out = scrub_text(r#"{"path":"/home/alice/x"}"#, None);
         assert!(out.starts_with(r#"{"path":"h:"#));
         assert!(out.ends_with("\"}"));
     }
@@ -411,11 +411,11 @@ mod tests {
     #[test]
     fn a_credentialed_url_is_redacted_and_a_path_beside_it_is_hashed() {
         let out = scrub_text(
-            "clone https://user:Zq8LmXv3Rt7Kp2Wd@example.test/o/r.git from /home/marco/x",
+            "clone https://user:Zq8LmXv3Rt7Kp2Wd@example.test/o/r.git from /home/alice/x",
             None,
         );
         assert!(!out.contains("Zq8LmXv3Rt7Kp2Wd"), "{out}");
-        assert!(!out.contains("/home/marco"), "{out}");
+        assert!(!out.contains("/home/alice"), "{out}");
         assert!(out.contains("h:"), "{out}");
     }
 

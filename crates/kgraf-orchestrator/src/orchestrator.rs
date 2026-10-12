@@ -9673,7 +9673,7 @@ mod tests {
         }
     }
 
-    /// The canary shape: a stall after a deny rule refused `python3`. The
+    /// A recorded shape: a stall after a deny rule refused `python3`. The
     /// stop note names the repeated call and the refusal behind it, and the
     /// brief carries both as data in the same tag as a verifier's refusal.
     #[test]

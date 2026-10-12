@@ -3,6 +3,7 @@
 **Status:** Accepted. Its verifier-selection clause is superseded by
 decision 0012. The disjoint-write requirement below stands unchanged and
 becomes more load-bearing, not less.
+**Superseded by:** 0012 (in part: the verifier-selection clause)
 **Related:** decision 0004
 
 This is one of the most consequential architectural decisions in the

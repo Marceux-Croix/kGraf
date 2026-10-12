@@ -298,7 +298,7 @@ mod tests {
         }
     }
 
-    /// The test file of the canary's second interface ask, verbatim.
+    /// The test file of a second interface ask, verbatim.
     const RECORDED: &str = "import sys\nsys.path.insert(0, 'src')\ndef test_dotproduct():\n    \
 from vectorops import dotproduct\n    assert 1 == dotproduct([1, 1], [0, 1])\n";
 

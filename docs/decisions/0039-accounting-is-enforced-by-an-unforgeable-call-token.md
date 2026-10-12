@@ -1,6 +1,7 @@
 # Decision 0039: A provider call requires an unforgeable ledger token, so cost accounting is a compile error rather than a review rule
 
 **Status:** Accepted.
+**Amended by:** 0040 (corrects a claim)
 **Related:** decisions 0006, 0007, 0008
 
 ---
