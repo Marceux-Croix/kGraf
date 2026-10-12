@@ -2,7 +2,7 @@
 
 GENERATED FILE. Do not hand-edit. Run `cargo run -p kgraf-diag --bin gen-errors-doc` after changing `crates/kgraf-diag/src/glossary.rs`, which is the single source of truth (decision 0069). `crates/kgraf-diag/tests/errors_doc.rs` fails the build if this file drifts from that table.
 
-Every error kGraf's local diagnostics file records carries one of these `KG-nnnn` codes. `KG-xx99` in each block is that crate's catch-all: an error variant not yet given its own code still reaches the file under its crate's catch-all. Use `kgraf diag show` and `kgraf diag export` to read or share this file.
+Every error kGraf's local diagnostics file records carries one of these `KG-nnnn` codes. `KG-xx99` is a crate's catch-all: an error variant not yet given its own code still reaches the file under its crate's catch-all. Most catch-alls are in one table at the end. Use `kgraf diag show` and `kgraf diag export` to read or share this file.
 
 ## Unclassified
 
@@ -34,24 +34,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Add the model to the price table, or use a priced model.
 
-### KG-0199 Core (Other)
-
-**Meaning:** An unclassified error from kgraf-core (cost, usage normalization, litellm price sync).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
-## kgraf-decide
-
-### KG-1599 Decide (Other)
-
-**Meaning:** An unclassified error from kgraf-decide.
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-diag
 
 ### KG-9901 Diag Internal
@@ -62,24 +44,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Free disk space or fix permissions on the kGraf data directory; diagnostics resume once it writes again.
 
-### KG-9999 Diag (Other)
-
-**Meaning:** An unclassified error from kgraf-diag (the diagnostics writer, reader, or exporter).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
-## kgraf-fleet
-
-### KG-1699 Fleet (Other)
-
-**Meaning:** An unclassified error from kgraf-fleet (the provider catalog).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-galaxy
 
 ### KG-1901 Scene Too Large
@@ -88,15 +52,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **Likely cause:** A very large repository at full detail with no collapsing applied.
 
-**What to do:** Collapse more of the graph, or use CPU mode, until GPU chunking lands.
-
-### KG-1999 Galaxy (Other)
-
-**Meaning:** An unclassified error from kgraf-galaxy (the renderer).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
+**What to do:** Collapse more of the graph, or use CPU mode.
 
 ## kgraf-graph
 
@@ -164,14 +120,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Close the reader. The log is truncated at the next checkpoint, at the end of a run, or when the last connection closes.
 
-### KG-0299 Graph (Other)
-
-**Meaning:** An unclassified error from kgraf-graph (layout, ranking, version history, facts).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-host
 
 ### KG-0501 Route Not Ready
@@ -189,14 +137,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 **Likely cause:** The run id is misspelled, or its state directory was removed.
 
 **What to do:** Check the run id, or start a fresh run instead of resuming.
-
-### KG-0599 Host (Other)
-
-**Meaning:** An unclassified error from kgraf-host (the shared run driver).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
 
 ## kgraf-ingest
 
@@ -216,31 +156,13 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Open the file in its native application to confirm it is not corrupted, then retry.
 
-### KG-1199 Ingest (Other)
-
-**Meaning:** An unclassified error from kgraf-ingest.
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
-## kgraf-instructions
-
-### KG-1799 Instructions (Other)
-
-**Meaning:** An unclassified error from kgraf-instructions (skill and instruction ingest).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-interpret
 
 ### KG-1201 Nothing To Interpret
 
 **Meaning:** The corpus root holds no documents and no code, and no instruction was given.
 
-**Likely cause:** An empty or wrong directory was passed to `kgraf orchestrate --corpus`.
+**Likely cause:** An empty or wrong project directory was used with `kgraf orchestrate --corpus`.
 
 **What to do:** Point at a directory with documents or code, or give an instruction directly.
 
@@ -252,14 +174,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Name a roadmap document explicitly with --source.
 
-### KG-1299 Interpret (Other)
-
-**Meaning:** An unclassified error from kgraf-interpret (reading, plans, model calls).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-mcp
 
 ### KG-0801 MCP OAuth Failed
@@ -268,15 +182,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **Likely cause:** An expired or revoked token, or a server-side authorization change.
 
-**What to do:** Re-run the server's pairing flow from Settings.
-
-### KG-0899 MCP (Other)
-
-**Meaning:** An unclassified error from kgraf-mcp (client, config, registration).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
+**What to do:** Reserved: no kGraf code raises this code today.
 
 ## kgraf-orchestrator
 
@@ -296,21 +202,13 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Use --resume to continue it, or choose a new run id.
 
-### KG-0403 Budget Refused
+### KG-0403 Spend Not Recorded
 
-**Meaning:** A call was refused because it would exceed a configured spend cap.
+**Meaning:** A model call's spend could not be recorded, so the orchestrator stopped the step. kGraf sets no spend limit.
 
-**Likely cause:** The per-task, per-run, or per-hour cap was reached.
+**Likely cause:** The orchestrator's interpretation call returned no ledger row, so its spend is unknown.
 
-**What to do:** Raise the cap if the spend is expected, or let the run stop as designed.
-
-### KG-0499 Orchestrator (Other)
-
-**Meaning:** An unclassified error from kgraf-orchestrator (decomposition, contracts, steering, compaction).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
+**What to do:** Run `kgraf ledger verify` and check that the provider route records its calls. Share this diagnostics file if it recurs.
 
 ## kgraf-provider
 
@@ -362,24 +260,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Read the stop reason in the message; shorten the context or rephrase the task, then retry.
 
-### KG-0399 Provider (Other)
-
-**Meaning:** An unclassified error from kgraf-provider (transport, decode, billing, cancellation).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
-## kgraf-runtime
-
-### KG-1399 Runtime (Other)
-
-**Meaning:** An unclassified error from kgraf-runtime (the worker loop, briefs, events).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-sandbox
 
 ### KG-0601 Workspace Busy
@@ -406,14 +286,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Install or update git; check the named git command's stderr in the context.
 
-### KG-0699 Sandbox (Other)
-
-**Meaning:** An unclassified error from kgraf-sandbox (worktrees or kernel isolation).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-schedule
 
 ### KG-0701 Invalid Time Zone
@@ -431,24 +303,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 **Likely cause:** Two processes raced for the same due run, or a claim's lease expired.
 
 **What to do:** Usually harmless: the run either already started elsewhere or will be claimed on the next tick.
-
-### KG-0799 Schedule (Other)
-
-**Meaning:** An unclassified error from kgraf-schedule.
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
-## kgraf-session
-
-### KG-1899 Session (Other)
-
-**Meaning:** An unclassified error from kgraf-session.
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
 
 ## kgraf-shell
 
@@ -468,14 +322,6 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Fix or remove the settings file; the shell recreates a default one.
 
-### KG-0999 Shell (Other)
-
-**Meaning:** An unclassified error from kgraf-shell (window, tray, project state).
-
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
 ## kgraf-tools
 
 ### KG-1401 Tool Access Refused
@@ -494,11 +340,28 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **What to do:** Retry, or raise the tool's timeout if the task is legitimately slow.
 
-### KG-1499 Tools (Other)
+## Catch-all codes
 
-**Meaning:** An unclassified error from kgraf-tools (registry, access, approvals).
+Likely cause for every code below: See the context string. What to do: Share this diagnostics file; the context names the failing operation.
 
-**Likely cause:** See the context string.
-
-**What to do:** Share this diagnostics file; the context names the failing operation.
-
+| Code | Name | Meaning |
+|---|---|---|
+| KG-0199 | Core (Other) | An unclassified error from kgraf-core (cost, usage normalization, litellm price sync). |
+| KG-0299 | Graph (Other) | An unclassified error from kgraf-graph (layout, ranking, version history, facts). |
+| KG-0399 | Provider (Other) | An unclassified error from kgraf-provider (transport, decode, billing, cancellation). |
+| KG-0499 | Orchestrator (Other) | An unclassified error from kgraf-orchestrator (decomposition, contracts, steering, compaction). |
+| KG-0599 | Host (Other) | An unclassified error from kgraf-host (the shared run driver). |
+| KG-0699 | Sandbox (Other) | An unclassified error from kgraf-sandbox (worktrees or kernel isolation). |
+| KG-0799 | Schedule (Other) | An unclassified error from kgraf-schedule. |
+| KG-0899 | MCP (Other) | An unclassified error from kgraf-mcp (client, config, registration). |
+| KG-0999 | Shell (Other) | An unclassified error from kgraf-shell (window, tray, project state). |
+| KG-1199 | Ingest (Other) | An unclassified error from kgraf-ingest. |
+| KG-1299 | Interpret (Other) | An unclassified error from kgraf-interpret (reading, plans, model calls). |
+| KG-1399 | Runtime (Other) | An unclassified error from kgraf-runtime (the worker loop, briefs, events). |
+| KG-1499 | Tools (Other) | An unclassified error from kgraf-tools (registry, access, approvals). |
+| KG-1599 | Decide (Other) | An unclassified error from kgraf-decide. |
+| KG-1699 | Fleet (Other) | An unclassified error from kgraf-fleet (the provider catalog). |
+| KG-1799 | Instructions (Other) | An unclassified error from kgraf-instructions (skill and instruction ingest). |
+| KG-1899 | Session (Other) | An unclassified error from kgraf-session. |
+| KG-1999 | Galaxy (Other) | An unclassified error from kgraf-galaxy (the renderer). |
+| KG-9999 | Diag (Other) | An unclassified error from kgraf-diag (the diagnostics writer, reader, or exporter). |

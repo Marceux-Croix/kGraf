@@ -1,5 +1,5 @@
-//! The window's layout: the Stage style (`docs/STYLE_GUIDE.md`, the app shell of
-//! section 6 and the stage of section 10) drawn with egui.
+//! The window's layout: the Stage style (`docs/STYLE_GUIDE.md`, its layout and
+//! stage rules) drawn with egui.
 //!
 //! ```text
 //!  masthead: [=] kGraf^branch | project   [ search .......... ][Q]   [Scheduler | n of m workers] [GPU] [bell]
@@ -800,7 +800,7 @@ impl ShellApp {
         chrome::kgraf_mark(ui.painter(), rect, p.text);
         ui.add_space(2.0);
         let word = ui.label(
-            // Wordmark: 700 20, letter spacing -0.6 (table 4.2).
+            // Wordmark: 700 20, letter spacing -0.6 (the type scale).
             RichText::new("kGraf")
                 .font(theme::bold(20.0))
                 .extra_letter_spacing(-0.6)
@@ -1888,7 +1888,7 @@ impl ShellApp {
                 .circle_stroke(rect.center(), 19.5, Stroke::new(1.0, p.outline));
             chrome::kgraf_mark(ui.painter(), rect.shrink(9.0), p.text);
             ui.vertical(|ui| {
-                // Page title: 700 18/26 (TYP-1, table 4.2).
+                // Page title: 700 18/26 (TYP-1, the type scale).
                 ui.label(RichText::new(&name).font(theme::bold(18.0)).color(p.text));
                 let branch = git_head_path(&root)
                     .and_then(|h| self.chrome.branches.get(&h, || git_branch(&root)));
@@ -2284,7 +2284,7 @@ impl ShellApp {
             let painter = ui.painter();
             match kind {
                 0 => {
-                    // Section 3.4: a node at rest.
+                    // Stage palette: a node at rest.
                     for (x, r) in [(4.0, 1.4), (11.0, 2.2), (20.0, 3.4)] {
                         painter.circle_filled(
                             pos2(icon.left() + x, icon.center().y),

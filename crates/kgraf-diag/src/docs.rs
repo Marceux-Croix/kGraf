@@ -6,12 +6,27 @@ use crate::glossary::{ErrorSpec, GLOSSARY};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+/// The shared cause and action of a plain catch-all entry. An entry with both
+/// is listed in one table at the end of the doc, not as a section of its own.
+const CATCH_ALL_CAUSE: &str = "See the context string.";
+const CATCH_ALL_ACTION: &str =
+    "Share this diagnostics file; the context names the failing operation.";
+
+fn is_plain_catch_all(e: &ErrorSpec) -> bool {
+    e.code.ends_with("99") && e.likely_cause == CATCH_ALL_CAUSE && e.action == CATCH_ALL_ACTION
+}
+
 /// The generated Markdown, byte-for-byte what `docs/ERRORS.md` should hold.
 /// Grouped by crate, each crate's entries in code order, so a diff against a
 /// future glossary change stays small and readable.
 pub fn render_markdown() -> String {
     let mut by_crate: BTreeMap<&str, Vec<&ErrorSpec>> = BTreeMap::new();
+    let mut catch_alls: Vec<&ErrorSpec> = Vec::new();
     for e in GLOSSARY {
+        if is_plain_catch_all(e) {
+            catch_alls.push(e);
+            continue;
+        }
         by_crate.entry(e.crate_name).or_default().push(e);
     }
     for entries in by_crate.values_mut() {
@@ -29,9 +44,9 @@ pub fn render_markdown() -> String {
     );
     out.push_str(
         "Every error kGraf's local diagnostics file records carries one of these \
-         `KG-nnnn` codes. `KG-xx99` in each block is that crate's catch-all: an \
-         error variant not yet given its own code still reaches the file under \
-         its crate's catch-all. Use `kgraf diag show` and `kgraf diag export` to \
+         `KG-nnnn` codes. `KG-xx99` is a crate's catch-all: an error variant \
+         not yet given its own code still reaches the file under its crate's \
+         catch-all. Most catch-alls are in one table at the end. Use `kgraf diag show` and `kgraf diag export` to \
          read or share this file.\n\n",
     );
 
@@ -42,6 +57,22 @@ pub fn render_markdown() -> String {
     }
     for (crate_name, entries) in by_crate {
         write_section(&mut out, crate_name, &entries);
+    }
+    catch_alls.sort_by_key(|e| e.code);
+    let _ = writeln!(out, "## Catch-all codes\n");
+    let _ = writeln!(
+        out,
+        "Likely cause for every code below: {CATCH_ALL_CAUSE} What to do: {CATCH_ALL_ACTION}\n"
+    );
+    out.push_str("| Code | Name | Meaning |\n|---|---|---|\n");
+    for e in catch_alls {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} |",
+            e.code,
+            e.name.replace('|', "\\|"),
+            e.meaning.replace('|', "\\|")
+        );
     }
     out
 }

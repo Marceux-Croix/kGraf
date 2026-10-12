@@ -8,11 +8,11 @@ Run from the repository root:
 The versions are pinned: the checked-in outputs were built with them, and a rerun
 with them gives the same bytes (timestamps are fixed below).
 
-Inputs are in this crate's `assets/` (see `assets/SOURCES.md`; docs/STYLE_GUIDE.md
-section 15 lists the assets of the Stage style):
+Inputs are in this crate's `assets/` (see `assets/SOURCES.md`, which lists the assets
+of the Stage style):
 
 - `fonts/woff2/`: Instrument Sans 400, 500 and 700 and Fragment Mono 400, latin subset
-  (OFL 1.1; style guide 1.9, table 4.1). They are decompressed to TrueType, because
+  (OFL 1.1; the style guide's type families). They are decompressed to TrueType, because
   egui reads TrueType and OpenType, not woff2. The latin subset is kept; egui's
   default fonts stay behind them as fallbacks for any other script. The family names
   are kept as they are (AST-4; neither font declares a reserved font name).

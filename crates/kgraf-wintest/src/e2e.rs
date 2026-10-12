@@ -66,7 +66,7 @@ pub const NOTICE: &str = "network not blocked";
 /// What an ask resolves to when nobody is attached (kgraf-host `worker::ask`).
 pub const UNATTENDED_DENIAL: &str = "Nobody is attached";
 
-/// The Git Bash worker run's script (section 5 of docs/WINDOWS-TESTING.md).
+/// The Git Bash worker run's script (case 5 of docs/WINDOWS-TESTING.md).
 pub fn shell_script(windows: bool) -> Vec<Step> {
     let third: &[&str] = if windows {
         &["cmd", "/d", "/c", "echo", "second-call"]
@@ -191,10 +191,10 @@ pub fn judge_shell(
     out
 }
 
-/// The permission file of section 6: Auto, one ask rule, granted programs.
+/// The permission file of case 6: Auto, one ask rule, granted programs.
 pub const READERS_PERMISSIONS: &str = "mode = \"auto\"\nask = [\"shell(curl*)\"]\n[allow]\nprograms = [\"cmd\", \"powershell\", \"echo\", \"Get-Location\", \"Write-Output\"]\n";
 
-/// Section 6's six argv lists: three plain (run on their grants), three
+/// Case 6's six argv lists: three plain (run on their grants), three
 /// kGraf cannot read as plain text (asked, so denied when unattended).
 pub fn readers_script() -> Vec<Step> {
     vec![

@@ -27,8 +27,9 @@ These areas are in scope and of most interest:
 - escape from a worker's sandbox or git worktree,
 - provider keys or other secrets that leak into transcripts, the ledger, logs or
   diagnostics,
-- network traffic to any destination other than the model providers and MCP servers the
-  user configured,
+- network traffic to any destination outside the classes listed under Privacy in the
+  [README](README.md) (model providers, MCP servers, package registries the user allowed,
+  and the opt-in update check),
 - tampering with the hash-chained ledger that `kgraf ledger verify` does not detect.
 
 Problems in a model provider's own service are out of scope. Report those to the provider.

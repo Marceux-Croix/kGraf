@@ -5,42 +5,29 @@ Thank you for your interest in kGraf. Bug reports, ideas and pull requests are w
 ## Before you start
 
 - For a bug, open an [issue](https://github.com/Marceux-Croix/kGraf/issues/new/choose)
-  with the steps to reproduce it and the output of `kgraf --version`.
+  with the steps to reproduce it, the output of `kgraf --version`, and the git commit hash
+  you built from (`git rev-parse HEAD`).
 - For a new feature or a large change, open an issue first so we can agree on the approach
   before you write the code.
 - For a security problem, do not open a public issue. Follow [SECURITY.md](SECURITY.md).
 
 ## Build and test
 
-You need [Rust](https://rustup.rs) 1.95 or later.
+You need [Rust](https://rustup.rs). `rustup` installs the toolchain version the repository
+pins (`rust-toolchain.toml`) on the first build.
 
 ```bash
 cargo build --workspace
 ```
 
-Every pull request must pass the same gates as the main branch:
+Run these three gates locally before you open a pull request. No workflow starts on its
+own; the maintainer runs CI by hand on your branch.
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-
-## Dependency updates
-
-No bot opens update pull requests, and no workflow starts on its own. Every checkpoint (closeout)
-applies the compatible updates first: `cargo update`, then the full gate and the advisory check; the
-new lock file is committed only when all of them pass. An update that breaks the gate is held back
-and named in the checkpoint record.
-
-```bash
-cargo update --dry-run               # compatible updates; then cargo update to apply
-cargo deny check advisories          # known security advisories in the lock file
-cargo deny check licenses            # enforces the about.toml list via deny.toml
-```
-
-Then run the three gates above. A major version bump, or a pinned GitHub Action SHA, is
-updated one at a time in its own commit, after its release notes are read.
 
 ## Code conventions
 
@@ -70,6 +57,10 @@ the commit and the license, and update [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTI
 - Add or update tests for the behavior you change.
 - Update the docs that describe that behavior, such as [docs/USAGE.md](docs/USAGE.md).
 - Fill in the pull request template.
+
+## Maintainers
+
+[docs/LINUX-TESTING.md](docs/LINUX-TESTING.md) describes the Linux test container.
 
 ## License
 

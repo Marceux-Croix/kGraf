@@ -33,11 +33,11 @@ use crate::workdir::{self, Layout, Made, Traces};
 
 /// Steps of docs/WINDOWS-TESTING.md that stay manual.
 pub const MANUAL: &[&str] = &[
-    "Section 2 (installing Git for Windows, the build tools and Rust): the bundle needs only Git for Windows, and it never installs anything.",
-    "Section 3 (building from source): replaced by the cross-built bundle; a native Windows build is still worth a manual run before a release.",
-    "Section 6a cases 1 to 3 (accepting or declining the winget install of Git for Windows, in the app and on a terminal): the runner never installs; the decision logic is covered by unit tests and the unattended answer by the end-to-end checks.",
-    "Section 6a case 4 (per-machine, per-user and other-drive Git installs): needs reinstalling Git; the runner records which install it found.",
-    "Section 6a case 5 (renaming the winget stub): the runner removes winget from PATH for one start instead.",
+    "Manual fallback, installing Git for Windows, the build tools and Rust: the bundle needs only Git for Windows, and it never installs anything.",
+    "Manual fallback, building from source: replaced by the cross-built bundle; a native Windows build is still worth a manual run before a release.",
+    "Case 6a, steps 1 to 3 (accepting or declining the winget install of Git for Windows, in the app and on a terminal): the runner never installs; the decision logic is covered by unit tests and the unattended answer by the end-to-end checks.",
+    "Case 6a, step 4 (per-machine, per-user and other-drive Git installs): needs reinstalling Git; the runner records which install it found.",
+    "Case 6a, step 5 (renaming the winget stub): the runner removes winget from PATH for one start instead.",
     "The desktop app (kgraf-app.exe) window, icon and installer: needs a person looking at the screen.",
     "Network isolation with Windows Firewall: see MANUAL-NETWORK-TEST.txt (needs an administrator PowerShell).",
 ];

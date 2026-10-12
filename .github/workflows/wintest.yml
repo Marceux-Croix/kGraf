@@ -22,8 +22,9 @@
 # nothing; every other step is skipped. The artifact holds
 # appcontainer-dns.md and the raw capture files in appcontainer-dns-raw/.
 #
-# Cost: this bills Windows minutes, at twice the Linux rate on a private
-# repository. The job stops after 165 minutes.
+# Cost: standard GitHub-hosted runners are free for public repositories; a
+# private copy bills Windows minutes at twice the Linux rate. The job stops
+# after 165 minutes.
 #
 # Time: the runner gets a wall-clock budget (--budget-mins) so that it stops
 # starting work early enough to remove the sandbox user and write the report

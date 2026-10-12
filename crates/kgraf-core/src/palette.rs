@@ -1,5 +1,5 @@
 //! The five semantic colors of kGraf's interface, in one place both the desktop
-//! shell and the galaxy renderer can read (`docs/STYLE_GUIDE.md` section 3, as
+//! shell and the galaxy renderer can read (`docs/STYLE_GUIDE.md`, the color section, as
 //! extended by decision 0070: "there should be a color blind mode in
 //! the settings for the various types of color blindness. this isn't a style
 //! guide problem - this should live only within kgraf").
@@ -379,7 +379,7 @@ pub struct Rgba {
     pub alpha: f32,
 }
 
-/// The stage's literal colors, which carry no meaning (style guide 1.8, section 3.4,
+/// The stage's literal colors, which carry no meaning (style guide, the stage palette,
 /// and the STG rules). One source for the shell's stage chrome and the galaxy's
 /// renderer: neither restates a value. "White at N%" is stored as its alpha.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -412,7 +412,7 @@ pub struct StageLiterals {
     pub light: Rgb,
 }
 
-/// The stage literals of style guide 1.8 (section 3.4).
+/// The stage literals of the style guide's stage palette.
 pub const STAGE: StageLiterals = StageLiterals {
     background: [0x07, 0x08, 0x0F],
     node: Rgba {
@@ -439,7 +439,7 @@ pub const STAGE: StageLiterals = StageLiterals {
 mod tests {
     use super::*;
 
-    /// Section 3.4, stated literally so an edit to `STAGE` fails here.
+    /// The stage palette, stated literally so an edit to `STAGE` fails here.
     #[test]
     fn the_stage_literals_are_section_3_4() {
         assert_eq!(STAGE.background, [0x07, 0x08, 0x0F]);

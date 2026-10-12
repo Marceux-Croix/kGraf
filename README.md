@@ -7,18 +7,13 @@
 **Direct a team of AI coding agents from different providers, and watch the work happen on a live map of your code.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-8b5cf6.svg)](LICENSE)
-[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-8b5cf6.svg?logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-stable-8b5cf6.svg?logo=rust)](https://www.rust-lang.org)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-8b5cf6.svg)](#install)
 [![Status: pre-release](https://img.shields.io/badge/status-pre--release-f59e0b.svg)](ROADMAP.md)
 
 [Quick start](#quick-start) · [Features](#features) · [How it works](#how-it-works) · [Usage guide](docs/USAGE.md) · [Architecture](ARCHITECTURE.md) · [Roadmap](ROADMAP.md)
 
 </div>
-
-<!-- Placeholder: replace .github/assets/screenshot-galaxy.png with a capture of the galaxy view. -->
-<p align="center">
-  <img src=".github/assets/screenshot-galaxy.png" alt="The kGraf galaxy view" width="900">
-</p>
 
 ## What it is
 
@@ -46,17 +41,13 @@ own provider keys. There is no account, no hosted service and no telemetry.
 | **Every token accounted** | Every model call goes through a hash-chained ledger. `kgraf spend` totals it, and `kgraf ledger verify` walks the chain. |
 | **Reads your roadmap** | Turns `ROADMAP.md`, `TODO.md` and similar files into work nodes, and flags where the document and the code disagree. |
 | **Uses your existing setup** | Reads the `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` and `SKILL.md` files your other coding agents already use. Connects to MCP servers, local or hosted. |
-| **Scheduled runs** | Cron or one-shot schedules attached to work nodes. The desktop app fires them from the tray. |
+| **Scheduled runs** | Cron or one-shot schedules attached to work nodes. The desktop app fires them while it sits in the tray. |
 | **Secrets stay out of transcripts** | Transcripts are scrubbed with gitleaks rules plus a registry of your own secrets. |
-
-<!-- Placeholder: replace .github/assets/screenshot-run.png with a capture of an orchestrated run. -->
-<p align="center">
-  <img src=".github/assets/screenshot-run.png" alt="An orchestrated run in kGraf" width="900">
-</p>
 
 ## Quick start
 
-kGraf builds from source. You need [Rust](https://rustup.rs) 1.95 or later and git.
+kGraf builds from source. You need [Rust](https://rustup.rs) and git. `rustup` installs the
+toolchain version the repository pins (`rust-toolchain.toml`) on the first build.
 
 ```bash
 git clone https://github.com/Marceux-Croix/kGraf.git
@@ -83,8 +74,8 @@ kgraf query 'kind=function -calls-> name=main'
 kgraf-app --project /path/to/your/repo
 ```
 
-**Run a team of agents.** Set each provider key in your shell (kGraf never reads keys from
-a file). Workers build with the network off, so let kGraf fetch the project's dependencies
+**Run a team of agents.** Set each provider key in your shell environment. (The Vertex AI
+route can also use Google credential files.) Workers build with the network off, so let kGraf fetch the project's dependencies
 when a run needs them (once per project; or run `cargo fetch` yourself). Then give the
 orchestrator an instruction:
 
@@ -96,8 +87,22 @@ kgraf orchestrate --route kimi:<model-id> --route openai:<model-id> \
   --instruction task.txt --prices prices.json
 ```
 
-A model missing from `prices.json` still runs; its spend is reported as unpriced, never as
-zero. `kgraf orchestrate` exits non-zero unless the run completed.
+`prices.json` holds one entry per model, in micro-dollars per million tokens (3000000 is $3):
+
+```json
+{
+  "<model-id>": {
+    "uncached_input": 3000000,
+    "cache_read": 300000,
+    "cache_write": 3000000,
+    "output": 15000000,
+    "reasoning": 15000000
+  }
+}
+```
+
+A model missing from the file still runs; its spend is reported as unpriced, never as
+zero. `{}` is a valid file. `kgraf orchestrate` exits non-zero unless the run completed.
 
 The [usage guide](docs/USAGE.md) covers every command, flag and window in detail.
 
@@ -160,19 +165,24 @@ each phase has and what it still lacks.
 
 ### What it costs
 
-kGraf makes no claim to save tokens. A team of agents costs more than one competent coding
-agent on the same work: about 2.6x the tokens by the project's cost model. The case for
+kGraf makes no claim to save tokens. A multi-agent run uses more tokens than one
+agent on the same work ([ARCHITECTURE.md](ARCHITECTURE.md) explains why). The case for
 kGraf is control, visibility, and the freedom to give each part of a job to the model that
 suits it. Every token is on the ledger, so you always see where the money went.
 
 ## Privacy
 
 - Local only and single-user. No hosted mode, no account, no telemetry.
-- Network traffic goes only to the model providers and MCP servers you configure. Those
-  calls carry code from your repository. For a project where you allow it (`kgraf deps
-  allow`), kGraf also downloads the project's dependencies from crates.io; it never does so
-  unasked.
-- Provider keys come from your shell environment, never from a file.
+- Network traffic has four classes, and no others:
+  1. Model providers you configure. These calls carry code from your repository.
+  2. MCP servers you configure, local or hosted.
+  3. Package registries, for a project where you allow it (`kgraf deps allow`): crates.io,
+     and for `kgraf deps allow <npm|python|go|maven|gradle|dotnet|composer|bundler>` the
+     registries of that package manager. kGraf never fetches unasked.
+  4. GitHub Releases, only if you turn on the update check (off by default). On Windows,
+     `winget` downloads Git for Windows, only if you agree.
+- API keys come from your shell environment. The Vertex AI route can also read Google
+  credential files.
 - A small local diagnostics file records usage counts and errors. It is never sent
   anywhere. `kgraf diag show` reads it.
 
@@ -190,7 +200,7 @@ suits it. Every token is on the ledger, so you always see where the money went.
 - [Usage guide](docs/USAGE.md): every command and the desktop app
 - [ARCHITECTURE.md](ARCHITECTURE.md): system design
 - [ROADMAP.md](ROADMAP.md): phases and status
-- [docs/decisions/](docs/decisions): architecture decision records and evidence
+- [docs/decisions/](docs/decisions): architecture decision records
 - [docs/ERRORS.md](docs/ERRORS.md): the `KG-nnnn` error glossary
 
 ## Contributing

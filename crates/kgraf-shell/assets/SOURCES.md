@@ -1,11 +1,11 @@
 # Sources of the desktop shell's assets
 
-The shell draws the Stage style (`docs/STYLE_GUIDE.md`). Its assets are listed in the guide's
-section 15 and ship in this tree (AST-1). The app makes no network request for them.
+The shell draws the Stage style (`docs/STYLE_GUIDE.md`). Its assets are listed here
+and ship in this tree (AST-1). The app makes no network request for them.
 
 ## Fonts (`fonts/`)
 
-Style guide 1.9, table 4.1 and section 15. Both fonts keep their real family names (AST-4);
+The style guide's type families. Both fonts keep their real family names (AST-4);
 neither declares a Reserved Font Name.
 
 | File | Source | License |
@@ -30,4 +30,10 @@ License: Apache 2.0, `icons/MaterialSymbols-Apache-2.0.txt`.
 ## The kGraf mark
 
 Drawn in code (`src/chrome.rs`, `kgraf_mark`): a "k" as graph edges with one `--accent`
-node (AST-2). No image file.
+node (AST-2). The in-window mark has no image file.
+
+## The app icon (`app-icon/`)
+
+`icon-16.png` to `icon-1024.png` (eight sizes) are the icon of the window, the tray and the
+installers (`src/icon.rs`; the packaging scripts copy the same files). The kGraf project made
+them. They are part of this repository and fall under its Apache 2.0 license.

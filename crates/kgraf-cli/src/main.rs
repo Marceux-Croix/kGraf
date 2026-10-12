@@ -762,7 +762,7 @@ enum ScheduleAction {
     /// transient failures) so the schedule resumes firing.
     Enable { id: String },
     /// Run a stored schedule's instruction immediately, through the same live path
-    /// `kgraf orchestrate` uses (readiness, admission and spend caps all apply).
+    /// `kgraf orchestrate` uses (readiness and admission apply, and the ledger records the spend).
     RunNow {
         id: String,
         /// A worker route as `route:model`. Repeatable.

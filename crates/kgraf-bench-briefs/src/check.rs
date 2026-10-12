@@ -34,6 +34,19 @@
 //! calls `exit(0)` passes only itself. Doc tests are not run. A test binary
 //! with its own `main` (`harness = false`, `#![no_main]`) answers `--list`
 //! itself and is not covered by this.
+//!
+//! **What a satisfied brief needs.** A named test must have run: cargo exits 0
+//! when no test matches, so the output must show exactly one passed test of
+//! that name. A `Tests` brief also carries mutations (a deliberately broken copy
+//! of the function under test) and the new test must fail on each one, so a
+//! test that asserts nothing does not pass. A commit that differs from the
+//! fixture on any `protected` path is unsatisfied. A changelog entry is read
+//! structurally: the version and date as whole tokens on one line, and the
+//! required word on that line or a later one. Where the sandbox allowlists
+//! reads, the check reads only `bin`, `registry` and `git` under the cargo home
+//! and the rustup home, never the cargo home itself, because its
+//! `credentials.toml` holds registry tokens. Files read from the attempt are
+//! not followed through links and are capped in size.
 
 use crate::brief::{Brief, Check, DocFact, Mutation, ScriptCase};
 use crate::gitutil;

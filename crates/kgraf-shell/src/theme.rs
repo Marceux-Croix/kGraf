@@ -2,7 +2,7 @@
 //! for the dark and the light theme. No other module names a chrome color
 //! (THM-4).
 //!
-//! **Tokens follow `docs/STYLE_GUIDE.md` section 17** (the token block), with the
+//! **Tokens follow the token block of `docs/STYLE_GUIDE.md`**, with the
 //! same names in Rust case: `--primary` is [`Palette::primary`], `--accent` is
 //! [`ACCENT`], `--indicator` is [`INDICATOR`], `--progress` is [`PROGRESS`],
 //! `--stage-bg` is [`STAGE_BG`], `--stage-popup` is [`stage_popup`],
@@ -10,9 +10,9 @@
 //! `--nav-mini` and `--nav-full` are [`size::NAV_MINI`] and [`size::NAV_FULL`],
 //! `--secondary-w` is [`size::secondary_w`], and the easings are in [`motion`].
 //! Values are the "Nocturne" palette of style guide 1.8. Text is Instrument Sans
-//! 400, 500 and 700 and code is Fragment Mono 400 (style guide 1.9, table 4.1; both
+//! 400, 500 and 700 and code is Fragment Mono 400 (the style guide's type families; both
 //! OFL 1.1, real family names kept, AST-4), icons are Material Symbols (Apache
-//! 2.0), all embedded from `assets/` (section 15; `assets/SOURCES.md`). The
+//! 2.0), all embedded from `assets/` (`assets/SOURCES.md`). The
 //! Instrument Sans files have tabular numerals baked in (TYP-2, see
 //! `assets/fonts/build_fonts.py`). All font loading is in [`fonts`] and
 //! [`family`], so a new typeface changes this module only.
@@ -157,7 +157,7 @@ pub const PROGRESS: Gradient = Gradient {
 };
 // `owner` and `owner_text` are retired (style guide 1.6, CMP-AV-3): the user's
 // avatar and name chip are the inverted fill with `text_inv`.
-/// The stage is near-black in both themes, `stage_bg` (section 3.4). From
+/// The stage is near-black in both themes, `stage_bg` (the stage palette). From
 /// `kgraf_core::palette::STAGE`, which the galaxy reads too.
 pub const STAGE_BG: Color32 = bytes(kgraf_core::palette::STAGE.background);
 
@@ -171,7 +171,7 @@ pub fn stage_popup() -> Color32 {
     rgba(22, 25, 38, 0.92)
 }
 
-/// Stage literals of section 3.4 and the STG rules, as egui colors. The values live
+/// Stage literals of the stage palette and the STG rules, as egui colors. The values live
 /// once, in `kgraf_core::palette::STAGE`, which the galaxy maps into its palette too.
 pub mod stage {
     use super::{Color32, bytes};

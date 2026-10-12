@@ -238,11 +238,11 @@ pub const GLOSSARY: &[ErrorSpec] = &[
     ),
     spec!(
         "KG-0403",
-        "Budget Refused",
+        "Spend Not Recorded",
         "kgraf-orchestrator",
-        "A call was refused because it would exceed a configured spend cap.",
-        "The per-task, per-run, or per-hour cap was reached.",
-        "Raise the cap if the spend is expected, or let the run stop as designed."
+        "A model call's spend could not be recorded, so the orchestrator stopped the step. kGraf sets no spend limit.",
+        "The orchestrator's interpretation call returned no ledger row, so its spend is unknown.",
+        "Run `kgraf ledger verify` and check that the provider route records its calls. Share this diagnostics file if it recurs."
     ),
     spec!(
         "KG-0499",
@@ -342,7 +342,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "kgraf-mcp",
         "A hosted MCP server's OAuth handshake did not complete.",
         "An expired or revoked token, or a server-side authorization change.",
-        "Re-run the server's pairing flow from Settings."
+        "Reserved: no kGraf code raises this code today."
     ),
     spec!(
         "KG-0899",
@@ -417,7 +417,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "Nothing To Interpret",
         "kgraf-interpret",
         "The corpus root holds no documents and no code, and no instruction was given.",
-        "An empty or wrong directory was passed to `kgraf orchestrate --corpus`.",
+        "An empty or wrong project directory was used with `kgraf orchestrate --corpus`.",
         "Point at a directory with documents or code, or give an instruction directly."
     ),
     spec!(
@@ -513,7 +513,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "kgraf-galaxy",
         "The graph is too large for the GPU to render at once.",
         "A very large repository at full detail with no collapsing applied.",
-        "Collapse more of the graph, or use CPU mode, until GPU chunking lands."
+        "Collapse more of the graph, or use CPU mode."
     ),
     spec!(
         "KG-1999",

@@ -1,6 +1,6 @@
 # kgraf-bench-briefs
 
-A per-model brief-following bench (coordination-hardening item 8). It feeds
+A per-model brief-following bench. It feeds
 `kgraf-core`'s `ProfileStore` (`crates/kgraf-core/src/model_profile.rs`),
 the seam decision 0075's routing reads: for each `TaskKind`, which model
 satisfies the most briefs per dollar spent.
@@ -17,42 +17,17 @@ ledger) against a fresh copy of the fixture. Whatever it commits is checked
 **mechanically**: a `cargo test` run that must pass and run at least the
 fixture's tests, a script whose stdout and exit status must match exactly, or
 a doc file whose required facts and word cap the check reads directly. There
-is no model judge anywhere in this crate; a judge model would just be a
-second guess, not a measurement.
+is no model judge in this crate.
 
-The check is strict in four ways:
+The check is strict:
 
-- A named test must have run: cargo exits 0 when no test matches, so the
-  output must show `test <name> ... ok` and exactly one passed test. A
-  `tests`-kind brief also carries mutations (a deliberately broken copy of the
-  function under test); the new test must fail on each one, so a test that
-  asserts nothing does not pass.
-- Each brief lists `protected` paths (the tests and sources its instruction
-  says not to change). A commit that differs from the fixture on any of them
-  is unsatisfied.
-- A changelog entry is read structurally: the version and date as whole
-  tokens on one line, and the required word on that line or a later one.
-- The worker's code (its tests, any `build.rs`, its scripts) is untrusted, so
-  the check runs it through `kgraf-sandbox`: network off, writes limited to
-  the attempt's directory and a scratch directory, an environment cleared to
-  `PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `CARGO_TARGET_DIR` and
-  `CARGO_NET_OFFLINE`, a 300 second wall-clock limit, and a kill of the whole
-  process group at the limit. Where reads are allowlisted, the check reads
-  only `bin`, `registry` and `git` under the cargo home and the rustup home,
-  not the cargo home itself (its `credentials.toml` holds registry tokens).
-- The check does not trust the tree it builds. A tree with a `build.rs`, a
-  `.cargo` directory or a toolchain pin is unsatisfied and is never built. The
-  runner writes its own copy of each protected file back before the build, and
-  a run that changed one is void. Tests are counted one process each: the
-  test executables are built once, asked for their tests with `--list`, and
-  every test runs alone and is judged by its exit status. Nothing a test
-  prints is read, so a test cannot forge a result line. A mutant is built and
-  run at the attempt's own path and target directory. Files read from the
-  attempt are not followed through links and are capped in size. An unmet
-  brief carries its reason in the outcome note.
-- Before the first model call, the runner runs its checks on a known-good
-  crate. If that fails, the run stops: a broken toolchain or sandbox is not a
-  set of failed briefs.
+- A named test must have run, and a `tests` brief must fail on deliberately broken copies of the code.
+- A commit that changes a protected file (a test or source the brief says not to touch) does not count.
+- The worker's code runs in `kgraf-sandbox` with the network off and a time limit. A tree with a `build.rs`, a `.cargo` directory or a toolchain pin is refused.
+- Nothing a test prints is read. Each test runs alone and is judged by its exit status.
+- Before the first model call, the runner checks a known-good crate. If that fails, the run stops: a broken toolchain is not a set of failed briefs.
+
+`src/check.rs` documents each rule in full.
 
 A provider or harness error (an outage, a failed ledger write, a worker that
 could not run, a check that could not run) is printed as `ERROR (not tallied)` and never recorded: only an
@@ -95,10 +70,11 @@ catalog id (`kgraf providers`). Other flags: `--brief <substring>`
 (repeatable, runs only matching briefs; default: every brief), `--reps <n>`
 (default 1), `--dry-run` (lists planned attempts and an estimated cost where
 the model is priced, "unpriced" otherwise; makes no provider call and writes
-nothing).
+nothing). `--json-out <path>` writes every attempt's full record, with token counts and
+wall time, as a JSON array (in a dry run too).
 
 Each attempt gets the budget `kgraf worker` gives a worker by default: 12
-model rounds, a 4,096-token output ceiling per round and a 128,000-token
+model rounds, a 16,384-token output ceiling per round and a 128,000-token
 context window. The values come from the same constants the `kgraf worker`
 flags read (`kgraf_host::worker::config`), so the bench and the command
 cannot drift apart. `--budget <rounds>`, `--max-tokens <n>` and
@@ -111,30 +87,11 @@ own; a spend limit belongs in the provider's own console, not here.
 
 ## Prices
 
-The default price source is kGraf's own vendored litellm catalog
-(`kgraf_core::litellm::LiteLlmCatalog`, loaded from
-`third_party/litellm/model_prices_and_context_window.json`) -- there is no
-separate price file to hand-maintain for a route already in
-`kgraf providers`. `--prices <path>` is optional and only overrides or adds
-entries (the same JSON shape `kgraf orchestrate --prices` reads): use it for
-a model the vendored table does not have or gets wrong, e.g. a self-hosted
-one.
-
-Prices are looked up by the exact model id given in `--route`. When the
-table has no entry for it, the bench prints a warning before any call,
-naming the closest catalog keys (a dated suffix or a missing provider prefix
-is a common near miss); it never picks one of them. Price the model with
-`--prices` if one of them is the same model.
-
-A model with no price entry still runs. Its cost is never recorded as a
-fabricated `$0`: it prints as "unpriced" and is left out of the
-`ProfileStore` tally's cost sum entirely, rather than making it look free to
-decision 0075's router. A local route (`ollama`, `llama-cpp`, or any route
-`kgraf-fleet` builds with no credential and a localhost base URL) with no
-price prints "local, unpriced" instead of plain "unpriced" -- decision 0041
-holds a local model is not special-cased to free, so this is informational,
-not a claim about its real cost. A local route the price table *does* cover
-is costed exactly like a hosted one.
+Prices come from kGraf's vendored litellm catalog. `--prices <path>` overrides or adds
+entries, in the JSON shape `kgraf orchestrate --prices` reads. When the catalog has no entry
+for a model id, the bench prints a warning with the closest keys and never picks one. A
+model with no price still runs. Its cost prints as "unpriced" ("local, unpriced" for a
+local route) and is left out of the cost sums, never counted as $0.
 
 ## Judging an attempt made outside kGraf
 
