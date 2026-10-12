@@ -220,3 +220,24 @@ Renamed tests: `after_two_re_asks_a_failing_interface_is_held` is
 `a_plan_the_gate_holds_before_any_work_is_re_planned_once_with_the_failure` is
 `a_held_plans_failure_reaches_only_the_contracts_it_concerns` (a stub-compile failure no longer
 reaches the gate, so a handshake mismatch holds the plan there).
+
+## Amendment (2026-10-12): a Python check runs with the check tree's root on the import path
+
+A reference package at the tree root (`vectorops/__init__.py`) could not be imported by its own
+test in `tests/`: `python tests/x.py` puts `tests/` on `sys.path`, not the root, and
+`pytest tests/x.py` in its default import mode does the same when `tests/` has no `__init__.py`
+and the tree has no `conftest.py`. The vacuity check then failed against the reference (a
+collection error, or `ModuleNotFoundError`), and a sound interface was refused three times for
+the check environment alone.
+
+Every check command now runs with the tree root first on `PYTHONPATH`, any value the host sets
+following it. The runner sets it for every stage, since every stage (stub-compile, vacuity,
+handshake, consumer tests after the stub lands) runs through one exec path. Only Python reads the
+variable, and the planner's command is not changed. This matches how a project is usually run,
+from its root.
+
+Tests: `tests/check_python_path.rs`
+`a_test_run_as_a_script_imports_the_package_at_the_tree_root`,
+`a_pytest_run_of_a_test_in_tests_imports_the_package_at_the_tree_root` (real Python; skipped
+without `python3` or `pytest`); `check_runner.rs`
+`the_tree_root_comes_first_on_the_python_path_and_the_host_value_stays`.

@@ -760,7 +760,8 @@ impl SandboxRunner {
         cmd.args(args)
             .env("CARGO_TARGET_DIR", run_dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")
-            .env("PYTHONDONTWRITEBYTECODE", "1");
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONPATH", python_path(&run_dir.join("tree")));
         let out_path = self.scratch.join(format!("{name}.out"));
         let err_path = self.scratch.join(format!("{name}.err"));
         let out = std::fs::File::create(&out_path).map_err(io(&out_path))?;
@@ -952,7 +953,8 @@ impl SandboxRunner {
         cmd.args(args)
             .env("CARGO_TARGET_DIR", run_dir.join("target"))
             .env("CARGO_NET_OFFLINE", "true")
-            .env("PYTHONDONTWRITEBYTECODE", "1");
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONPATH", python_path(&run_dir.join("tree")));
         cmd.stdin(Redirect::Null)
             .stdout(Redirect::Piped)
             .stderr(Redirect::Piped);
@@ -1054,6 +1056,26 @@ impl SandboxRunner {
     ) -> Result<RunResult, CheckError> {
         Err(CheckError::Sandbox("no sandbox on this platform".into()))
     }
+}
+
+/// `PYTHONPATH` for a check: the check tree's root first, then any value the
+/// host already sets.
+///
+/// `python tests/x.py` puts `tests/` on `sys.path`, not the root, and
+/// `pytest tests/x.py` in its default import mode does the same when `tests/`
+/// has no `__init__.py` and the tree has no `conftest.py`. A package at the
+/// root (`pkg/__init__.py`) then cannot be imported by its own tests, and a
+/// sound interface fails against its reference. A project is usually run
+/// from its root, which is on the path there, so the check puts it on the
+/// path too. Every stage runs through `exec`, so the stub-compile, vacuity,
+/// handshake and consumer-test runs all get it. Only Python reads the
+/// variable; the command the planner wrote is not changed.
+pub(crate) fn python_path(tree: &Path) -> std::ffi::OsString {
+    let mut paths = vec![tree.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing).filter(|p| !p.as_os_str().is_empty()));
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| tree.as_os_str().to_owned())
 }
 
 /// A run's hold file: `<scratch>/<name>.hold`, beside the run's directory and
@@ -1535,7 +1557,26 @@ fn copy_tree(from: &Path, to: &Path, top: bool) -> Result<(), CheckError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TAIL_BYTES, RunResult, condense, filter_host_noise, missing_program};
+    use super::{
+        DEFAULT_TAIL_BYTES, RunResult, condense, filter_host_noise, missing_program, python_path,
+    };
+
+    /// The tree root comes first and a value the host already sets stays after it.
+    #[test]
+    fn the_tree_root_comes_first_on_the_python_path_and_the_host_value_stays() {
+        let tree = std::path::Path::new("/t/tree");
+        let joined = python_path(tree);
+        let parts: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(parts[0], tree);
+        let host: Vec<_> = std::env::var_os("PYTHONPATH")
+            .map(|h| {
+                std::env::split_paths(&h)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(&parts[1..], host.as_slice());
+    }
 
     /// A compile error in the middle of the output, then more than the cap of
     /// trailing toolchain warnings: the error and its location are kept.

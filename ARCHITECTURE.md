@@ -719,7 +719,8 @@ another's code, and each is registered in the run trace before any party
 dispatches.
 The sandboxed runner checks it: stub-compile, vacuity against the stub and a
 reference, then a handshake, one call per party on that party's own route
-through the ledger. A worker challenges with a dedicated tool; one challenge
+through the ledger. Every check command runs with the tree root first on `PYTHONPATH`, so
+a package at the root imports from a test in `tests/` (0031, amended 2026-10-12). A worker challenges with a dedicated tool; one challenge
 per lineage and interface is open at a time, each worker has a fixed budget
 of challenges, and escalation to the user follows only a paid review.
 
