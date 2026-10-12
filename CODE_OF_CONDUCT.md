@@ -37,7 +37,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement. Contact the maintainer, [@Marceux-Croix](https://github.com/Marceux-Croix), through GitHub and ask for a private conversation; reports are kept confidential.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement. Send reports by email to [admin@hyperadvancedsupernova.com](mailto:admin@hyperadvancedsupernova.com). Reports are kept confidential.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
