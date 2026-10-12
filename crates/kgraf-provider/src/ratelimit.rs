@@ -550,6 +550,10 @@ impl Provider for RouteRecorded {
         self.inner.resends_reasoning()
     }
 
+    fn turns_reasoning_off(&self) -> bool {
+        self.inner.turns_reasoning_off()
+    }
+
     fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
         self.inner.undelivered_output_tokens(response)
     }
@@ -699,6 +703,10 @@ impl Provider for RateLimited {
 
     fn resends_reasoning(&self) -> bool {
         self.inner.resends_reasoning()
+    }
+
+    fn turns_reasoning_off(&self) -> bool {
+        self.inner.turns_reasoning_off()
     }
 
     fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {

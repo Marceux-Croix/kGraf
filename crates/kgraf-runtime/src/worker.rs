@@ -827,6 +827,7 @@ async fn prepare(
         notified_round: None,
         output_limit_retried: false,
         empty_turn_retried: false,
+        reasoning_off: false,
         malformed_retries: 0,
         lost_output_retries: 0,
         no_change_notices: 0,
@@ -1096,6 +1097,11 @@ pub const EMPTY_TURN_ABANDON_REASON: &str = "the turn had no tool call and no an
 pub const EMPTY_TURN_NOTICE: &str = "You ended your turn without calling a tool or giving an \
      answer; continue the task with a tool call, or answer.";
 
+/// The notice that says reasoning is off for the rest of the attempt, after a
+/// turn that held reasoning and nothing else.
+pub const REASONING_OFF_NOTICE: &str = "The model ended a turn with reasoning only; the next \
+     request runs with reasoning off.";
+
 /// How many times a round is sent again after the server failed to parse the
 /// model's own output. Beyond it the attempt fails, naming the cause. The
 /// provider crate's bound, shared with the orchestrator's JSON-asked calls.
@@ -1236,6 +1242,11 @@ struct Worker {
     /// Whether the round just before was an empty turn that got its one
     /// continuation. Cleared by any round that has a tool call or an answer.
     empty_turn_retried: bool,
+    /// Whether this attempt's rounds run with reasoning off, set by the first
+    /// turn that held reasoning and nothing else on a route that can turn it
+    /// off. Never cleared inside an attempt (not by a compaction); a new
+    /// attempt is a new worker and starts at the configured level.
+    reasoning_off: bool,
     /// Consecutive rounds the server failed on the model's own malformed
     /// output and that were sent again. Cleared by any round that gets a
     /// response; capped at [`MAX_MALFORMED_OUTPUT_RETRIES`].
@@ -1844,6 +1855,9 @@ impl Worker {
                 .settings
                 .reasoning
                 .effort(kgraf_provider::ReasoningProcess::WorkerRound);
+            if self.reasoning_off {
+                request.reasoning_effort = Some(kgraf_provider::ReasoningEffort::Off);
+            }
             self.choose_tool_choice(ep, &mut request, final_round)
                 .await?;
             self.env
@@ -2057,7 +2071,23 @@ impl Worker {
                 (StopReason::EndTurn | StopReason::StopSequence, true)
                     if response.text().trim().is_empty() =>
                 {
-                    if !final_round && !self.empty_turn_retried && self.budget.rounds_left() >= 2 {
+                    // A turn of reasoning alone, on a route that can turn it off
+                    // and run at a level above off: the rest of the attempt
+                    // runs with it off. That gets one more continuation even
+                    // after an earlier empty turn, as it changes the request.
+                    let turn_off = !self.reasoning_off
+                        && !response.reasoning().trim().is_empty()
+                        && self.env.provider.turns_reasoning_off()
+                        && self
+                            .env
+                            .settings
+                            .reasoning
+                            .effort(kgraf_provider::ReasoningProcess::WorkerRound)
+                            != Some(kgraf_provider::ReasoningEffort::Off);
+                    if !final_round
+                        && (!self.empty_turn_retried || turn_off)
+                        && self.budget.rounds_left() >= 2
+                    {
                         self.empty_turn_retried = true;
                         self.abandon(
                             ep,
@@ -2074,6 +2104,17 @@ impl Worker {
                             },
                         )
                         .await?;
+                        if turn_off {
+                            self.reasoning_off = true;
+                            self.emit(
+                                ep,
+                                WorkerEvent::Notice {
+                                    kind: crate::event::NoticeKind::ReasoningOff,
+                                    text: REASONING_OFF_NOTICE.to_owned(),
+                                },
+                            )
+                            .await?;
+                        }
                         continue;
                     }
                     self.emit_stop(ep, reason, &response).await?;

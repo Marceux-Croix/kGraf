@@ -1250,6 +1250,12 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
         Some(response.undelivered_output_floor())
     }
 
+    /// `reasoning_effort: "none"` is sent for an off request, and every answer
+    /// to it is checked for reasoning.
+    fn turns_reasoning_off(&self) -> bool {
+        true
+    }
+
     /// `tool_choice: "required"` is part of this protocol, on every transport.
     fn forces_tool_choice(&self) -> bool {
         true

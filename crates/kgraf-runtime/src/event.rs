@@ -248,6 +248,10 @@ pub enum NoticeKind {
     /// planned only in its reasoning); it was discarded and the model was told
     /// to continue. A second empty turn in a row fails the attempt.
     EmptyTurn,
+    /// A turn had reasoning and nothing else, and the route can turn reasoning
+    /// off: the rest of the attempt's rounds run with reasoning off. Sent once
+    /// an attempt.
+    ReasoningOff,
     /// The model ended the attempt as done with no tool call in the whole
     /// attempt although its contract writes files; it was told once to
     /// continue or call `report_shortfall`. A second such end fails the attempt.

@@ -100,9 +100,23 @@ struct Fake {
     /// Whether `Provider::undelivered_output_tokens` measures the reply, as a
     /// Chat Completions adapter does, or answers `None`.
     counts_delivery: bool,
+    /// What `Provider::turns_reasoning_off` answers.
+    turns_off: bool,
 }
 
 impl Fake {
+    /// A provider whose route can turn reasoning off.
+    fn turning_off(script: impl Fn(&Request) -> Round + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            script: Box::new(script),
+            requests: Mutex::new(Vec::new()),
+            streams: false,
+            resends_reasoning: false,
+            counts_delivery: false,
+            turns_off: true,
+        })
+    }
+
     fn new(streams: bool, script: impl Fn(&Request) -> Round + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             script: Box::new(script),
@@ -110,6 +124,7 @@ impl Fake {
             streams,
             resends_reasoning: false,
             counts_delivery: false,
+            turns_off: false,
         })
     }
 
@@ -122,6 +137,7 @@ impl Fake {
             streams: false,
             resends_reasoning: false,
             counts_delivery: true,
+            turns_off: false,
         })
     }
 
@@ -133,6 +149,7 @@ impl Fake {
             streams: false,
             resends_reasoning: true,
             counts_delivery: false,
+            turns_off: false,
         })
     }
 
@@ -188,6 +205,10 @@ impl Provider for Fake {
 
     fn resends_reasoning(&self) -> bool {
         self.resends_reasoning
+    }
+
+    fn turns_reasoning_off(&self) -> bool {
+        self.turns_off
     }
 
     fn undelivered_output_tokens(&self, response: &Response) -> Option<u64> {
@@ -5096,4 +5117,134 @@ async fn a_third_rejected_patch_on_one_file_names_the_whole_file_route() {
     let (t7, is_error) = finished_output(&events, "t7");
     assert!(is_error, "{t7}");
     assert!(!t7.contains(hint), "{t7}");
+}
+
+// ------------------------------------------- reasoning-only turn: reasoning off
+
+/// A turn that holds reasoning and nothing else.
+fn reasoning_only() -> Round {
+    Round {
+        reasoning: "plan the edit step by step".repeat(40),
+        ..Round::answer("")
+    }
+}
+
+fn medium_env(provider: Arc<Fake>) -> WorkerEnv {
+    let mut env = env_with(provider, vec![], CallMode::Complete);
+    env.settings.reasoning = kgraf_provider::ReasoningLevels::new().with(
+        kgraf_provider::ReasoningScope::All,
+        kgraf_provider::ReasoningEffort::Medium.into(),
+    );
+    env
+}
+
+async fn run_one(env: &Arc<WorkerEnv>, dir: &Path) -> (Vec<WorkerEvent>, WorkerResult) {
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "task", dir, 8),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    with_timeout(drain(handle)).await.expect("in time")
+}
+
+fn reasoning_off_notices(events: &[WorkerEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkerEvent::Notice {
+                    kind: NoticeKind::ReasoningOff,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn efforts_of(provider: &Fake) -> Vec<Option<kgraf_provider::ReasoningEffort>> {
+    provider
+        .requests()
+        .iter()
+        .map(|r| r.reasoning_effort)
+        .collect()
+}
+
+/// A reasoning-only empty turn on a route that can turn reasoning off: the
+/// continue notice stays, the next request carries reasoning off, and the
+/// attempt goes on to a tool call.
+#[tokio::test]
+async fn a_reasoning_only_turn_is_followed_by_a_request_with_reasoning_off() {
+    let dir = tempfile::tempdir().expect("dir");
+    let off_rounds = AtomicUsize::new(0);
+    let provider = Fake::turning_off(move |request| {
+        if request.reasoning_effort != Some(kgraf_provider::ReasoningEffort::Off) {
+            return reasoning_only();
+        }
+        match off_rounds.fetch_add(1, Ordering::SeqCst) {
+            0 => Round::tool(vec![("t1", "list_directory", json!({"path": "."}))]),
+            _ => Round::answer("finished"),
+        }
+    });
+    let env = Arc::new(medium_env(provider.clone()));
+    let (events, result) = run_one(&env, dir.path()).await;
+    assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+    use kgraf_provider::ReasoningEffort::{Medium, Off};
+    assert_eq!(
+        efforts_of(&provider),
+        vec![Some(Medium), Some(Off), Some(Off)]
+    );
+    assert_eq!(reasoning_off_notices(&events), 1, "once an attempt");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        WorkerEvent::Notice {
+            kind: NoticeKind::EmptyTurn,
+            ..
+        }
+    )));
+}
+
+/// A route with no off level keeps today's behavior: the same level on the
+/// retry, and a second empty turn fails the attempt.
+#[tokio::test]
+async fn a_route_without_an_off_level_keeps_the_empty_turn_behavior() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| reasoning_only());
+    let env = Arc::new(medium_env(provider.clone()));
+    let (events, result) = run_one(&env, dir.path()).await;
+    match &result.outcome {
+        WorkerOutcome::Failed { error } => {
+            assert!(error.contains("reasoning only: true"), "{error}")
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    use kgraf_provider::ReasoningEffort::Medium;
+    assert_eq!(efforts_of(&provider), vec![Some(Medium), Some(Medium)]);
+    assert_eq!(reasoning_off_notices(&events), 0);
+}
+
+/// Reasoning stays off for one attempt only: the next attempt (a new worker
+/// on the same environment) starts at the configured level.
+#[tokio::test]
+async fn the_next_attempt_starts_at_the_configured_reasoning_level() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::turning_off(|request| {
+        if request.reasoning_effort == Some(kgraf_provider::ReasoningEffort::Off) {
+            Round::answer("finished")
+        } else {
+            reasoning_only()
+        }
+    });
+    let env = Arc::new(medium_env(provider.clone()));
+    let (_, first) = run_one(&env, dir.path()).await;
+    assert_eq!(first.outcome, WorkerOutcome::Completed, "{first:?}");
+    let (_, second) = run_one(&env, dir.path()).await;
+    assert_eq!(second.outcome, WorkerOutcome::Completed, "{second:?}");
+    use kgraf_provider::ReasoningEffort::{Medium, Off};
+    assert_eq!(
+        efforts_of(&provider),
+        vec![Some(Medium), Some(Off), Some(Medium), Some(Off)]
+    );
 }

@@ -230,6 +230,16 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether this adapter has a wire form for [`crate::ReasoningEffort::Off`]
+    /// that a running server has been seen to take. The default is `false`: an
+    /// adapter without one refuses an off request before sending it. A caller
+    /// that wants to turn reasoning off mid-run, as a fallback, asks first so
+    /// the fallback never becomes a refused call. An adapter that returns
+    /// `true` still checks every answer with [`crate::check_reasoning_off`].
+    fn turns_reasoning_off(&self) -> bool {
+        false
+    }
+
     /// The output tokens this adapter's provider counted for `response` but did
     /// not deliver in it, as a floor ([`Response::undelivered_output_floor`]),
     /// or `None` where the adapter cannot tell.

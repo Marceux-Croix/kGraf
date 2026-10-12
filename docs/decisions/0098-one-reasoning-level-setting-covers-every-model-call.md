@@ -188,3 +188,25 @@ needs a new record before kGraf sends it there.
 
 Tests: `kgraf-fleet` `tool_choice.rs`; `kgraf-runtime` `announce_without_tool_call.rs`;
 `kgraf-provider` `a_forced_tool_choice_is_refused_where_it_cannot_be_sent`.
+
+## Amendment (2026-10-12): a reasoning-only turn turns reasoning off for the rest of the attempt
+
+A thinking model can end a turn with reasoning and no tool call or text. Two such turns in a
+row failed the attempt. The fallback keeps item 3's rule: `off` is sent only where an adapter
+has a verified form, and every answer to it is checked.
+
+- At the first empty turn whose reply holds reasoning, on a route whose adapter declares it can
+  turn reasoning off (`Provider::turns_reasoning_off`; Chat Completions only today), and when
+  the configured worker-round level is not already `off`, the worker keeps the continue notice,
+  adds a `ReasoningOff` notice ("the model ended a turn with reasoning only; the next request
+  runs with reasoning off"), and sends every later round request of that attempt with `off`.
+  This turn gets its continuation even when an earlier empty turn had one.
+- Bound: that attempt only, and a compaction does not clear it. A new attempt is a new worker
+  and starts at the configured level. Compaction summary calls keep their own level.
+- No off level on the route: behavior is unchanged, with no notice.
+- A server that ignores the off request fails the call with `ReasoningNotOff`, as for any off
+  request. No substitute is made.
+
+Tests: `kgraf-runtime` `worker_loop.rs` (`a_reasoning_only_turn_is_followed_by_a_request_with_reasoning_off`,
+`a_route_without_an_off_level_keeps_the_empty_turn_behavior`,
+`the_next_attempt_starts_at_the_configured_reasoning_level`).
