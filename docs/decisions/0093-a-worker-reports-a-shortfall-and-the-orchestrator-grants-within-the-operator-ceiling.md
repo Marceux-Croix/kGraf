@@ -418,3 +418,17 @@ Tests: `kgraf-runtime` `tests/kgraf_files_shortfall.rs`
 `two_different_programs_refused_once_each_file_nothing`,
 `a_program_that_later_ran_does_not_count_its_earlier_refusal`. With the call to the guard
 removed, the first fails and the others pass; restored, all pass.
+
+Correction (2026-10-12): the rule fired too early. In canary round 24 (`lang-python`) the worker
+tried two different exploratory `python3 -c` commands, each refused once, and neither was needed
+because the gate runs the tests itself. The filing held the contract while the worker's work was
+unfinished. The rule now needs the same command line refused twice in the attempt: the same
+words, whitespace aside, with the model's `report_shortfall` not called in between. Two different
+command lines of one program, refused once each, do not trigger it. The program refused is the
+`need` as before. A second trigger (one program refused three or more times with no file change)
+was considered and not added: the recorded run it would cover (`mkdir -p out` refused twice with
+other calls between) is already covered by the same-line rule. The exclusions, the once-per-attempt
+limit, the label and the notice are unchanged. Tests: `two_different_commands_of_one_program_refused_once_each_file_nothing`
+fails on the earlier rule and passes on this one; `the_same_command_refused_twice_without_a_report_is_filed_by_kgraf`
+(renamed from `two_refusals_of_one_program_without_a_report_are_filed_by_kgraf`) and
+`the_same_command_with_other_spacing_counts_as_the_same` cover the trigger.

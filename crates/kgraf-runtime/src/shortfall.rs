@@ -447,10 +447,11 @@ const MAX_REPORTED_LINES: usize = 3;
 const MAX_REPORTED_LINE_CHARS: usize = 160;
 
 /// A permission report that kGraf filed for a worker that was refused the
-/// same program twice and never reported it. At most one per attempt.
+/// same command line twice and never reported it. At most one per attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KgrafShortfall {
-    /// The program the report asks for: the one refused twice.
+    /// The program the report asks for: the one whose command line was refused
+    /// twice.
     pub need: String,
     /// The report's reason, which names every refused program and its
     /// command lines. Begins with [`KGRAF_FILED_LEAD`].
@@ -459,12 +460,6 @@ pub struct KgrafShortfall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
 }
-
-/// How many refusals of one program, with no run of it in between, make kGraf
-/// file the report. Two, as the no-change guard gives two notices: a first
-/// refusal can be a slip the model corrects, a second names a program it
-/// needs and will not report.
-pub const REFUSALS_BEFORE_KGRAF_FILES: usize = 2;
 
 /// Refusals of shell programs in one attempt, and whether a report was made
 /// (by the model) or filed (by kGraf). The rule, kept here so it is one
@@ -476,11 +471,18 @@ pub const REFUSALS_BEFORE_KGRAF_FILES: usize = 2;
 ///   a different kind, so the model's own report is the right one.
 /// - A later run of the program without error clears its count.
 /// - Two different programs refused once each do not count.
+/// - Two different command lines of one program, refused once each, do not
+///   count either: a worker that tries a second exploratory command is not
+///   stuck on the refusal. Only the same command line (the same words,
+///   whitespace aside) refused twice is a worker that will not give up the
+///   command, so kGraf reports it.
 /// - Any `report_shortfall` call by the model ends the guard for the attempt.
 /// - It fires once per attempt.
 #[derive(Debug, Default)]
 pub(crate) struct RepeatedRefusals {
-    /// Per program, in order of first refusal: the command lines refused.
+    /// Per program, in order of first refusal: the command lines refused,
+    /// each with its whitespace normalized and not shortened, so two lines
+    /// that differ only late compare as different.
     by_program: Vec<(String, Vec<String>)>,
     model_reported: bool,
     filed: bool,
@@ -520,8 +522,7 @@ impl RepeatedRefusals {
             }
         };
         let line = lines.join(" ; ");
-        let line: String = line.chars().take(MAX_REPORTED_LINE_CHARS).collect();
-        entry.push(line);
+        entry.push(line.split_whitespace().collect::<Vec<_>>().join(" "));
     }
 
     /// The report to file now, if the rule says so and none was filed.
@@ -529,10 +530,12 @@ impl RepeatedRefusals {
         if self.model_reported || self.filed {
             return None;
         }
-        let (need, _) = self
-            .by_program
-            .iter()
-            .find(|(_, lines)| lines.len() >= REFUSALS_BEFORE_KGRAF_FILES)?;
+        let (need, _) = self.by_program.iter().find(|(_, lines)| {
+            lines
+                .iter()
+                .enumerate()
+                .any(|(i, line)| lines[..i].contains(line))
+        })?;
         let named: Vec<String> = self
             .by_program
             .iter()
@@ -540,7 +543,10 @@ impl RepeatedRefusals {
                 let shown: Vec<String> = lines
                     .iter()
                     .take(MAX_REPORTED_LINES)
-                    .map(|l| format!("`{l}`"))
+                    .map(|l| {
+                        let short: String = l.chars().take(MAX_REPORTED_LINE_CHARS).collect();
+                        format!("`{short}`")
+                    })
                     .collect();
                 format!(
                     "`{program}` refused {} time(s): {}",

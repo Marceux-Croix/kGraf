@@ -100,8 +100,8 @@ pub use progress::{
 pub use rebuild::{INTERRUPTED_RESULT, ResumeError, ResumeState, TranscriptBuilder};
 pub use settle::{TranscriptSettler, settle_for_disk};
 pub use shortfall::{
-    KGRAF_FILED_LEAD, KgrafShortfall, REFUSALS_BEFORE_KGRAF_FILES, RefusalDirectory, RefusalRecord,
-    RefusedCall, SHORTFALL_TOOL, capability_of, refusal_hint, refused_call,
+    KGRAF_FILED_LEAD, KgrafShortfall, RefusalDirectory, RefusalRecord, RefusedCall, SHORTFALL_TOOL,
+    capability_of, refusal_hint, refused_call,
 };
 pub use stall::{DEFAULT_STALL_REPEATS, Stall, StallDetector, call_digest};
 pub use step::{RoundPlan, StepBudget, WARN_AT_ROUNDS_LEFT};

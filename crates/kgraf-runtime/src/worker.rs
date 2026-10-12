@@ -2221,8 +2221,8 @@ impl Worker {
         }
     }
 
-    /// File the permission report for a worker that was refused one program
-    /// twice and did not report it (see [`crate::shortfall::RepeatedRefusals`]).
+    /// File the permission report for a worker that was refused one command
+    /// line twice and did not report it (see [`crate::shortfall::RepeatedRefusals`]).
     /// The report goes through the approval chain and the registered
     /// `report_shortfall` tool, so the orchestrator decides as it does for a
     /// report the model wrote: it grants, asks, or holds, and cancels the

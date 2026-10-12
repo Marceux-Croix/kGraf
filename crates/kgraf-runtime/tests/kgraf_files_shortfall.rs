@@ -311,14 +311,15 @@ fn filed_notices(events: &[WorkerEvent]) -> Vec<String> {
     notices_of(events, NoticeKind::KgrafShortfall)
 }
 
-/// The failed run: `mkdir` once, then `python3` twice, and no report. kGraf
-/// files the report for `python3` after its second refusal.
+/// The permissions-manual run: `mkdir -p out` refused, other calls between,
+/// then the same `mkdir -p out` refused again, with no report. kGraf files the
+/// report for `mkdir`.
 #[tokio::test]
-async fn two_refusals_of_one_program_without_a_report_are_filed_by_kgraf() {
+async fn the_same_command_refused_twice_without_a_report_is_filed_by_kgraf() {
     let provider = Fake::new(|request| match results_in(request) {
         0 => shell("t1", &["mkdir", "-p", "out"]),
         1 => shell("t2", &["python3", "-c", "print(1)"]),
-        2 => shell("t3", &["python3", "-c", "print(2)"]),
+        2 => shell("t3", &["mkdir", "-p", "out"]),
         _ => says("done"),
     });
     let (events, result, filed) = run(provider).await;
@@ -326,15 +327,15 @@ async fn two_refusals_of_one_program_without_a_report_are_filed_by_kgraf() {
     assert_eq!(filed.len(), 1, "{filed:?}");
     assert_eq!(filed[0]["kind"], "permission");
     assert_eq!(filed[0]["scope"], "command");
-    assert_eq!(filed[0]["need"], "python3");
+    assert_eq!(filed[0]["need"], "mkdir");
     let why = filed[0]["why"].as_str().expect("why");
     assert!(why.starts_with(KGRAF_FILED_LEAD), "{why}");
-    assert!(why.contains("python3 -c print(1)"), "{why}");
-    assert!(why.contains("python3 -c print(2)"), "{why}");
-    assert!(why.contains("`mkdir` refused 1 time(s)"), "{why}");
+    assert!(why.contains("`mkdir` refused 2 time(s)"), "{why}");
+    assert!(why.contains("`mkdir -p out`"), "{why}");
+    assert!(why.contains("`python3` refused 1 time(s)"), "{why}");
     // The result carries the flag, with the tool's answer.
     let report = result.kgraf_shortfall.as_ref().expect("a filed report");
-    assert_eq!(report.need, "python3");
+    assert_eq!(report.need, "mkdir");
     assert_eq!(report.reply.as_deref(), Some("held: stand-in. Stop now."));
     // The worker log shows it as kGraf's, then shows the answer.
     let notices = filed_notices(&events);
@@ -368,14 +369,14 @@ async fn one_refusal_then_a_report_by_the_model_files_nothing() {
     assert!(filed_notices(&events).is_empty());
 }
 
-/// A report by the model before the second refusal ends the guard for the
-/// attempt: the second refusal is then the model's to handle.
+/// A report by the model before the second refusal of a command ends the guard
+/// for the attempt: the second refusal is then the model's to handle.
 #[tokio::test]
 async fn a_report_by_the_model_before_the_second_refusal_ends_the_guard() {
     let provider = Fake::new(|request| match results_in(request) {
         0 => shell("t1", &["python3", "-c", "print(1)"]),
         1 => reports("r1", "python3"),
-        2 => shell("t2", &["python3", "-c", "print(2)"]),
+        2 => shell("t2", &["python3", "-c", "print(1)"]),
         _ => says("stopped"),
     });
     let (_, result, filed) = run(provider).await;
@@ -411,4 +412,45 @@ async fn a_program_that_later_ran_does_not_count_its_earlier_refusal() {
     let (_, result, filed) = run(provider).await;
     assert!(filed.is_empty(), "{filed:?}");
     assert!(result.kgraf_shortfall.is_none());
+}
+
+/// The lang-python shape: two different exploratory commands of one program,
+/// refused once each. The worker is exploring, not stuck on one command, so
+/// nothing is filed.
+#[tokio::test]
+async fn two_different_commands_of_one_program_refused_once_each_file_nothing() {
+    let provider = Fake::new(|request| match results_in(request) {
+        0 => shell(
+            "t1",
+            &["python3", "-c", "import re; print(re.findall('a', 'a'))"],
+        ),
+        1 => shell(
+            "t2",
+            &[
+                "python3",
+                "-c",
+                "import re, collections; print(collections.Counter('a'))",
+            ],
+        ),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert!(filed.is_empty(), "{filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+    assert!(filed_notices(&events).is_empty());
+    assert_eq!(result.refused.len(), 2);
+}
+
+/// The same command line with different spacing is the same command.
+#[tokio::test]
+async fn the_same_command_with_other_spacing_counts_as_the_same() {
+    let provider = Fake::new(|request| match results_in(request) {
+        0 => shell("t1", &["python3", "-c", "print(1,   2)"]),
+        1 => shell("t2", &["python3", "-c", "print(1, 2)"]),
+        _ => says("done"),
+    });
+    let (_, result, filed) = run(provider).await;
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_eq!(filed[0]["need"], "python3");
+    assert!(result.kgraf_shortfall.is_some());
 }

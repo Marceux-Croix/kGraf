@@ -491,8 +491,8 @@ the adapter has a wire form and the route is not recorded as ignoring it
 (`kgraf_fleet::TOOL_CHOICE_MEASUREMENTS`, decision 0098's rule); a `WorkerEvent::ToolChoice`
 records each decision and why. After `MAX_NO_CHANGE_NOTICES` (2) notices, the next such end
 fails the attempt with the count and the contract's write paths named (0096). A compaction does
-not lift this guard (0095). If the model is refused one shell program twice and never calls `report_shortfall`, kGraf
-files the permission report for it, once per attempt, through the same tool and decision path,
+not lift this guard (0095). If the model is refused the same shell command line twice and never calls `report_shortfall`, kGraf
+files the permission report for its program, once per attempt, through the same tool and decision path,
 and marks it as filed by kGraf (0093).
 
 **A retry carries what stopped the last attempt.** The stop note (`OpenContract::last_stop`)
