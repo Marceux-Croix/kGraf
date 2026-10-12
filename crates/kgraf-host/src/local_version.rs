@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use semver::Version;
 
 use crate::config::RouteSpec;
-use crate::error::NotReady;
+use crate::error::{NotReady, ServerTooOld};
 use crate::host::Notice;
 
 /// The route this check covers. Other local routes speak other protocols.
@@ -283,13 +283,13 @@ pub(crate) fn check_ollama_versions(
     for model in models {
         match model_minimum(&native, model, timeout) {
             Ok(Some(minimum)) if minimum > server => {
-                return Err(NotReady::ServerTooOld {
+                return Err(NotReady::ServerTooOld(Box::new(ServerTooOld {
                     route: ROUTE.to_owned(),
                     model: model.to_owned(),
                     endpoint,
                     server: server.to_string(),
                     minimum: minimum.to_string(),
-                });
+                })));
             }
             Ok(_) => {}
             Err(why) => notices(Notice::LocalServer(format!(
@@ -427,7 +427,7 @@ mod tests {
         assert!(text.contains("qwen3.6:35b"), "{text}");
         assert!(text.contains("0.29.1") && text.contains("0.30.0"), "{text}");
         assert!(text.contains("update Ollama"), "{text}");
-        assert!(matches!(err, NotReady::ServerTooOld { .. }), "{err:?}");
+        assert!(matches!(err, NotReady::ServerTooOld(_)), "{err:?}");
         // The version was recorded before the refusal.
         assert!(seen.iter().any(|s| s.contains("Ollama 0.29.1")), "{seen:?}");
     }

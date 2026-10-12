@@ -260,17 +260,23 @@ pub enum NotReady {
     },
     /// The Ollama server is older than the model's minimum (`requires` of its
     /// `/api/show`): every call to the model would fail.
+    /// Boxed: five strings would make every `Result` carrying this error large.
     #[error(
-        "route `{route}` model `{model}` needs Ollama {minimum} or later, and the server at \
-         {endpoint} runs {server}; update Ollama or choose another model"
+        "route `{}` model `{}` needs Ollama {} or later, and the server at {} runs {}; update \
+         Ollama or choose another model",
+        .0.route, .0.model, .0.minimum, .0.endpoint, .0.server
     )]
-    ServerTooOld {
-        route: String,
-        model: String,
-        endpoint: String,
-        server: String,
-        minimum: String,
-    },
+    ServerTooOld(Box<ServerTooOld>),
+}
+
+/// The versions a [`NotReady::ServerTooOld`] names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerTooOld {
+    pub route: String,
+    pub model: String,
+    pub endpoint: String,
+    pub server: String,
+    pub minimum: String,
 }
 
 impl kgraf_diag::DiagCode for NotReady {
@@ -281,7 +287,7 @@ impl kgraf_diag::DiagCode for NotReady {
             NotReady::MissingCredential { .. } => "KG-0501",
             NotReady::PricesUnreadable { .. } => "KG-0501",
             NotReady::Unreachable { .. } => "KG-0501",
-            NotReady::ServerTooOld { .. } => "KG-0501",
+            NotReady::ServerTooOld(_) => "KG-0501",
             NotReady::Invalid(_) => kgraf_diag::catch_all_for("kgraf-host").code,
         }
     }

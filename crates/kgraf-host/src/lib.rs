@@ -154,7 +154,7 @@ pub mod worker;
 mod workspaces;
 
 pub use config::{ModelRouteSpec, RouteSpec, RunConfig, WorktreeRetention};
-pub use error::{Error, NotReady, Result};
+pub use error::{Error, NotReady, Result, ServerTooOld};
 pub use gates::{discover_validation_commands, pytest_importable};
 pub use host::{
     CorpusRequest, Host, HostFactory, Housekeeping, Notice, PreparedRun, Retained,
