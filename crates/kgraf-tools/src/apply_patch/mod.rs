@@ -203,9 +203,20 @@ pub fn whole_file_hint(path: &str) -> String {
     format!(
         "\nThis file has failed to patch repeatedly. You can replace the whole file in one \
          patch: `*** Delete File: {path}` followed by `*** Add File: {path}` with the full new \
-         content, every line starting with `+` (a body with no `+` at all is read as plain text):\n*** Begin Patch\n*** Delete File: {path}\n\
-         *** Add File: {path}\n+full new content\n*** End Patch"
+         content, every line starting with `+` (a body with no `+` at all is read as plain text):\n{}",
+        whole_file_skeleton(path, true)
     )
+}
+
+/// A patch that writes `path` as a whole file: a Delete File first when the
+/// file exists (the tool applies the pair as a replace), then an Add File.
+pub fn whole_file_skeleton(path: &str, replace: bool) -> String {
+    let delete = if replace {
+        format!("*** Delete File: {path}\n")
+    } else {
+        String::new()
+    };
+    format!("*** Begin Patch\n{delete}*** Add File: {path}\n+full new content\n*** End Patch")
 }
 
 /// A patch longer than this is refused before it is even parsed (cap

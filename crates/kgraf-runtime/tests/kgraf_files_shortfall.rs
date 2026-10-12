@@ -9,6 +9,9 @@
 //! 2. One refusal and then a report by the model: nothing is filed.
 //! 3. Two different programs refused once each: nothing is filed.
 //! 4. A program that later ran does not count its earlier refusal.
+//! 5. A shell command that only writes a file in the worktree, refused twice,
+//!    files nothing and its refusal carries the `apply_patch` skeleton; a write
+//!    outside the worktree, or one that also runs a command, files as before.
 
 use kgraf_core::{Protocol, TokenUsage};
 use kgraf_provider::message::ToolDefinition;
@@ -149,7 +152,7 @@ impl ApprovalHook for RefuseUnlisted {
     async fn review(&self, call: &PendingCall) -> HookDecision {
         let program = call.input["command"][0].as_str().unwrap_or_default();
         let allowed = call.input["command"][1] == "--allowed";
-        if call.tool == "shell" && matches!(program, "mkdir" | "python3") && !allowed {
+        if call.tool == "shell" && matches!(program, "mkdir" | "python3" | "sh") && !allowed {
             HookDecision::Deny {
                 reason: "unattended run".into(),
             }
@@ -453,4 +456,85 @@ async fn the_same_command_with_other_spacing_counts_as_the_same() {
     assert_eq!(filed.len(), 1, "{filed:?}");
     assert_eq!(filed[0]["need"], "python3");
     assert!(result.kgraf_shortfall.is_some());
+}
+
+/// The refusal texts the worker saw, in order.
+fn refusals_seen(events: &[WorkerEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::ToolCallFinished {
+                output,
+                is_error: true,
+                ..
+            } => Some(output.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A worker that writes a whole file with `sh -c` and a heredoc, refused
+/// twice with the identical line: the file is `apply_patch`'s to write, so no
+/// shortfall is filed, and each refusal carries the whole-file patch.
+#[tokio::test]
+async fn a_heredoc_file_write_refused_twice_files_nothing_and_names_apply_patch() {
+    let script = "cat > loyalty_points/src/lib.rs << 'EOF'\npub fn a() {}\nEOF";
+    let provider = Fake::new(move |request| match results_in(request) {
+        0 => shell("t1", &["sh", "-c", script]),
+        1 => shell("t2", &["sh", "-c", script]),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert!(filed.is_empty(), "{filed:?}");
+    assert!(result.kgraf_shortfall.is_none());
+    assert!(filed_notices(&events).is_empty());
+    let seen = refusals_seen(&events);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for text in seen {
+        assert!(text.contains("apply_patch"), "{text}");
+        assert!(
+            text.contains(
+                "*** Begin Patch\n*** Add File: loyalty_points/src/lib.rs\n+full new content\n\
+                 *** End Patch"
+            ),
+            "{text}"
+        );
+    }
+}
+
+/// A heredoc to a path outside the worktree is no pure write: it files.
+#[tokio::test]
+async fn a_heredoc_write_outside_the_worktree_still_files() {
+    let script = "cat > /etc/kgraf_probe << 'EOF'\nx\nEOF";
+    let provider = Fake::new(move |request| match results_in(request) {
+        0 | 1 => shell("t", &["sh", "-c", script]),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_eq!(filed[0]["need"], "sh");
+    assert!(result.kgraf_shortfall.is_some());
+    assert!(
+        refusals_seen(&events)
+            .iter()
+            .all(|t| !t.contains("*** Begin Patch"))
+    );
+}
+
+/// A script that writes and also runs a command is no pure write: it files.
+#[tokio::test]
+async fn a_write_that_also_runs_a_command_still_files() {
+    let script = "cat > a.txt << 'EOF'\nx\nEOF\nmake";
+    let provider = Fake::new(move |request| match results_in(request) {
+        0 | 1 => shell("t", &["sh", "-c", script]),
+        _ => says("done"),
+    });
+    let (events, result, filed) = run(provider).await;
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert!(result.kgraf_shortfall.is_some());
+    assert!(
+        refusals_seen(&events)
+            .iter()
+            .all(|t| !t.contains("*** Begin Patch"))
+    );
 }

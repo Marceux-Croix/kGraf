@@ -3995,7 +3995,11 @@ impl Worker {
             return;
         };
         let recorded = call.refusal(&by, output, path);
-        self.repeated.refused(&tool, &recorded, call.subjects());
+        // A command that only writes a file counts toward no report: the
+        // worker is pointed at `apply_patch`, which needs no permission.
+        if call.file_write().is_none() {
+            self.repeated.refused(&tool, &recorded, call.subjects());
+        }
         self.refused.refused(recorded);
         let can_report = self
             .env
@@ -4003,6 +4007,9 @@ impl Worker {
             .get(crate::shortfall::SHORTFALL_TOOL)
             .is_some();
         *output = crate::shortfall::with_refusal_hint(output, can_report);
+        if let Some(write) = call.file_write() {
+            output.push_str(&kgraf_tools::file_write_hint(write));
+        }
     }
 
     /// Record the worktree paths git reports as changed after a sandboxed build

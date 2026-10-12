@@ -148,6 +148,10 @@ pub(crate) struct CallCapability {
     /// first ([`kgraf_tools::permissions::programs_to_grant`]); empty when no
     /// program grant can cover the call.
     grant_programs: Vec<String>,
+    /// The file a shell call only writes, when it is a pure file write inside
+    /// the worktree ([`kgraf_tools::pure_file_write`]). `apply_patch` writes
+    /// it, so a refusal of the call is no missing permission.
+    file_write: Option<kgraf_tools::FileWrite>,
 }
 
 impl CallCapability {
@@ -192,6 +196,13 @@ impl CallCapability {
             patch_target: (tool == "apply_patch")
                 .then(|| kgraf_tools::patch_target(input))
                 .flatten(),
+            file_write: (tool == "shell")
+                .then(|| {
+                    ctx.root
+                        .as_deref()
+                        .and_then(|root| kgraf_tools::pure_file_write(input, root))
+                })
+                .flatten(),
             grant_programs: if tool == "shell" {
                 kgraf_tools::command_argv(input)
                     .and_then(|argv| {
@@ -202,6 +213,11 @@ impl CallCapability {
                 Vec::new()
             },
         }
+    }
+
+    /// The file this call only writes, if it is a pure file write.
+    pub(crate) fn file_write(&self) -> Option<&kgraf_tools::FileWrite> {
+        self.file_write.as_ref()
     }
 
     pub(crate) fn programs(&self) -> &[String] {
@@ -476,6 +492,9 @@ pub struct KgrafShortfall {
 ///   stuck on the refusal. Only the same command line (the same words,
 ///   whitespace aside) refused twice is a worker that will not give up the
 ///   command, so kGraf reports it.
+/// - A shell command whose only effect is writing a file inside the worktree
+///   does not count (the caller skips it): `apply_patch` writes that file, so
+///   the worker lacks no permission.
 /// - Any `report_shortfall` call by the model ends the guard for the attempt.
 /// - It fires once per attempt.
 #[derive(Debug, Default)]

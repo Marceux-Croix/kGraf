@@ -43,6 +43,7 @@ pub mod dependency_refetch;
 mod error;
 pub mod execpolicy;
 pub mod external;
+mod file_write;
 mod fs_safety;
 mod fs_tools;
 mod graph_slice;
@@ -62,12 +63,13 @@ pub(crate) use access::normalize_relative;
 pub use access::{Access, PathCase, detect_path_case};
 pub use apply_patch::{
     ApplyPatchTool, PatchTarget, ProtectedApplyPatch, WHOLE_FILE_HINT_AFTER, patch_target,
-    rejection_help, whole_file_hint,
+    rejection_help, whole_file_hint, whole_file_skeleton,
 };
 pub use approval::{INVALID_INPUT, SKILLS_POLICY};
 pub use dependency_refetch::{DependencyRefetch, RefetchOutcome};
 pub use error::{AccessError, ApprovalError, RegistryError, ToolError};
 pub use external::{ExternalExecutor, ExternalOutcome, SyncedWrites, remote_policy};
+pub use file_write::{FileWrite, file_write_hint, pure_file_write};
 pub use fs_safety::AllowedHardlinkReads;
 pub use fs_tools::{ListDirectoryTool, ReadFileTool, SearchFilesTool};
 pub use graph_slice::{DEFAULT_SLICE_BUDGET, GraphSliceTool};

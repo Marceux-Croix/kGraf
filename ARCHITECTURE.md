@@ -493,7 +493,7 @@ records each decision and why. After `MAX_NO_CHANGE_NOTICES` (2) notices, the ne
 fails the attempt with the count and the contract's write paths named (0096). A compaction does
 not lift this guard (0095). If the model is refused the same shell command line twice and never calls `report_shortfall`, kGraf
 files the permission report for its program, once per attempt, through the same tool and decision path,
-and marks it as filed by kGraf (0093).
+and marks it as filed by kGraf (0093). A shell command that only writes a file inside the worktree (an `sh -c` heredoc, `cat`, `printf` or `echo` redirect, or `tee`) never counts: its refusal names `apply_patch` and gives the whole-file patch for that path (0093, amended 2026-10-12).
 
 **A retry carries what stopped the last attempt.** The stop note (`OpenContract::last_stop`)
 holds the repeated call of a stall, a spent budget or a named failure, with the calls a policy
