@@ -456,6 +456,7 @@ mod tests {
                     new_lines: vec!["new".to_string()],
                     context_line_indices: vec![],
                     is_end_of_file: false,
+                    final_newline: None,
                 }],
             }])
         );

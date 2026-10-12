@@ -169,18 +169,21 @@ fn replaced(
         return Err("`old` and `new` are the same text, so nothing would change".to_owned());
     }
     // A model writes line breaks as `\n`. In a file with CRLF line endings
-    // the same lines are found by writing them with CRLF.
-    let crlf = |t: &str| t.replace('\n', "\r\n");
-    let mut tries = vec![(old.to_owned(), new.to_owned(), None)];
-    if original.contains("\r\n") && old.contains('\n') && !old.contains('\r') {
-        tries.push((
-            crlf(old),
-            crlf(new),
-            Some(
-                "note: the file has CRLF line endings; `old` and `new` were matched and written \
-                 with CRLF",
-            ),
-        ));
+    // the same lines are found by writing them with CRLF, and `new` is written
+    // with CRLF at every line break, so the file keeps one ending style. A
+    // `\r\n` already in the text is mapped to `\n` first, so it is not doubled.
+    const CRLF_NOTE: &str = "note: the file has CRLF line endings; `old` and `new` were matched \
+                             and written with CRLF";
+    let crlf = |t: &str| t.replace("\r\n", "\n").replace('\n', "\r\n");
+    let is_crlf = original.contains("\r\n");
+    let new_written = if is_crlf { crlf(new) } else { new.to_owned() };
+    let mut tries = vec![(
+        old.to_owned(),
+        new_written.clone(),
+        (new_written != new).then_some(CRLF_NOTE),
+    )];
+    if is_crlf && old.contains('\n') && crlf(old) != old {
+        tries.push((crlf(old), new_written, Some(CRLF_NOTE)));
     }
     for (old, new, note) in tries {
         let (count, at) = occurrences(original, &old);
@@ -401,7 +404,13 @@ impl Tool for ReplaceInFileTool {
                 path: path.clone(),
                 contents: change.contents,
             };
-            let applied = apply_all_names(&[hunk], &root, &cancel, fs_safety::Names::Plain)?;
+            let applied = apply_all_names(
+                REPLACE_IN_FILE,
+                &[hunk],
+                &root,
+                &cancel,
+                fs_safety::Names::Plain,
+            )?;
             let shown = [path.to_string_lossy().into_owned()];
             let text = if change.created {
                 summary(&shown, &[], &[])

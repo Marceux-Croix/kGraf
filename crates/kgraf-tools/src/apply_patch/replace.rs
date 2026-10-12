@@ -309,7 +309,8 @@ fn region_endings(
 /// Apply `chunks` to `original`, returning the new file contents. Each line
 /// the patch does not touch keeps its own ending (LF or CRLF), and the file
 /// keeps its final-newline state: a file that did not end in a newline still
-/// does not, and one that did still does. Lines the patch adds take the
+/// does not, and one that did still does, unless the last chunk asks for the
+/// other state and its edit reaches the end of the file. Lines the patch adds take the
 /// file's dominant ending. The edit itself runs on lines without their
 /// endings, so patch lines (always LF) match a CRLF line exactly.
 pub(crate) fn derive_new_contents(
@@ -318,7 +319,7 @@ pub(crate) fn derive_new_contents(
     chunks: &[UpdateFileChunk],
 ) -> Result<(String, Vec<String>), String> {
     let dominant = if uses_crlf(original) { "\r\n" } else { "\n" };
-    let final_newline = original.is_empty() || original.ends_with('\n');
+    let mut final_newline = original.is_empty() || original.ends_with('\n');
     let segments: Vec<&str> = original.split('\n').collect();
     let last = segments.len() - 1;
     let mut original_lines = Vec::with_capacity(segments.len());
@@ -347,9 +348,24 @@ pub(crate) fn derive_new_contents(
 
     let Computed {
         replacements,
-        notes,
+        mut notes,
         tolerant,
     } = compute_replacements(&original_lines, path, chunks)?;
+    // A requested final-newline state holds only when the last edit reaches
+    // the end of the file; anywhere else it names nothing to change.
+    if let Some(want) = chunks.last().and_then(|c| c.final_newline) {
+        if replacements
+            .last()
+            .is_some_and(|(start, old_len, _)| start + old_len == original_lines.len())
+        {
+            final_newline = want;
+        } else {
+            notes.push(format!(
+                "note: in {path}, a `\\ No newline at end of file` line was ignored because the \
+                 edit does not end at the end of the file"
+            ));
+        }
+    }
     let ending_replacements: Vec<(usize, usize, Vec<&'static str>)> = replacements
         .iter()
         .map(|(start, old_len, new)| {

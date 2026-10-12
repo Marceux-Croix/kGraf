@@ -183,6 +183,76 @@ async fn a_crlf_file_is_matched_with_crlf_and_the_result_says_so() {
     assert_eq!(read(&dir, "a.txt"), "ONE\r\nTWO\r\nthree\r\n");
 }
 
+/// In a CRLF file every line break `new` writes is CRLF, whether or not `old`
+/// has a line break, and a `new` that already has CRLF gains no extra `\r`.
+#[tokio::test]
+async fn new_text_gets_crlf_line_breaks_in_a_crlf_file_without_doubling() {
+    let file = "one\r\ntwo\r\n";
+    // `old` is one line; `new` adds a line break.
+    let (out, dir) = run(
+        &ReplaceInFileTool::default(),
+        &[("a.txt", file)],
+        input("a.txt", "one", "one\nuno"),
+    )
+    .await;
+    let text = out.expect("applies");
+    assert!(text.contains("CRLF"), "{text}");
+    assert_eq!(read(&dir, "a.txt"), "one\r\nuno\r\ntwo\r\n");
+    // `new` carries CRLF already.
+    let (out, dir) = run(
+        &ReplaceInFileTool::default(),
+        &[("a.txt", file)],
+        input("a.txt", "one\ntwo", "ONE\r\nTWO"),
+    )
+    .await;
+    out.expect("applies");
+    assert_eq!(read(&dir, "a.txt"), "ONE\r\nTWO\r\n");
+    // `old` carries CRLF too.
+    let (out, dir) = run(
+        &ReplaceInFileTool::default(),
+        &[("a.txt", file)],
+        input("a.txt", "one\r\ntwo", "ONE\r\nTWO"),
+    )
+    .await;
+    out.expect("applies");
+    assert_eq!(read(&dir, "a.txt"), "ONE\r\nTWO\r\n");
+}
+
+/// A missing file with an empty `old` is created with `new`, even when `new`
+/// is empty too; an existing file with equal `old` and `new` is still refused.
+#[tokio::test]
+async fn an_empty_old_and_new_creates_an_empty_file() {
+    let (out, dir) = run(
+        &ReplaceInFileTool::default(),
+        &[],
+        input("empty.txt", "", ""),
+    )
+    .await;
+    out.expect("creates");
+    assert_eq!(read(&dir, "empty.txt"), "");
+}
+
+/// An error from the shared write path names this tool, not `apply_patch`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linked_file_is_refused_in_the_name_of_replace_in_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside.path().join("keys");
+    std::fs::write(&target, "k\n").expect("seed");
+    std::fs::hard_link(&target, dir.path().join("keys")).expect("hard link");
+    let err = run_in(
+        &ReplaceInFileTool::default(),
+        dir.path(),
+        input("keys", "k", "x"),
+    )
+    .await
+    .expect_err("refused");
+    assert!(err.contains("replace_in_file"), "{err}");
+    assert!(!err.contains("apply_patch"), "{err}");
+    assert_eq!(std::fs::read_to_string(&target).expect("outside"), "k\n");
+}
+
 #[tokio::test]
 async fn an_empty_old_creates_a_missing_file_and_never_overwrites_one() {
     let (out, dir) = run(

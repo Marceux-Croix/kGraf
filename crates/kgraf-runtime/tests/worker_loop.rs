@@ -5146,6 +5146,52 @@ async fn a_third_rejected_patch_on_one_file_names_the_whole_file_route() {
     assert!(!t7.contains(hint), "{t7}");
 }
 
+/// A successful `replace_in_file` on a file clears that file's count of
+/// rejected patches, so the next rejection is a first failure and carries no
+/// whole-file hint. The path may be spelled with a leading `./` in the patch.
+#[tokio::test]
+async fn a_successful_replace_in_file_clears_the_rejected_patch_count() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    std::fs::write(worktree.path().join("a.rs"), "one\n").expect("seed");
+    let bad = |n: u32| {
+        json!({"patch": format!(
+            "*** Begin Patch\n*** Update File: ./a.rs\n@@\n-missing {n}\n+x\n*** End Patch"
+        )})
+    };
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "apply_patch", bad(1))]),
+        1 => Round::tool(vec![("t2", "apply_patch", bad(2))]),
+        2 => Round::tool(vec![(
+            "t3",
+            "replace_in_file",
+            json!({"path": "a.rs", "old": "one", "new": "two"}),
+        )]),
+        3 => Round::tool(vec![("t4", "apply_patch", bad(4))]),
+        _ => Round::answer("done"),
+    });
+    let env = env_with(
+        provider.clone(),
+        vec![
+            Arc::new(kgraf_tools::ApplyPatchTool),
+            Arc::new(kgraf_tools::ReplaceInFileTool::default()),
+        ],
+        CallMode::Stream,
+    );
+    let handle = spawn_worker(
+        Arc::new(env),
+        brief("w1", "edit it", worktree.path(), 12),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let (t3, is_error) = finished_output(&events, "t3");
+    assert!(!is_error, "{t3}");
+    let (t4, is_error) = finished_output(&events, "t4");
+    assert!(is_error, "{t4}");
+    assert!(!t4.contains("replace the whole file in one patch"), "{t4}");
+}
+
 /// `replace_in_file` goes through the worker loop's write-scope check as
 /// `apply_patch` does: an edit inside the scope is applied, one outside is
 /// refused and writes nothing. The whole-file hint after three failed patches

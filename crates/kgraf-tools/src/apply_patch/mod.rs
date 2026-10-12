@@ -279,7 +279,8 @@ const RAW_ADD_NOTE: &str = "note: an Add File section had no line starting with 
      of the new file";
 
 const NO_NEWLINE_NOTE: &str = "note: a `\\ No newline at end of file` line is a git diff marker, \
-     not part of this format; it was ignored";
+     not part of this format; it was ignored unless it follows the last '+' or '-' line of a \
+     hunk, where it sets the file's final-newline state";
 
 const BLANK_ADD_NOTE: &str = "note: an Add File section had a blank line with no '+' between \
      lines that start with '+'; it was read as an empty line of the new file";
@@ -314,19 +315,27 @@ const NO_NEWLINE_MARKER: &str = "\\ No newline at end of file";
 ///   starts with `***` cannot be raw content: it ends the section, and the
 ///   parser refuses it as a bad header. A section with any `+` line is left
 ///   alone and refused if it also has a bare line.
-/// - A line that is exactly git's `\ No newline at end of file` is dropped,
-///   wherever it stands. A body line that carries it as content starts with
-///   `+`, `-` or a space, so no real line is lost.
+/// - A line that is exactly git's `\ No newline at end of file` is read, not
+///   kept as content. After the last `+` line of an Add File section it makes
+///   the file end with no newline. After the last `+` line of an Update File
+///   chunk it makes the result end with no newline; after the last `-` line,
+///   with no such marker after the last `+` line, it makes the result end with
+///   one. Either holds only when the chunk ends at the end of the file. Any
+///   other marker is dropped with a note. A body line that carries the text as
+///   content starts with `+`, `-` or a space, so no real line is lost.
 /// - In an Add File section whose non-blank lines all start with `+`, a blank
 ///   line between the first and the last `+` line is an empty line of the
 ///   file. A blank line outside that span, and any non-blank line without a
 ///   `+`, stay refused.
-/// - In an Update File section, a line with no ` `, `+` or `-` prefix is a
+/// - In an Update File chunk (the lines between `@@` markers) that has no
+///   line starting with a space, a line with no ` `, `+` or `-` prefix is a
 ///   context line, written with its prefix left out. It is matched against
-///   the file as any context line is, so a wrong reading fails there. A line
+///   the file as any context line is, so a wrong reading fails there. A chunk
+///   that mixes spaced and bare lines is left alone: a bare line there is
+///   likely a lost `-` or `+`, and the parser refuses it. A line
 ///   starting with `@@` or `***` is not read this way: those are markers, and
 ///   a malformed one is refused by the parser.
-fn repaired(patch: &str) -> (String, Vec<&'static str>) {
+fn repaired(patch: &str) -> (String, Vec<&'static str>, Vec<FinalNewline>) {
     let mut notes = Vec::new();
     let first = patch.lines().map(str::trim).find(|l| !l.is_empty());
     let headed = first.is_some_and(|l| {
@@ -336,7 +345,7 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     });
     let begun = first == Some(parser::BEGIN_PATCH_MARKER);
     if !headed && !begun {
-        return (patch.to_string(), notes);
+        return (patch.to_string(), notes, Vec::new());
     }
     // Blank lines are dropped from both ends, but no line is trimmed: with no
     // end marker the last line is a body line, and trimming the whole patch
@@ -373,9 +382,9 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
             notes.push(END_NOTE);
         }
     }
-    let before = lines.len();
+    let marked = scan_sections(&lines);
     lines.retain(|l| l.trim_end() != NO_NEWLINE_MARKER);
-    if lines.len() != before {
+    if marked.stray_marker {
         notes.push(NO_NEWLINE_NOTE);
     }
     if prefix_raw_add_bodies(&mut lines) {
@@ -384,13 +393,21 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     if plus_blank_add_lines(&mut lines) {
         notes.push(BLANK_ADD_NOTE);
     }
+    // Chunk membership is read again here: the repairs above add and drop
+    // lines, and the marker lines are gone.
+    let sections = scan_sections(&lines);
     let mut in_update = false;
     let mut bare_context = false;
-    for line in &mut lines {
+    for (i, line) in lines.iter_mut().enumerate() {
         let t = line.trim_end();
-        if t.starts_with("*** ") {
+        if t.starts_with(parser::MOVE_TO_MARKER) || t == parser::EOF_MARKER {
+            // Both stand inside an Update File section.
+        } else if t.starts_with("*** ") {
             in_update = t.starts_with(parser::UPDATE_FILE_MARKER);
-        } else if in_update && is_bare_body_line(line) {
+        } else if in_update
+            && is_bare_body_line(line)
+            && sections.chunk_of[i].is_some_and(|c| !sections.chunks[c].spaced)
+        {
             line.insert(0, ' ');
             bare_context = true;
         } else if in_update && let Some(glued) = glued_marker_text(t) {
@@ -417,7 +434,168 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     if bare_context {
         notes.push(BARE_CONTEXT_NOTE);
     }
-    (lines.join("\n"), notes)
+    (lines.join("\n"), notes, marked.requests)
+}
+
+/// A final-newline state asked for by a `\ No newline at end of file` line,
+/// for the hunk at index `hunk` of the patch (and its chunk `chunk`, for an
+/// Update File).
+#[derive(Debug, PartialEq)]
+struct FinalNewline {
+    hunk: usize,
+    chunk: Option<usize>,
+    newline: bool,
+}
+
+/// One chunk of an Update File section, as [`scan_sections`] reads it.
+#[derive(Default)]
+struct ChunkScan {
+    hunk: usize,
+    index: usize,
+    /// Whether a body line starts with a space.
+    spaced: bool,
+    /// A marker line follows the chunk's last `+` line.
+    after_plus: bool,
+    /// A marker line follows the chunk's last `-` line.
+    after_minus: bool,
+}
+
+#[derive(Default)]
+struct Scan {
+    /// For each line, the index in `chunks` of the Update chunk it belongs to.
+    chunk_of: Vec<Option<usize>>,
+    chunks: Vec<ChunkScan>,
+    requests: Vec<FinalNewline>,
+    /// A marker line that asks for nothing: it follows no `+` line of an Add
+    /// File and no `+` or `-` line of an Update File chunk.
+    stray_marker: bool,
+}
+
+/// Reads the sections of a patch the way the parser will: which chunk each
+/// Update line is in (a chunk starts at an `@@` line, or at the first body
+/// line when none came before), and where a `\ No newline at end of file`
+/// line asks for a final-newline state.
+fn scan_sections(lines: &[String]) -> Scan {
+    #[derive(PartialEq)]
+    enum Section {
+        Other,
+        Add,
+        Update,
+    }
+    let mut scan = Scan::default();
+    let mut section = Section::Other;
+    let mut hunks = 0usize;
+    let mut add_after_plus = false;
+    let mut chunk: Option<usize> = None;
+    let mut chunks_in_hunk = 0usize;
+    let close_add = |scan: &mut Scan, hunk: usize, after_plus: &mut bool| {
+        if std::mem::take(after_plus) {
+            scan.requests.push(FinalNewline {
+                hunk,
+                chunk: None,
+                newline: false,
+            });
+        }
+    };
+    for (i, line) in lines.iter().enumerate() {
+        scan.chunk_of.push(None);
+        let t = line.trim_end();
+        if t.starts_with(parser::MOVE_TO_MARKER) || t == parser::EOF_MARKER {
+            continue;
+        }
+        if t.starts_with("*** ") {
+            if section == Section::Add {
+                close_add(&mut scan, hunks - 1, &mut add_after_plus);
+            }
+            section = if t.starts_with(parser::ADD_FILE_MARKER) {
+                Section::Add
+            } else if t.starts_with(parser::UPDATE_FILE_MARKER) {
+                Section::Update
+            } else {
+                Section::Other
+            };
+            if section != Section::Other || t.starts_with(parser::DELETE_FILE_MARKER) {
+                hunks += 1;
+            }
+            chunk = None;
+            chunks_in_hunk = 0;
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| lines[p].as_str());
+        if t == NO_NEWLINE_MARKER {
+            match (&section, chunk, prev) {
+                (Section::Add, _, Some(p)) if p.starts_with('+') => add_after_plus = true,
+                (Section::Update, Some(c), Some(p)) if p.starts_with('+') => {
+                    scan.chunks[c].after_plus = true;
+                }
+                (Section::Update, Some(c), Some(p)) if p.starts_with('-') => {
+                    scan.chunks[c].after_minus = true;
+                }
+                _ => scan.stray_marker = true,
+            }
+            continue;
+        }
+        match section {
+            Section::Add => {
+                if line.starts_with('+') {
+                    add_after_plus = false;
+                }
+            }
+            Section::Update => {
+                if chunk.is_none() || line.starts_with("@@") {
+                    scan.chunks.push(ChunkScan {
+                        hunk: hunks - 1,
+                        index: chunks_in_hunk,
+                        ..ChunkScan::default()
+                    });
+                    chunk = Some(scan.chunks.len() - 1);
+                    chunks_in_hunk += 1;
+                }
+                let Some(c) = chunk else { continue };
+                scan.chunk_of[i] = Some(c);
+                let c = &mut scan.chunks[c];
+                match line.chars().next() {
+                    Some(' ') => c.spaced = true,
+                    Some('+') => c.after_plus = false,
+                    Some('-') => c.after_minus = false,
+                    _ => {}
+                }
+            }
+            Section::Other => {}
+        }
+    }
+    if section == Section::Add {
+        close_add(&mut scan, hunks - 1, &mut add_after_plus);
+    }
+    for c in &scan.chunks {
+        if c.after_plus || c.after_minus {
+            scan.requests.push(FinalNewline {
+                hunk: c.hunk,
+                chunk: Some(c.index),
+                newline: !c.after_plus,
+            });
+        }
+    }
+    scan
+}
+
+/// Sets the final-newline state `requests` ask for on the parsed `hunks`.
+fn apply_final_newlines(hunks: &mut [Hunk], requests: &[FinalNewline]) {
+    for request in requests {
+        match (hunks.get_mut(request.hunk), request.chunk) {
+            (Some(Hunk::AddFile { contents, .. }), None) if !request.newline => {
+                if contents.ends_with('\n') {
+                    contents.pop();
+                }
+            }
+            (Some(Hunk::UpdateFile { chunks, .. }), Some(c)) => {
+                if let Some(chunk) = chunks.get_mut(c) {
+                    chunk.final_newline = Some(request.newline);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether `line`, inside an Update File section, has no prefix at all: it is
@@ -570,12 +748,13 @@ fn merge_delete_add(hunks: Vec<Hunk>, notes: &mut Vec<String>) -> Vec<Hunk> {
 }
 
 fn parse(input: &Value) -> Result<Parsed, ToolError> {
-    let (text, repairs) = repaired(patch_text(input)?);
+    let (text, repairs, final_newlines) = repaired(patch_text(input)?);
     let mut notes: Vec<String> = repairs.iter().map(ToString::to_string).collect();
-    let hunks = parse_patch(&text).map_err(|e| ToolError::InvalidInput {
+    let mut hunks = parse_patch(&text).map_err(|e| ToolError::InvalidInput {
         tool: "apply_patch".into(),
         reason: e.to_string(),
     })?;
+    apply_final_newlines(&mut hunks, &final_newlines);
     if hunks.len() > MAX_HUNKS {
         return Err(ToolError::InvalidInput {
             tool: "apply_patch".into(),
@@ -823,7 +1002,7 @@ fn apply_all(
     root: &Path,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    let applied = apply_all_names(hunks, root, cancel, fs_safety::Names::Plain)?;
+    let applied = apply_all_names("apply_patch", hunks, root, cancel, fs_safety::Names::Plain)?;
     with_notes(Ok(ToolOutput::text(applied.summary)), applied.notes)
 }
 
@@ -836,26 +1015,26 @@ struct Applied {
 
 /// [`apply_all`] under the write guard's names policy `names`: the protected
 /// apply admits `.gitattributes`, `.gitmodules` and `.githooks` in Bypass.
+/// `tool` is the name its errors carry: `replace_in_file` writes through here too.
 fn apply_all_names(
+    tool: &str,
     hunks: &[Hunk],
     root: &Path,
     cancel: &CancellationToken,
     names: fs_safety::Names,
 ) -> Result<Applied, ToolError> {
     refuse_repeated_paths(hunks, lexical)?;
-    let dir = fs_safety::open_workspace("apply_patch", root)?;
+    let dir = fs_safety::open_workspace(tool, root)?;
     // Again with links followed: a hunk on a link and a hunk on its target
     // name one file, and both would plan from its old content.
-    refuse_repeated_paths(hunks, |path| {
-        fs_safety::resolve_links("apply_patch", &dir, path)
-    })?;
+    refuse_repeated_paths(hunks, |path| fs_safety::resolve_links(tool, &dir, path))?;
     // The write guard runs on every written path before any hunk is planned:
     // planning reads through the read guard, which lets `.gitmodules` through,
     // so without this a protected path late in the patch would be refused only
     // at commit, after earlier hunks had written.
     for hunk in hunks {
         for path in written_paths(hunk)? {
-            fs_safety::guard_write_names("apply_patch", &dir, &path, names)?;
+            fs_safety::guard_write_names(tool, &dir, &path, names)?;
         }
     }
 
@@ -863,11 +1042,9 @@ fn apply_all_names(
     let mut notes = Vec::new();
     for hunk in hunks {
         if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled {
-                tool: "apply_patch".into(),
-            });
+            return Err(ToolError::Cancelled { tool: tool.into() });
         }
-        planned.push(plan_one(hunk, &dir, &mut notes)?);
+        planned.push(plan_one(tool, hunk, &dir, &mut notes)?);
     }
 
     let mut added = Vec::new();
@@ -875,11 +1052,17 @@ fn apply_all_names(
     let mut deleted = Vec::new();
     for change in planned {
         if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled {
-                tool: "apply_patch".into(),
-            });
+            return Err(ToolError::Cancelled { tool: tool.into() });
         }
-        commit_one(change, &dir, names, &mut added, &mut modified, &mut deleted)?;
+        commit_one(
+            tool,
+            change,
+            &dir,
+            names,
+            &mut added,
+            &mut modified,
+            &mut deleted,
+        )?;
     }
     Ok(Applied {
         summary: summary(&added, &modified, &deleted),
@@ -909,20 +1092,25 @@ pub fn check_applies(input: &Value, root: &Path) -> Result<(), String> {
         }
         let mut notes = Vec::new();
         for hunk in &hunks {
-            plan_one(hunk, &dir, &mut notes)?;
+            plan_one("apply_patch", hunk, &dir, &mut notes)?;
         }
         Ok(())
     };
     check().map_err(|e| e.to_string())
 }
 
-fn plan_one(hunk: &Hunk, dir: &Dir, notes: &mut Vec<String>) -> Result<Planned, ToolError> {
+fn plan_one(
+    tool: &str,
+    hunk: &Hunk,
+    dir: &Dir,
+    notes: &mut Vec<String>,
+) -> Result<Planned, ToolError> {
     match hunk {
         Hunk::AddFile { path, contents } => {
             let path = normalize_hunk_path(path)?;
             // An add over an existing hard-linked file would be refused at
             // commit, after earlier hunks had written; refuse it here.
-            fs_safety::refuse_if_hard_linked("apply_patch", dir, &path)?;
+            fs_safety::refuse_if_hard_linked(tool, dir, &path)?;
             Ok(Planned::Add {
                 path,
                 contents: contents.clone(),
@@ -1003,6 +1191,7 @@ fn plan_one(hunk: &Hunk, dir: &Dir, notes: &mut Vec<String>) -> Result<Planned, 
 }
 
 fn commit_one(
+    tool: &str,
     change: Planned,
     dir: &Dir,
     names: fs_safety::Names,
@@ -1012,20 +1201,20 @@ fn commit_one(
 ) -> Result<(), ToolError> {
     match change {
         Planned::Add { path, contents } => {
-            fs_safety::write_confined_names("apply_patch", dir, &path, contents.as_bytes(), names)?;
+            fs_safety::write_confined_names(tool, dir, &path, contents.as_bytes(), names)?;
             added.push(display(&path));
         }
         Planned::Delete { path } => {
-            fs_safety::remove_file_confined_names("apply_patch", dir, &path, names)?;
+            fs_safety::remove_file_confined_names(tool, dir, &path, names)?;
             deleted.push(display(&path));
         }
         Planned::Write { path, contents } => {
-            fs_safety::write_confined_names("apply_patch", dir, &path, contents.as_bytes(), names)?;
+            fs_safety::write_confined_names(tool, dir, &path, contents.as_bytes(), names)?;
             modified.push(display(&path));
         }
         Planned::Move { from, to, contents } => {
-            fs_safety::write_confined_names("apply_patch", dir, &to, contents.as_bytes(), names)?;
-            fs_safety::remove_file_confined_names("apply_patch", dir, &from, names)?;
+            fs_safety::write_confined_names(tool, dir, &to, contents.as_bytes(), names)?;
+            fs_safety::remove_file_confined_names(tool, dir, &from, names)?;
             modified.push(display(&to));
         }
     }
@@ -1625,6 +1814,43 @@ mod tests {
         );
     }
 
+    /// The shared write path names the tool it was called for in its errors:
+    /// `replace_in_file` writes through it, and its refusals must not say
+    /// `apply_patch`.
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_write_path_errors_name_the_calling_tool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("authorized_keys");
+        std::fs::write(&target, "k\n").expect("seed");
+        std::fs::hard_link(&target, dir.path().join("keys")).expect("hard link");
+        let hunk = Hunk::AddFile {
+            path: PathBuf::from("keys"),
+            contents: "x\n".into(),
+        };
+        for tool in ["replace_in_file", "apply_patch"] {
+            let err = apply_all_names(
+                tool,
+                std::slice::from_ref(&hunk),
+                dir.path(),
+                &CancellationToken::new(),
+                fs_safety::Names::Plain,
+            )
+            .err()
+            .expect("refused")
+            .to_string();
+            assert!(err.contains(tool), "{tool}: {err}");
+            let other = if tool == "apply_patch" {
+                "replace_in_file"
+            } else {
+                "apply_patch"
+            };
+            assert!(!err.contains(other), "{tool}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(&target).expect("outside"), "k\n");
+    }
+
     /// A pre-existing hard link inside the workspace names a file outside it.
     /// Every hunk kind that would write, delete or move it is refused while
     /// planning, so an earlier hunk in the same patch writes nothing either
@@ -2044,13 +2270,43 @@ fn a() {
         assert!(!dir.path().join("n.txt").exists());
     }
 
-    /// Git's `\ No newline at end of file` line is ignored in any position.
+    /// Git's `\ No newline at end of file` line sets the final-newline state
+    /// when it follows the last `+` or `-` line of a hunk that ends the file,
+    /// and is dropped with a note anywhere else.
     #[tokio::test]
-    async fn a_git_no_newline_line_is_ignored_and_noted() {
+    async fn a_git_no_newline_line_sets_the_final_newline_state_or_is_noted() {
         let marker = "\\ No newline at end of file";
+        // After the last `+` line: the result and the new file have no final
+        // newline. The marker after `-b` is mid-hunk and changes nothing.
         let patch = format!(
             "*** Begin Patch\n*** Update File: f.txt\n@@\n a\n-b\n{marker}\n+c\n{marker}\n\
              *** Add File: n.txt\n+one\n{marker}\n*** End Patch"
+        );
+        let (out, dir) = run_patch(&[("f.txt", "a\nb\n")], &patch).await;
+        let text = out.expect("applies");
+        assert!(!text.contains("is a git diff marker"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "a\nc"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
+            "one"
+        );
+        // After the last `-` line, with none after the last `+` line: the
+        // result gains a final newline.
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n a\n-b\n{marker}\n+c\n*** End Patch"
+        );
+        let (out, dir) = run_patch(&[("f.txt", "a\nb")], &patch).await;
+        out.expect("applies");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "a\nc\n"
+        );
+        // A marker that follows a context line is dropped with a note.
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n a\n{marker}\n-b\n+c\n*** End Patch"
         );
         let (out, dir) = run_patch(&[("f.txt", "a\nb\n")], &patch).await;
         let text = out.expect("applies");
@@ -2059,9 +2315,20 @@ fn a() {
             std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
             "a\nc\n"
         );
+        // A hunk that does not reach the end of the file keeps the final
+        // newline state, and the result says so.
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-a\n+z\n{marker}\n b\n*** End Patch"
+        );
+        let (out, dir) = run_patch(&[("f.txt", "a\nb\nc\n")], &patch).await;
+        let text = out.expect("applies");
+        assert!(
+            text.contains("does not end at the end of the file"),
+            "{text}"
+        );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
-            "one\n"
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "z\nb\nc\n"
         );
         // A content line that carries the text keeps it.
         let patch = format!("*** Begin Patch\n*** Add File: m.txt\n+{marker}\n*** End Patch");
@@ -2129,6 +2396,45 @@ fn a() {
             let (out, _dir) = run_patch(&[("f.rs", file)], &patch).await;
             out.expect_err(bad);
         }
+    }
+
+    /// A chunk that mixes ` `-prefixed and bare lines is refused: a bare line
+    /// there is likely a lost `-`, and reading it as context would keep a line
+    /// the patch meant to delete. A later all-bare chunk is still repaired.
+    #[tokio::test]
+    async fn a_bare_line_in_a_chunk_with_spaced_context_is_refused() {
+        let file = "a\nb\nd\n";
+        let patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n a\nb\n+c\n d\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.txt", file)], patch).await;
+        out.expect_err("refused");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            file
+        );
+        let file = "a\nb\nd\ne\nf\ng\n";
+        let patch =
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n a\n+x\n@@\ne\n-f\n+F\ng\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.txt", file)], patch).await;
+        out.expect("second chunk is all bare");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "a\nx\nb\nd\ne\nF\ng\n"
+        );
+    }
+
+    /// A `*** Move to:` line does not end the repairs of its Update section.
+    #[tokio::test]
+    async fn a_bare_line_after_a_move_to_line_is_still_context() {
+        let file = "one\ntwo\nthree\n";
+        let patch = "*** Begin Patch\n*** Update File: f.txt\n*** Move to: g.txt\n@@\none\n-two\n+2\nthree\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.txt", file)], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("no ' ', '+' or '-' prefix"), "{text}");
+        assert!(!dir.path().join("f.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("g.txt")).expect("read"),
+            "one\n2\nthree\n"
+        );
     }
 
     #[tokio::test]

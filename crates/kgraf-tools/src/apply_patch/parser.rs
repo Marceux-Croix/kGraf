@@ -126,6 +126,11 @@ pub struct UpdateFileChunk {
     /// If set to true, `old_lines` must occur at the end of the source file.
     /// (Tolerance around trailing newlines should be encouraged.)
     pub is_end_of_file: bool,
+
+    /// The final-newline state a git `\ No newline at end of file` line asked
+    /// for. It applies when the chunk reaches the end of the file:
+    /// `Some(false)` writes no final newline, `Some(true)` writes one.
+    pub final_newline: Option<bool>,
 }
 
 impl UpdateFileChunk {
@@ -358,7 +363,8 @@ fn test_parse_patch() {
                     old_lines: vec!["    pass".to_string()],
                     new_lines: vec!["    return 123".to_string()],
                     context_line_indices: vec![],
-                    is_end_of_file: false
+                    is_end_of_file: false,
+                    final_newline: None,
                 }]
             }
         ]
@@ -380,6 +386,7 @@ fn test_parse_patch_preserves_end_of_file_marker() {
                 new_lines: vec!["quux".to_string()],
                 context_line_indices: vec![],
                 is_end_of_file: true,
+                final_newline: None,
             }],
         }])
     );
@@ -401,6 +408,7 @@ fn test_parse_patch_lenient() {
             new_lines: vec!["import foo".to_string(), "bar".to_string()],
             context_line_indices: vec![(0, 0)],
             is_end_of_file: false,
+            final_newline: None,
         }],
     }];
     let expected_error =

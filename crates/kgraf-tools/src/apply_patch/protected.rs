@@ -206,7 +206,7 @@ fn apply_protected(
             fs_safety::Names::Plain
         };
         let group: Vec<Hunk> = group.iter().map(|h| h.hunk.clone()).collect();
-        match apply_all_names(&group, root, cancel, names) {
+        match apply_all_names("apply_patch", &group, root, cancel, names) {
             Ok(applied) => notes.extend(applied.notes),
             Err(e) => problems.push(e.to_string()),
         }

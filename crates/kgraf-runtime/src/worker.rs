@@ -4040,6 +4040,17 @@ impl Worker {
         if !is_error {
             for path in accesses[j].writes_paths() {
                 self.changed.insert(path.clone());
+                // A file that was edited, by any write tool, starts its count
+                // of rejected patches again. The keys are the paths as the
+                // patch headers spelled them, so a leading `./` is dropped
+                // before the comparison.
+                self.patch_failures_by_file.retain(|key, _| {
+                    std::path::Path::new(key)
+                        .components()
+                        .filter(|c| !matches!(c, std::path::Component::CurDir))
+                        .collect::<std::path::PathBuf>()
+                        != *path
+                });
                 self.done
                     .push(format!("{tool} wrote {}", path.to_string_lossy()));
                 // The workspace changed: identical calls (a test run, a re-read)
