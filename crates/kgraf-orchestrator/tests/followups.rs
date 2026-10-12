@@ -183,6 +183,8 @@ struct Factory {
     closed: Arc<AtomicUsize>,
     /// Builds still to fail.
     fail: AtomicUsize,
+    /// Said with every environment built (a replaced shared prefix).
+    notice: Option<String>,
 }
 
 struct Closer(Arc<AtomicUsize>);
@@ -217,6 +219,7 @@ impl AttemptEnvs for Factory {
         Ok(AttemptEnv {
             env: route.env.clone(),
             closer: Some(Box::new(Closer(self.closed.clone()))),
+            notice: self.notice.clone(),
         })
     }
 }
@@ -238,6 +241,7 @@ async fn each_attempt_runs_in_the_environment_built_for_its_worktree() {
         built: Mutex::new(Vec::new()),
         closed: Arc::new(AtomicUsize::new(0)),
         fail: AtomicUsize::new(0),
+        notice: None,
     });
     let report = Orchestrator::new(config(), p.services(WINDOW))
         .expect("orchestrator")
@@ -263,6 +267,41 @@ async fn each_attempt_runs_in_the_environment_built_for_its_worktree() {
     );
 }
 
+/// An environment builder that replaced the shared prefix says so: the
+/// notice reaches the trace under the attempt's contract and worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_shared_prefix_is_said_in_the_trace() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[c("a", "make a", "src/a.rs", &[])]);
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let factory = Arc::new(Factory {
+        built: Mutex::new(Vec::new()),
+        closed: Arc::new(AtomicUsize::new(0)),
+        fail: AtomicUsize::new(0),
+        notice: Some("the shared prefix changed from aaa to bbb".into()),
+    });
+    Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_attempt_envs(factory)
+        .start(RunId::new("r1"), "make a".into())
+        .await
+        .expect("run");
+    let trace = trace_of(&p).await;
+    assert!(
+        trace.iter().any(|e| matches!(
+            e,
+            TraceEvent::Notice { contract, worker, detail, .. }
+                if contract == "a" && worker == "r1-a-r0-a0" && detail.contains("aaa to bbb")
+        )),
+        "{trace:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_whose_environment_cannot_be_built_fails_loudly() {
     let dir = tempfile::tempdir().expect("dir");
@@ -277,6 +316,7 @@ async fn an_attempt_whose_environment_cannot_be_built_fails_loudly() {
         built: Mutex::new(Vec::new()),
         closed: Arc::new(AtomicUsize::new(0)),
         fail: AtomicUsize::new(usize::MAX),
+        notice: None,
     });
     let report = Orchestrator::new(config(), p.services(WINDOW))
         .expect("orchestrator")
@@ -383,6 +423,7 @@ async fn an_environment_that_recovers_is_retried_and_the_contract_verifies() {
         built: Mutex::new(Vec::new()),
         closed: Arc::new(AtomicUsize::new(0)),
         fail: AtomicUsize::new(2),
+        notice: None,
     });
     let mut cfg = config();
     cfg.max_retries = 0;

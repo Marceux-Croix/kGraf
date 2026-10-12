@@ -140,3 +140,20 @@ its attempts were assembled with no graph, and both died at spawn before any mod
 source of that mismatch is also closed: when the build found nothing to index, an attempt now
 opens the graph at assembly if it holds nodes by then, since the run indexes its own writes as
 contracts finish.
+
+## Amendment (2026-10-11): a prefix that really changed replaces the old one, said
+
+Seen live: after a re-plan, the first worker spawned and the next two died at spawn with
+"already has prefix ...; a different prefix ... must replace it explicitly". The cause was not a
+worker-specific byte. The graph tool is listed only while an attempt holds a graph, and the
+graph appeared mid-run (the run indexes its own writes), so the tool list, and so the shared
+prefix, differed between two attempts of one run. That is a real change of the shared content.
+The assembler now replaces the run's prefix for the vendor and model with the new attempt's
+(`PrefixRegistry::replace`), which records an invalidation, and the attempt's start puts a trace
+notice naming vendor, model, old digest, new digest and the cause. The first request on the new
+prefix is a cache miss, and that is said. The refusal at spawn is unchanged: an environment
+built outside the assembler, or a prefix that disagrees without a replacement, still fails
+loud, as does a worker-specific byte (`refuse_worker_specific`).
+
+Tests: `a_graph_that_appears_mid_run_replaces_the_shared_prefix_and_says_so` (host),
+`a_replaced_shared_prefix_is_said_in_the_trace` (orchestrator).

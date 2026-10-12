@@ -400,7 +400,11 @@ fleet pays one prompt-cache write between them rather than one each. A
 **private remainder** carries the brief, this worker's own slices, and its
 transcript. Provider caches key on an exact prefix rather than on a
 conversation, which is what makes the sharing possible; one worker-specific
-byte before the breakpoint removes the effect entirely. Selective reading
+byte before the breakpoint removes the effect entirely. When the shared
+content really changes mid-run (a graph that appears adds the graph tool),
+the next attempt's prefix replaces the run's for that vendor and model, with
+a trace notice naming both digests; the spawn refusal stays for any other
+disagreement. Selective reading
 beyond the pool happens the way it already does: the worker asks the graph,
 and that read is charged to it alone. The Anthropic adapter also marks the
 last block of the last message as a cache breakpoint, so the growing history is

@@ -2613,6 +2613,7 @@ impl kgraf_orchestrator::AttemptEnvs for PanicEnvs {
         Ok(kgraf_orchestrator::AttemptEnv {
             env: route.env.clone(),
             closer: None,
+            notice: None,
         })
     }
 }

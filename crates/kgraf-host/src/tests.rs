@@ -1434,6 +1434,123 @@ async fn an_attempt_opens_a_graph_indexed_after_the_build_found_none() {
     }
 }
 
+/// A graph that appears mid-run adds the graph tool to the next attempt's
+/// tool list, so its shared prefix differs from the earlier attempt's (seen
+/// live: a re-plan's second contract failed at spawn with "already has
+/// prefix"). The assembler replaces the run's prefix for the vendor and
+/// model, says so with both digests, and the spawn guard admits the new
+/// prefix. The guard still refuses the old one afterward: two different
+/// prefixes never share a slot unannounced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_graph_that_appears_mid_run_replaces_the_shared_prefix_and_says_so() {
+    let dir = tempfile::tempdir().expect("dir");
+    let root = dir.path().join("repo");
+    let base = dir.path().join("ws");
+    let r = repo_in(
+        dir,
+        root,
+        &base,
+        &[(
+            "iface/src/lib.rs",
+            "pub fn order_total() -> i64 {\n    42\n}\n",
+        )],
+    );
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let graph_path = state.join("graph.db");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(ShellCaller),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let prefixes = Arc::new(kgraf_runtime::PrefixRegistry::new());
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path: graph_path.clone(),
+        indexed: false,
+        ledger: ledger.clone(),
+        config: WorkerConfig::with_servers(vec![]).expect("config"),
+        max_output_tokens: 1_000,
+        max_checkpoints: 3,
+        reasoning: Default::default(),
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: prefixes.clone(),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
+        skill_directory: Default::default(),
+        refusal_directory: Default::default(),
+        permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
+    };
+    let route = Route {
+        name: "fake:m".into(),
+        vendor: "fake".into(),
+        env: Arc::new(kgraf_runtime::WorkerEnv::new(
+            ledger.clone(),
+            Arc::new(ShellCaller),
+            Arc::new(kgraf_tools::ToolRegistry::new()),
+            assemble_prefix(),
+        )),
+        context: ContextConfig::for_model(200_000).expect("context"),
+        readiness: Arc::new(kgraf_orchestrator::AlwaysReady),
+        local: false,
+    };
+    // First attempt: no graph yet. Its spawn admits the first prefix.
+    let ws1 = worktree(&r, "w-early").await;
+    let early = assembler
+        .build(&route, &ws1, &"w-early".into(), &"r9/c-early".into())
+        .await
+        .expect("early built");
+    assert!(early.notice.is_none(), "the first prefix replaces nothing");
+    prefixes.admit(&early.env.prefix).expect("first admitted");
+    // The run indexes its own writes; the next attempt opens that graph.
+    {
+        let g = GraphStore::open(&graph_path, &r.root).expect("graph");
+        kgraf_graph::Indexer::new(&g).index().expect("index");
+    }
+    let ws2 = worktree(&r, "w-late").await;
+    let late = assembler
+        .build(&route, &ws2, &"w-late".into(), &"r9/c-late".into())
+        .await
+        .expect("late built");
+    assert_ne!(
+        early.env.prefix.digest(),
+        late.env.prefix.digest(),
+        "the graph tool changes the prefix"
+    );
+    let notice = late.notice.as_deref().expect("the replacement is said");
+    assert!(
+        notice.contains(early.env.prefix.digest().as_str())
+            && notice.contains(late.env.prefix.digest().as_str())
+            && notice.contains("graph"),
+        "{notice}"
+    );
+    let changes = prefixes.invalidations();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    // The spawn guard admits the replacement and still refuses a stray prefix.
+    prefixes
+        .admit(&late.env.prefix)
+        .expect("replacement admitted");
+    assert!(prefixes.admit(&early.env.prefix).is_err());
+    for built in [early, late] {
+        if let Some(closer) = built.closer {
+            closer.close().await;
+        }
+    }
+}
+
 /// Item 2: each attempt's environment is assembled in its own worktree.
 /// The shell runs in that worktree (two attempts see their own files),
 /// its approval hook denies an unapproved write (a delegate never asks),

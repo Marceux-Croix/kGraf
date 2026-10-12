@@ -220,7 +220,7 @@ impl AttemptAssembler {
         worker: &kgraf_core::AgentId,
         task: &kgraf_core::TaskId,
         granted: &[String],
-    ) -> std::result::Result<Assembled, String> {
+    ) -> std::result::Result<(Assembled, Option<String>), String> {
         let ws = self
             .workspaces
             .get(workspace)
@@ -231,12 +231,46 @@ impl AttemptAssembler {
         assembly.config = assembly
             .config
             .with_granted_programs(granted.iter().cloned());
+        let graph_open = assembly.graph.is_some();
         let assembled = assemble(assembly).await.map_err(|e| format!("{e:#}"))?;
         if let Some(session) = &assembled.env.skills {
             self.skill_directory.register(session);
         }
-        Ok(assembled)
+        // Decision 0043, amended 2026-10-11: the graph tool is listed only
+        // while an attempt holds a graph, and a graph can appear mid-run (the
+        // run indexes its own writes), so a later attempt's tool list, and so
+        // its prefix, can differ from an earlier one's. That is a real change
+        // of the shared content, not a worker-specific byte: this attempt's
+        // prefix replaces the run's for the vendor and model, said and
+        // recorded, instead of the spawn refusing it. The refusal at spawn
+        // stays for every other disagreement.
+        let notice = self
+            .prefixes
+            .replace(&assembled.env.prefix)
+            .map(|change| prefix_replaced_notice(&change, graph_open));
+        Ok((assembled, notice))
     }
+}
+
+/// The notice for a replaced shared prefix: both digests and the cause the
+/// assembler can name. The old prefix's cache entry is no longer shared.
+pub(crate) fn prefix_replaced_notice(
+    change: &kgraf_runtime::PrefixInvalidation,
+    graph_open: bool,
+) -> String {
+    format!(
+        "the shared prefix for vendor `{}` model `{}` changed from {} to {}: {}. The new prefix replaces the old one for later workers; their \
+         first request is a cache miss.",
+        change.vendor,
+        change.model,
+        change.old,
+        change.new,
+        if graph_open {
+            "this attempt holds a graph, so the graph slice tool is listed"
+        } else {
+            "this attempt has no graph, so the graph slice tool is not listed"
+        },
+    )
 }
 
 /// The check a worker's write to kGraf's settings must pass (decision
@@ -286,12 +320,13 @@ impl AttemptEnvs for AttemptAssembler {
         task: &kgraf_core::TaskId,
         granted: &[String],
     ) -> std::result::Result<AttemptEnv, String> {
-        let assembled = self
+        let (assembled, notice) = self
             .assembled(route, workspace, worker, task, granted)
             .await?;
         Ok(AttemptEnv {
             env: assembled.env.clone(),
             closer: Some(Box::new(AssembledCloser(assembled))),
+            notice,
         })
     }
 }
@@ -327,7 +362,7 @@ impl AttemptEnvs for ResolverOverride {
         task: &kgraf_core::TaskId,
         granted: &[String],
     ) -> std::result::Result<AttemptEnv, String> {
-        let mut assembled = self
+        let (mut assembled, notice) = self
             .inner
             .assembled(route, workspace, worker, task, granted)
             .await?;
@@ -342,6 +377,7 @@ impl AttemptEnvs for ResolverOverride {
         Ok(AttemptEnv {
             env: assembled.env.clone(),
             closer: Some(Box::new(AssembledCloser(assembled))),
+            notice,
         })
     }
 }

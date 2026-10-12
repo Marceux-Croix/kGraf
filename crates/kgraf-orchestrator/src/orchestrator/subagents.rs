@@ -1453,6 +1453,7 @@ impl RunLoop {
                 None => Ok(AttemptEnv {
                     env: route_env,
                     closer: None,
+                    notice: None,
                 }),
                 Some((envs, route)) => envs
                     .build(&route, &brief.workspace_root, &brief.worker, &brief.task)
@@ -1460,7 +1461,7 @@ impl RunLoop {
                     .map_err(|e| format!("the subagent's environment could not be built: {e}")),
             };
             let (result, env_failure) = match built {
-                Ok(AttemptEnv { env, closer }) => {
+                Ok(AttemptEnv { env, closer, .. }) => {
                     // The one attempt runner: a child's inbox is injected at
                     // spawn and its deliveries are marked, as a worker's.
                     let r = run_attempt(

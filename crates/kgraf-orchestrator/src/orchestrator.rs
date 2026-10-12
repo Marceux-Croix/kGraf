@@ -492,6 +492,9 @@ pub trait AttemptEnvs: Send + Sync {
 /// An attempt's environment, and what to close once its worker has finished.
 pub struct AttemptEnv {
     pub env: Arc<WorkerEnv>,
+    /// Said in the trace when the attempt starts: the builder replaced the
+    /// run's shared prefix for this vendor and model (decision 0043).
+    pub notice: Option<String>,
     /// Closed after the worker ends and `env` is dropped (MCP connections).
     pub closer: Option<Box<dyn CloseEnv>>,
 }
@@ -1111,6 +1114,13 @@ enum LoopMsg {
     Subagent(Box<subagents::SubagentMsg>),
     /// A speculative merge round finished off the loop (decision 0074).
     Speculated(Box<speculate::SpecDone>),
+    /// A fact an attempt's environment build reports (decision 0043: the
+    /// shared prefix it replaced), traced as a notice.
+    AttemptNotice {
+        contract: String,
+        worker: AgentId,
+        detail: String,
+    },
 }
 
 /// Controls a running orchestrator: stop, steer, status (full directional control).
@@ -4421,6 +4431,20 @@ impl RunLoop {
                 Some(LoopMsg::Session(w)) => on_heap(|| self.on_session_work(*w)).await?,
                 Some(LoopMsg::Subagent(m)) => on_heap(|| self.on_subagent(*m)).await?,
                 Some(LoopMsg::Speculated(done)) => on_heap(|| self.on_speculated(*done)).await?,
+                Some(LoopMsg::AttemptNotice {
+                    contract,
+                    worker,
+                    detail,
+                }) => {
+                    let at = self.now();
+                    self.trace(TraceEvent::Notice {
+                        at_ms: at,
+                        contract,
+                        worker: worker.to_string(),
+                        detail: kgraf_secrets::scrub_persist_owned(detail),
+                    })
+                    .await?;
+                }
                 Some(LoopMsg::PortError(e)) => {
                     let at = self.now();
                     self.trace(TraceEvent::Deferred {
@@ -6361,11 +6385,15 @@ impl RunLoop {
         // below, `LoopMsg::Finished` is never sent, `in_flight` never empties
         // for this contract, and the run (and `stop`) hangs forever holding
         // its `MachineGate` slot. Same pattern as `starter.rs`.
+        let notice_tx = self.tx.clone();
+        let notice_contract = contract.contract.clone();
+        let notice_worker = worker.clone();
         let task = tokio::spawn(async move {
             let built = match attempt_env {
                 None => Ok(AttemptEnv {
                     env: route_env,
                     closer: None,
+                    notice: None,
                 }),
                 Some((envs, route)) => envs
                     .build_granted(
@@ -6380,7 +6408,20 @@ impl RunLoop {
             };
             let mut env_failure = None;
             let finished = match built {
-                Ok(AttemptEnv { env, closer }) => {
+                Ok(AttemptEnv {
+                    env,
+                    closer,
+                    notice,
+                }) => {
+                    if let Some(detail) = notice {
+                        let _ = notice_tx
+                            .send(LoopMsg::AttemptNotice {
+                                contract: notice_contract,
+                                worker: notice_worker,
+                                detail,
+                            })
+                            .await;
+                    }
                     let finished = run_attempt(
                         env,
                         brief,
