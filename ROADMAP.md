@@ -16,6 +16,8 @@ what is planned next, as things you can do or expect, not as an internal project
   AI), AWS Bedrock, Azure OpenAI, DeepSeek, xAI, z.ai, Qwen, Llama-based hosts and local
   models such as llama.cpp. Those routes are built and tested against recorded replies only;
   `docs/MODEL-SUPPORT.md` says which routes have run against the real service.
+  A route for Apple MLX servers (`mlx_lm.server`) is planned. Until then an MLX server can be
+  reached through the `llama-cpp` route's movable address (`KGRAF_LLAMA_CPP_BASE_URL`), unverified.
 - A route can serve a kind of model other than a chat model: embeddings, reranking and typed
   decisions (for example a local System-One server). The orchestrator decides when to use one;
   nothing calls one on its own (decision 0089).
