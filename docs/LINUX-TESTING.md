@@ -2,16 +2,14 @@
 
 ## Linux self-test in GitHub Actions
 
-kGraf's Linux sandbox needs unprivileged user namespaces. Dependency installs that are
-limited to the egress proxy, and hidden folders inside a writable tree, both depend on
-them. Ubuntu 23.10 and later block user namespaces for ordinary programs
+kGraf's Linux sandbox needs unprivileged user namespaces. Dependency installs limited to
+kGraf's local egress proxy (the only network route a sandboxed install has), and hidden
+folders inside a writable tree, both depend on them. Ubuntu 23.10 and later block user namespaces for ordinary programs
 (`kernel.apparmor_restrict_unprivileged_userns=1`) unless an AppArmor profile grants the
 `userns` permission to that program. The kGraf `.deb` carries such a profile for the
 installed program.
 
-The `linuxtest.yml` workflow tests this on a real Ubuntu 24.04 machine. Before it existed,
-the Linux tests ran only as root in a container. That never used the unprivileged path, a
-real package install or AppArmor.
+The `linuxtest.yml` workflow tests this on a real Ubuntu 24.04 machine.
 
 ### Start it
 
@@ -22,8 +20,8 @@ gh run download <run id> -n kgraf-linux-selftest
 ```
 
 The workflow has a manual trigger only. It takes about 30 minutes, most of it the release
-build of the package, and stops after 60. Linux minutes bill at the base rate on the free
-tier. The artifact is kept for 14 days.
+build of the package, and stops after 60. The repository is public, so standard runners
+cost nothing. The artifact is kept for 14 days.
 
 Two optional inputs:
 

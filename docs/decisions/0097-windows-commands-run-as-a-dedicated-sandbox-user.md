@@ -1,8 +1,40 @@
 # Decision 0097: On Windows, sandboxed commands run as a dedicated local sandbox user, set up once with administrator rights
 
 **Status:** Accepted (2026-10-08). Status as of 2026-10-11: setup, the runner, the launch path and the access-list confinement are built and have run on a GitHub-hosted Windows Server 2025 runner (x86_64, Git for Windows installed). The last full run passed except for one named gap: DNS is not confined on that Windows version. They have not run on a standard-user Windows 11 machine, on ARM64, or on another Windows version.
+**Supersedes:** 0011 (in part: the Windows token design)
 **Deciders:** the project maintainer.
 **Related:** 0011 (sandboxing per platform; its Windows token design is superseded here), 0084 (the build and test allowlist and read grants), 0087 (dependency installs and the egress proxy), 0083 (host writes never follow a link).
+
+## Current state
+
+Checked against the code on 2026-10-12. Where the history below disagrees, this block holds.
+
+- **Backend.** After `kgraf sandbox setup` (run once, with administrator rights), every sandboxed command on Windows runs as a dedicated local user, with that user's own token and no restricting SIDs. Without setup, the restricted-token sandbox of decision 0011 runs. It does not block the network, and a notice says so.
+- **Users.** Each worker slot has one user without the network and one with it. The slot count is 4 by default and at most 99. A fixed offline user and a fixed online user also exist.
+- **Slots.** A command leases the slot of its first writable root. Two folders never share a slot. When another folder holds every slot, the command is refused. This replaces the earlier fold rule and the single online user.
+- **Files.** Access-control entries confine writes and reads.
+- **Network.** Firewall rules and seven Windows Filtering Platform filters block the users without the network. Their commands reach only kGraf's egress proxy, on a port from 47100 to 47131.
+- **Launch.** `kgraf-sandbox-runner` starts each command. A launcher service, `kgraf-launcher-<hash>`, installed by setup, starts the runner in session 0, so cargo and rustc can create named objects. If setup cannot prove the service, it grants the sandbox group named-object rights in the owner's session. That boundary is weaker, and every report says so.
+- **Known gap.** DNS. Windows Server 2025 refuses the two name resolution cache filters, so a lookup by a user without the network leaves the machine. `kgraf sandbox selfcheck` fails on its `dns:` line alone.
+- **Proved on** a hosted Windows Server 2025 runner (x86_64) only. It has not run on standard-user Windows 11, ARM64 or another Windows version.
+
+### Amendment index
+
+- [Amendment (2026-10-08): the runner, the launch path and the ACLs](#amendment-2026-10-08-the-runner-the-launch-path-and-the-acls)
+- [Amendment (2026-10-08): the access-list lock, owners of files in a granted tree, and a removal that finishes](#amendment-2026-10-08-the-access-list-lock-owners-of-files-in-a-granted-tree-and-a-removal-that-finishes)
+- [Amendment (2026-10-08): where the access-list lock is held, and a slot whose revokes fail](#amendment-2026-10-08-where-the-access-list-lock-is-held-and-a-slot-whose-revokes-fail)
+- [Amendment (2026-10-08): the undo record's folder and the deny entries](#amendment-2026-10-08-the-undo-records-folder-and-the-deny-entries)
+- [Amendment (2026-10-09): one entry set at the root and on every existing child](#amendment-2026-10-09-one-entry-set-at-the-root-and-on-every-existing-child)
+- [Amendment (2026-10-09): what the first Windows run of setup and remove found](#amendment-2026-10-09-what-the-first-windows-run-of-setup-and-remove-found)
+- [Amendment (2026-10-09): a current folder in a granted tree no longer stops a grant or a revoke](#amendment-2026-10-09-a-current-folder-in-a-granted-tree-no-longer-stops-a-grant-or-a-revoke)
+- [Amendment (2026-10-09): what the second Windows run of setup found](#amendment-2026-10-09-what-the-second-windows-run-of-setup-found)
+- [Amendment (2026-10-09): what the first re-run as the sandbox user found](#amendment-2026-10-09-what-the-first-re-run-as-the-sandbox-user-found)
+- [Amendment (2026-10-09): what the second re-run as the sandbox user found](#amendment-2026-10-09-what-the-second-re-run-as-the-sandbox-user-found)
+- [Amendment (2026-10-09): a launcher service starts a sandboxed command in session 0, so cargo and rustc run](#amendment-2026-10-09-a-launcher-service-starts-a-sandboxed-command-in-session-0-so-cargo-and-rustc-run)
+- [Amendment (2026-10-10): a session-0 launch names the runner the service was installed with](#amendment-2026-10-10-a-session-0-launch-names-the-runner-the-service-was-installed-with)
+- [Amendment (2026-10-10): the command's own window station in session 0, and a self-test that can read clean](#amendment-2026-10-10-the-commands-own-window-station-in-session-0-and-a-self-test-that-can-read-clean)
+- [Amendment (2026-10-11): what a full Windows run counted, and a run that fits its budget](#amendment-2026-10-11-what-a-full-windows-run-counted-and-a-run-that-fits-its-budget)
+- [Amendment (2026-10-11): the confirmation run read clean, one gap stays, and what the AppContainer probe found](#amendment-2026-10-11-the-confirmation-run-read-clean-one-gap-stays-and-what-the-appcontainer-probe-found)
 
 This record exists so the Windows sandbox model is not re-argued. If a future
 contributor asks "why does kGraf create Windows user accounts," the reasoning is here.
@@ -2272,22 +2304,20 @@ nothing under "Not run" says `not run: budget`; (f) leaves nothing.
 
 ## Amendment (2026-10-11): the confirmation run read clean, one gap stays, and what the AppContainer probe found
 
-A full Windows self-test with the sandbox user phase read `ALL PASSED` on GitHub run
-38163271605 (pin `69d798cb`, started 18:18 UTC, ended 20:18 UTC; Windows Server 2025
-Datacenter 24H2, build 26100.33438). It names one known gap: DNS. This closes the campaign
+A full Windows self-test with the sandbox user phase read `ALL PASSED` on a hosted runner
+(started 18:18 UTC, ended 20:18 UTC; Windows Server 2025 Datacenter 24H2, build 26100.33438). It names one known gap: DNS. This closes the campaign
 that began with the first filtered run of the fixes below. The numbers are from the reports
-of the runs; `docs/WINDOWS-TESTING.md`, "Campaign summary", holds the
-summary table.
+of the runs. The table lists them in order.
 
-| GitHub run | Pin | Result |
-|---|---|---|
-| 38101426277 | `056ec4b3` | Filtered to 8 tests: ALL PASSED. 17 baseline failures listed apart. |
-| 38104966373 | `ea643ad9` | Cancelled at the 120 minute job limit during the bundle step. No report. |
-| 38112396765 | `3af966b0` | INCOMPLETE (budget 115 min): 46 tests and 1 end-to-end check counted; 103 listed apart. |
-| 38124181868 | `f0ebf25d` | 2 tests counted; 143 listed apart. |
-| 38134080482 | `3a1117c2` | 2 tests counted; 144 listed apart. |
-| 38149445796 | `300ef853` | 9 tests counted and 1 binary hung; 135 listed apart. |
-| 38163271605 | `69d798cb` | ALL PASSED; 144 listed apart; known gap: DNS only. |
+| Run | Result |
+|---|---|
+| 1 | Filtered to 8 tests: ALL PASSED. 17 baseline failures listed apart. |
+| 2 | Cancelled at the 120 minute job limit during the bundle step. No report. |
+| 3 | INCOMPLETE (budget 115 min): 46 tests and 1 end-to-end check counted; 103 listed apart. |
+| 4 | 2 tests counted; 143 listed apart. |
+| 5 | 2 tests counted; 144 listed apart. |
+| 6 | 9 tests counted and 1 binary hung; 135 listed apart. |
+| 7 | ALL PASSED; 144 listed apart; known gap: DNS only. |
 
 What the last run showed. 181 test binaries ran, 170 clean, none hung. 5,577 tests passed;
 the baseline had 143 failures and 1 failed end-to-end check (`shell.git_bash`), and all 144
@@ -2366,7 +2396,7 @@ packet attribution and a way to run git and rustc in it. The probe-only run belo
 attribution; the tool access does not exist, so 0097 keeps the dedicated sandbox user and the
 recorded DNS gap.
 
-Probe-only run (2026-10-11, GitHub run 38179466993). With per-packet names and the DNS Client
+Probe-only run (2026-10-11, on a hosted runner). With per-packet names and the DNS Client
 log, which names the calling process in each event: inside the container, getaddrinfo and
 `DnsQuery_W` were both refused (status 87 within about 2 ms), the service logged no send and no
 answer for the container's processes, and the capture held no DNS packet at all. The control

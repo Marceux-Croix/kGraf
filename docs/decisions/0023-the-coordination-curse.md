@@ -3,6 +3,7 @@
 **Status:** Accepted. Corrects a factual error in decision 0022. Challenges the
 premise, shared by decisions 0012, 0016, and 0022, that collision control is
 what stands between kGraf and working concurrency.
+**Amends:** 0022 (corrects a figure)
 **Amended by:** 0024 (the go/no-go criterion)
 **Related:** decisions 0009, 0012, 0016, 0018, 0022
 

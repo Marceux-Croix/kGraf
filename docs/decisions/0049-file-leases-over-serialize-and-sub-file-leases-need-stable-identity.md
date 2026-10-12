@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Amends the acceptance criterion in decision 0022 and extends the
 granularity note in decision 0048.
+**Amends:** 0022 (the acceptance criterion), 0048 (extends the granularity note)
 **Related:** decisions 0010, 0015, 0022, 0048
 
 This record exists so the next review of write-lease granularity does not have to re-derive

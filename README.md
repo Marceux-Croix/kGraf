@@ -41,13 +41,22 @@ own provider keys. There is no account, no hosted service and no telemetry.
 | **Every token accounted** | Every model call goes through a hash-chained ledger. `kgraf spend` totals it, and `kgraf ledger verify` walks the chain. |
 | **Reads your roadmap** | Turns `ROADMAP.md`, `TODO.md` and similar files into work nodes, and flags where the document and the code disagree. |
 | **Uses your existing setup** | Reads the `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` and `SKILL.md` files your other coding agents already use. Connects to MCP servers, local or hosted. |
-| **Scheduled runs** | Cron or one-shot schedules attached to work nodes. The desktop app fires them while it sits in the tray. |
+| **Scheduled runs** | Cron or one-shot schedules attached to work nodes. The desktop app fires them while it sits in the tray. This is tested against a live provider, not yet checked by hand on a real tray icon. |
 | **Secrets stay out of transcripts** | Transcripts are scrubbed with gitleaks rules plus a registry of your own secrets. |
 
 ## Quick start
 
 kGraf builds from source. You need [Rust](https://rustup.rs) and git. `rustup` installs the
-toolchain version the repository pins (`rust-toolchain.toml`) on the first build.
+toolchain version the repository pins (`rust-toolchain.toml`) on the first build. On Linux,
+the desktop app also needs system libraries:
+
+```bash
+sudo apt-get install -y --no-install-recommends \
+  pkg-config libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
+  libxkbcommon-dev libwayland-dev libssl-dev libglib2.0-dev
+```
+
+Then build and install:
 
 ```bash
 git clone https://github.com/Marceux-Croix/kGraf.git
@@ -75,16 +84,18 @@ kgraf-app --project /path/to/your/repo
 ```
 
 **Run a team of agents.** Set each provider key in your shell environment. (The Vertex AI
-route can also use Google credential files.) Workers build with the network off, so let kGraf fetch the project's dependencies
-when a run needs them (once per project; or run `cargo fetch` yourself). Then give the
-orchestrator an instruction:
+and Bedrock routes also read cloud credential files.) Workers build with the network off,
+so let kGraf fetch the project's dependencies when a run needs them (once per project, or
+run `cargo fetch` yourself). Then give the orchestrator an instruction. `--verify` is the
+command that decides whether a worker's attempt passes. It defaults to
+`cargo test --workspace`, so name your project's own test command:
 
 ```bash
 export KGRAF_KIMI_API_KEY=...
 export KGRAF_OPENAI_API_KEY=...
 kgraf deps allow
 kgraf orchestrate --route kimi:<model-id> --route openai:<model-id> \
-  --instruction task.txt --prices prices.json
+  --instruction task.txt --prices prices.json --verify "<your test command>"
 ```
 
 `prices.json` holds one entry per model, in micro-dollars per million tokens (3000000 is $3):
@@ -104,7 +115,7 @@ kgraf orchestrate --route kimi:<model-id> --route openai:<model-id> \
 A model missing from the file still runs; its spend is reported as unpriced, never as
 zero. `{}` is a valid file. `kgraf orchestrate` exits non-zero unless the run completed.
 
-The [usage guide](docs/USAGE.md) covers every command, flag and window in detail.
+The [usage guide](docs/USAGE.md) covers the user-facing commands, flags and windows.
 
 ## How it works
 
@@ -149,40 +160,31 @@ Prebuilt packages are not published yet. Local packaging scripts build them from
 | Linux | `scripts/package-linux.sh` | Tarball and `.deb` |
 | Windows | `scripts/package-windows.sh` | x64 `.msi` and `.zip` |
 
-On Windows, kGraf needs Git for Windows (git and Git Bash). It is not bundled; kGraf offers
-to install it with `winget` at first start, and says how to install it by hand when it
-cannot (see the Installers section of `docs/USAGE.md`).
+On Windows, kGraf needs Git for Windows. It is not bundled; see
+[Platform notes](docs/USAGE.md#platform-notes).
 
-The packages are not yet signed with a developer certificate, so expect Gatekeeper and
-SmartScreen warnings. `scripts/release-all.sh` builds all three from one git tag.
+`scripts/release-all.sh` builds all three from one git tag. The packages are unsigned; see
+[Platform notes](docs/USAGE.md#platform-notes).
 
 ## Project status
 
 kGraf is **pre-release** software. The command line and the desktop app work today, and
 orchestrated runs across providers have run live end to end. Some parts are still open,
 such as signed installers and a few desktop workflows. [ROADMAP.md](ROADMAP.md) lists what
-each phase has and what it still lacks.
+works today, what is in progress and what is planned.
 
-### What it costs
-
-kGraf makes no claim to save tokens. A multi-agent run uses more tokens than one
-agent on the same work ([ARCHITECTURE.md](ARCHITECTURE.md) explains why). The case for
-kGraf is control, visibility, and the freedom to give each part of a job to the model that
-suits it. Every token is on the ledger, so you always see where the money went.
+kGraf makes no claim to save tokens. A multi-agent run uses more tokens than one agent on
+the same work ([ARCHITECTURE.md](ARCHITECTURE.md) explains why). Every token is on the ledger.
 
 ## Privacy
 
 - Local only and single-user. No hosted mode, no account, no telemetry.
-- Network traffic has four classes, and no others:
-  1. Model providers you configure. These calls carry code from your repository.
-  2. MCP servers you configure, local or hosted.
-  3. Package registries, for a project where you allow it (`kgraf deps allow`): crates.io,
-     and for `kgraf deps allow <npm|python|go|maven|gradle|dotnet|composer|bundler>` the
-     registries of that package manager. kGraf never fetches unasked.
-  4. GitHub Releases, only if you turn on the update check (off by default). On Windows,
-     `winget` downloads Git for Windows, only if you agree.
-- API keys come from your shell environment. The Vertex AI route can also read Google
-  credential files.
+- Network traffic goes to model providers and MCP servers you configure, to package
+  registries where you allow it, and to GitHub only for the opt-in update check. The full
+  list, including a Windows exception, is in the
+  [usage guide](docs/USAGE.md#privacy-and-what-lives-where).
+- API keys come from your shell environment. The Vertex AI and Bedrock routes also read
+  cloud credential files.
 - A small local diagnostics file records usage counts and errors. It is never sent
   anywhere. `kgraf diag show` reads it.
 
@@ -191,13 +193,12 @@ suits it. Every token is on the ledger, so you always see where the money went.
 | Path | Contents |
 |---|---|
 | [`crates/`](crates) | The Rust workspace: graph, providers, runtime, orchestrator, sandbox, galaxy renderer, desktop shell and CLI |
-| [`docs/`](docs) | Usage guide, decision records, error glossary |
 | [`third_party/`](third_party) | Code taken from permissively licensed projects, each with its `UPSTREAM` record |
 | [`scripts/`](scripts), [`packaging/`](packaging) | Installers and release tooling |
 
 ## Documentation
 
-- [Usage guide](docs/USAGE.md): every command and the desktop app
+- [Usage guide](docs/USAGE.md): the commands and the desktop app
 - [ARCHITECTURE.md](ARCHITECTURE.md): system design
 - [ROADMAP.md](ROADMAP.md): phases and status
 - [docs/decisions/](docs/decisions): architecture decision records
@@ -212,7 +213,7 @@ a pull request, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 kGraf stands on permissively licensed open source. It reuses code from projects that
 include codex-rs, container-use, codebase-memory-mcp, aider, Graphiti, litellm, gitleaks,
-rerun and `rmcp`, and takes design ideas from Haystack, CowAgent and others. Each copy's origin is in
+rerun, `rmcp`, Haystack and CowAgent, and takes design ideas from others. Each copy's origin is in
 `third_party/<name>/UPSTREAM`, and every dependency's license is in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

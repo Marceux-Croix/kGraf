@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Refines decision 0056 and replaces its planned compaction method.
 Thresholds superseded by the addendum below.
+**Amends:** 0056 (replaces its planned compaction method)
 **Amended by:** 0095 (a worker may compact once, by the runtime)
 **Related:** decisions 0043, 0055, 0056
 

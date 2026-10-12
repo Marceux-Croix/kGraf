@@ -1,7 +1,7 @@
 # Decision 0046: The local-decider negative was a category error, not a data gap
 
-**Status:** Accepted. Amends the diagnosis in decision 0045. Superseded in part by decision
-0047.
+**Status:** Accepted. Amends the diagnosis in decision 0045. Amended by decision 0047.
+**Amends:** 0045 (the diagnosis)
 **Amended by:** 0047
 **Related:** decisions 0042, 0044, 0045
 

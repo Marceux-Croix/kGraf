@@ -1,6 +1,6 @@
 # Validation gates: fmt check, clippy -D warnings, test.
-# Ubuntu-only by design: Actions minutes are limited, and macOS and Windows
-# runners bill at a higher per-minute rate than Linux. Cross-platform build
+# Ubuntu-only by design: in a private copy macOS and Windows runners bill at
+# a higher per-minute rate than Linux. Cross-platform build
 # correctness is instead exercised by the release workflow's per-platform
 # matrix (.github/workflows/release.yml), which runs only when started by hand
 # from a version tag. See scripts/release-local.md for a local Linux/macOS/

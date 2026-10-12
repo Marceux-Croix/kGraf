@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Refines decision 0018's gate cadence, which was
 configurable and time-based. The rest of decision 0018 stands.
+**Amends:** 0018 (gate cadence)
 **Related:** decisions 0007, 0013, 0014, 0018
 
 ## Context

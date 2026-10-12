@@ -4,6 +4,44 @@
 **Supersedes:** 0093 (in part: the operator ceiling)
 **Related:** decisions 0004, 0017, 0027, 0029, 0035, 0053, 0063, 0084, 0093
 
+## Current state
+
+Checked against the code on 2026-10-12. Where the history below disagrees, this block holds.
+
+- **Modes.** One setting with five modes: Manual, Accept edits, Auto, Orchestrator decides and Bypass. Only the user sets it: the desktop dropdown, the user-level `permissions.toml`, or `--permission-mode`. A change applies at once.
+- **The ceiling is the mode.** The mode and the user's allow set decide a grant, never the worker's words.
+- **Rules.** The user's deny rules block, and the ask rules ask, in every mode, Bypass included. No grant is made against either. Rules match each command inside a `sh -c` script and each program a wrapper starts (`env`, `find -exec`, `docker exec`). A script construct kGraf cannot read is asked about. Six construct groups can be allowed to a mode, all off by default.
+- **Limits no mode lifts.** The OS sandbox; hooks; the refusal to delete a filesystem root, a top-level directory or the home directory; denial of what would ask in an unattended run. `disable_bypass = true` refuses Bypass. Bypass is refused as root unless `KGRAF_CONTAINER_SANDBOX=1`. The desktop offers Bypass only once "Allow Bypass mode" is on.
+- **Bypass and git.** Every Bypass shell command gets the shared git directory as a writable root, with the git configuration files read-only. Only in Bypass may a worker write the git directory, `.gitattributes`, `.gitmodules`, `.githooks`, `.kgraf/run.json` and `.kgraf/worker.json`. A git or settings write has a snapshot, an integrity check and a restore on failure. The ledger, trace, run records, transcripts, graph and schedule stay refused in every mode.
+- **Grouping.** Requests raised within 2,000 ms of a group's first request form one card.
+- **Plan review.** Off by default. `--plan-review` or the desktop switch turns it on. A run with nobody to approve is refused before planning, unless `--approve-plan`.
+
+### Amendment index
+
+- [Amendment: Bypass writes the git directory and kGraf's settings, behind a snapshot and a check](#amendment-bypass-writes-the-git-directory-and-kgrafs-settings-behind-a-snapshot-and-a-check)
+- [Amendment: object restore and a repository lock for Bypass git writes](#amendment-object-restore-and-a-repository-lock-for-bypass-git-writes)
+- [Amendment: kGraf's own git runs nothing a repository selects, and Bypass writes `.gitattributes`, `.gitmodules` and `.githooks`](#amendment-kgrafs-own-git-runs-nothing-a-repository-selects-and-bypass-writes-gitattributes-gitmodules-and-githooks)
+- [Amendment: every Bypass shell command writes the git directory; only real changes are checked](#amendment-every-bypass-shell-command-writes-the-git-directory-only-real-changes-are-checked)
+- [Amendment: a Bypass command's sandbox keeps the git configuration read-only](#amendment-a-bypass-commands-sandbox-keeps-the-git-configuration-read-only)
+- [Amendment: a call a skill refuses is not put to the user](#amendment-a-call-a-skill-refuses-is-not-put-to-the-user)
+- [Amendment (2026-10-01): no grant is made against a deny or an ask rule](#amendment-2026-10-01-no-grant-is-made-against-a-deny-or-an-ask-rule)
+- [Amendment (2026-10-01): a permission event states the final decision](#amendment-2026-10-01-a-permission-event-states-the-final-decision)
+- [Amendment (2026-10-02): a refusal names the program a rule matched](#amendment-2026-10-02-a-refusal-names-the-program-a-rule-matched)
+- [Amendment (2026-10-02): a warning when your own command runs a program your rules block](#amendment-2026-10-02-a-warning-when-your-own-command-runs-a-program-your-rules-block)
+- [Amendment (2026-10-02): a tool refusal keeps its tool; a script is granted command by command](#amendment-2026-10-02-a-tool-refusal-keeps-its-tool-a-script-is-granted-command-by-command)
+- [Amendment (2026-10-02): the user may let a mode grant the script constructs the strict reader refuses](#amendment-2026-10-02-the-user-may-let-a-mode-grant-the-script-constructs-the-strict-reader-refuses)
+- [Amendment (2026-10-02): grouping and prefix words never hide a program from the rules](#amendment-2026-10-02-grouping-and-prefix-words-never-hide-a-program-from-the-rules)
+- [Amendment (2026-10-02): a script of build commands, after one `cd` into the worktree, runs as a build](#amendment-2026-10-02-a-script-of-build-commands-after-one-cd-into-the-worktree-runs-as-a-build)
+- [Amendment (2026-10-02): a run refused before it starts creates nothing](#amendment-2026-10-02-a-run-refused-before-it-starts-creates-nothing)
+- [Amendment (2026-10-02): a rule names a tool a worker can have](#amendment-2026-10-02-a-rule-names-a-tool-a-worker-can-have)
+- [Amendment (2026-10-05): a Claude Code tool kGraf lacks is a notice; the desktop keeps the valid entries](#amendment-2026-10-05-a-claude-code-tool-kgraf-lacks-is-a-notice-the-desktop-keeps-the-valid-entries)
+- [Amendment (2026-10-06): a program given as an argument is a command, and a grant of a wrapper grants nothing it runs](#amendment-2026-10-06-a-program-given-as-an-argument-is-a-command-and-a-grant-of-a-wrapper-grants-nothing-it-runs)
+- [Amendment (2026-10-06, second): runners, Windows shells, git settings, commands named by a variable, recipes and interpreter code are read](#amendment-2026-10-06-second-runners-windows-shells-git-settings-commands-named-by-a-variable-recipes-and-interpreter-code-are-read)
+- [Amendment (2026-10-06, third): the readers close more ways a program was run past a rule](#amendment-2026-10-06-third-the-readers-close-more-ways-a-program-was-run-past-a-rule)
+- [Amendment (2026-10-07): a cmd or PowerShell script is read only when its text is the text the interpreter runs](#amendment-2026-10-07-a-cmd-or-powershell-script-is-read-only-when-its-text-is-the-text-the-interpreter-runs)
+- [Amendment (2026-10-07, second): kGraf's git and a worker's git use fixed line-ending settings](#amendment-2026-10-07-second-kgrafs-git-and-a-workers-git-use-fixed-line-ending-settings)
+- [Amendment (2026-10-08): a worker's git entries no longer follow the host's](#amendment-2026-10-08-a-workers-git-entries-no-longer-follow-the-hosts)
+
 ## Context
 
 Decision 0093 let a worker report a permission shortfall, and let the orchestrator grant within

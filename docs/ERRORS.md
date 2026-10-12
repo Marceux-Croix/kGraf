@@ -10,9 +10,9 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 **Meaning:** An error occurred and the code that recorded it could not name its own crate.
 
-**Likely cause:** A call site outside the crates this glossary covers, or a new crate not yet given a block.
+**Likely cause:** The error came from code that this glossary does not cover.
 
-**What to do:** Read the context string; if this recurs, give the raising crate its own block in kgraf-diag::glossary.
+**What to do:** Read the context string, and share this diagnostics file if it recurs.
 
 ## kgraf-cli
 
@@ -124,7 +124,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 ### KG-0501 Route Not Ready
 
-**Meaning:** A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.
+**Meaning:** A configured route is missing a credential or is not in the catalog, or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.
 
 **Likely cause:** The environment is not fully set up for the routes a run names, or the local model server is not running.
 
@@ -142,11 +142,11 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 ### KG-1101 File Too Large
 
-**Meaning:** A document exceeded the ingest size limit and was skipped.
+**Meaning:** A document exceeded the ingest size limit and was skipped. The limit is 64 MiB, and 2 MiB for plain-text and source files. No setting changes it.
 
-**Likely cause:** A large PDF, DOCX, or text file over the configured byte limit.
+**Likely cause:** A large PDF, DOCX, or text file, or a log or data dump.
 
-**What to do:** Raise the ingest limit if the file must be read, or exclude it.
+**What to do:** Exclude the file, or split it into smaller files.
 
 ### KG-1102 Unreadable Document
 
@@ -178,11 +178,7 @@ Every error kGraf's local diagnostics file records carries one of these `KG-nnnn
 
 ### KG-0801 MCP OAuth Failed
 
-**Meaning:** A hosted MCP server's OAuth handshake did not complete.
-
-**Likely cause:** An expired or revoked token, or a server-side authorization change.
-
-**What to do:** Reserved: no kGraf code raises this code today.
+**Meaning:** A hosted MCP server's OAuth handshake did not complete. Reserved: no kGraf code raises this code today.
 
 ## kgraf-orchestrator
 

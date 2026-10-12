@@ -8,19 +8,14 @@ real service.
 Read it before you pick a route for work that matters. A route marked BUILT, UNTESTED has
 passed tests against recorded replies only. It may fail on its first live call.
 
-The state of each route in your own build is also shown by `kgraf providers`.
+## How the catalog agrees with this page
 
-## The short version
-
-- **VERIFIED** means one live request and its response were exchanged with the real service
-  and recorded. Six rows have this status.
-- **BUILT, UNTESTED** means the adapter exists and passes tests against recorded or documented
-  replies. No live exchange is recorded. Twenty-six rows have this status.
-- The table has 32 rows: one per route and model kind.
 - `kgraf providers` prints a confidence word for each route (`verified`, `documented`,
-  `unverified`). A generative route is `verified` there only where this page
-  marks it VERIFIED. See "The catalog agrees with the record".
-- A route moves to VERIFIED by one recorded live exchange. See "How a route becomes VERIFIED".
+  `unverified`). A generative route is `verified` there only where the table below marks
+  it VERIFIED. The test `the_catalog_confidence_matches_the_recorded_live_exchanges` in
+  `kgraf-fleet` fails if the catalog and the table disagree.
+- A route moves to VERIFIED by one recorded live exchange. [CONTRIBUTING.md](../CONTRIBUTING.md)
+  gives the steps.
 
 ## Model kinds
 
@@ -122,28 +117,6 @@ have been found on other routes: a field accepted and ignored with HTTP 200, a m
 silently replaced, and a usage shape that differs from the documentation. kGraf refuses
 some of these before or after the call (model echo check, missing usage), and the call then
 stays open in the ledger until you settle it with `kgraf unreconciled`.
-
-### How a route becomes VERIFIED
-
-1. Set the route's credential in your shell. Never write a key into a file.
-2. Send one real request and read one real response through the adapter, built the same way a
-   run builds it. For a generative route, `kgraf call --provider <route> --model <model-id>
-   --record <file>` does this. For a non-generative kind, use the kind's tool in a run, or an
-   ignored live test as `crates/kgraf-fleet/tests/live_embeddings.rs` does.
-3. Check the model echo, the reply, the raw usage, and the ledger row.
-4. Record the exchange: the date, the model, the request as sent, the raw reply, and what it
-   showed.
-5. Change the route's confidence in the catalog, and update this page.
-
-A route that fails this check stays BUILT, UNTESTED. The failure is recorded and the adapter
-is fixed first.
-
-
-## The catalog agrees with the record
-
-The catalog (`crates/kgraf-fleet/src/lib.rs`) marks a generative route `Verified` only where
-the table above says VERIFIED. The test `the_catalog_confidence_matches_the_recorded_live_exchanges`
-in `kgraf-fleet` reads the table and fails if a catalog value and a status disagree.
 
 ## Known limits
 

@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Refines decision 0023's go/no-go criterion, which had two
 arms. Strengthens decision 0004's justification for a single director.
+**Amends:** 0023 (the go/no-go criterion)
 **Related:** decisions 0004, 0012, 0022, 0023
 
 ---

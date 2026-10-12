@@ -160,7 +160,7 @@ Tests: `a_graph_that_appears_mid_run_replaces_the_shared_prefix_and_says_so` (ho
 
 ## Amendment (2026-10-12): a slice name takes the forms a planner writes
 
-Canary rounds 15 to 26 traced 300 empty graph lookups. The common ones were
+Internal test runs traced 300 empty graph lookups. The common ones were
 `path::Name` (`iface/src/lib.rs::Order`), `Type::method`
 (`Discount::discount_cents`) and a bare file stem (`lib`). The orchestrator then gave the worker
 whole declared files in place of slices, and workers called `graph_slice` 26 times against 2,512

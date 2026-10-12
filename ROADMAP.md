@@ -1,11 +1,11 @@
 # kGraf Roadmap
 
 kGraf is pre-release software. This page lists what works today, what is in progress, and
-what is planned next, as things you can do or expect, not as an internal project schedule.
+what is planned.
 
 ## Works today
 
-[docs/USAGE.md](docs/USAGE.md) covers each item. The [README](README.md) lists the features.
+[docs/USAGE.md](docs/USAGE.md) covers each item.
 
 - Indexing, graph queries and context slices, from the command line and in the desktop app.
 - Orchestrated runs across providers: contracts, parallel workers in their own worktrees and
@@ -24,8 +24,11 @@ what is planned next, as things you can do or expect, not as an internal project
   the tray. A test drove this against a live provider. Nobody has yet watched a run fire
   from the real tray icon.
 - An opt-in update check, off by default.
-- Full sandbox confinement on macOS and Linux. On Windows, setup, removal and commands run
-  as a dedicated low-privilege user (decision 0097); loopback connections are filtered.
+- Sandboxed worker commands with the network off on macOS and Linux. Reads outside the
+  worktree are denied by default on Linux. On macOS only credential and tool-config paths
+  are denied. On Windows, setup, removal and commands run as a dedicated low-privilege user
+  (decision 0097), and loopback connections are filtered. See
+  [Platform notes](docs/USAGE.md#platform-notes).
 
 ## In progress
 
@@ -43,10 +46,9 @@ what is planned next, as things you can do or expect, not as an internal project
   with the cloud routes (Gemini, Vertex AI, Bedrock and Azure OpenAI).
 - Full sandbox confinement on Windows. Name lookups (DNS) from the sandbox user still leave
   the machine on Windows Server 2025, because Windows has no working filter for them there.
-  macOS and Linux confinement is in daily use.
 - Signed installers for macOS, Linux and Windows, notarized on macOS. The packaging
-  scripts already build all three; the packages are unsigned today, so expect a security
-  warning on first launch.
+  scripts build all three. The packages are unsigned today (see
+  [Platform notes](docs/USAGE.md#platform-notes)).
 - A detached signature for the update check, so a download is checked against a key and not
   only against a checksum file published with it.
 
@@ -62,5 +64,4 @@ what is planned next, as things you can do or expect, not as an internal project
 - A settings screen for provider routes that shows, per configured model, what kind of
   reasoning trace it can actually return.
 - A casual messaging channel, for example iMessage or WhatsApp, to check on a run or drop
-  in a quick note from your phone. This is a later addition, not part of the initial
-  release.
+  in a quick note from your phone.

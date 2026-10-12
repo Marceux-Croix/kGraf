@@ -53,8 +53,8 @@ pub const UNKNOWN: ErrorSpec = ErrorSpec {
     name: "Unclassified",
     crate_name: "unknown",
     meaning: "An error occurred and the code that recorded it could not name its own crate.",
-    likely_cause: "A call site outside the crates this glossary covers, or a new crate not yet given a block.",
-    action: "Read the context string; if this recurs, give the raising crate its own block in kgraf-diag::glossary.",
+    likely_cause: "The error came from code that this glossary does not cover.",
+    action: "Read the context string, and share this diagnostics file if it recurs.",
 };
 
 macro_rules! spec {
@@ -257,7 +257,7 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "KG-0501",
         "Route Not Ready",
         "kgraf-host",
-        "A configured route is missing a credential, an unknown catalog id, or has no price; or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.",
+        "A configured route is missing a credential or is not in the catalog, or a local route's server (Ollama, llama.cpp, System One, TEI) accepts no connection at run start.",
         "The environment is not fully set up for the routes a run names, or the local model server is not running.",
         "Run `kgraf providers` (or the shell's readiness check) and fix what it names; for an unreachable local route, start its server (for Ollama, `ollama serve`), point the route at the server's address with `KGRAF_<ROUTE>_BASE_URL` (for example `KGRAF_OLLAMA_BASE_URL`), or remove the route."
     ),
@@ -340,9 +340,9 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "KG-0801",
         "MCP OAuth Failed",
         "kgraf-mcp",
-        "A hosted MCP server's OAuth handshake did not complete.",
-        "An expired or revoked token, or a server-side authorization change.",
-        "Reserved: no kGraf code raises this code today."
+        "A hosted MCP server's OAuth handshake did not complete. Reserved: no kGraf code raises this code today.",
+        "",
+        ""
     ),
     spec!(
         "KG-0899",
@@ -391,9 +391,9 @@ pub const GLOSSARY: &[ErrorSpec] = &[
         "KG-1101",
         "File Too Large",
         "kgraf-ingest",
-        "A document exceeded the ingest size limit and was skipped.",
-        "A large PDF, DOCX, or text file over the configured byte limit.",
-        "Raise the ingest limit if the file must be read, or exclude it."
+        "A document exceeded the ingest size limit and was skipped. The limit is 64 MiB, and 2 MiB for plain-text and source files. No setting changes it.",
+        "A large PDF, DOCX, or text file, or a log or data dump.",
+        "Exclude the file, or split it into smaller files."
     ),
     spec!(
         "KG-1102",

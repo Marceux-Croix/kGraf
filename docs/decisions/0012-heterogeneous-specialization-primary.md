@@ -3,6 +3,7 @@
 **Status:** Accepted. Supersedes the verifier-selection clause of decision
 0009. The disjoint-write requirement of 0009 stands unchanged and becomes
 more load-bearing, not less.
+**Supersedes:** 0009 (in part: the verifier-selection clause)
 **Amended by:** 0026 (agent identity lifetime)
 **Related:** decisions 0004, 0008, 0009
 

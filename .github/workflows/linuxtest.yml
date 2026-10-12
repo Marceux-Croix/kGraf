@@ -18,8 +18,10 @@
 #      check. It must fail with kGraf's message about the fix.
 #   6. Uploads linuxtest-out/ (report.md and the logs) as one artifact.
 #
-# Cost: Linux minutes bill at the base rate. A run takes about 30 minutes,
-# most of it the release build of the .deb. The job stops after 60 minutes.
+# Cost: standard GitHub-hosted runners are free for public repositories; a
+# private copy bills Linux minutes at the base rate. A run takes about 30
+# minutes, most of it the release build of the .deb. The job stops after 60
+# minutes.
 #
 # Differences from a user's machine:
 #   - The runner is an ephemeral virtual machine, so the job changes a

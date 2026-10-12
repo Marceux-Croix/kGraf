@@ -3,6 +3,7 @@
 **Status:** Accepted. Refines decision 0014's recursion floor, which said
 decomposition stops when a part fits one worker's brief, without saying what
 determines that.
+**Amends:** 0014 (the recursion floor)
 **Related:** decisions 0004, 0012, 0014, 0015, 0017, 0019, 0023, 0024
 
 ---

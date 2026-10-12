@@ -6,8 +6,9 @@ decision without re-deriving it.
 
 Records are dated. A record is not rewritten: a change is an appended, dated amendment, and a
 decision that is reversed gets a new record that supersedes the old one. A long record keeps
-its decision first and its amendments after it, oldest to newest. To see a record's current
-state, read its first section and its newest amendment. A header line says what changed it:
+its decision first and its amendments after it, oldest to newest. A record that opens with a
+**Current state** block (0030, 0084, 0094, 0097) says what the code does now, with an index of its
+amendments. For any other record, read its first section and its newest amendment. A header line says what changed it:
 `Amended by`, `Superseded by` (in whole or in part), `Amends`, `Supersedes`.
 
 ## Start here
@@ -133,5 +134,3 @@ Active means no later record changed it. Where a record changes an earlier one, 
 | [0097](0097-windows-commands-run-as-a-dedicated-sandbox-user.md) | On Windows, sandboxed commands run as a dedicated local sandbox user | Active; supersedes part of 0011 |
 | [0098](0098-one-reasoning-level-setting-covers-every-model-call.md) | One reasoning-level setting covers every model call | Active |
 | [0099](0099-replace-in-file-is-an-edit-tool-that-needs-no-patch-format.md) | `replace_in_file` is an edit tool that needs no patch format | Active |
-
-Some records cite internal test rounds; their raw results are not published.

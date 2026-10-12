@@ -13,7 +13,7 @@ One Rust process does everything except draw. It:
 - talks to model providers through one client trait, and to the MCP (Model Context Protocol) servers the user configured, local or hosted ([0051]);
 - streams events to the shell that renders the graph.
 
-The shell is a native Rust window with a taskbar icon and a tray icon. It draws with egui and `wgpu`, and it runs without a GPU ([0054]). kGraf is single-user and runs on the user's machine. Only model and MCP calls leave it.
+The shell is a native Rust window with a taskbar icon and a tray icon. It draws with egui and `wgpu`, and it runs without a GPU ([0054]). kGraf is single-user and runs on the user's machine. Every network path it uses is listed in the privacy section of `docs/USAGE.md`.
 
 This page describes what is built. Section 7 lists what is not.
 
@@ -61,7 +61,9 @@ These terms are used throughout. Each is defined once, here.
 - **Contract**: one unit of planned work. It has an instruction, an acceptance command, the file paths it may write, and its dependencies on other contracts.
 - **Gate**: a work node that runs the project's own validation commands (for example `cargo test --workspace`) against a pinned commit. The **root gate** is the gate at the top of the hierarchy. It runs once everything is built.
 - **Galaxy**: the graph view. Code, agents and work items are drawn as points in clusters.
+- **Coupling cluster**: a set of contracts whose write sets overlap, that depend on each other, or whose files share a co-change count of 3 or more. The cluster cap and vendor routing treat the set as one unit.
 - **Hand-back**: what a worker does at its stop point. It returns the unfinished remainder to the orchestrator, which makes it a new child contract.
+- **Handshake**: a note that the worker of each of two coupled contracts writes on its own route. It states what the worker provides, what it assumes the other provides, what it assumes will not change, and what it touches.
 - **Ledger**: the record of every provider call, with its usage and cost. It is a hash chain, so edits show.
 - **Plan target**: the most context a contract should need at its start. It is half the stop point.
 - **Presumed work node**: a work node read from the project's own roadmap document before any plan is approved.
@@ -69,6 +71,8 @@ These terms are used throughout. Each is defined once, here.
 - **Shortfall**: a worker's report, by the `report_shortfall` tool, that policy refused something it needs or that its instructions fell short. The worker stops.
 - **Sizing miss**: a count of times a contract was bigger than planned. A compaction or a round-budget extension each add one.
 - **Stop point**: the context size at which a worker must hand back or compact.
+- **Stub-compile check**: builds a trivial stub of a producer's interface, so a consumer's test runs against code that compiles.
+- **Vacuity check**: confirms that a contract's test fails against the stub and passes against a correct reference.
 - **Work node**: one item in the work hierarchy. Work nodes are distinct from code nodes and agent nodes. Doneness is derived, never stored.
 
 ## 3. From instruction to merge
@@ -82,7 +86,7 @@ These terms are used throughout. Each is defined once, here.
 
 ## 4. The governing principle and collision control
 
-**Published results on multi-agent coding split on shared state versus disjoint state, not on single agent versus multi-agent.** Gains come from read-mostly or explicitly partitioned work. Losses come from agents writing into the same state. kGraf therefore lets **workers read widely and write disjointly**, and every concurrent writer **declares its write scope before writing** (decisions [0009], [0012]).
+**Studies of multi-agent coding split on shared state versus disjoint state, not on single agent versus multi-agent.** Gains come from read-mostly or explicitly partitioned work. Losses come from agents writing into the same state. In one study of 33,596 pull requests, textual conflicts ran 41.7 percent between agents and 19.8 percent within one agent (table in [0009]). kGraf therefore lets **workers read widely and write disjointly**, and every concurrent writer **declares its write scope before writing** (decisions [0009], [0012]).
 
 The primary mode is **division of labor**: different vendors work different parts of one problem at the same time. Redundant attempts with a verifier choosing a winner are a secondary mode.
 
@@ -90,7 +94,7 @@ A multi-agent run uses more tokens than one agent doing the same work. kGraf mak
 
 ### Why the code graph does not predict collisions
 
-The design asked whether the code graph could tell the orchestrator, before dispatch, which changes would collide. It could not. Whether the graph judged two changes disjoint was close to independent of whether they collided. A call graph records what code is. Collision risk depends on what changes with what, which only history shows. Decision [0020] made co-change (how often two files change together in version history) the predictor. Co-change did not help scheduling either, so decision [0022] stopped predicting collisions.
+A call graph records what code is. Collision risk depends on what changes with what, which only history shows. In measurement, the graph's verdict that two changes were disjoint was close to independent of whether they collided ([0020]). Decision [0020] made co-change (how often two files change together in version history) the collision relation, and decision [0022] stopped predicting collisions at dispatch. Co-change survives as the coupling signal in the next list.
 
 ### What controls collisions today
 
@@ -102,9 +106,9 @@ All of these are built.
 - **Speculative merge** ([0074]): while two or more contracts are in flight, a round trial-merges each worktree onto the integration tip, and each pair together, in the object database. It validates clean pairs with the gate commands. A pair that merges alone but not together is a textual conflict. A pair that merges cleanly and fails validation is a semantic conflict. The finding is traced and stored in the run record. It never delays or cancels a merge.
 - **Cross-feature ordering** ([0022], [0074]): among contracts the user did not pin, the next one dispatched is the one least similar, by shared significant words, to what already runs. A found conflicting pair counts as maximally similar. It reorders contracts and never withholds one.
 - **Cluster cap** ([0082]): at most two contracts of one coupling cluster run at once.
-- **Routing by coupling** ([0075]): coupled work is pinned to one vendor under `RoutingPolicy::Fitness`, which is opt-in.
+- **Routing by coupling** ([0075]): the contracts of one coupling cluster are pinned to one vendor under `RoutingPolicy::Fitness`, which is opt-in.
 
-Speculative merge and cross-feature ordering are wired into the live run path. `run_loop` in `kgraf-orchestrator` calls `speculate_tick` on every pass, and `cross_feature_order` runs in the dispatch step (`pairing::order_for_concurrency`). `OrchestratorConfig::speculate_every` defaults to 60 seconds. The host builds its configuration from that default and sets no override, and no user setting turns it off. A round runs only while two or more contracts have a worktree in flight. It takes one work-item slot, like a gate. Tests: `kgraf-orchestrator/tests/speculation_loop.rs` and `kgraf-host/src/speculation_e2e.rs`.
+Speculative merge and cross-feature ordering run in the live path. A speculative round runs every 60 seconds, only while two or more contracts have a worktree in flight. It takes one work-item slot, like a gate. No user setting turns it off.
 
 The code graph keeps its other jobs: producing context slices for agents, and modeling the interface structure the orchestrator plans against.
 
@@ -117,14 +121,14 @@ The index is both the picture the user sees and the context agents read. Every n
 - **The graph indexes locations, not text.** A node holds a file path and a line span. Source is read from disk on demand, so a slice never serves stale source. A slice refuses a file whose hash differs from the indexed one.
 - **Chunking** follows disjoint tree-sitter syntax spans, with no sliding windows. Markdown headings become section nodes.
 - **A context slice** is a requested symbol plus a neighborhood sized to a token budget. A slice shows each line once. Slices of one brief share a record, so a symbol or file shown earlier is named in one line. A slice name takes the forms a planner writes: a bare or dotted name, `Type::method`, a crate or module prefix, or `path/to/file.rs::name`. A name that matches several nodes gives none, and the miss is traced with the candidates. Slice retrieval is weakest for changes that span the codebase.
-- **Reindexing compares content hashes**, not only modification time and size. A write is one transaction, and a read never builds an index. Only `kgraf index` creates or rebuilds the database. A pass writes up to 256 files per transaction and parses on up to four threads.
-- **A walk skips installed packages.** A directory that holds a `pyvenv.cfg` is a Python virtual environment and is skipped at any depth.
+- **Reindexing compares content hashes**, not only modification time and size. A write is one transaction, and a read never builds an index. Only `kgraf index` creates or rebuilds the database.
+- **A walk skips installed packages**, including any directory that holds a `pyvenv.cfg`.
 - **Call resolution** is by name, scoped by proximity, and bounded in fan-out ([0038]). Calls stay in their language family. Each extractor is stamped with a hash, so a changed extractor re-derives only its language. Rust, Python, TypeScript, TSX, JavaScript and Markdown use kGraf's own extraction tables. Go, Java, C, C++, Ruby, C# and PHP chunk from each grammar's `TAGS_QUERY`, and a slice marks those members as resolved by name only ([0065]).
 - **Node identity** derives from the parent's id, the name, and a digest of the signature, meaning the source up to the body. A body edit does not change it. Siblings that no signature can tell apart carry an "identity unstable" flag ([0049], [0050]).
 
 ### 5.2 Co-change relation
 
-A weighted relation computed from git history by `kgraf cochange`, and queried by `kgraf partners`. Every observed pair is kept with its count, and nothing is thresholded at index time. Commit-size filtering and recency weighting are read-time options. No dispatch decision consumes it today ([0020], [0022]).
+A weighted relation computed from git history by `kgraf cochange`, and queried by `kgraf partners`. Every observed pair is kept with its count, and nothing is thresholded at index time. Commit-size filtering and recency weighting are read-time options. Its one consumer is the coupling cluster: the cluster cap and routing read pairs with a count of 3 or more ([0020], [0075], [0082]).
 
 ### 5.3 Document ingestion and interpretation
 
@@ -133,7 +137,7 @@ kGraf reads whatever documentation a project has and turns it into a plan model.
 - `kgraf-ingest` parses Markdown, PDF and DOCX, and reads plain-text and source-format files up to 2 MiB.
 - `kgraf-interpret` ranks the corpus with a port of aider's repo-map PageRank, builds a bounded brief, and makes one accounted model call. The reading prints a plan id. Nothing is created until the user approves that id.
 - The corpus supplies the verifier. A command counts as discovered only when a document contains it whole. A proposed command becomes a gate only when the user accepts it by name. Where the corpus declares no gates, the orchestrator says so and asks.
-- **Presumed work nodes** ([0064]). A roadmap parser with no model call reads status tables, task lists and status headings into presumed work nodes. Read time compares the document's status word with the named code in the graph, and states any disagreement. A re-read with no change writes nothing. An entry no longer listed is marked gone, never deleted. `kgraf index` runs the read by default. The desktop shell runs it, with no model call and no token, when it opens an indexed project.
+- **Presumed work nodes** ([0064]). A roadmap parser, with no model call, reads status tables, task lists and status headings into presumed work nodes. It compares the document's status word with the named code in the graph and states any disagreement. A re-read with no change writes nothing. An entry no longer listed is marked gone, never deleted. `kgraf index` and the desktop shell (when it opens an indexed project) run the read, and no token is spent.
 
 ### 5.4 Provider layer
 
@@ -164,9 +168,8 @@ Workers are tasks in this process. The loop assembles context, calls the provide
 - **Edit tools.** `apply_patch` repairs what the model's intent makes certain, and notes each repair. `replace_in_file` ([0099]) needs no patch format. Both write through one path, so the write scope, protected paths and sandbox apply the same way. Shell commands are bounded in output and time ([0084]).
 - **Tools come from three places:** kGraf's graph and file tools; MCP servers (stdio, or Streamable HTTP with OAuth for hosted servers, [0051]); and skills in the `SKILL.md` format, ingested from the user's other agents ([0053]). A skill's allowed tools are enforced by the runtime, not by asking the model.
 - **Questions.** `ask_user_question` first tries to answer from the run record in one accounted call. The user is asked only when that fails. An unattended run returns a recorded no-answer result at once ([0067]).
-- **Secret scrubbing** ([0071]) runs on two paths. Model-facing text is redacted only against kGraf's exact-secret registry. Persisted and displayed text also gets gitleaks-derived pattern rules.
+- **Secret scrubbing** ([0071]) runs on two paths. Model-facing text is redacted only against kGraf's exact-secret registry, except build and test output, which also gets the pattern rules ([0084]). Persisted and displayed text always gets the gitleaks-derived pattern rules.
 
-`kgraf-runtime` holds the loop. `kgraf-tools` holds file and shell tools. `kgraf-mcp` holds the MCP clients. `kgraf-session` holds the transcript, observation masking and persisted allow rules.
 
 ### 5.6 Orchestrator
 
@@ -180,9 +183,8 @@ The single director ([0004]). It splits an instruction, or an approved plan, int
 - **A killed run resumes** from its record with no repeated paid call ([0056]).
 - **No local decider model ships** ([0042] to [0047]). Routing and recursion decisions are frontier calls or fixed rules.
 - **A malformed structured answer is asked again within one bound** (twice). Each try is its own ledger call. A cut-off answer that stops right after a complete value is closed mechanically before it is asked again ([0030], [0039]).
-- **Planning** can add contract checks, which are off by default and opt in per run ([0029], [0030], [0031], [0035], [0036], [0037], [0076], [0078], [0079], [0081]). With checks on, a second planner call writes an interface contract wherever one contract uses another's code. The sandboxed runner checks it: stub-compile, a vacuity check, then a handshake in which each party states what it expects, on its own route. The planner is given the project's real names and signatures and is refused when it invents them. A plan that no worker could verify is refused with the cause named, and asked again within a bound.
+- **Planning** can add contract checks, which are off by default and opt in per run ([0029], [0030], [0031], [0035], [0036], [0037], [0076], [0078], [0079], [0081]). With checks on, a second planner call writes an interface contract wherever one contract uses another's code. The sandboxed runner checks it in three steps: the **stub-compile check**, the **vacuity check**, then the **handshake**, in which each party states what it expects, on its own route. The planner is given the project's real names and signatures and is refused when it invents them. A plan that no worker could verify is refused with the cause named, and asked again within a bound.
 
-`kgraf-orchestrator` holds decomposition, readiness, admission, delegation guards, the report policy, verifier selection, the run record, gates and the message port. `kgraf-host` builds a run for both the command line and the shell.
 
 ### 5.7 Message bus
 
@@ -210,7 +212,7 @@ Three SQLite databases per project, under `.kgraf/` ([0007]):
 
 ### 5.10 Scheduled runs
 
-An orchestrator run can start on a recurrence rule or at an instant ([0052]). A schedule belongs to a work node, and each run is history on that node. Due occurrences are claimed atomically, and readiness is checked before capacity. A missing credential disables the schedule and says why. The app keeps a tray process so schedules fire with the window closed. `kgraf-schedule` owns the rules and the claim table. The scheduler loop is in `kgraf-orchestrator`.
+An orchestrator run can start on a recurrence rule or at an instant ([0052]). A schedule belongs to a work node, and each run is history on that node. Due occurrences are claimed atomically, and readiness is checked before capacity. A missing credential disables the schedule and says why. The app keeps a tray process so schedules fire with the window closed.
 
 ### 5.11 Desktop shell
 
@@ -220,7 +222,7 @@ One native Rust binary ([0054]): `winit` for the window, `tray-icon`, egui for p
 
 - the window, panels, tray, and adapter selection with the adapter type shown;
 - `theme.rs`: tokens for the light and dark themes, and the five semantic colors under the chosen color-vision mode;
-- **color-vision modes** ([0070]): protanopia, deuteranopia, tritanopia and achromatopsia, each with its own table of the five semantic colors, chosen to stay distinct under a simulation of that deficiency while keeping WCAG AA contrast. The setting takes effect on the next frame. The galaxy reads the same palette: the shell passes `theme::galaxy_palette(vision)` to the view;
+- **color-vision modes** ([0070]): protanopia, deuteranopia, tritanopia and achromatopsia, each with its own table of the five semantic colors, chosen to stay distinct under a simulation of that deficiency while keeping WCAG AA contrast. The setting takes effect on the next frame, and the galaxy reads the same palette;
 - a settings dialog with five tabs (General, Runs, Permissions, Appearance, Providers);
 - `projects.rs` ([0066]): a workspace of open projects, each with its own host, scheduler, graph view and runs;
 - `activity.rs` ([0063]): one live activity card of change-log events, each routing to its node.
@@ -243,12 +245,11 @@ Work is a recursive hierarchy of work nodes. A part decomposes until one piece f
 Layout is computed in the Rust core and cached, so the renderer never runs a force simulation ([0058], [0010]). The renderer is an instanced `wgpu` renderer, with shader techniques taken from rerun's `re_renderer`. A **CPU mode** draws point sprites and edges on selection only, and does not animate when nothing changed.
 
 - The layout is anchored: directory-ring seeding, depth on the third axis, and a disc per cluster that grows in power-of-two size buckets. A node moves only when its cluster crosses a bucket or its call depth changes.
-- Code nodes are colored by stellar class and sized by degree. Agents have their own visual channel. Selecting an agent dims everything unrelated.
+- Code nodes are gray and sized by degree, the count of their edges (STG-DRAW-2 in the style guide). Only the demo scene draws the star colors that the layout cache also stores. Agents and work items have their own shapes. Selecting an agent dims everything unrelated.
 - Edge intensity dims with the edge count, because edges, not nodes, wash out a large view.
 - **Folding** ([0068]). Children fold into parents: a chunk under its containing parent, a file under its directory. No node shows more than 64 children, and the automatic cut draws at most 1,000 hierarchy nodes. The cut keeps its previous shape while it still fits, so one change moves the view by about the size of the change. Work nodes fold too and are never opened by the automatic cut. A click expands a folded node.
 - The galaxy is the only work surface. There is no board or list view ([0003]).
 - `kgraf-galaxy` holds the layout, the renderer, and a live feed from the change log. The interaction layer sits on the same crate: the orchestrator's input box, approvals answered in place, play, stop and order, and search whose result is a graph selection ([0032], [0034]).
-- Every color comes from one shared palette (`kgraf_core::palette`), so the shell chrome and the galaxy draw from the same source.
 
 ### 5.14 Worktrees, merge, gates and permissions
 
@@ -286,9 +287,7 @@ Workers build and test against dependencies the user installed. Installed trees 
 
 ### 5.16 Diagnostics
 
-Local-only usage counts and errors. `kgraf-diag` has no network code ([0069]). One capped per-user JSONL file records launches, runs, workers (provider and model names, never credentials), feature use, and every error under a stable code. No secrets, file contents, prompts or completions reach it. Paths inside the project are written relative to it, and other paths are hashed with a keyed BLAKE3. Recording never blocks, and a full channel drops the event and counts it. `kgraf diag show` prints a summary. `kgraf diag export` writes a re-scrubbed copy the user can share.
-
-A credentialed URL or an API key inside a provider's HTTP error body is not yet scrubbed by this crate (see section 7).
+Local-only usage counts and errors. `kgraf-diag` has no network code ([0069]). One capped per-user JSONL file records launches, runs, workers (provider and model names, never credentials), feature use, and every error under a stable code. No secrets, file contents, prompts or completions reach it. Credentials in error text, such as a credentialed URL or an API key in a provider's error body, are redacted first. Paths inside the project are written relative to it, and other paths are hashed with a keyed BLAKE3. Recording never blocks, and a full channel drops the event and counts it. `kgraf diag show` prints a summary. `kgraf diag export` writes a re-scrubbed copy the user can share.
 
 ## 6. Crate map
 
@@ -325,18 +324,17 @@ A credentialed URL or an API key inside a provider's HTTP error body is not yet 
 ## 7. Not built yet
 
 - Co-change: sub-file granularity, recording kGraf's own observed collisions, and a cold-start policy.
-- Constraints read from the corpus that bind the orchestrator's own behavior.
+- Enforcement of corpus constraints that name no path. A constraint that names forbidden paths strikes matching writes from the plan. Any other constraint only reaches worker instructions.
 - Sticky inherited fallback chains for per-worker model selection.
-- Deferring rarely used tools behind a search tool, and an intent argument on each tool call.
+- A tool search a worker can use to find deferred tools (the registry can hold them, but no search tool ships), and an intent argument on each tool call.
 - A gate that refuses to build without an agreed roadmap on every path. An instruction given directly dispatches without one.
-- A runs table with a parent run id, which would make delegation a walkable tree.
+- A runs table. The run record has a `parent_run` field that nothing sets yet, so delegation is not a walkable tree.
 - Edges from a work node to the code nodes it is expected to change.
 - Edges re-routed between folded parents ([0068]); a bloom pass, and node glow boosted by channel dominance.
-- Call traces on nodes, and questions from a worker reaching the input box.
+- Call traces on nodes.
 - Execution runtimes other than git worktrees.
-- A per-platform sandbox strength indicator.
+- A sandbox strength display. Each backend reports its strength as data (`IsolationStrength`), and no surface shows it.
 - Reindexing triggered by a worker's edits before its merge is accepted.
-- Scrubbing of non-path secrets inside the diagnostics file (see 5.16).
 
 [0001]: docs/decisions/0001-native-agent-loop.md
 [0003]: docs/decisions/0003-graph-is-the-only-surface.md

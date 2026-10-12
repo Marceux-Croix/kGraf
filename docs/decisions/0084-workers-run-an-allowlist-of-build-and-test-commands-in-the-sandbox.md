@@ -3,6 +3,50 @@
 **Status:** Accepted
 **Related:** decisions 0043, 0051, 0060, 0067, 0071, 0083
 
+## Current state
+
+Checked against the code on 2026-10-12. Where the history below disagrees, this block holds.
+
+- **Allowlist.** A worker's shell runs a standard list of build and test commands without approval: five cargo commands, and the build and test commands of npm, pnpm, yarn, pytest, unittest, Go, Maven, Gradle and .NET. `build_commands` in `.kgraf/worker.json` narrows the list, and `[]` turns it off. An orchestrated run adds its acceptance command, the narrowed forms of it, and each gate command.
+- **Argument rules.** Each entry accepts only listed options. Output redirection, toolchain choice, `cargo clippy --fix`, installs and publishes are refused or asked about. A command line sent as one string is split on whitespace when it holds no shell syntax.
+- **Fixed per attempt.** The worktree's cargo configuration and toolchain file. A change refuses every allowlisted command.
+- **Sandbox.** Writes stay in the worktree and a scratch directory, and the network is off. Installed dependency trees are linked in read-only. With consent, the host fetches dependencies outside the sandbox (decision 0087).
+- **Time.** `shell_timeout_secs` (600 by default) is the longest any command runs, and an allowlisted command gets all of it. Any other command gets 120 s unless the call sets `timeout_secs`.
+- **Output.** An allowlisted command's output gets the pattern rules and the exact-secret registry before the model sees it (decision 0071).
+- **Commit.** Lockfiles, caches and build output stay out of the commit. The verifier refuses a change outside the declared writes.
+- **Permissions.** What is not allowlisted is decided by the permission mode (decision 0094).
+- **Known gap.** A process that closes its descriptors and starts a new session can outlive its command on macOS and on Linux without PID namespaces.
+
+### Amendment index
+
+- [Amendments (2026-09-29)](#amendments-2026-09-29)
+- [Amendments (2026-09-30)](#amendments-2026-09-30)
+- [Amendments (2026-09-30, corrections to the amendment above)](#amendments-2026-09-30-corrections-to-the-amendment-above)
+- [Amendment: a refused worker reports the shortfall, and the operator may widen the shell (decision 0093)](#amendment-a-refused-worker-reports-the-shortfall-and-the-operator-may-widen-the-shell-decision-0093)
+- [Amendment: the ways past point 3 are the permission modes (decision 0094)](#amendment-the-ways-past-point-3-are-the-permission-modes-decision-0094)
+- [Amendment: host-side git goes through one hardened runner (decision 0094)](#amendment-host-side-git-goes-through-one-hardened-runner-decision-0094)
+- [Amendment: a command line in one string is read as its words; the description names the options](#amendment-a-command-line-in-one-string-is-read-as-its-words-the-description-names-the-options)
+- [Amendment: the narrowed forms of the acceptance command are allowed too](#amendment-the-narrowed-forms-of-the-acceptance-command-are-allowed-too)
+- [Amendment (2026-10-01): two forms of a model's tool call are repaired, and said](#amendment-2026-10-01-two-forms-of-a-models-tool-call-are-repaired-and-said)
+- [Amendment (2026-10-02): a repeated patch rejection carries a worked example](#amendment-2026-10-02-a-repeated-patch-rejection-carries-a-worked-example)
+- [Amendment (2026-10-02): `apply_patch` repairs more of what a model's intent makes certain, and refuses a silent append](#amendment-2026-10-02-apply_patch-repairs-more-of-what-a-models-intent-makes-certain-and-refuses-a-silent-append)
+- [Amendment (2026-10-06): a looser `apply_patch` match is written in the file's own whitespace](#amendment-2026-10-06-a-looser-apply_patch-match-is-written-in-the-files-own-whitespace)
+- [Amendment (2026-10-06): a Python package build's output is generated, not written](#amendment-2026-10-06-a-python-package-builds-output-is-generated-not-written)
+- [Amendment (2026-10-06, second): every language's build output is generated, Go builds in the sandbox, and a tab-indented file takes a spaces patch](#amendment-2026-10-06-second-every-languages-build-output-is-generated-go-builds-in-the-sandbox-and-a-tab-indented-file-takes-a-spaces-patch)
+- [Amendment (2026-10-06, third): other build tools' configuration, more lockfiles, and generated files cost nothing](#amendment-2026-10-06-third-other-build-tools-configuration-more-lockfiles-and-generated-files-cost-nothing)
+- [Amendment (2026-10-06, fourth): installed dependencies are readable, never writable, and every language builds and tests](#amendment-2026-10-06-fourth-installed-dependencies-are-readable-never-writable-and-every-language-builds-and-tests)
+- [Amendment (2026-10-06, fifth): a check never reads tool settings the worker left, a dependency grant never follows a link, workspace packages resolve to the tree, and the command's own virtual environment is activated](#amendment-2026-10-06-fifth-a-check-never-reads-tool-settings-the-worker-left-a-dependency-grant-never-follows-a-link-workspace-packages-resolve-to-the-tree-and-the-commands-own-virtual-environment-is-activated)
+- [Amendment (2026-10-06, sixth): nothing a worker's run built decides its check, pnpm workspaces resolve to the tree, and Windows links by junction](#amendment-2026-10-06-sixth-nothing-a-workers-run-built-decides-its-check-pnpm-workspaces-resolve-to-the-tree-and-windows-links-by-junction)
+- [Amendment (2026-10-07): a pnpm workspace resolves to the tree on Linux too, and a folder made within a time step of an install's change is made again](#amendment-2026-10-07-a-pnpm-workspace-resolves-to-the-tree-on-linux-too-and-a-folder-made-within-a-time-step-of-an-installs-change-is-made-again)
+- [Amendment (2026-10-07): a command reads the package stores kGraf's install filled, read-only](#amendment-2026-10-07-a-command-reads-the-package-stores-kgrafs-install-filled-read-only)
+- [Amendment (2026-10-07): ignored files are removed through the handle walk on Windows too](#amendment-2026-10-07-ignored-files-are-removed-through-the-handle-walk-on-windows-too)
+- [Amendment (2026-10-08): a shell question also names what the permission mode grants](#amendment-2026-10-08-a-shell-question-also-names-what-the-permission-mode-grants)
+- [Amendment (2026-10-08): a toolchain outside the home folder is readable on Linux](#amendment-2026-10-08-a-toolchain-outside-the-home-folder-is-readable-on-linux)
+- [Amendment (2026-10-09): a command off the allowlist gets 120 s unless its call asks for more](#amendment-2026-10-09-a-command-off-the-allowlist-gets-120-s-unless-its-call-asks-for-more)
+- [Amendment (2026-10-11): an `@@` marker with no space is read, and a file that keeps failing is offered a whole-file replace](#amendment-2026-10-11-an--marker-with-no-space-is-read-and-a-file-that-keeps-failing-is-offered-a-whole-file-replace)
+- [Addition (2026-10-12): an Add File body with no `+` is read as plain text](#addition-2026-10-12-an-add-file-body-with-no--is-read-as-plain-text)
+- [Amendment (2026-10-12): three more repairs for patches that fail on form alone](#amendment-2026-10-12-three-more-repairs-for-patches-that-fail-on-form-alone)
+
 ## Context
 
 Under a declared write scope, a worker's shell call was refused outright: a shell command
@@ -276,7 +320,7 @@ example parses), `kgraf-runtime` `a_second_rejected_patch_carries_a_worked_examp
 
 ## Amendment (2026-10-02): `apply_patch` repairs more of what a model's intent makes certain, and refuses a silent append
 
-In one benchmark round 290 of 508 `apply_patch` calls failed (57%): "Failed to find expected
+In one benchmark run 290 of 508 `apply_patch` calls failed (57%): "Failed to find expected
 lines", "Failed to find context", "last line must be `*** End Patch`", "Unexpected line in
 update hunk", a delete and an add of one file refused as one path in two hunks, a bad hunk
 header, a unified-diff `@@ -a,b +c,d @@` header, an empty hunk. Stalled attempts ran for a long
@@ -1105,7 +1149,7 @@ Tests: `kgraf-tools` `an_at_marker_glued_to_its_text_is_read_as_a_context_line`,
 
 ### Addition (2026-10-12): an Add File body with no `+` is read as plain text
 
-In round 24 a worker followed the whole-file hint and wrote the Add File body as plain lines.
+In an internal test run a worker followed the whole-file hint and wrote the Add File body as plain lines.
 The tool refused it, the worker fell back to a shell heredoc that Manual mode denied, and the
 run blocked.
 
@@ -1129,7 +1173,7 @@ rejected patch, since a bare body is no longer rejected.
 
 ## Amendment (2026-10-12): three more repairs for patches that fail on form alone
 
-Mining eight canary rounds of real-model `apply_patch` calls found that 54% failed (1,970 of
+Mining eight internal test runs of real-model `apply_patch` calls found that 54% failed (1,970 of
 3,677), with no change over twelve rounds. Three failures were about the form of the patch, not
 its content. Each repair below follows the rule of the earlier ones: the intent is certain, the
 file still decides whether the patch applies, and the result carries a `note:`.

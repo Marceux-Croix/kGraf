@@ -2,7 +2,49 @@
 
 **Status:** Accepted. Refines decision 0027's classification test and
 decision 0029's detection path.
+**Amends:** 0027 (the classification test), 0029 (the detection path)
 **Related:** decisions 0013, 0018, 0019, 0024, 0026, 0027, 0029
+
+## Current state
+
+Checked against the code on 2026-10-12. Where the history below disagrees, this block holds.
+
+- **Contract checks are off by default** and opt in per run. With checks on, a second planner call writes an interface wherever one contract consumes another's code. kGraf derives the stub, the consumer and the compile command first, and asks the planner only for judgment.
+- **Three checks run in a sandbox:** the stub-compile check, the vacuity check, then the handshake. The vacuity check is two-sided: the test fails against the stub and passes against a correct reference.
+- **Derived compile commands** exist for Rust, Python, TypeScript, Go, Java and C#. Where none can be derived, or the check program is not installed, the edge is recorded as unchecked with the reason and no party is held. A check never blocks a project it cannot judge.
+- **The plan is checked against the repository** before dispatch and refused, with the cause named, when: a scaffold file the instruction names is written by no contract; a workspace member manifest comes after its use, or a package is not listed in the workspace; a check command cannot run; or no contract declares a write.
+- **A cut-off answer** that stopped after a complete value is closed mechanically. Other malformed answers are asked again within a bound.
+- **With a run time limit,** the planner asks other than the first contracts ask share 30 percent of it. A held ask is traced.
+- **Re-decompose** is a third outcome beside amend and supersede.
+
+### Amendment index
+
+- [Amendments (2026-09-30)](#amendments-2026-09-30)
+- [Amendments (2026-09-30, corrections to the amendment above)](#amendments-2026-09-30-corrections-to-the-amendment-above)
+- [Amendment (2026-10-01): consuming contracts need an interface, or the run says checks did not run](#amendment-2026-10-01-consuming-contracts-need-an-interface-or-the-run-says-checks-did-not-run)
+- [Amendment (2026-10-01): the planner is told the project's names, and four planning faults are closed](#amendment-2026-10-01-the-planner-is-told-the-projects-names-and-four-planning-faults-are-closed)
+- [Amendment (2026-10-02): interfaces are a second planner call, and an unwritten interface is counted, never held](#amendment-2026-10-02-interfaces-are-a-second-planner-call-and-an-unwritten-interface-is-counted-never-held)
+- [Amendment (2026-10-02): the plan is checked against the repository, and a plan-shape hold says so](#amendment-2026-10-02-the-plan-is-checked-against-the-repository-and-a-plan-shape-hold-says-so)
+- [Amendment (2026-10-02, second): derive first, ask the planner only for judgment](#amendment-2026-10-02-second-derive-first-ask-the-planner-only-for-judgment)
+- [Amendment (2026-10-02, third): a check command names only files the check can see, and `not run` is two counts](#amendment-2026-10-02-third-a-check-command-names-only-files-the-check-can-see-and-not-run-is-two-counts)
+- [Amendment (2026-10-02, fourth): a placeholder is found only in code](#amendment-2026-10-02-fourth-a-placeholder-is-found-only-in-code)
+- [Amendment (2026-10-06): a surface of files is anchored in the handshake](#amendment-2026-10-06-a-surface-of-files-is-anchored-in-the-handshake)
+- [Amendment (2026-10-06): every cargo command in a workspace loads every member](#amendment-2026-10-06-every-cargo-command-in-a-workspace-loads-every-member)
+- [Amendment (2026-10-06, second): a member list in prose is read](#amendment-2026-10-06-second-a-member-list-in-prose-is-read)
+- [Amendment (2026-10-06, third): a producer that edits existing code is checked against its current code](#amendment-2026-10-06-third-a-producer-that-edits-existing-code-is-checked-against-its-current-code)
+- [Amendment (2026-10-06, fourth): an abstract method is not a scaffold, and a check that cannot apply to a language never blocks](#amendment-2026-10-06-fourth-an-abstract-method-is-not-a-scaffold-and-a-check-that-cannot-apply-to-a-language-never-blocks)
+- [Amendment (2026-10-06, fifth): derived compile checks and the member check reach other languages](#amendment-2026-10-06-fifth-derived-compile-checks-and-the-member-check-reach-other-languages)
+- [Amendment (2026-10-08): a package the workspace does not list is refused](#amendment-2026-10-08-a-package-the-workspace-does-not-list-is-refused)
+- [Amendment (2026-10-08, second): an ask the planner cannot win is not made, and a script test gets its call](#amendment-2026-10-08-second-an-ask-the-planner-cannot-win-is-not-made-and-a-script-test-gets-its-call)
+- [Amendment (2026-10-09): a contract that declares no writes is refused](#amendment-2026-10-09-a-contract-that-declares-no-writes-is-refused)
+- [Amendment (2026-10-09, second): only a plan in which no contract declares a write is refused](#amendment-2026-10-09-second-only-a-plan-in-which-no-contract-declares-a-write-is-refused)
+- [Amendment (2026-10-09, third): the interface answer cap holds only where the model does not reason](#amendment-2026-10-09-third-the-interface-answer-cap-holds-only-where-the-model-does-not-reason)
+- [Amendment (2026-10-09, fourth): an answer the model stopped before its JSON closed is closed or asked once more, not refused](#amendment-2026-10-09-fourth-an-answer-the-model-stopped-before-its-json-closed-is-closed-or-asked-once-more-not-refused)
+- [Amendment (2026-10-11): a file only a finished contract wrote is handed to the contract that needs it](#amendment-2026-10-11-a-file-only-a-finished-contract-wrote-is-handed-to-the-contract-that-needs-it)
+- [Amendment (2026-10-11, second): a cargo workspace refusal with a mechanical remedy is repaired, not asked again](#amendment-2026-10-11-second-a-cargo-workspace-refusal-with-a-mechanical-remedy-is-repaired-not-asked-again)
+- [Amendment (2026-10-11, third): a missing check program skips an interface's checks; it no longer holds its parties](#amendment-2026-10-11-third-a-missing-check-program-skips-an-interfaces-checks-it-no-longer-holds-its-parties)
+- [Amendment (2026-10-12): an interface refused again for a reason it was told is not asked for again; a repeated missing tests file becomes compile-only](#amendment-2026-10-12-an-interface-refused-again-for-a-reason-it-was-told-is-not-asked-for-again-a-repeated-missing-tests-file-becomes-compile-only)
+- [Amendment (2026-10-12): the optional planner asks have a budget when the run has a time limit](#amendment-2026-10-12-the-optional-planner-asks-have-a-budget-when-the-run-has-a-time-limit)
 
 ---
 
@@ -504,7 +546,7 @@ the repository at the dispatch base with the interface's own files laid over it.
 
 **Not run is two counts.** `checks_not_run`, the report's `not run`, counts each `Unchecked` edge and
 each `CheckNotRun` event, both event-sourced (`challenge.rs`, `apply`). A report can say `not run 1`
-with no unchecked edge: one interface whose check could not run. The scenario canary compared the
+with no unchecked edge: one interface whose check could not run. The internal scenario suite compared the
 counter with the unchecked edges alone and read that as a disagreement; it now compares it with
 unchecked edges plus `check_not_run` events.
 
@@ -512,7 +554,7 @@ unchecked edges plus `check_not_run` events.
 stub to stand in, so no compile check can be derived for the edges that consume it. kGraf records each
 as `unchecked` with the cause ("no file P writes holds a scaffold (a placeholder body) to stand in as
 its stub") and the skipped behavior check, and counts it in `not run`. That is correct behavior. The
-scenario canary treats it as honest only when the reason says the behavior check was skipped on
+internal scenario suite treats it as honest only when the reason says the behavior check was skipped on
 purpose and states a cause; a derived check that failed or could not run, a bare "could not be
 derived", and an edge with no record are still defects.
 
@@ -592,7 +634,7 @@ statements as given. A party that names no surface symbol is still `no_claims` a
 
 The same run's first plan had two edges with nothing to derive after its interface call was refused
 at its last ask; kGraf recorded both as `unchecked` with the asked reason and the cause of the
-missing compile check, counted in `not run`. That is correct behavior. The scenario canary now reads
+missing compile check, counted in `not run`. That is correct behavior. The internal scenario suite now reads
 that case as honest too, only after the last ask and only with the cause stated.
 
 Tests: `kgraf-orchestrator` `handshake_diagnosis_tests.rs`
@@ -1059,7 +1101,7 @@ inside a string, mid-word.
 - **Never silent.** Each closing and each re-ask is written to the run's trace as
   `answer_repaired` (call, agent, kind, `appended`; no call added) or `answer_reasked` (call,
   agent, kind, `reason`), with a notice in the run's output naming the call.
-- **Measured.** A cheaper path can be taken more often, so the canary records `answer_repairs`
+- **Measured.** A cheaper path can be taken more often, so the internal test harness records `answer_repairs`
   and `answer_reasks`, with counts per call kind, for every model scenario. Neither is a wasted
   ask.
 - **Accounting.** A closed answer costs no call. The re-ask's tokens go through the same
@@ -1073,7 +1115,7 @@ Tests: `kgraf-orchestrator` `incomplete_answer_tests.rs`, built from recorded an
 
 ## Amendment (2026-10-11): a file only a finished contract wrote is handed to the contract that needs it
 
-A greenfield canary run (round 17d, `qwen3.6:35b`) planned `c1`, which wrote the root `Cargo.toml`
+A greenfield internal test run (`qwen3.6:35b`) planned `c1`, which wrote the root `Cargo.toml`
 (a workspace with member `wcl-core`) and `wcl-core`, and `c2`, which wrote `wcl/Cargo.toml` and
 `wcl/src/main.rs`. `c1` finished and was integrated. The worker of `c2` correctly reported that
 `wcl` must be a root member for `cargo test -p wcl --offline` to pass. No open contract wrote the
@@ -1104,7 +1146,7 @@ fail with the finished-writer lookup disabled.
 
 ## Amendment (2026-10-11, second): a cargo workspace refusal with a mechanical remedy is repaired, not asked again
 
-A greenfield canary run (round 17e, `qwen3.6:35b`) asked the planner three times. The checks
+A greenfield internal test run (`qwen3.6:35b`) asked the planner three times. The checks
 against the repository refused all three plans, and the run ended PlanFailed. The three refusals:
 `c1` ran `cargo test --workspace` while `wcl/Cargo.toml` was written only by `c2`, which `c1` did
 not depend on; `c1` ran `cargo test -p wcl-core` at the root while only `c3`, which ran after
@@ -1136,7 +1178,7 @@ repaired plan is still refused, or it fails the plan rules, the plan is asked fo
 unchanged refusal, exactly as before; on the last ask the run fails as before.
 
 A repair is loud: one `plan_repaired` trace event per change (the ask, the contract, the change in
-words) and one run notice per change, which the accepted plan's notices carry. The canary counts
+words) and one run notice per change, which the accepted plan's notices carry. The internal test harness counts
 the events as `plan_repairs` beside `answer_repairs`; a repair writes no `plan_refused`, so it is
 never a wasted ask.
 
@@ -1154,7 +1196,7 @@ guards disabled their two tests failed.
 
 ## Amendment (2026-10-11, third): a missing check program skips an interface's checks; it no longer holds its parties
 
-A canary run of `benchmark-terminal-bench-c` on a local model ended Blocked. Every interface had a
+An internal test run of a terminal-task workload on a local model ended Blocked. Every interface had a
 `pytest` test command, `pytest` was not installed on the machine, and the check runner returned
 `CheckError::ProgramMissing`. Each interface became `InterfaceState::NotRun`, and the dispatch gate held
 every party of it, so no work was done. A machine without a language's test runner is a normal
@@ -1171,8 +1213,8 @@ no party is held.
   run's verify gate still judges the work". The event is in the trace, and the run report adds an
   `interface checks skipped` line.
 - The fact is counted in `ContractCounters::interface_checks_skipped`. It is not added to
-  `checks_not_run`, because no party is held and no verdict is pending; the canary's `not run`
-  comparison is unchanged. The canary reads the events (`checks_skipped_programs`) and, when the notice
+  `checks_not_run`, because no party is held and no verdict is pending; the test harness's `not run`
+  comparison is unchanged. The test harness reads the events (`checks_skipped_programs`) and, when the notice
   is present, reports the skip with the program named.
 - The dispatch gate treats such an interface as a run with contract checks off: it runs no mechanical
   check, handshake, stub landing (`ensure_stub_landed`) or consumer test (`run_consumer_tests`) for it,
@@ -1187,13 +1229,13 @@ twice, an I/O or configuration error of the runner.
 Tests: `an_interface_whose_check_program_is_missing_does_not_hold_its_parties` (parties dispatch, one
 notice, the trace event, the count, no stub landed), `a_check_that_cannot_run_for_another_cause_still_holds_its_parties`,
 `skipped_checks_replay_without_a_hold_and_count_once`, the host test
-`a_contract_in_a_language_this_machine_cannot_check_skips_its_checks_and_runs`, and the canary test
+`a_contract_in_a_language_this_machine_cannot_check_skips_its_checks_and_runs`, and the internal scenario test
 `test_skipped_interface_checks_are_read_as_a_fact_with_the_program_named`. With the skip arm disabled the
 first test failed.
 
 ## Amendment (2026-10-12): an interface refused again for a reason it was told is not asked for again; a repeated missing tests file becomes compile-only
 
-A canary run of `benchmark-terminal-bench-c` on a local model spent all three interface asks on the same
+An internal test run of a terminal-task workload on a local model spent all three interface asks on the same
 omission. The planner answered interfaces with no tests file, was told so, and answered again with no
 tests file under a new interface id that grouped the edges differently. The repeat check compared an
 answer only with the last ask, and matched an interface only by its id or by exactly the same edges, so
@@ -1215,7 +1257,7 @@ The rule:
   why and the edge is unchecked.
 - Asks whose reasons differ are unchanged: the planner made progress, and the budget (3 asks) is not
   reduced. No rule here adds an ask.
-- The canary's wasted-ask rule needs no change. A degraded repeat writes no `interfaces_refused` event,
+- The test harness's wasted-ask rule needs no change. A degraded repeat writes no `interfaces_refused` event,
   because the refusal text holds only reasons that were not given before, and the loop ends when it is
   empty. A refusal that does repeat an earlier reason still counts as waste.
 
@@ -1227,8 +1269,8 @@ compile-only interface, the notice; it fails with the compile-only branch disabl
 
 ## Amendment (2026-10-12): the optional planner asks have a budget when the run has a time limit
 
-Canary rounds 15b to 26 of `benchmark-terminal-bench-c` (a 900 s task window) spent 51 to 82 percent of
-the window in planner asks: 82% (15b), 79% (20), 60% (21), 65% (24), 70% (25), 51% (26). In round 26 the
+Six internal test runs of a terminal-task workload (a 900 s task window) spent 51 to 82 percent of
+the window in planner asks. In the run with the lowest share the
 contracts ask took 81 s, three interface asks took 104, 102 and 156 s, and all three were refused. The
 workers then had 3 to 14 steps. A refused interface ask is an optional ask that bought nothing, and no
 rule stopped it from taking the time the work needed.
@@ -1238,7 +1280,7 @@ The rule:
   `.kgraf/run.json`, `OrchestratorConfig::time_limit`). The Terminal-Bench bridge passes the task's agent
   window (`--ak time_limit_sec`). Without a limit nothing below applies and behavior is unchanged.
 - The planner asks get 30 percent of the limit. The share is a measured choice: it holds a contracts ask
-  and one or two interface asks on a local model (81 s and 104 s of 270 s in round 26) and leaves two
+  and one or two interface asks on a local model (81 s and 104 s of 270 s in one measured run) and leaves two
   thirds of the window to the workers.
 - Planner time is the wall-clock time of the planner asks of this run so far (contracts, splits,
   interfaces, re-plans). Before an interface ask or a re-plan, the ask is not made when the time spent is
@@ -1251,7 +1293,7 @@ The rule:
   notice names the budget.
 - A skipped re-plan leaves the held plan's outcome as it is when no re-plan is left, with a notice.
 - Each skip is a `planner_budget_skipped` contract event (`phase` `interfaces` or `replan`) and counts in
-  `planner_budget_skips`. The canary reads the events: the fact `planner_budget_skips`, and a budget stop
+  `planner_budget_skips`. The test harness reads the events: the fact `planner_budget_skips`, and a budget stop
   counts as an honest end of the interface call, so the edges it left unchecked are not a defect.
 - A resumed run counts planner time from the resume.
 
@@ -1259,5 +1301,5 @@ Tests: `slow_planner_asks_stop_the_interface_asks_at_the_budget` (a 9 s limit, a
 interface ask is not made, the edge is unchecked and counted, the notice and the event; it fails with the
 gate disabled), `with_no_time_limit_the_interface_asks_are_not_held_back`,
 `the_contracts_ask_is_never_skipped_by_the_budget`, `a_replan_is_skipped_when_the_budget_is_spent`, the unit
-tests in `planner_budget.rs`, and the canary tests `test_a_budget_stop_is_an_honest_end_of_the_interface_call_and_a_fact`
+tests in `planner_budget.rs`, and the internal scenario tests `test_a_budget_stop_is_an_honest_end_of_the_interface_call_and_a_fact`
 and `test_only_the_counted_skip_record_ends_the_interface_call`.

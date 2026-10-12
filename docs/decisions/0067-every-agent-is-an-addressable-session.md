@@ -146,7 +146,7 @@ This decision amends 0033 so that a change notice arrives mid-run, and point 3 b
 injector, but the mailbox (`envelope.rs`, `post_message`) still delivered only in the
 recipient's next fresh brief, with a `pending` trace that said the runtime cannot inject a
 turn. A recipient whose attempt finished without a later brief never got the report, and no
-event said so. In measured canary and benchmark traces this was about 1% of mailbox notes.
+event said so. In measured traces of internal test runs and benchmarks this was about 1% of mailbox notes.
 
 Now:
 - A report to a contract with a running attempt is pushed to that attempt's session inbox as a

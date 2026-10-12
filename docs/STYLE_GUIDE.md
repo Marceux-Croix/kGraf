@@ -2,8 +2,6 @@
 
 This is the UI guide for kGraf's desktop shell. It is for anyone who designs or builds a screen in the shell, or reviews one. The style is called **Stage**. It suits an interface built around one large canvas, the **stage**, which in kGraf is the galaxy graph. The interface keeps attention on the stage, and it offers information density that scales with what the stage shows.
 
-Think of a dark theater just before the show. The house lights fall and the stage glows. Everything else waits in the wings until it is called. The palette is called Nocturne: blue-black surfaces, with violet, cyan, yellow and orange as the only signal colors.
-
 The shell is a native Rust app, not a web page. Section 8 says how the web terms in this guide map to it.
 
 ## 1. Principles
@@ -127,7 +125,7 @@ The base unit is 4 px. Prefer 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48. A componen
 | ID | Rule |
 |---|---|
 | ICO-1 | Icons are Material Symbols Outlined, weight 400. The default size is 24 px. Use 20 px in small icon buttons, 18 px in small buttons and badges, 16 px beside 12 px text. |
-| ICO-2 | Icons take the current text color. Use the outlined form at rest and the filled form for the active state (ICO-3). Icons on the stage are white. |
+| ICO-2 | Icons take the current text color. Use the outlined form at rest and the filled form for the active state. Icons on the stage are white. |
 | MOT-1 | Things enter more slowly than they leave: 150 to 350 ms in, 100 to 200 ms out. |
 | MOT-2 | When the user asks for reduced motion, all transitions and animations MUST have zero duration, blinking stops (the dot stays solid), and scrolling is instant. |
 | MOT-3 | "Working" shows as a blink. Opacity goes from 1 to 0.3 and back over 1.6 s, without end. On the stage the lowest opacity is 0.35. It applies to gray working dots and the gray aggregate indicator. |
@@ -300,7 +298,7 @@ The stage palette is fixed in every theme. Its values are the `STAGE` literals i
 | STG-CAM-1 | Camera scale is screen pixels per world unit. The fit scale is the scale after "Fit", which frames all content clear of the overlays. The zoom range runs from 0.6 x the fit scale to a camera scale of 5. |
 | STG-CAM-2 | Wheel zoom is continuous and keeps the point under the pointer fixed. Buttons and keys zoom 1.4 x per step. |
 | STG-CAM-3 | Selecting an object from outside the stage moves the camera to it in 500 ms. A resize refits only if the view was at fit. Keys: arrows pan, `+` and `-` zoom, `0` fits, Escape clears. |
-| STG-PERF-1 | Redraw only when something changes. A blinking state needs about 15 redraws per second, not 60 (STG-PERF-2). |
+| STG-PERF-1 | Redraw only when something changes. A blinking state needs about 15 redraws per second, not 60. |
 | STG-PERF-4 | A software-rendering mode says so in a mode badge (CMP-STAT-3). If the mode leaves out a costly effect, the tooltip names it. |
 
 ## 7. Interaction, content and accessibility
@@ -320,7 +318,7 @@ The stage palette is fixed in every theme. Its values are the `STAGE` literals i
 | TXT-5 | A tooltip says what a control does, not what it is: "Pause the scheduler". |
 | TXT-6 | A disabled or degraded state says why, and what to do about it. |
 | TXT-7 | Do not claim a benefit the product cannot measure. |
-| A11Y-1 | All text meets WCAG 2.2 AA contrast on its surface in both themes: 4.5:1, or 3:1 for large text. Non-text parts that carry meaning meet 3:1. Disabled text and decorative borders are exempt. Measure any new pair of tokens before you use it. |
+| A11Y-1 | Text MUST meet WCAG 2.2 AA contrast on its surface in both themes: 4.5:1, or 3:1 for large text. Non-text parts that carry meaning MUST meet 3:1. Disabled text and decorative borders are exempt. Tests check only the pairs named under this table. Measure any other pair of tokens before you use it. |
 | A11Y-2 | Every control has an accessible name. A control that shows only an icon gets its name from its tooltip text. |
 | A11Y-3 | Use the native role for each control: button, switch, slider, tab, radio group, menu, dialog. |
 | A11Y-4 | Live feeds are announced politely. Form errors are announced at once. |
@@ -347,7 +345,14 @@ kGraf's shell is a native Rust app built with egui and `wgpu`. It has no webview
 
 **Normative rules.** Sections 1, 3, 7 and 9 bind every surface. Sections 4 to 6 bind in their stated values, except where a value assumes a browser, such as a stylesheet property. For those, apply the intent. The color rules (COL-1 to COL-9), CMP-DLG-6 and CMP-NAV-7 are checked in review.
 
-**Assets.** The product ships all fonts and icons in its own source tree and makes no network request for assets (AST-1). Each product has its own original brand mark, one color (`--text`) with at most one `--accent` element (AST-2). Each font keeps its real family name (AST-4). The source, version, date and license of each asset are in `crates/kgraf-shell/assets/SOURCES.md` (AST-3).
+**Assets.**
+
+| ID | Rule |
+|---|---|
+| AST-1 | The product ships all fonts and icons in its own source tree and makes no network request for assets. |
+| AST-2 | Each product has its own original brand mark: one color (`--text`) with at most one `--accent` element. |
+| AST-3 | The source, version, date and license of each asset are in `crates/kgraf-shell/assets/SOURCES.md`. |
+| AST-4 | Each font keeps its real family name. |
 
 ## 9. Blocking rules
 

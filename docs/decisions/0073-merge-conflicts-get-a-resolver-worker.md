@@ -2,6 +2,7 @@
 
 **Status:** Accepted; amends decision 0018's consequence that a merge conflict is never
 auto-resolved (0018 itself otherwise stands unchanged)
+**Amends:** 0018 (merge conflict handling)
 **Related:** decisions 0018, 0067
 
 ## Context

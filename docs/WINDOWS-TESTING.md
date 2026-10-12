@@ -8,10 +8,10 @@ downloaded program. The bundle path needs no Rust knowledge. The manual path nee
 build. Decisions 0011 and 0097 give the design; 0097 replaces the restricted-token design of
 0011 with dedicated sandbox users.
 
-Four terms recur:
+Seven terms recur:
 
 - The **token sandbox** is the backend kGraf uses when no sandbox user exists. A command runs
-  with a restricted copy of the owner's own Windows token. It needs no administrator rights.
+  with a restricted copy of the current user's own Windows token. It needs no administrator rights.
   It cannot deny network access, and Git Bash and some build tools fail under it.
 - A **sandbox user** is a dedicated local Windows account that `kgraf sandbox setup` creates
   once, with administrator rights. A sandboxed command runs as that account. Setup makes two
@@ -19,14 +19,14 @@ Four terms recur:
   run as two different users.
 - The **baseline** is the first full pass of the test suite, with no sandbox user set up.
 - A **Windows Filtering Platform (WFP) filter** is a rule in the Windows network stack.
-  Setup adds seven: four that block loopback connections outside kGraf's proxy ports, and
-  three that are meant to block name lookups (DNS). kGraf's **egress proxy** is the local
+  Setup adds seven: four that block loopback connections (TCP outside kGraf's proxy ports,
+  and UDP), and three that are meant to block name lookups (DNS). kGraf's **egress proxy** is the local
   proxy that is the only network path a sandboxed command without network access may use.
 - The **launcher service** is a Windows service that setup installs. It starts each
   sandboxed command in session 0 (the non-interactive Windows session), where cargo and
   rustc can create the named objects (semaphores, mutexes) they need.
 
-State as of 2026-10-11 (run 22, section 4):
+Latest recorded result (2026-10-11, section 4):
 
 - The self-test bundle has run on a GitHub-hosted runner: Windows Server 2025 on x86_64, with
   Git for Windows, as an administrator. Its last full run read clean except for one named
@@ -164,10 +164,8 @@ time left, and it cuts a running item's limit to the time left. It keeps a reser
 (540 s with the sandbox user phase) for removal, cleanup and the report. The verdict reads
 `INCOMPLETE` as soon as one item did not run or was stopped, and the runner exits 1.
 
-The workflow computes the budget as the job limit (165 minutes), less the minutes already
-used, less 12 for the steps after the bundle, less 1. On the measured runs the budget was
-about 130 minutes. A full run took 94 to 103 minutes in the bundle and 118 to 127 minutes in
-the job. The 165 minute limit leaves a margin of at least 38 minutes.
+The workflow sets N to the job limit (165 minutes), less the minutes already used, less 12
+for the steps after the bundle, less 1.
 
 ### Running only some tests
 
@@ -232,13 +230,7 @@ Two things differ from a standard user's machine. The runner account is an admin
 the runner has Git for Windows. A hosted run does not replace a run on a standard-user
 machine without Git for Windows.
 
-**Cost.** GitHub-hosted standard runners are free and unlimited for public repositories. A
-private repository bills Windows minutes at twice the Linux rate. The job stops after 165
-minutes in both cases. A public repository also gets a larger standard Windows runner
-(4 vCPU and 16 GB, against 2 vCPU and 8 GB for private) according to
-[GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
-The times in this guide were measured on the 2 vCPU runner; times on the larger one are not
-measured.
+**Cost.** GitHub-hosted standard runners are free on a public repository.
 
 ## 4. What a clean run looks like
 
@@ -264,35 +256,22 @@ when all six hold:
 A verdict that counts any other test, a hung binary, an end-to-end failure, a
 `not run: budget` item or a non-empty status after removal is not clean.
 
-### Campaign summary
+### Latest recorded result
 
-The campaign ran the bundle on hosted runners (Windows Server 2025 Datacenter 24H2, build
-26100.33438, x86_64, 2 cores, 8 GiB, Git for Windows 2.55.0, cargo 1.99.0) on 2026-10-10 and
-2026-10-11, until a full run with the sandbox user phase read clean. Each run fixed what the
-one before it showed.
+On 2026-10-11 a full run with the sandbox user phase read clean on a hosted runner (Windows
+Server 2025 Datacenter 24H2, build 26100.33438, x86_64, 2 cores, 8 GiB, Git for Windows
+2.55.0, cargo 1.99.0). The verdict was `ALL PASSED`, with DNS as the only known gap.
 
-| Run | Verdict | Bundle time | Job time |
-|---|---|---|---|
-| 15 | FAILURES (143 tests, 1 end-to-end check; before classification) | 1:17:48 | not recorded |
-| 16 | ALL PASSED (filtered to 8 tests) | 31:40 | 62.7 min |
-| 17 | cancelled at the 120 minute job limit; no report | not written | 120.3 min |
-| 18 | INCOMPLETE (115 minute budget) | 1:42:28 | 127.8 min |
-| 19 | FAILURES (2 tests) | 1:34:26 | 117.6 min |
-| 20 | FAILURES (2 tests, both timing) | 1:34:37 | 117.8 min |
-| 21 | FAILURES (9 tests, 1 binary hung) | 1:43:10 | 126.8 min |
-| 22 | ALL PASSED, known gap: DNS only | 1:36:25 | 119.7 min |
-
-Run 17 led to the time budget and to the upload that runs after a cancel. Run 18 led to
-re-running only the failed tests of a binary and to the expected-failure classification. Runs
-19 to 21 fixed tests that depended on a fast machine or a short command. Run 22 in numbers:
-181 test binaries, none hung or crashed; 5,577 tests passed, 143 failed in the baseline and
-11 were ignored; 144 baseline failures (143 tests and `shell.git_bash`) were all expected
-under the token sandbox, and every one passed as the sandbox user (77 `STATUS_DLL_INIT_FAILED`,
-34 jobserver, 32 Git Bash, 1 Schannel). The re-run took 15 binaries; all passed except
-`dns_windows` (3 passed, 1 failed, the known gap). The sandbox user phase took 3,022 s and
-the budget (131 minutes) was not reached. The launcher service path started every command in
-session 0, and the fallback grant did not run. Per-run detail is in the development
-records, not published.
+- 181 test binaries ran; none hung or crashed. 5,577 tests passed, 143 failed in the baseline
+  and 11 were ignored.
+- The 144 baseline failures (143 tests and `shell.git_bash`) were all expected under the token
+  sandbox, and every one passed as the sandbox user (77 `STATUS_DLL_INIT_FAILED`, 34
+  jobserver, 32 Git Bash, 1 Schannel).
+- The re-run took 15 binaries. All passed except `dns_windows` (3 passed, 1 failed, the known
+  gap).
+- The bundle took 1:36:25, of which 3,022 s went to the sandbox user phase. The job took
+  119.7 minutes. The budget of 131 minutes was not reached.
+- The launcher service started every command in session 0. The fallback grant did not run.
 
 ## 5. Known gaps
 
@@ -305,18 +284,14 @@ reaches a DNS server and gets an answer (status 9003, `DNS_ERROR_RCODE_NAME_ERRO
   including the loopback filters and the egress proxy line.
 - `dns_windows :: an_offline_lookup_does_not_reach_the_dns_client_service` fails with "This
   is the recorded gap".
-- All runs from 16 to 22 that wrote a report show the same gap.
+- Every recorded run that wrote a report shows the same gap.
 
 Another Windows version may accept those filters. None was tested. A run on one is the most
 useful new result.
 
-**The AppContainer probe.** AppContainer was examined as a replacement for the DNS filters.
-A probe-only run on 2026-10-11 found that, on Windows Server 2025, the DNS Client service
-refuses a lookup from an AppContainer that has no network capability, before anything is
-sent: no DNS packet appears in the container phase, and the control phase answers. Git and
-`cargo build` did not run inside the container with the access grants the probe gave. The
-probe ran as the runner account, not as a sandbox user. No part of the sandbox uses an
-AppContainer. Decision 0097 keeps the sandbox user and records the DNS gap.
+**The AppContainer probe.** A probe on 2026-10-11 found that the DNS Client service refuses a
+lookup from an AppContainer that has no network capability. Git and `cargo build` did not run
+inside the container, so decision 0097 keeps the sandbox user and records the DNS gap.
 
 **Not tested:**
 
@@ -398,7 +373,7 @@ again after `kgraf sandbox setup` (case 6b) with `$env:KGRAF_REQUIRE_SANDBOX_USE
 Notes for steps 3 to 3c:
 
 - The escape tests use the test binary itself as the probe, and a sandbox user cannot read
-  the owner's profile. Set `$env:CARGO_TARGET_DIR = "C:\kgraf-target"` (outside the profile)
+  the current user's profile. Set `$env:CARGO_TARGET_DIR = "C:\kgraf-target"` (outside the profile)
   before building and running them. A test fails with a message that names
   `CARGO_TARGET_DIR` if the binary is under the profile.
 - Many escape tests report a measurement and not only a block, such as whether a sandbox

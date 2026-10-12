@@ -1,6 +1,7 @@
 # Decision 0061: The Windows MSI is built with `wixl` (msitools), not `cargo-dist`/`cargo-packager`
 
 **Status:** Accepted
+**Amends:** 0055 (the Windows installer tool)
 **Related:** decision 0055 (reuse existing code before writing new code, which named
 `cargo-dist`/`cargo-packager` as the planned release pipeline)
 

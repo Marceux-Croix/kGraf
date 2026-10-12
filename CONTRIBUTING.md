@@ -21,7 +21,7 @@ cargo build --workspace
 ```
 
 Run these three gates locally before you open a pull request. No workflow starts on its
-own; the maintainer runs CI by hand on your branch.
+own. The maintainer runs CI after pulling your change into a branch of this repository.
 
 ```bash
 cargo fmt --all -- --check
@@ -50,6 +50,21 @@ Large design choices are recorded in [docs/decisions/](docs/decisions).
 Prefer existing, permissively licensed code over new code. When you copy or port code into
 the tree, put it under `third_party/<name>/` with an `UPSTREAM` file that names the source,
 the commit and the license, and update [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Verifying a route
+
+A route is VERIFIED in [docs/MODEL-SUPPORT.md](docs/MODEL-SUPPORT.md) only after one real
+request and response through the adapter, built as a run builds it.
+
+1. Set the route's credential in your shell.
+2. For a generative route, run `kgraf call --provider <route> --model <model-id> --record
+   <file>`. For another kind, use the kind's tool in a run, or an ignored live test such as
+   `crates/kgraf-fleet/tests/live_embeddings.rs`.
+3. Check the model echo, the reply, the raw usage and the ledger row.
+4. Record the date, the model, the request as sent, the raw reply and what it showed.
+5. Change the route's confidence in the catalog and update the table.
+
+A route that fails the check stays BUILT, UNTESTED, and the adapter is fixed first.
 
 ## Pull requests
 

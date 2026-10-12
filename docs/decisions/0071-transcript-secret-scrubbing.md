@@ -4,6 +4,10 @@
 **Deciders:** the project maintainer.
 **Related:** 0051 (MCP header values are read from the environment, never stored), 0056 and 0057 (the transcript is the memory that a resume and a compaction re-ground on), 0059 (the ledger stores token counts only), 0084 (build and test output). Code: `crates/kgraf-secrets`. The pattern rules are ported from gitleaks (MIT); see `third_party/gitleaks/UPSTREAM`.
 
+## Current state
+
+Checked against the code on 2026-10-12. The pattern rule set holds 45 rules: 43 ported from gitleaks and two written for kGraf, `generic-url-credential` and `git-url-token`. The Decision section below states the original count.
+
 This record exists so a later change to the worker loop, the ledger or an MCP transport does not open a path for a credential to reach disk, the shell or a model provider unredacted.
 
 ## Context

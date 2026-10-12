@@ -1,9 +1,8 @@
 # kGraf usage guide
 
 This guide covers installing kGraf, running work with it, and the `kgraf` command line and
-`kgraf-app` desktop window. It assumes you know git and a terminal. It does not assume you
-know kGraf. The [README](../README.md) has the overview. [ARCHITECTURE](../ARCHITECTURE.md)
-has the design.
+`kgraf-app` desktop window. It assumes you know git and a terminal, not kGraf. It covers the
+user-facing commands and flags. Internal and benchmark flags are in `--help`.
 
 Numbers in parentheses, such as (0084), name a record in [`decisions/`](decisions).
 Commands are written as `kgraf ...`. Add `-C <dir>` to run a command against another
@@ -26,7 +25,14 @@ repository.
 
 kGraf builds from source. You need git 2.31 or later and [rustup](https://rustup.rs).
 With rustup, the pinned Rust toolchain in `rust-toolchain.toml` (1.99.0) installs itself on
-the first build. Without rustup, you need Rust 1.95 or later.
+the first build. Without rustup, you need Rust 1.95 or later. On Linux, the desktop app also
+needs system libraries:
+
+```
+sudo apt-get install -y --no-install-recommends \
+  pkg-config libx11-dev libxi-dev libxrandr-dev libxcursor-dev \
+  libxkbcommon-dev libwayland-dev libssl-dev libglib2.0-dev
+```
 
 ```
 git clone https://github.com/Marceux-Croix/kGraf.git
@@ -43,9 +49,9 @@ kgraf index
 kgraf-app --project /path/to/your/repo
 ```
 
-Run a team of agents. Set each provider key in your own shell. kGraf never reads keys from
-a file. Describe the work in a text file. Write a prices file (see
-[Providers and prices](#providers-and-prices)).
+Run a team of agents. Set each provider key in your own shell. (Vertex AI and Bedrock also
+read cloud credential files; see [Providers and prices](#providers-and-prices).) Describe the
+work in a text file. Write a prices file (see the same section).
 
 ```
 export KGRAF_KIMI_API_KEY=...
@@ -71,15 +77,16 @@ exits non-zero unless the run completed.
 | **Verify** | The command (`--verify`) that decides whether an attempt passes. |
 | **Gate** | A quality command (tests, lint) that runs on the merged result. The **root gate** is the whole `--verify` command run on the merged tree. |
 | **Shortfall** | A worker's report that a policy refused it something it needs, or that its instruction lacks something. Your permission mode decides what happens next. |
+| **Compaction point** | The share of the context window at which a worker stops. Set it with `--point`. |
 | **Hand-back** | A worker that reaches its compaction point stops and a new worker continues from its summary. |
 | **Ledger** | A hash-chained record of every model call and its tokens. Cost is derived from it and a prices file. |
-| **Route** | A provider and a model, written `route:model`. `kgraf providers` lists the routes. |
+| **Route** | A catalog entry for one vendor, wire and address, such as `kimi`. `route:model` names a model on it. `kgraf providers` lists the routes. |
 | **Model kind** | What a model returns: generative (prose and tool calls), embedding, rerank, or typed-decision. |
 | **System-One** | A kind of model that answers typed questions about a state you give it, over the `/v1/systemone` wire (0042). |
 
 ## Command reference
 
-`-C <dir>` and `--help` work on every command. Defaults are in the Default column.
+`-C <dir>` and `--help` work on every command. A table has a Default column, or the default follows the flag in its description.
 
 ### Graph
 
@@ -250,7 +257,7 @@ Each route reads its key from its own environment variable. The variable is
 `KGRAF_<ROUTE>_API_KEY`, with the route id in upper case and `-` as `_`. Routes that share
 a vendor key share a variable: `kimi` and `kimi-anthropic` read `KGRAF_KIMI_API_KEY`, and
 `kimi-code` reads `KGRAF_KIMI_CODE_API_KEY`. Local routes (`ollama`, `llama-cpp`,
-`systemone`, `tei`) take no key. Set keys in your own shell. kGraf reads no key file.
+`systemone`, `tei`) take no key. Set keys in your own shell. Two routes also read cloud credential files: Vertex AI and Bedrock (below).
 
 [MODEL-SUPPORT.md](MODEL-SUPPORT.md) lists which routes and model kinds have run against
 the live service (VERIFIED) and which are built but untested. Read it before you choose a
@@ -297,7 +304,7 @@ export AWS_SESSION_TOKEN=...              # only for temporary keys
 export AWS_REGION=us-east-1               # or AWS_DEFAULT_REGION
 ```
 
-A profile with static keys in `~/.aws/credentials` also works (`AWS_PROFILE`). A profile
+kGraf also reads a profile with static keys from `~/.aws/credentials` (or the file `AWS_SHARED_CREDENTIALS_FILE` names) (`AWS_PROFILE`). A profile
 that needs SSO, role assumption, a credential process or web identity is refused. Export
 temporary keys instead. The model id is the Bedrock model id or inference profile id.
 
@@ -313,7 +320,8 @@ All three are listed as unverified. The `google` route is Gemini's OpenAI-compat
 which ignores parameters it does not support. Use `gemini` for the thinking control.
 
 ```
-export KGRAF_VERTEX_CREDENTIALS=adc       # or metadata, gcloud, or a service-account key file path
+export KGRAF_VERTEX_CREDENTIALS=adc       # or metadata, gcloud, or a service-account key file path;
+                                          # if unset, GOOGLE_APPLICATION_CREDENTIALS is used
 export KGRAF_VERTEX_PROJECT=my-project    # optional with a key file
 export KGRAF_VERTEX_REGION=us-east5       # or global; there is no default
 ```
@@ -637,11 +645,10 @@ extension.
 | Tested | Development platform | Tested on Ubuntu 24.04 in CI and in containers ([guide](LINUX-TESTING.md)) | Tested on a hosted Windows Server 2025 runner. Not yet on Windows 11 or ARM64 ([guide](WINDOWS-TESTING.md)) |
 | Sandbox setup | None | None. Needs unprivileged user namespaces | Once per machine, with administrator rights |
 | Network off for worker commands | Yes | Yes | Yes, after setup. Gap: DNS (below) |
-| Reads outside the worktree | Credential and tool-config paths denied | Denied by default | Not confined for dependency installs |
-| Signed packages | No | No | No |
+| Reads outside the worktree | Only credential and tool-config paths are denied | Denied by default | Not confined for dependency installs |
 
-Packages are not signed with a developer certificate, so expect Gatekeeper and SmartScreen
-warnings. `scripts/package-macos.sh`, `scripts/package-linux.sh` and
+The packages are not signed with a developer certificate, so expect Gatekeeper and
+SmartScreen warnings. `scripts/package-macos.sh`, `scripts/package-linux.sh` and
 `scripts/package-windows.sh` build them. `scripts/release-all.sh` builds all three from one
 tag.
 
@@ -674,16 +681,15 @@ kgraf sandbox remove    # undo everything setup made
 different worktrees cannot write each other's files. Run `setup` again with a larger N if
 a command reports that no slot is free.
 
-Known gap: on Windows Server 2025, the filter that confines DNS lookups is refused by
-Windows. Setup says so and ends with a notice that DNS is not confined on that machine.
-Windows dependency installs run with the network open, and the install and its scripts can
-read any file you can. The install question says so. Full detail:
+Known gap: Windows Server 2025 refuses the filter that confines DNS lookups. Setup says
+so. Windows dependency installs then run with the network open, and the install and its
+scripts can read any file you can. The install question says so. Detail:
 [WINDOWS-TESTING.md](WINDOWS-TESTING.md).
 
 ## Privacy and what lives where
 
-kGraf is local and single-user. It has no account, no hosted mode and no telemetry. These
-are every network path in the program:
+kGraf is local and single-user. It has no account, no hosted mode and no telemetry. This
+table is the complete list of network paths in the program:
 
 | Destination | When | Carries |
 |---|---|---|
@@ -692,6 +698,7 @@ are every network path in the program:
 | A package registry | Only for a project where you ran `kgraf deps allow` or passed `--fetch-deps`. crates.io for cargo. The registries of the package manager you allowed for installs. | Package requests |
 | GitHub Releases of `Marceux-Croix/kGraf` | Only if you turn on "Check for updates on start" or press "Check now" | A version query, and the installer if you accept it |
 | `winget` | Windows only, only if you agree to install Git for Windows | `winget`'s own downloads |
+| Anywhere, from a dependency install | Windows only, when you allow installs. The network is open, and DNS is not confined on Windows Server 2025 | The install and its scripts, which can also read any file you can (see [Platform notes](#platform-notes)) |
 
 Local routes (Ollama, llama.cpp, TEI, System-One) talk to your own machine or the address
 you set. kGraf's own git never uses a network transport. Workers' commands run with the
@@ -700,9 +707,9 @@ network off.
 **`.kgraf/`** in each repository holds the state of that project: `graph.db` (the index),
 `ledger.db`, `runs/` (run records and traces), `worktrees/` and `workspaces/`,
 `worker.json`, `run.json`, `allow-rules.json`, `inventory.json`, `dependency-fetch.json`,
-`package-stores/` and `acknowledged.json`. kGraf adds `/.kgraf/` to the repository's
+`schedule.db`, `package-stores/` and `acknowledged.json`. kGraf adds `/.kgraf/` to the repository's
 `.git/info/exclude` and never edits your tracked `.gitignore`. It holds the ledger and run
-records, so do not commit it.
+records, so do not commit it. An old `.haustoria/` folder is moved to `.kgraf/` on first use.
 
 **Diagnostics.** kGraf keeps one local file, `diagnostics.jsonl`, in its per-user data
 directory. `kgraf diag show` prints its path and contents. It holds basic usage counts
@@ -727,13 +734,5 @@ own git and for workers. Your own git is unchanged.
 |---|---|
 | Which routes and model kinds are verified | [MODEL-SUPPORT.md](MODEL-SUPPORT.md) |
 | Error codes (`KG-nnnn`) | [ERRORS.md](ERRORS.md) |
-| Testing on Windows | [WINDOWS-TESTING.md](WINDOWS-TESTING.md) |
-| Testing on Linux | [LINUX-TESTING.md](LINUX-TESTING.md) |
 | Why kGraf works as it does | [`decisions/`](decisions) |
 | System design | [ARCHITECTURE.md](../ARCHITECTURE.md) |
-| Contributing | [CONTRIBUTING.md](../CONTRIBUTING.md) |
-
-**Coming from Haustoria.** kGraf was named Haustoria. A project's `.haustoria/` folder moves
-to `.kgraf/` on first use, with one notice. `HAUSTORIA_*` variables are still read when the
-`KGRAF_*` name is unset, with a warning. A worker transcript recorded before the rename does
-not resume: finish or stop running work before you upgrade.

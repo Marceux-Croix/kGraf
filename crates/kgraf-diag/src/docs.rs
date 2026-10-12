@@ -82,8 +82,12 @@ fn write_section(out: &mut String, heading: &str, entries: &[&ErrorSpec]) {
     for e in entries {
         let _ = writeln!(out, "### {} {}\n", e.code, e.name);
         let _ = writeln!(out, "**Meaning:** {}\n", e.meaning);
-        let _ = writeln!(out, "**Likely cause:** {}\n", e.likely_cause);
-        let _ = writeln!(out, "**What to do:** {}\n", e.action);
+        if !e.likely_cause.is_empty() {
+            let _ = writeln!(out, "**Likely cause:** {}\n", e.likely_cause);
+        }
+        if !e.action.is_empty() {
+            let _ = writeln!(out, "**What to do:** {}\n", e.action);
+        }
     }
 }
 

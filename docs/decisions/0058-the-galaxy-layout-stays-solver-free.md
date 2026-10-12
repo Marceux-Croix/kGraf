@@ -1,6 +1,7 @@
 # Decision 0058: The galaxy layout stays solver-free; clusters grow by size bucket
 
 **Status:** Accepted, from measurement. Amends decisions 0010 and 0015.
+**Amends:** 0010 (the layout stays solver-free), 0015 (the layout stays solver-free)
 **Related:** decisions 0007, 0054, 0055
 
 This record exists so force-directed layout refinement is not re-proposed without new

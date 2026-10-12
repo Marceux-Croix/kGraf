@@ -2,6 +2,7 @@
 
 **Status:** Accepted; supersedes the spend-cap parts of decision 0017 (its concurrency
 limits, the work-item cap and the live-agent ceiling, stand unchanged)
+**Supersedes:** 0017 (in part: the spend-cap parts)
 **Related:** kGraf's every-token-attributed standing rule
 
 ## Context

@@ -1,6 +1,7 @@
 # Decision 0063: One live activity card is permitted, and every row routes back to the graph
 
 **Status:** Accepted. Amends decision 0034 and the no-second-place-to-look rule.
+**Amends:** 0034 (one live activity card)
 **Related:** decisions 0004, 0007, 0015, 0017, 0028, 0032, 0034
 
 This record exists so the live activity card is not cut on an overly strict reading of the

@@ -1,6 +1,7 @@
 # Decision 0051: kGraf stays single-user; hosted MCP servers are allowed
 
 **Status:** Accepted. Amends decision 0005.
+**Amends:** 0005 (hosted tool servers)
 **Related:** decision 0005
 
 This record exists so multi-tenant machinery found in reference client implementations is

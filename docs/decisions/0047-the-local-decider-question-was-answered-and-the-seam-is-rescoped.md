@@ -2,6 +2,8 @@
 
 **Status:** Accepted. Supersedes the acceptance premise of decision 0042 and the robustness
 argument in decision 0045. Amends decision 0046.
+**Supersedes:** 0042 (in part: the acceptance premise), 0045 (in part: the robustness argument)
+**Amends:** 0046
 **Related:** decisions 0020, 0021, 0022
 
 This is the fourth record about one measurement. The first three each diagnosed it, and each

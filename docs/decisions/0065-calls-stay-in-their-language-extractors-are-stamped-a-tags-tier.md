@@ -1,6 +1,7 @@
 # Decision 0065: A call resolves only within its own language family; each language extractor is stamped; a lighter tier adds more languages
 
 **Status:** Accepted
+**Amends:** 0038 (a call resolves only within its language family)
 **Related:** refines decision 0038; decisions 0049, 0050, 0055
 
 ## Context

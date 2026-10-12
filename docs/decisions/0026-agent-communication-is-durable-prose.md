@@ -3,6 +3,7 @@
 **Status:** Accepted. Closes the question left open by decisions 0024 and
 0025 on how an interface contract is expressed. Refines decision 0004 and
 0012 on agent identity lifetime.
+**Amends:** 0004 (agent identity lifetime), 0012 (agent identity lifetime)
 **Related:** decisions 0004, 0005, 0007, 0012, 0013, 0018, 0019, 0022, 0024,
 0025
 

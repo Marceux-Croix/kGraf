@@ -1,6 +1,7 @@
 # Decision 0040: An invariant enforced by the type system gets a compile-fail test
 
 **Status:** Accepted, and it corrects a claim in decision 0039.
+**Amends:** 0039 (corrects a claim)
 **Related:** decisions 0006, 0039
 
 This record exists because decision 0039 recorded a gap as unavoidable, and

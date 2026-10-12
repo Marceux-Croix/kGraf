@@ -2,6 +2,7 @@
 
 **Status:** Accepted. Extends decision 0006 and corrects an over-reading of
 it.
+**Amends:** 0006 (extends it and corrects an over-reading of it)
 **Related:** decisions 0006, 0012
 
 ---

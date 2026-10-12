@@ -148,7 +148,8 @@ enum Command {
     ///
     /// The credential is read from the route's own environment variable, for
     /// example KGRAF_KIMI_API_KEY for `kimi` and KGRAF_KIMI_CODE_API_KEY for
-    /// `kimi-code`. Set it in your own shell; it is never read from a file here.
+    /// `kimi-code`. Set it in your own shell. (The Vertex AI and Bedrock routes
+    /// also read their cloud credential files.)
     Call {
         /// Catalog route id, as `kgraf providers` lists it.
         #[arg(long)]
@@ -311,8 +312,9 @@ enum Command {
         /// Run id for a new run (default `run-<unix seconds>`).
         #[arg(long)]
         run: Option<String>,
-        /// A JSON price table covering every model used (see `spend --prices`).
-        /// Required: spend is reserved before each dispatch.
+        /// A JSON price file (see `spend --prices`). Required. kGraf uses it to
+        /// show and record spend; it sets no limit. A model missing from it
+        /// runs unpriced, and `{}` is valid.
         #[arg(long)]
         prices: PathBuf,
         /// Work items in flight at once.
@@ -503,8 +505,9 @@ enum Command {
         /// sandbox), and each missing install of the other package managers
         /// (`npm ci`, `pip install`, ...), run with its install scripts in
         /// kGraf's sandbox, the network limited to their registries (open on
-        /// Windows). Stores nothing; `kgraf deps allow [package-manager]`
-        /// makes it the project's default.
+        /// Windows, where DNS is also not confined on Windows Server 2025).
+        /// Stores nothing; `kgraf deps allow [package-manager]` makes it the
+        /// project's default.
         #[arg(long, conflicts_with = "no_fetch_deps")]
         fetch_deps: bool,
         /// Never fetch dependencies for this run: a run whose cargo
@@ -779,7 +782,8 @@ enum ScheduleAction {
         /// call its tool (`embed`, `rerank`, `decide`). Nothing calls it by default.
         #[arg(long = "model-route")]
         model_routes: Vec<String>,
-        /// A JSON price table covering every model used.
+        /// A JSON price file (see `spend --prices`). Required. A model missing
+        /// from it runs unpriced, and `{}` is valid.
         #[arg(long)]
         prices: PathBuf,
         #[arg(long, default_value_t = 4)]
@@ -819,8 +823,9 @@ enum ScheduleAction {
         /// sandbox), and each missing install of the other package managers
         /// (`npm ci`, `pip install`, ...), run with its install scripts in
         /// kGraf's sandbox, the network limited to their registries (open on
-        /// Windows). Stores nothing; `kgraf deps allow [package-manager]`
-        /// makes it the project's default.
+        /// Windows, where DNS is also not confined on Windows Server 2025).
+        /// Stores nothing; `kgraf deps allow [package-manager]` makes it the
+        /// project's default.
         #[arg(long, conflicts_with = "no_fetch_deps")]
         fetch_deps: bool,
         /// Never fetch dependencies for this run: a run whose cargo

@@ -292,7 +292,7 @@ in `kgraf-provider-openai` and `kgraf-provider-anthropic`.
 
 ## Amendment (2026-10-12): a patch pasted as text is applied as the call
 
-**Evidence.** Several no-change notices in canary runs show the model's reply holding a
+**Evidence.** Several no-change notices in internal test runs show the model's reply holding a
 complete `*** Begin Patch ... *** End Patch` block as plain text, with no tool call. The turn
 read as an announcement: the notice cost a round, and the patch was still not applied.
 
@@ -314,8 +314,8 @@ read as an announcement: the notice cost a round, and the patch was still not ap
 - **Once per turn.** The call is added only to a turn that has no tool call, and adding it gives
   the turn one. Not on the final round, whose tool calls never run.
 - **It is said.** After the call's result, a `NoticeKind::PatchAsText` notice joins the same
-  turn: "The reply held a patch as text; kGraf applied it as an apply_patch call." The canary
-  counts it as `patch_as_text_applied`, next to `no_change_notices`.
+  turn: "The reply held a patch as text; kGraf applied it as an apply_patch call." The internal test
+  harness counts it as `patch_as_text_applied`, next to `no_change_notices`.
 - **Not changed.** The no-change guard, its bound of two, and the forced tool choice. A block
   that the tool rejects is rejected as any other call is, with the same help.
 

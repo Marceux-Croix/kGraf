@@ -310,7 +310,7 @@ runs on; cargo's fetch does not change.
    manager, `allow`, `refuse` and `reset` are cargo's, as before. `--fetch-deps` and
    `--no-fetch-deps` cover installs too.
 
-**Reuse.** Searched: this repository (no proxy or forwarder in Rust; the canary's forwarder is
+**Reuse.** Searched: this repository (no proxy or forwarder in Rust; an internal test forwarder is
 Python test tooling), crates.io (CONNECT proxies `hudsucker` and `http-mitm-proxy` intercept TLS;
 no allowlisting proxy without hyper), and Anthropic's sandbox-runtime
 (github.com/anthropics/sandbox-runtime, Apache-2.0, read 2026-10-07: `src/sandbox/http-proxy.ts`,

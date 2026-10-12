@@ -185,5 +185,5 @@ is judged as it arrived. Each try is its own ledger call. Tests: `kgraf-provider
 `both_wrappers_pass_the_undelivered_output_question_to_the_adapter`; `kgraf-provider-openai`
 `a_reply_whose_tool_call_the_server_dropped_shows_undelivered_output`; `kgraf-runtime`
 `a_reply_the_server_cut_down_is_sent_again_not_taken_as_the_answer`,
-`lost_output_retries_are_bounded_and_need_a_measuring_provider`; the scripted canary scenario
+`lost_output_retries_are_bounded_and_need_a_measuring_provider`; the scripted end-to-end scenario
 `lost-output-resent`.

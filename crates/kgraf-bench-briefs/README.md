@@ -1,19 +1,17 @@
 # kgraf-bench-briefs
 
-A per-model brief-following bench. It feeds
-`kgraf-core`'s `ProfileStore` (`crates/kgraf-core/src/model_profile.rs`),
-the seam decision 0075's routing reads: for each `TaskKind`, which model
-satisfies the most briefs per dollar spent.
+A per-model brief-following bench. It records, for each kind of task, which model
+satisfies the most briefs per dollar spent. The `fitness` routing mode (decision 0075) reads
+those tallies.
 
 ## What it measures
 
 A fixed suite of small, self-contained briefs (`src/brief.rs`), at least two
-per `TaskKind` (Interface, Implementation, Tests, Refactor, Scripting, Docs),
+per task kind (Interface, Implementation, Tests, Refactor, Scripting, Docs),
 each with a tiny fixture repository under `fixtures/`. For each configured
 route and brief, one worker runs through kGraf's normal worker path
-(`kgraf_host::worker`: the same assembly and `run_segment` `kgraf worker`
-uses, a real git repository, a real worktree, the real tool set, the real
-ledger) against a fresh copy of the fixture. Whatever it commits is checked
+(the same code path `kgraf worker` uses: a real git repository, a real
+worktree, the real tool set, the real ledger) against a fresh copy of the fixture. Whatever it commits is checked
 **mechanically**: a `cargo test` run that must pass and run at least the
 fixture's tests, a script whose stdout and exit status must match exactly, or
 a doc file whose required facts and word cap the check reads directly. There
@@ -40,21 +38,19 @@ store to `model_profiles.<hash>.json` and starts the bench tallies from zero
 (live tallies stay). The printed table names any set-aside suite instead of
 mixing it in.
 
-Every priced attempt's `(model, vendor, kind, satisfied, cost)` is recorded
-into the `ProfileStore` at `--state-dir` with `Source::Bench` (see "Prices"
-below for what happens when a model has no price), and the run prints a
-per-model, per-kind table (attempts, satisfied, rate, cost per satisfied)
-marked `bench` and carrying the suite's hash (`brief::suite_hash()`), so a
-result is always traceable to the exact briefs that produced it.
+Every priced attempt (model, vendor, task kind, satisfied, cost) is recorded
+in the profile store at `--state-dir`, marked as a bench tally (see "Prices"
+below for a model with no price). The run prints a per-model, per-kind table
+(attempts, satisfied, rate, cost per satisfied) marked `bench` and carrying the
+suite's hash, so a result traces to the exact briefs that produced it.
 
 ## What it does not measure
 
 These are small, single-file tasks in a fresh repository with no MCP
-servers, indexed as a real run indexes a repository: a prior on a
-model's brief-following, not a repo-scale benchmark, and not a substitute for
-watching the model work a real task. Per decision 0075's routing rule, a
-bench tally (`Source::Bench`) is a prior; a live, verified tally
-(`Source::Live`) for the same model and kind, once one exists, overrides it.
+servers, indexed as a real run indexes a repository. They give a starting estimate of a
+model's brief-following. They are not a repo-scale benchmark, and not a substitute for
+watching the model work a real task. Under decision 0075's routing rule, a live, verified
+tally for the same model and task kind overrides a bench tally once one exists.
 
 ## Running it
 
@@ -76,8 +72,7 @@ wall time, as a JSON array (in a dry run too).
 Each attempt gets the budget `kgraf worker` gives a worker by default: 12
 model rounds, a 16,384-token output ceiling per round and a 128,000-token
 context window. The values come from the same constants the `kgraf worker`
-flags read (`kgraf_host::worker::config`), so the bench and the command
-cannot drift apart. `--budget <rounds>`, `--max-tokens <n>` and
+flags read, so the bench and the command cannot drift apart. `--budget <rounds>`, `--max-tokens <n>` and
 `--window <tokens>` override them, as the `kgraf worker` flags of the same
 names do. The dry-run estimate is the rounds times the output ceiling,
 priced at the output rate.
