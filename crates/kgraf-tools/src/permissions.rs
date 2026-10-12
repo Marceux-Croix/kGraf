@@ -91,7 +91,7 @@ pub const PERMISSIONS_PATH_ENV: &str = "KGRAF_PERMISSIONS_PATH";
 pub const FILE_EDIT_PROGRAMS: &[&str] = &["mkdir", "touch", "mv", "cp"];
 
 /// Tools that edit files.
-pub const FILE_EDIT_TOOLS: &[&str] = &["apply_patch"];
+pub const FILE_EDIT_TOOLS: &[&str] = &["apply_patch", "replace_in_file"];
 
 /// How long a permission request waits for others before its group is shown:
 /// requests raised within this many milliseconds of a group's first request

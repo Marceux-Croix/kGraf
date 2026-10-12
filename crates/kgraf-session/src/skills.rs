@@ -1022,6 +1022,17 @@ mod tests {
         tool: &str,
         input: Value,
     ) -> Result<ToolOutput, String> {
+        attempt_in(policy, reg, tool, input, &ctx()).await
+    }
+
+    /// [`attempt`] with the tool context the call runs in.
+    async fn attempt_in(
+        policy: &ToolPolicy,
+        reg: &ToolRegistry,
+        tool: &str,
+        input: Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, String> {
         let chain = ApprovalChain::new(vec![]).with_policy(Arc::new(policy.clone()));
         let discovered = DiscoveredTools::new();
         let view = ToolView {
@@ -1035,10 +1046,52 @@ mod tests {
             .map_err(|e| e.to_string())?
         {
             Verdict::Run(approved) => policy
-                .dispatch(reg, approved, &ctx())
+                .dispatch(reg, approved, context)
                 .await
                 .map_err(|e| e.to_string()),
             other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// `replace_in_file` is a tool of its own to `allowed-tools`: a skill that
+    /// lists only `apply_patch` refuses it and the file stays as it was; one
+    /// that lists it runs it.
+    #[tokio::test]
+    async fn allowed_tools_without_replace_in_file_refuses_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("a.txt"), "old\n").expect("seed");
+        let context = ToolContext {
+            workspace_root: dir.path().to_path_buf(),
+            ..ctx()
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register_builtin(Arc::new(kgraf_tools::ApplyPatchTool), Exposure::Prefix)
+            .expect("apply_patch");
+        reg.register_builtin(
+            Arc::new(kgraf_tools::ReplaceInFileTool::default()),
+            Exposure::Prefix,
+        )
+        .expect("replace_in_file");
+        let call = json!({"path": "a.txt", "old": "old", "new": "new"});
+        for (allowed, runs) in [
+            (&["apply_patch"][..], false),
+            (&["replace_in_file"][..], true),
+        ] {
+            std::fs::write(dir.path().join("a.txt"), "old\n").expect("seed");
+            let catalog =
+                SkillCatalog::from_skills([skill("s", Some(allowed), false)]).expect("catalog");
+            let mut policy = ToolPolicy::unrestricted();
+            policy.restrict(&catalog.activate("s", Invoker::Model).expect("activate"));
+            let result = attempt_in(&policy, &reg, "replace_in_file", call.clone(), &context).await;
+            let text = std::fs::read_to_string(dir.path().join("a.txt")).expect("read");
+            if runs {
+                result.unwrap_or_else(|e| panic!("{allowed:?}: {e}"));
+                assert_eq!(text, "new\n", "{allowed:?}");
+            } else {
+                let reason = result.expect_err("refused");
+                assert!(reason.contains("replace_in_file"), "{allowed:?}: {reason}");
+                assert_eq!(text, "old\n", "{allowed:?}: a refused call never writes");
+            }
         }
     }
 

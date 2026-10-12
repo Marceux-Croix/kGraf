@@ -57,6 +57,10 @@ async fn one_instruction_is_decomposed_and_run_across_two_providers_concurrently
         |_| SERVES.into(),
         Duration::from_millis(40),
     );
+    // The first two worker requests wait until both are in flight, so the
+    // overlap is forced by the fixture, not by a sleep outlasting the gap
+    // between dispatches on a loaded machine.
+    p.stats.rendezvous_parties.store(2, Ordering::SeqCst);
     let o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
     let report = o
         .start(RunId::new("r1"), "build a, b, c and wire them".into())
@@ -76,7 +80,9 @@ async fn one_instruction_is_decomposed_and_run_across_two_providers_concurrently
         "parts ran concurrently"
     );
     assert!(
-        p.stats.overlapped("make a", "make b") || p.stats.overlapped("make b", "make c"),
+        p.stats.overlapped("make a", "make b")
+            || p.stats.overlapped("make b", "make c")
+            || p.stats.overlapped("make a", "make c"),
         "independent parts overlapped in time"
     );
     // The dependent part ran only after all three were verified.

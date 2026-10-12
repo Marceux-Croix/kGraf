@@ -1126,3 +1126,30 @@ Tests: `kgraf-tools` `an_unprefixed_add_file_body_after_a_delete_replaces_the_fi
 `a_raw_add_file_line_starting_with_stars_ends_the_section_and_is_refused`. The `kgraf-runtime`
 test `a_second_rejected_patch_carries_a_worked_example_for_its_file` now uses a mixed body as its
 rejected patch, since a bare body is no longer rejected.
+
+## Amendment (2026-10-12): three more repairs for patches that fail on form alone
+
+Mining eight canary rounds of real-model `apply_patch` calls found that 54% failed (1,970 of
+3,677), with no change over twelve rounds. Three failures were about the form of the patch, not
+its content. Each repair below follows the rule of the earlier ones: the intent is certain, the
+file still decides whether the patch applies, and the result carries a `note:`.
+
+- **Git's `\ No newline at end of file` line is ignored**, wherever it stands in the patch (53
+  failures: "Expected update hunk to start with a @@ context marker"). A line that carries that
+  text as content starts with `+`, `-` or a space, so no real line is lost.
+- **A blank line with no `+` between `+` lines of an Add File body is an empty line of the new
+  file** (15 failures in two rounds: "the line is blank"). It applies only when every non-blank
+  line of the section starts with `+`, and only between the first and the last `+` line. A blank
+  line outside that span, and a body with any non-blank line without `+`, are still refused.
+- **A line with no ` `, `+` or `-` prefix in an Update File section is a context line**
+  (25 to 46 failures per round: "Unexpected line found in update hunk"). The line is matched
+  against the file as any context line is, so a wrong reading fails with the usual "Failed to
+  find" error and nothing is written. A line that starts with `@@` or `***` is a marker, is not
+  read this way, and is refused as before. This repair is kGraf's own: the upstream codex parser
+  does not read a bare line as context; it ends the chunk at such a line, or refuses it when the
+  chunk is empty. A line that starts with a space is already a context line, so a bare indented
+  line keeps the usual one-space shift, which the indentation check reports.
+
+Tests: `kgraf-tools` `a_git_no_newline_line_is_ignored_and_noted`,
+`a_blank_line_between_plus_lines_of_an_add_file_is_an_empty_line`,
+`a_bare_line_in_an_update_hunk_is_a_context_line`. Each fails with its repair disabled.

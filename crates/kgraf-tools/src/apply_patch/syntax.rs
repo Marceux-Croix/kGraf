@@ -213,22 +213,33 @@ fn first_error_row(node: tree_sitter::Node<'_>) -> usize {
     }
 }
 
-/// `Err` with a refusal when `path` is a file kind with a parse check, `before`
-/// parses and `after` does not.
-pub(crate) fn refuse_if_newly_broken(path: &str, before: &str, after: &str) -> Result<(), String> {
+/// The name of the file kind `path` has a check for and the line of the first
+/// error in `after`, when `before` parses and `after` does not; `None` when
+/// the edit is fine or the kind has no check.
+pub(crate) fn newly_broken(
+    path: &str,
+    before: &str,
+    after: &str,
+) -> Result<Option<(&'static str, usize)>, String> {
     let Some(kind) = kind_of(path) else {
-        return Ok(());
+        return Ok(None);
     };
     let name = match kind {
         Kind::Python => "Python",
         Kind::Yaml => "YAML",
     };
     if first_error(kind, before)?.is_some() {
-        return Ok(());
+        return Ok(None);
     }
-    match first_error(kind, after)? {
+    Ok(first_error(kind, after)?.map(|line| (name, line)))
+}
+
+/// `Err` with a refusal when `path` is a file kind with a parse check, `before`
+/// parses and `after` does not.
+pub(crate) fn refuse_if_newly_broken(path: &str, before: &str, after: &str) -> Result<(), String> {
+    match newly_broken(path, before, after)? {
         None => Ok(()),
-        Some(line) => Err(format!(
+        Some((name, line)) => Err(format!(
             "In {path}, the patch matched only after ignoring whitespace, and the result is no \
              longer valid {name} (first error at line {line}), so it was not written. Copy the \
              unchanged and `-` lines with the file's exact indentation and send the patch again."

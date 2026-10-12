@@ -42,6 +42,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "list_directory",
     "read_file",
     "recall_history",
+    "replace_in_file",
     "report_shortfall",
     "request_connection",
     "rerank",
@@ -54,7 +55,13 @@ pub const BUILTIN_TOOLS: &[&str] = &[
 
 /// Built-in tools whose calls a rule's pattern matches by path: the paths
 /// `apply_patch` writes, or a read tool's `path`.
-pub const PATH_TOOLS: &[&str] = &["apply_patch", "list_directory", "read_file", "search_files"];
+pub const PATH_TOOLS: &[&str] = &[
+    "apply_patch",
+    "list_directory",
+    "read_file",
+    "replace_in_file",
+    "search_files",
+];
 
 /// Claude Code tool names a rule or an allow-set entry may use, with the
 /// kGraf tool each is read as. The matching is the same:
@@ -358,6 +365,13 @@ pub(super) fn tool_name_matches(rule_tool: &str, tool: &str) -> bool {
         return false;
     }
     if rule_tool == tool || rule_tool == "*" {
+        return true;
+    }
+    // `replace_in_file` writes a file as `apply_patch` does, so what is said
+    // of `apply_patch` (or of `Edit`, `Write` and the other names read as it)
+    // covers it: a deny rule on a path cannot be sidestepped by the other tool.
+    // The reverse does not hold: a rule on `replace_in_file` covers only it.
+    if rule_tool == "apply_patch" && tool == "replace_in_file" {
         return true;
     }
     if rule_tool.contains('*') {

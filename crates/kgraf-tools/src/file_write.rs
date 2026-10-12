@@ -42,11 +42,18 @@ pub fn pure_file_write(input: &Value, root: &Path) -> Option<FileWrite> {
 }
 
 /// The text that tells a worker refused a command that only writes a file to
-/// write it with `apply_patch`, with the whole-file patch for that path.
-pub fn file_write_hint(write: &FileWrite) -> String {
+/// write it with `apply_patch`, with the whole-file patch for that path. When
+/// the file exists and the worker has `replace_in_file`, a change to part of
+/// the file is pointed at that tool too.
+pub fn file_write_hint(write: &FileWrite, replace_in_file: bool) -> String {
+    let small = if replace_in_file && write.exists {
+        "\nTo change only part of the file, use replace_in_file with the old and the new text."
+    } else {
+        ""
+    };
     format!(
         "\nThat command only writes `{path}`. Write it with apply_patch instead, which needs no \
-         shell:\n{skeleton}",
+         shell:\n{skeleton}{small}",
         path = write.path,
         skeleton = crate::apply_patch::whole_file_skeleton(&write.path, write.exists)
     )
@@ -312,9 +319,23 @@ mod tests {
         let s = "cat > a.txt << EOF\nx\nEOF";
         let old = pure_file_write(&sh(s), dir.path()).expect("write");
         assert!(old.exists);
-        assert!(file_write_hint(&old).contains("*** Delete File: a.txt"));
+        assert!(file_write_hint(&old, false).contains("*** Delete File: a.txt"));
         let new = pure_file_write(&sh(&s.replace("a.txt", "b.txt")), dir.path()).expect("write");
-        let hint = file_write_hint(&new);
+        let hint = file_write_hint(&new, false);
         assert!(hint.contains("*** Add File: b.txt") && !hint.contains("Delete File"));
+    }
+
+    /// `replace_in_file` is named only for a file that exists, and only when
+    /// the worker has the tool.
+    #[test]
+    fn the_hint_names_replace_in_file_for_an_existing_file_the_worker_can_edit() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("a.txt"), "old").expect("write");
+        let s = "cat > a.txt << EOF\nx\nEOF";
+        let old = pure_file_write(&sh(s), dir.path()).expect("write");
+        assert!(file_write_hint(&old, true).contains("use replace_in_file"));
+        assert!(!file_write_hint(&old, false).contains("replace_in_file"));
+        let new = pure_file_write(&sh(&s.replace("a.txt", "b.txt")), dir.path()).expect("write");
+        assert!(!file_write_hint(&new, true).contains("replace_in_file"));
     }
 }

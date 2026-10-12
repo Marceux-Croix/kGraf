@@ -10,6 +10,7 @@
 //! directory, never the real one. Each test names what it covers in its doc
 //! comment; a failure message quotes the rule and the call that broke.
 
+use super::permission_names::{PATH_TOOLS, tool_name_matches};
 use super::*;
 use kgraf_core::{AgentId, TaskId};
 use serde_json::json;
@@ -599,5 +600,117 @@ fn a_refused_entry_is_listed_and_only_a_refused_deny_or_ask_forces_manual() {
         unreadable
             .file_text(&PermissionSettings::default())
             .is_err()
+    );
+}
+
+fn replace(path: &str) -> PendingCall {
+    call(
+        "replace_in_file",
+        json!({"path": path, "old": "a", "new": "b"}),
+    )
+}
+
+/// `replace_in_file` writes files as `apply_patch` does. A deny or ask rule on
+/// `apply_patch`, or on a Claude Code name read as it, covers it by path in
+/// every mode, so the other tool cannot be used to write a path the rule
+/// keeps closed. A rule on `replace_in_file` covers only it.
+#[tokio::test]
+async fn a_rule_on_the_patch_tool_covers_replace_in_file_by_path_in_every_mode() {
+    for rule in [
+        "apply_patch(secrets/*)",
+        "Edit(secrets/*)",
+        "Write(secrets/*)",
+        "MultiEdit(secrets/*)",
+        "replace_in_file(secrets/*)",
+    ] {
+        for mode in PermissionMode::ALL {
+            let h = hook(mode, rules(&[rule], &[]));
+            assert!(
+                matches!(
+                    h.review(&replace("secrets/key.txt")).await,
+                    HookDecision::Deny { .. }
+                ),
+                "{mode}: `{rule}` must refuse a replace in secrets/"
+            );
+            assert_eq!(
+                h.review(&replace("src/a.rs")).await,
+                HookDecision::Allow,
+                "{mode}: `{rule}` names another path"
+            );
+            let h = hook(mode, rules(&[], &[rule]));
+            assert!(
+                matches!(
+                    h.review(&replace("secrets/key.txt")).await,
+                    HookDecision::Ask { .. }
+                ),
+                "{mode}: an ask rule `{rule}` must ask for a replace in secrets/"
+            );
+        }
+    }
+    // The other direction: a rule on `replace_in_file` leaves a patch alone.
+    let h = hook(
+        PermissionMode::Bypass,
+        rules(&["replace_in_file(secrets/*)"], &[]),
+    );
+    assert_eq!(
+        h.review(&patch("secrets/key.txt")).await,
+        HookDecision::Allow
+    );
+    // A rule with no pattern covers every call of the tool.
+    let h = hook(PermissionMode::Bypass, rules(&["Edit"], &[]));
+    assert!(matches!(
+        h.review(&replace("src/a.rs")).await,
+        HookDecision::Deny { .. }
+    ));
+}
+
+/// The tool is a name a rule or an allow entry may use, its `path` is what a
+/// path pattern matches, and an `apply_patch` allow entry covers it.
+#[test]
+fn replace_in_file_is_a_known_path_tool_and_an_apply_patch_entry_covers_it() {
+    assert!(BUILTIN_TOOLS.contains(&"replace_in_file"));
+    assert!(PATH_TOOLS.contains(&"replace_in_file"));
+    assert!(crate::permissions::FILE_EDIT_TOOLS.contains(&"replace_in_file"));
+    assert!(Rule::parse("replace_in_file(src/*)").is_ok());
+    assert!(hits("replace_in_file(src/*)", &replace("src/a.rs")));
+    assert!(!hits("replace_in_file(src/*)", &replace("docs/a.md")));
+    assert!(tool_name_matches("apply_patch", "replace_in_file"));
+    assert!(!tool_name_matches("replace_in_file", "apply_patch"));
+    assert!(!tool_name_matches("shell", "replace_in_file"));
+    let allow = crate::permissions::AllowSet::default()
+        .with_tools(["apply_patch"])
+        .expect("entry");
+    assert!(allow.allows_tool("replace_in_file"));
+}
+
+/// Accept edits grants a replace as it grants a patch, and Auto grants it only
+/// for a path in the allow set.
+#[test]
+fn modes_grant_replace_in_file_as_they_grant_a_patch() {
+    let control = |mode, toml: &str| {
+        let mut settings = PermissionSettings::from_toml_str(toml).expect("parse");
+        settings.mode = mode;
+        PermissionControl::new(settings, ModeSource::CommandLine, ProcessFacts::default())
+            .expect("control")
+    };
+    let call = |path: &str| json!({"path": path, "old": "a", "new": "b"});
+    let accept = control(PermissionMode::AcceptEdits, "");
+    assert_eq!(
+        accept.route_ask("replace_in_file", &call("src/a.rs")),
+        AskRoute::Grant { by: "mode" }
+    );
+    let auto = control(PermissionMode::Auto, "[allow]\npaths = [\"docs/*\"]\n");
+    assert_eq!(
+        auto.route_ask("replace_in_file", &call("docs/a.md")),
+        AskRoute::Grant { by: "mode" }
+    );
+    assert_eq!(
+        auto.route_ask("replace_in_file", &call("src/a.rs")),
+        AskRoute::User
+    );
+    let manual = control(PermissionMode::Manual, "");
+    assert_eq!(
+        manual.route_ask("replace_in_file", &call("docs/a.md")),
+        AskRoute::User
     );
 }

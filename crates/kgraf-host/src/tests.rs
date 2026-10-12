@@ -1971,17 +1971,28 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     // Windows sentences forced on (the Git Bash sentence; and, for the token
     // sandbox, the network left open); the same forcing on the previous code
     // gave both values the hosted Windows self-test reported, exactly.
+    //
+    // Re-pinned (decision 0099) when every worker began listing the
+    // `replace_in_file` tool and the system prompt named it. The Windows
+    // values were measured the same way, with the Windows sentences forced on;
+    // the same forcing with the tool and the prompt sentence removed gave the
+    // previous Windows values exactly.
+    //
+    // Re-pinned when the `apply_patch` description said a body line with no
+    // prefix is read as a context line, as the parser now reads it. The
+    // Windows values were measured the same way; the same forcing with the
+    // previous description gave the previous Windows values exactly.
     let pinned = if cfg!(windows) {
         if kgraf_sandbox::CheckNetwork::current()
             .shell_notice()
             .is_some()
         {
-            "3d88dcbcfbccc735823aaa813d36ed51dadc073ef3d8367053bceec83d031e62"
+            "bbbc8cad796883ca4bac71f71d903d8f0fb14a10fd568b6b8f10289b0c4a3b5a"
         } else {
-            "198847af609672a89da0055b8ea2a9b50cec6a2e5e7b687faec836a577a9f5f2"
+            "6bd67f92bc79fa479c44ab3db5480f4116d2f8b96cfd4a923a2ee8a83e72a5dc"
         }
     } else {
-        "26149e46a9ccaab01e78221b2438cd764f25de4fbee7c70b6c3cf72b92a844d7"
+        "22d24b93d4af72c5cf73e1d20c2a13fdce96b29e7982e24555eb1ea2c32e9f05"
     };
     assert_eq!(
         digest, pinned,

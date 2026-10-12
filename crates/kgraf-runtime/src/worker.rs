@@ -4121,7 +4121,8 @@ impl Worker {
                 .or_insert(0);
             *count = count.saturating_add(1);
             if *count >= kgraf_tools::WHOLE_FILE_HINT_AFTER {
-                output.push_str(&kgraf_tools::whole_file_hint(&target.path));
+                let can_replace = self.env.tools.get(kgraf_tools::REPLACE_IN_FILE).is_some();
+                output.push_str(&kgraf_tools::whole_file_hint(&target.path, can_replace));
             }
         }
     }
@@ -4178,7 +4179,8 @@ impl Worker {
             .is_some();
         *output = crate::shortfall::with_refusal_hint(output, can_report);
         if let Some(write) = call.file_write() {
-            output.push_str(&kgraf_tools::file_write_hint(write));
+            let can_replace = self.env.tools.get(kgraf_tools::REPLACE_IN_FILE).is_some();
+            output.push_str(&kgraf_tools::file_write_hint(write, can_replace));
         }
         if script_without_grant && call.file_write().is_none() {
             output.push_str(crate::shortfall::SCRIPT_SPLIT_HINT);

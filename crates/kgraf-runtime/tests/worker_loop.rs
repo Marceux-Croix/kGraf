@@ -5146,6 +5146,94 @@ async fn a_third_rejected_patch_on_one_file_names_the_whole_file_route() {
     assert!(!t7.contains(hint), "{t7}");
 }
 
+/// `replace_in_file` goes through the worker loop's write-scope check as
+/// `apply_patch` does: an edit inside the scope is applied, one outside is
+/// refused and writes nothing. The whole-file hint after three failed patches
+/// names the tool when the worker has it, and does not when it lacks it.
+#[tokio::test]
+async fn replace_in_file_is_held_to_the_write_scope_and_named_by_the_hint() {
+    let worktree = tempfile::tempdir().expect("worktree");
+    std::fs::write(worktree.path().join("a.rs"), "one\n").expect("seed");
+    std::fs::write(worktree.path().join("b.rs"), "one\n").expect("seed");
+    let bad = |n: u32| {
+        json!({"patch": format!(
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n-missing {n}\n+x\n*** End Patch"
+        )})
+    };
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "apply_patch", bad(1))]),
+        1 => Round::tool(vec![("t2", "apply_patch", bad(2))]),
+        2 => Round::tool(vec![("t3", "apply_patch", bad(3))]),
+        3 => Round::tool(vec![(
+            "t4",
+            "replace_in_file",
+            json!({"path": "b.rs", "old": "one", "new": "two"}),
+        )]),
+        4 => Round::tool(vec![(
+            "t5",
+            "replace_in_file",
+            json!({"path": "a.rs", "old": "one", "new": "two"}),
+        )]),
+        _ => Round::answer("done"),
+    });
+    let env = env_with(
+        provider.clone(),
+        vec![
+            Arc::new(kgraf_tools::ApplyPatchTool),
+            Arc::new(kgraf_tools::ReplaceInFileTool::default()),
+        ],
+        CallMode::Stream,
+    );
+    let mut b = brief("w1", "edit it", worktree.path(), 12);
+    b.write_scope = Some(vec![std::path::PathBuf::from("a.rs")]);
+    let handle = spawn_worker(Arc::new(env), b, SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let (t3, is_error) = finished_output(&events, "t3");
+    assert!(is_error, "{t3}");
+    assert!(t3.contains("call replace_in_file"), "{t3}");
+    let (t4, is_error) = finished_output(&events, "t4");
+    assert!(is_error, "{t4}");
+    assert!(t4.contains("outside the declared write scope"), "{t4}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("b.rs")).expect("read"),
+        "one\n"
+    );
+    let (t5, is_error) = finished_output(&events, "t5");
+    assert!(!is_error, "{t5}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("a.rs")).expect("read"),
+        "two\n"
+    );
+
+    // A worker without the tool is not pointed at it.
+    let worktree = tempfile::tempdir().expect("worktree");
+    std::fs::write(worktree.path().join("a.rs"), "one\n").expect("seed");
+    let provider = Fake::new(true, move |request| match round_of(request) {
+        0 => Round::tool(vec![("t1", "apply_patch", bad(1))]),
+        1 => Round::tool(vec![("t2", "apply_patch", bad(2))]),
+        2 => Round::tool(vec![("t3", "apply_patch", bad(3))]),
+        _ => Round::answer("done"),
+    });
+    let env = env_with(
+        provider.clone(),
+        vec![Arc::new(kgraf_tools::ApplyPatchTool)],
+        CallMode::Stream,
+    );
+    let handle = spawn_worker(
+        Arc::new(env),
+        brief("w1", "edit it", worktree.path(), 12),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _) = with_timeout(drain(handle)).await.expect("in time");
+    let (t3, _) = finished_output(&events, "t3");
+    assert!(t3.contains("replace the whole file in one patch"), "{t3}");
+    assert!(!t3.contains("replace_in_file"), "{t3}");
+}
+
 // ------------------------------------------- reasoning-only turn: reasoning off
 
 /// A turn that holds reasoning and nothing else.

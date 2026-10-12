@@ -11,8 +11,8 @@ use kgraf_graph::GraphStore;
 use kgraf_provider_google::vertex_schema;
 use kgraf_tools::execpolicy::{Decision, ExecPolicy};
 use kgraf_tools::{
-    ApplyPatchTool, GraphSliceTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, ShellTool,
-    Tool, ToolDefinition,
+    ApplyPatchTool, GraphSliceTool, ListDirectoryTool, ReadFileTool, ReplaceInFileTool,
+    SearchFilesTool, ShellTool, Tool, ToolDefinition,
 };
 
 /// A parameterless tool sends no `parameters`, so its empty object schema is
@@ -49,10 +49,11 @@ fn every_built_in_tool_schema_converts_for_vertex() {
         Arc::new(ListDirectoryTool),
         Arc::new(SearchFilesTool::default()),
         Arc::new(ApplyPatchTool),
+        Arc::new(ReplaceInFileTool::default()),
         Arc::new(shell),
         Arc::new(GraphSliceTool::new(Arc::new(Mutex::new(store)))),
     ];
     let definitions: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
-    assert_eq!(definitions.len(), 6);
+    assert_eq!(definitions.len(), 7);
     assert_converts(&definitions);
 }

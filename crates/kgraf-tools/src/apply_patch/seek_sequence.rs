@@ -116,7 +116,7 @@ const ECHO_LIMIT: usize = 160;
 
 /// `line` cut to [`ECHO_LIMIT`] characters at a character boundary, with a
 /// marker saying how much was left out.
-fn clip(line: &str) -> String {
+pub(crate) fn clip(line: &str) -> String {
     match line.char_indices().nth(ECHO_LIMIT) {
         None => line.to_owned(),
         Some((cut, _)) => {
@@ -232,7 +232,7 @@ pub(crate) fn describe_mismatch(lines: &[String], pattern: &[String], start: usi
 /// tier `seek_sequence` allows), breaking ties toward the earliest window.
 /// Returns `(start_index, score)`, or `None` if `pattern` cannot fit in
 /// `lines` at all.
-fn best_candidate_window(
+pub(crate) fn best_candidate_window(
     lines: &[String],
     pattern: &[String],
     start: usize,

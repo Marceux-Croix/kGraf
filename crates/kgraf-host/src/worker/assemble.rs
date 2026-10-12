@@ -69,7 +69,7 @@ use kgraf_tools::approval::{ApprovalChain, ApprovalHook, HookDecision, PendingCa
 use kgraf_tools::execpolicy::ExecPolicy;
 use kgraf_tools::{
     ApplyPatchTool, Exposure, GraphSliceTool, ListDirectoryTool, PathCase, ReadFileTool,
-    SearchFilesTool, ShellTool, Tool, ToolRegistry,
+    ReplaceInFileTool, SearchFilesTool, ShellTool, Tool, ToolRegistry,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -79,7 +79,7 @@ use std::sync::{Arc, Mutex};
 pub const SYSTEM_PROMPT: &str = "You are a kGraf worker. You work inside one git \
 worktree; every path is relative to its root. Read code with graph_slice first, when it is \
 offered, and read whole files only when a slice is not enough. Change files with \
-apply_patch. Run commands with shell, as an argv array, one array element per argument. The \
+apply_patch, or with replace_in_file for one small edit. Run commands with shell, as an argv array, one array element per argument. The \
 build and test commands its description lists run without approval; other commands outside a \
 short read-only list need approval and may be denied. Do not run git to stage, commit or push: \
 kGraf commits your worktree itself after its check, so an instruction to commit is met when \
@@ -577,22 +577,39 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
     // With an external executor, every command runs there and never on this
     // host, and every file write is synced to the remote tree before the call
     // returns.
-    let apply_patch: Arc<dyn Tool> = match &a.external_executor {
+    // `replace_in_file` is bound the same way: it writes through the same
+    // function as `apply_patch`, so it is synced to a remote tree alike, and
+    // it knows the guard so it can refuse the paths `apply_patch` handles in
+    // Bypass.
+    let (apply_patch, replace_in_file): (Arc<dyn Tool>, Arc<dyn Tool>) = match &a.external_executor
+    {
         Some(executor) => {
             shell = shell.with_external_executor(executor.clone());
-            Arc::new(kgraf_tools::SyncedWrites::new(
-                ApplyPatchTool,
-                executor.clone(),
-            ))
+            (
+                Arc::new(kgraf_tools::SyncedWrites::new(
+                    ApplyPatchTool,
+                    executor.clone(),
+                )),
+                Arc::new(kgraf_tools::SyncedWrites::new(
+                    ReplaceInFileTool::default(),
+                    executor.clone(),
+                )),
+            )
         }
         None => {
             // Decision 0094: in Bypass the guard admits `.git` and kGraf's
             // settings; with a remote executor no host repository is near.
             if let Some(guard) = &a.protected_writes {
                 shell = shell.with_protected_writes(guard.clone());
-                Arc::new(ApplyPatchTool::with_protected_writes(guard.clone()))
+                (
+                    Arc::new(ApplyPatchTool::with_protected_writes(guard.clone())),
+                    Arc::new(ReplaceInFileTool::with_protected_writes(guard.clone())),
+                )
             } else {
-                Arc::new(ApplyPatchTool)
+                (
+                    Arc::new(ApplyPatchTool),
+                    Arc::new(ReplaceInFileTool::default()),
+                )
             }
         }
     };
@@ -604,6 +621,7 @@ pub async fn assemble(a: Assembly) -> Result<Assembled> {
         Arc::new(ListDirectoryTool),
         Arc::new(SearchFilesTool::with_hardlink_reads(hard_links.clone())),
         apply_patch,
+        replace_in_file,
         Arc::new(shell),
     ];
     let slices: Arc<dyn SliceSource> = match a.graph {

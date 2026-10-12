@@ -1230,13 +1230,15 @@ cargo run -p kgraf-cli -- orchestrate --resume <run-id> --route kimi:<model-id> 
   or ask rule keeps the app in Manual (every request asks) until you correct the file, because a
   block or ask you wrote is missing; a refused allow entry keeps your mode. A file that is not
   valid TOML, or has an unknown key, gives Manual with no rules, and the app does not write over
-  it. The names are kGraf's tools (`shell`, `apply_patch`, `read_file`,
+  it. The names are kGraf's tools (`shell`, `apply_patch`, `replace_in_file`, `read_file`,
   `list_directory`, `search_files`, and the others the refusal lists), `*` for every tool, an
   MCP server's tool as `mcp__<server>__<tool>`, every tool of a server as `mcp__<server>` or
   `mcp__<server>__*`, and Claude Code's names, read as the kGraf tool that does the same job:
   `Bash` as `shell` (`deny = ["Bash(rm *)"]` is `shell(rm *)`), `Edit`, `Write`, `MultiEdit`
   and `NotebookEdit` as `apply_patch`, `Read` as `read_file`, `Grep` and `Glob` as
-  `search_files`. Patterns follow Claude Code's: a `*` stands for any text, and a trailing ` *`
+  `search_files`. A rule or allow entry on `apply_patch` (or on `Edit` and `Write`) also covers
+  `replace_in_file`, which writes files the same way, so a deny rule on a path holds for both;
+  a rule on `replace_in_file` covers only that tool. Patterns follow Claude Code's: a `*` stands for any text, and a trailing ` *`
   or `:*` that is the only `*` also matches the bare command, so `shell(ls *)` and
   `shell(ls:*)` match `ls` and `ls -la` but not `lsof`, and `shell(ls*)` matches `lsof` too.
   A Claude Code path rule names a path in the repository: `Edit(.env)` or `Edit(secrets/**)`
@@ -1718,13 +1720,13 @@ an inventory is there.
   and applies to that worker and the subagents it spawns while restricted. Two active
   skills allow only the tools both list.
   Entries name kGraf's tools (`read_file`, `list_directory`, `search_files`,
-  `apply_patch`, `shell`, `graph_slice`, `skill`, `mcp__<server>__<tool>`), with a
+  `apply_patch`, `replace_in_file`, `shell`, `graph_slice`, `skill`, `mcp__<server>__<tool>`), with a
   trailing `*` for a prefix (`mcp__git*`) and `mcp__<server>` for all of a server's
   tools. An entry naming another agent's tool (`Read`, `Bash`) matches nothing here, so
   a skill written only for another agent refuses every call; edit its list to use these
   names.
   A skill that lists a tool the worker does not have (a name from another agent, or
-  `write_file`: the write tool is `apply_patch`) is not activated. The worker's call fails
+  `write_file`: the write tools are `apply_patch` and `replace_in_file`) is not activated. The worker's call fails
   with each unknown entry, the real tool that does the same job where there is one, and the
   list of tools the worker has, and its tool set is left as it was (decision 0053, amended
   2026-10-02).
@@ -2198,6 +2200,20 @@ Behavior that differs from earlier builds. Each item names the decision that hol
   and the output says so. The build commands run without approval
   with their usual options: `--workspace`, `-p`, `--test`, `--release`, `--no-run` and the
   others the shell tool's description lists (0084).
+- Every worker's tool list now includes `replace_in_file(path, old, new)`: it replaces the one
+  place where `old` occurs exactly, with no line prefixes and no context lines, for a small
+  edit. If `old` occurs more than once or not at all, the call fails and says how many places
+  it found (and the nearest line when there is none). An empty `old` creates a file that
+  does not exist. It follows the same write scope, protected paths, sandbox confinement, and
+  Python and YAML syntax check as `apply_patch`; a deny rule on `apply_patch` covers it. A
+  path under `.git` or `.kgraf`, and the files Bypass mode admits to `apply_patch`, are
+  refused with a pointer to `apply_patch`. The tool list is part of every worker's shared
+  prefix, so a worker transcript recorded by an earlier build cannot be resumed; start that
+  work again (0099).
+- `apply_patch` also reads, with a note in the result: a git `\ No newline at end of file`
+  line (ignored), a blank line with no `+` between `+` lines of an Add File body (an empty
+  line of the file), and a line with no ` `, `+` or `-` prefix in an Update File hunk (a
+  context line, matched against the file like any other) (0084).
 - A worker's `apply_patch` patch that starts with a file header (`*** Add File:`,
   `*** Update File:`, `*** Delete File:`) and lacks `*** Begin Patch` is applied as if it had
   the envelope, and the result says so. So is a patch with no `*** End Patch` line or a

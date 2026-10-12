@@ -39,6 +39,9 @@ pub(crate) mod parser;
 mod protected;
 mod reindent;
 mod replace;
+mod replace_tool;
+#[cfg(test)]
+mod replace_tool_tests;
 mod seek_sequence;
 mod streaming_parser;
 mod syntax;
@@ -46,6 +49,7 @@ mod syntax;
 pub use parser::parse_patch;
 pub use parser::{Hunk, ParseError, UpdateFileChunk};
 pub use protected::ProtectedApplyPatch;
+pub use replace_tool::{REPLACE_IN_FILE, ReplaceInFileTool};
 
 use crate::fs_safety::{self, MAX_READ_BYTES};
 use crate::{Access, CallPermit, Tool, ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -96,8 +100,8 @@ const APPLY_PATCH_DESCRIPTION: &str = concat!(
     "- An Update File hunk's body lines are prefixed with one of three characters: ",
     "a literal space for an unchanged context line copied from the file, `-` for a ",
     "line the file currently has that is being removed, or `+` for a new line ",
-    "being added. Every body line needs one of these three prefixes -- a bare line ",
-    "with no prefix is invalid, even if it matches the file exactly. Include a few ",
+    "being added. Give every body line one of these three prefixes; a bare line ",
+    "with no prefix is read as a context line and must match the file. Include a few ",
     "unchanged context lines around each change so the matcher can place it.\n",
     "- A Delete File hunk has no body lines: just the header.\n",
     "- Write the `*** Begin Patch` and `*** End Patch` lines. A patch that starts ",
@@ -198,12 +202,22 @@ pub const WHOLE_FILE_HINT_AFTER: u32 = 3;
 
 /// One sentence for a model whose patches on `path` keep failing: replacing
 /// the whole file needs no context or `-` line to match. The tool applies a
-/// Delete File and an Add File of one path as a replace.
-pub fn whole_file_hint(path: &str) -> String {
+/// Delete File and an Add File of one path as a replace. With
+/// `replace_in_file` (the worker has that tool), a small edit is pointed at it
+/// first: it takes the old and the new text, with no line prefixes.
+pub fn whole_file_hint(path: &str, replace_in_file: bool) -> String {
+    let small = if replace_in_file {
+        format!(
+            "\nFor a small edit, call replace_in_file with `path` {path:?}, `old` (the exact \
+             text now in the file) and `new`; it needs no line prefixes or context lines."
+        )
+    } else {
+        String::new()
+    };
     format!(
         "\nThis file has failed to patch repeatedly. You can replace the whole file in one \
          patch: `*** Delete File: {path}` followed by `*** Add File: {path}` with the full new \
-         content, every line starting with `+` (a body with no `+` at all is read as plain text):\n{}",
+         content, every line starting with `+` (a body with no `+` at all is read as plain text):\n{}{small}",
         whole_file_skeleton(path, true)
     )
 }
@@ -264,6 +278,18 @@ const RAW_ADD_NOTE: &str = "note: an Add File section had no line starting with 
      line of it was read as content of the new file, as written; write a '+' before each line \
      of the new file";
 
+const NO_NEWLINE_NOTE: &str = "note: a `\\ No newline at end of file` line is a git diff marker, \
+     not part of this format; it was ignored";
+
+const BLANK_ADD_NOTE: &str = "note: an Add File section had a blank line with no '+' between \
+     lines that start with '+'; it was read as an empty line of the new file";
+
+const BARE_CONTEXT_NOTE: &str = "note: an Update File section had a line with no ' ', '+' or '-' \
+     prefix; it was read as an unchanged context line, so it must match the file exactly";
+
+/// The git diff marker for a last line with no newline.
+const NO_NEWLINE_MARKER: &str = "\\ No newline at end of file";
+
 /// A patch repaired into the form the parser takes, and a note per repair.
 /// Models send the hunks without the envelope, drop or mangle the end line,
 /// or head a chunk with a unified-diff `@@ -a,b +c,d @@` line. Each repair is
@@ -288,6 +314,18 @@ const RAW_ADD_NOTE: &str = "note: an Add File section had no line starting with 
 ///   starts with `***` cannot be raw content: it ends the section, and the
 ///   parser refuses it as a bad header. A section with any `+` line is left
 ///   alone and refused if it also has a bare line.
+/// - A line that is exactly git's `\ No newline at end of file` is dropped,
+///   wherever it stands. A body line that carries it as content starts with
+///   `+`, `-` or a space, so no real line is lost.
+/// - In an Add File section whose non-blank lines all start with `+`, a blank
+///   line between the first and the last `+` line is an empty line of the
+///   file. A blank line outside that span, and any non-blank line without a
+///   `+`, stay refused.
+/// - In an Update File section, a line with no ` `, `+` or `-` prefix is a
+///   context line, written with its prefix left out. It is matched against
+///   the file as any context line is, so a wrong reading fails there. A line
+///   starting with `@@` or `***` is not read this way: those are markers, and
+///   a malformed one is refused by the parser.
 fn repaired(patch: &str) -> (String, Vec<&'static str>) {
     let mut notes = Vec::new();
     let first = patch.lines().map(str::trim).find(|l| !l.is_empty());
@@ -335,14 +373,26 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
             notes.push(END_NOTE);
         }
     }
+    let before = lines.len();
+    lines.retain(|l| l.trim_end() != NO_NEWLINE_MARKER);
+    if lines.len() != before {
+        notes.push(NO_NEWLINE_NOTE);
+    }
     if prefix_raw_add_bodies(&mut lines) {
         notes.push(RAW_ADD_NOTE);
     }
+    if plus_blank_add_lines(&mut lines) {
+        notes.push(BLANK_ADD_NOTE);
+    }
     let mut in_update = false;
+    let mut bare_context = false;
     for line in &mut lines {
         let t = line.trim_end();
         if t.starts_with("*** ") {
             in_update = t.starts_with(parser::UPDATE_FILE_MARKER);
+        } else if in_update && is_bare_body_line(line) {
+            line.insert(0, ' ');
+            bare_context = true;
         } else if in_update && let Some(glued) = glued_marker_text(t) {
             let spaced = format!("@@ {glued}");
             *line = match unified_header_context(&spaced) {
@@ -364,7 +414,58 @@ fn repaired(patch: &str) -> (String, Vec<&'static str>) {
             }
         }
     }
+    if bare_context {
+        notes.push(BARE_CONTEXT_NOTE);
+    }
     (lines.join("\n"), notes)
+}
+
+/// Whether `line`, inside an Update File section, has no prefix at all: it is
+/// not blank, does not start with ` `, `+` or `-`, and is not a marker.
+fn is_bare_body_line(line: &str) -> bool {
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
+    !matches!(first, ' ' | '+' | '-') && !line.starts_with("@@") && !line.starts_with("***")
+}
+
+/// Turns a blank line inside an Add File body into `+` (see [`repaired`]).
+/// Only a section whose non-blank lines all start with `+` is touched, and
+/// only between its first and last `+` line. True when a line was changed.
+fn plus_blank_add_lines(lines: &mut [String]) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i]
+            .trim_start()
+            .starts_with(parser::ADD_FILE_MARKER.trim_end())
+        {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < lines.len() && !lines[end].trim_start().starts_with("***") {
+            end += 1;
+        }
+        let body = &mut lines[start..end];
+        let first = body.iter().position(|l| l.starts_with('+'));
+        let last = body.iter().rposition(|l| l.starts_with('+'));
+        if let (Some(first), Some(last)) = (first, last)
+            && body
+                .iter()
+                .all(|l| l.starts_with('+') || l.trim().is_empty())
+        {
+            for l in &mut body[first..last] {
+                if l.trim().is_empty() {
+                    *l = "+".to_string();
+                    changed = true;
+                }
+            }
+        }
+        i = end.max(i + 1);
+    }
+    changed
 }
 
 /// Gives every line of an all-raw Add File body a `+` (see [`repaired`]).
@@ -1886,7 +1987,11 @@ fn a() {
     /// The whole-file route the repeated-failure hint names must itself apply.
     #[tokio::test]
     async fn the_whole_file_hint_skeleton_replaces_the_file() {
-        let hint = whole_file_hint("src/lib.rs");
+        let hint = whole_file_hint("src/lib.rs", false);
+        assert!(!hint.contains("replace_in_file"), "{hint}");
+        let with = whole_file_hint("src/lib.rs", true);
+        assert!(with.contains("call replace_in_file"), "{with}");
+        assert!(with.starts_with(&hint[..hint.find("*** Begin Patch").expect("skeleton")]));
         let skeleton = &hint[hint.find("*** Begin Patch").expect("skeleton")..];
         assert_eq!(
             skeleton,
@@ -1937,6 +2042,93 @@ fn a() {
         let err = out.expect_err("refused");
         assert!(err.contains("does not start with '+'"), "{err}");
         assert!(!dir.path().join("n.txt").exists());
+    }
+
+    /// Git's `\ No newline at end of file` line is ignored in any position.
+    #[tokio::test]
+    async fn a_git_no_newline_line_is_ignored_and_noted() {
+        let marker = "\\ No newline at end of file";
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n a\n-b\n{marker}\n+c\n{marker}\n\
+             *** Add File: n.txt\n+one\n{marker}\n*** End Patch"
+        );
+        let (out, dir) = run_patch(&[("f.txt", "a\nb\n")], &patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("is a git diff marker"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).expect("read"),
+            "a\nc\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
+            "one\n"
+        );
+        // A content line that carries the text keeps it.
+        let patch = format!("*** Begin Patch\n*** Add File: m.txt\n+{marker}\n*** End Patch");
+        let (out, dir) = run_patch(&[], &patch).await;
+        let text = out.expect("applies");
+        assert!(!text.contains("git diff marker"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("m.txt")).expect("read"),
+            format!("{marker}\n")
+        );
+    }
+
+    /// A blank line without `+` between `+` lines is an empty line of the new
+    /// file. A truly mixed body, or a blank line outside the `+` lines, stays
+    /// refused.
+    #[tokio::test]
+    async fn a_blank_line_between_plus_lines_of_an_add_file_is_an_empty_line() {
+        let patch = "*** Begin Patch\n*** Add File: n.txt\n+one\n\n+two\n*** End Patch";
+        let (out, dir) = run_patch(&[], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("blank line with no '+'"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("n.txt")).expect("read"),
+            "one\n\ntwo\n"
+        );
+        for refused in [
+            "*** Add File: n.txt\n+one\n\nbare\n+two",
+            "*** Add File: n.txt\n+one\n+two\n",
+            "*** Add File: n.txt\n\n+one\n+two",
+        ] {
+            let patch = format!("*** Begin Patch\n{refused}\n*** End Patch");
+            let (out, dir) = run_patch(&[], &patch).await;
+            out.expect_err(refused);
+            assert!(!dir.path().join("n.txt").exists(), "{refused}");
+        }
+    }
+
+    /// A line with no prefix in an Update hunk is a context line, and must
+    /// match the file; a marker-like line is still refused.
+    #[tokio::test]
+    async fn a_bare_line_in_an_update_hunk_is_a_context_line() {
+        let file = "fn a() {\none();\ntwo();\n}\n";
+        let patch = "*** Begin Patch\n*** Update File: f.rs\n@@\nfn a() {\none();\n-two();\n+three();\n}\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.rs", file)], patch).await;
+        let text = out.expect("applies");
+        assert!(text.contains("no ' ', '+' or '-' prefix"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.rs")).expect("read"),
+            "fn a() {\none();\nthree();\n}\n"
+        );
+        // A bare line that is not in the file fails at the match, file intact.
+        let patch = "*** Begin Patch\n*** Update File: f.rs\n@@\nfn zzz() {\n-two();\n+three();\n*** End Patch";
+        let (out, dir) = run_patch(&[("f.rs", file)], patch).await;
+        let err = out.expect_err("no match");
+        assert!(err.contains("Failed to find"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.rs")).expect("read"),
+            file
+        );
+        // Marker-like lines are not context.
+        for bad in ["@@@ x", "*** Bogus: x"] {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: f.rs\n@@\n one();\n{bad}\n-two();\n*** End Patch"
+            );
+            let (out, _dir) = run_patch(&[("f.rs", file)], &patch).await;
+            out.expect_err(bad);
+        }
     }
 
     #[tokio::test]
