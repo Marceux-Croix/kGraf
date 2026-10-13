@@ -234,6 +234,14 @@ pub enum WorkerEvent {
         checkpoint: Box<crate::progress::Checkpoint>,
         baseline: Box<crate::progress::CheckpointBaseline>,
     },
+    /// The first block's early progress probe (decision 0096, amendment of
+    /// 2026-10-13): what the loop measured at round `ceil(B / 3)` and its
+    /// verdict. Built by the loop alone, between rounds; never model input
+    /// (the nudge, when there is one, is its own `Notice`). A resume reads it
+    /// so the probe is not measured again.
+    Probe {
+        probe: Box<crate::progress::ProgressProbe>,
+    },
 }
 
 /// Why the loop added text to a user turn.
@@ -250,6 +258,12 @@ pub enum NoticeKind {
     /// A checkpoint measured no progress and granted one more block (decision
     /// 0096); the next checkpoint without progress ends the attempt.
     NoProgress,
+    /// The first block's early probe measured no progress (or a sloppy
+    /// pattern) about a third of the way in; the model was told to write its
+    /// best attempt or call `report_shortfall`. Sent at most once an attempt;
+    /// the attempt goes on. Its own kind, apart from [`NoticeKind::NoProgress`],
+    /// because that one means the next idle checkpoint ends the attempt.
+    ProgressProbe,
     /// The last turn had no tool call and no visible answer (a model that
     /// planned only in its reasoning); it was discarded and the model was told
     /// to continue. A second empty turn in a row fails the attempt.
@@ -491,6 +505,14 @@ impl WorkerEvent {
                     checkpoint,
                     baseline,
                 }
+            }
+            // The same measurement, taken early: scrubbed the same way.
+            WorkerEvent::Probe { mut probe } => {
+                probe.measure.checks_improved = std::mem::take(&mut probe.measure.checks_improved)
+                    .into_iter()
+                    .map(|t| scrub(t, counts))
+                    .collect();
+                WorkerEvent::Probe { probe }
             }
             // Structured data only: ids, usage counts, a stop reason, a
             // phase, a digest, node ids, kind names from this crate's own
@@ -751,6 +773,9 @@ impl EventSequence {
             }
             // Decision 0096: a checkpoint is measured between rounds.
             WorkerEvent::Checkpoint { .. } if self.streaming || !self.open.is_empty() => {
+                return Err(SequenceError::NotBetweenRounds);
+            }
+            WorkerEvent::Probe { .. } if self.streaming || !self.open.is_empty() => {
                 return Err(SequenceError::NotBetweenRounds);
             }
             // Decided for the next request, so between rounds.

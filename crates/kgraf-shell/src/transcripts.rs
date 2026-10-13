@@ -242,6 +242,8 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
         WorkerEvent::Checkpoint { checkpoint, .. } => {
             turns.push(Turn::Event(checkpoint.render()))
         }
+        // The first block's early probe, as the loop measured it.
+        WorkerEvent::Probe { probe } => turns.push(Turn::Event(probe.render())),
     }
 }
 

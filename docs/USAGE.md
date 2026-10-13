@@ -435,6 +435,17 @@ that makes progress gets another block, up to `max_checkpoints`. Two blocks in a
 progress end the attempt as stuck. kGraf never reads what the model says about its own
 progress. With `max_checkpoints` at 1, the round limit is fixed.
 
+A block of 9 rounds or more also gets one early probe, a third of the way in (round 10 of 30).
+It takes the same measure. A worker that has changed no file and improved no check, or that
+repeats a failure, is told once to write its best attempt now or report what blocks it. The
+probe never ends the attempt.
+
+When an attempt ends before verification (out of rounds, stuck, or stalled), the next attempt's
+brief says what stopped it and what it tried: the files it wrote and the commands it ran, each
+with its exit status and, for a failure, its error line. Repeated commands are listed once with
+a count. The list is built from the attempt's record without a model call and is capped at
+about 1,500 tokens, oldest lines dropped first. Only the previous attempt's list is carried.
+
 A single worker uses at most 100,000 tokens of the window (0057). A reply cap above what the
 model supports is lowered for the run, and the run says so on a `clamped` line.
 

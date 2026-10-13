@@ -581,6 +581,8 @@ impl TranscriptBuilder {
             // (`ProgressGate::resume`); the grace notice, when there is one,
             // is its own `Notice` event.
             WorkerEvent::Checkpoint { .. } => {}
+            // The early probe: the same rule. Its nudge is its own `Notice`.
+            WorkerEvent::Probe { .. } => {}
             // A request parameter the loop chose, never model input: the
             // notice that asked for the tool call is its own `Notice` event.
             WorkerEvent::ToolChoice { .. } => {}

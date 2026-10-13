@@ -260,6 +260,12 @@ pub fn run(root: &Path, mut args: WorkerArgs) -> Result<()> {
                 ""
             }
         );
+        if let Some(probe) = &blocks.probe {
+            println!(
+                "probe      {}",
+                kgraf_secrets::scrub_persist(&probe.render())
+            );
+        }
         for checkpoint in &blocks.checkpoints {
             println!(
                 "checkpoint {}",
@@ -749,6 +755,8 @@ fn show(event: &WorkerEvent, started: std::time::Instant) {
         ),
         // Decision 0096: the loop's own measurement at a round checkpoint.
         WorkerEvent::Checkpoint { checkpoint, .. } => println!("\n[{}]", checkpoint.render()),
+        // The first block's early probe (decision 0096, amendment of 2026-10-13).
+        WorkerEvent::Probe { probe } => println!("\n[{}]", probe.render()),
     }
     std::io::stdout().flush().ok();
 }

@@ -516,9 +516,15 @@ async fn a_worker_that_never_measured_progress_meets_its_budget_as_before() {
     assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
     assert_eq!(result.steps, 10);
     assert_eq!(verdicts(&result), vec![CheckpointVerdict::EndNoProgress]);
+    // The early probe (round ceil(10 / 3) = 4) nudged once; the wall that
+    // follows is unchanged.
     assert_eq!(
         notices(&events),
-        vec![NoticeKind::StepsLeft, NoticeKind::FinalRound]
+        vec![
+            NoticeKind::ProgressProbe,
+            NoticeKind::StepsLeft,
+            NoticeKind::FinalRound
+        ]
     );
 }
 
@@ -774,4 +780,204 @@ async fn a_first_block_of_early_writes_and_churn_with_a_flat_failing_check_gets_
     );
     assert!(first.measure.checks_improved.is_empty());
     assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+}
+
+// ------------------------------------------------- the early probe (2026-10-13)
+
+/// Explores without writing: a different read every round, so neither the
+/// stall detector nor a repeated-call pattern ends it.
+fn exploring(round: usize) -> Turn {
+    call("read_file", json!({"path": format!("notes/{round}.md")}))
+}
+
+fn probes(events: &[WorkerEvent]) -> Vec<kgraf_runtime::ProgressProbe> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::Probe { probe } => Some(probe.as_ref().clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn notice_texts(events: &[WorkerEvent], kind: NoticeKind) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::Notice { kind: k, text } if *k == kind => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The evidence shape: 30 rounds of exploration, no file changed. The probe
+/// falls at round 10 (not at the checkpoint's round 27), says so once, and the
+/// worker is not ended by it: the old wall still ends the attempt.
+#[tokio::test]
+async fn the_probe_nudges_an_idle_worker_at_a_third_of_the_block_and_does_not_end_it() {
+    let dir = tempfile::tempdir().expect("dir");
+    let model = Model::new(exploring);
+    let (events, result) = run(env(model.clone()), dir.path(), 30).await;
+
+    let found = probes(&events);
+    assert_eq!(found.len(), 1, "measured once: {found:?}");
+    assert_eq!(found[0].at_round, 10);
+    assert_eq!(found[0].verdict, kgraf_runtime::ProbeVerdict::ProbeNudge);
+    assert!(found[0].measure.files_changed.is_empty());
+    let blocks = result.round_blocks.as_ref().expect("blocks");
+    assert_eq!(blocks.probe.as_ref(), Some(&found[0]), "on the result too");
+    let texts = notice_texts(&events, NoticeKind::ProgressProbe);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(
+        texts[0].starts_with("10 rounds have run and no file changed and no check improved."),
+        "{}",
+        texts[0]
+    );
+    assert!(texts[0].contains("report_shortfall"), "{}", texts[0]);
+    // Round 11's request is the first to carry it; round 10's did not.
+    let carries = |r: &Request| {
+        r.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                c.as_text()
+                    .is_some_and(|t| t.contains("10 rounds have run"))
+            })
+        })
+    };
+    let requests = model.requests();
+    assert!(!carries(&requests[9]));
+    assert!(carries(&requests[10]));
+    // Not an end: the checkpoint at 27 and the wall at 30, as before.
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    assert_eq!(result.steps, 30);
+    assert_eq!(verdicts(&result), vec![CheckpointVerdict::EndNoProgress]);
+    assert_eq!(blocks.checkpoints[0].at_round, 27);
+}
+
+#[tokio::test]
+async fn the_probe_says_nothing_to_a_worker_that_is_progressing() {
+    let dir = tempfile::tempdir().expect("dir");
+    let model = Model::new(|round| {
+        if round < 10 {
+            productive(round)
+        } else {
+            answer("done")
+        }
+    });
+    let (events, result) = run(env(model), dir.path(), 12).await;
+
+    assert_eq!(result.outcome, WorkerOutcome::Completed);
+    let found = probes(&events);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].at_round, 4);
+    assert_eq!(found[0].verdict, kgraf_runtime::ProbeVerdict::ProbeOk);
+    assert!(notices(&events).is_empty(), "{:?}", notices(&events));
+}
+
+/// A worker that wrote a file and then repeats one failing patch has a net
+/// change, but the repeated failure is a sloppy pattern: the probe nudges, and
+/// says what it measured.
+#[tokio::test]
+async fn a_sloppy_pattern_at_the_probe_is_a_nudge() {
+    let dir = tempfile::tempdir().expect("dir");
+    let model = Model::new(|round| {
+        if round == 0 {
+            call("write_file", json!({"path": "done/f0", "content": "ok"}))
+        } else {
+            sloppy(round, "working")
+        }
+    });
+    let (events, _) = run(env(model), dir.path(), 12).await;
+
+    let found = probes(&events);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].verdict, kgraf_runtime::ProbeVerdict::ProbeNudge);
+    assert!(!found[0].measure.files_changed.is_empty());
+    assert!(!found[0].measure.sloppy.is_empty());
+    let texts = notice_texts(&events, NoticeKind::ProgressProbe);
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains("measured the same failure repeating")
+            && texts[0].contains("Stop repeating it"),
+        "{}",
+        texts[0]
+    );
+}
+
+/// Under 9 rounds the probe would leave fewer than three rounds before the
+/// first checkpoint: there is none.
+#[tokio::test]
+async fn a_block_under_nine_rounds_has_no_probe() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (events, result) = run(env(Model::new(exploring)), dir.path(), 8).await;
+
+    assert!(probes(&events).is_empty());
+    assert!(
+        result
+            .round_blocks
+            .as_ref()
+            .expect("blocks")
+            .probe
+            .is_none()
+    );
+    assert_eq!(
+        notices(&events),
+        vec![NoticeKind::StepsLeft, NoticeKind::FinalRound]
+    );
+}
+
+async fn resume_exploring(stored: Vec<WorkerEvent>) -> (Vec<WorkerEvent>, WorkerResult) {
+    let dir = tempfile::tempdir().expect("dir");
+    let handle = spawn_worker(
+        Arc::new(env(Model::new(exploring))),
+        brief(dir.path(), 12),
+        SpawnOptions {
+            resume_from: Some(stored),
+            ..SpawnOptions::default()
+        },
+    )
+    .await
+    .expect("resume");
+    tokio::time::timeout(Duration::from_secs(60), drain(handle))
+        .await
+        .expect("in time")
+}
+
+/// A resume after the probe reads it back and does not measure or say it
+/// again; a resume from before it measures it in the resumed segment.
+#[tokio::test]
+async fn a_resume_does_not_probe_twice() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (events, full) = run(env(Model::new(exploring)), dir.path(), 12).await;
+    assert_eq!(probes(&events).len(), 1);
+    assert_eq!(full.steps, 12);
+    let cut_at = |n: usize| {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, WorkerEvent::ModelCall { .. }))
+            .nth(n)
+            .map(|(i, _)| i)
+            .expect("round")
+    };
+
+    // Cut where round 7 was about to be recorded: the probe (round 4) is stored.
+    let stored = events[..cut_at(6)].to_vec();
+    assert_eq!(probes(&stored).len(), 1);
+    let (after, resumed) = resume_exploring(stored).await;
+    assert!(
+        probes(&after).is_empty(),
+        "measured again: {:?}",
+        probes(&after)
+    );
+    assert!(notice_texts(&after, NoticeKind::ProgressProbe).is_empty());
+    let kept = resumed.round_blocks.as_ref().and_then(|b| b.probe.clone());
+    assert_eq!(kept.map(|p| p.at_round), Some(4), "restored on the result");
+
+    // Cut where round 4 was about to be recorded: no probe yet, so the
+    // resumed segment measures it.
+    let stored = events[..cut_at(3)].to_vec();
+    assert!(probes(&stored).is_empty());
+    let (after, _) = resume_exploring(stored).await;
+    assert_eq!(probes(&after).len(), 1);
+    assert_eq!(notice_texts(&after, NoticeKind::ProgressProbe).len(), 1);
 }

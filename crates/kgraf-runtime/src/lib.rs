@@ -39,6 +39,7 @@
 //! library), the tool-call dependency order, and the loop itself (0055: no agent
 //! framework allows the accounting path and the shared-prefix layout).
 
+mod attempt_digest;
 mod bridge;
 mod brief;
 mod compaction;
@@ -64,6 +65,7 @@ mod thresholds;
 mod worker;
 mod worktree;
 
+pub use attempt_digest::{ATTEMPT_DIGEST_TOKENS, attempt_digest, error_line};
 pub use bridge::{StreamPump, StreamSink, stream_bridge};
 pub use brief::{
     BriefError, Handoff, HandoffCause, MIN_STEP_BUDGET, OutOfTime, RATIONALE_WORD_CAP, Rationale,
@@ -98,8 +100,9 @@ pub use prefix::{
 };
 pub use progress::{
     CheckKind, CheckScore, Checkpoint, CheckpointBaseline, CheckpointVerdict,
-    DEFAULT_MAX_CHECKPOINTS, FAILED_WRITE_LIMIT, ProgressMeasure, REPEATED_CALL_LIMIT,
-    REPEATED_ERROR_LIMIT, RoundBlocks, SloppyPattern, check_score, command_of,
+    DEFAULT_MAX_CHECKPOINTS, FAILED_WRITE_LIMIT, PROBE_MIN_BLOCK, ProbeVerdict, ProgressMeasure,
+    ProgressProbe, REPEATED_CALL_LIMIT, REPEATED_ERROR_LIMIT, RoundBlocks, SloppyPattern,
+    check_score, command_of, probe_notice, probe_round,
 };
 pub use rebuild::{INTERRUPTED_RESULT, ResumeError, ResumeState, TranscriptBuilder};
 pub use settle::{TranscriptSettler, settle_for_disk};

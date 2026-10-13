@@ -323,3 +323,37 @@ Tests: `kgraf-runtime` `tests/patch_pasted_as_text.rs`
 `one_pasted_block_is_applied_as_an_apply_patch_call`, and its counter-cases
 `two_pasted_blocks_are_not_applied`, `a_block_beside_a_tool_call_is_not_applied` and
 `an_unfinished_block_is_not_applied`.
+
+## Amendment (2026-10-13): an early progress probe in the first block
+
+A worker that explored for 30 rounds and changed no file was first measured at round 27, so
+the model was told nothing for 27 rounds and the attempt ended on its budget.
+
+- **Where.** In the first block only, at round `ceil(B / 3)`: round 10 of 30, round 4 of
+  `kgraf worker`'s 12. Not for `B < 9` (`PROBE_MIN_BLOCK`): from 9 rounds up at least three
+  rounds lie between the probe and the first checkpoint at `B - 3`, so a nudged model has rounds
+  to act. Not for a check-only contract (an empty write scope), which a nudge to write would
+  contradict.
+- **What.** The checkpoint's own measure, between rounds, against the block's start. The first
+  block's midpoint and discount rules are not applied: a worker that wrote its files and runs a
+  failing test is working. A sloppy pattern at the probe is also a nudge. Model text is never
+  read.
+- **Verdicts.** Progressing: `probe_ok`, nothing is said. Otherwise `probe_nudge`: one
+  `Notice` of kind `progress_probe`, for example "10 rounds have run and no file changed and no
+  check improved. Stop exploring: write your best attempt at the contract's files (out.txt)
+  now, then check it. If you are blocked, call report_shortfall and say what blocks you. The
+  attempt goes on; this notice is sent once." With a sloppy pattern the notice names it.
+- **Its own notice kind.** `no_progress` says the next idle checkpoint ends the attempt; the
+  probe ends nothing, so the two are kept apart.
+- **Never an end.** The probe grants no rounds and leaves the block's measurement alone; the
+  checkpoint at `B - 3` and its verdicts are unchanged.
+- **The record.** A `WorkerEvent::Probe` in the transcript (never model input); a resume reads
+  it back and does not probe again. `RoundBlocks::probe` and the `worker_checkpoints` trace
+  event carry it. It is not counted as a checkpoint.
+
+Tests: `kgraf-runtime` `progress_gate.rs`
+`the_probe_nudges_an_idle_worker_at_a_third_of_the_block_and_does_not_end_it`,
+`the_probe_says_nothing_to_a_worker_that_is_progressing`,
+`a_sloppy_pattern_at_the_probe_is_a_nudge`, `a_block_under_nine_rounds_has_no_probe`,
+`a_resume_does_not_probe_twice`; `progress.rs`
+`the_probe_falls_at_a_third_of_the_block_from_nine_rounds_up`.

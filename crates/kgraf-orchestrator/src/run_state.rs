@@ -231,6 +231,14 @@ pub struct OpenContract {
     /// attempt's brief as data. Scrubbed and capped ([`MAX_REFUSAL_CHARS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stop: Option<String>,
+    /// What the last failed round's attempts that no verifier saw tried and
+    /// what failed: the files each changed and the commands each ran, with
+    /// their status and error line, built from the transcript with no model
+    /// call (`kgraf_runtime::attempt_digest`). Set and cleared with
+    /// `last_stop`, so only the previous round's is carried. Quoted in the
+    /// next fresh attempt's brief as data. Scrubbed for storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_digest: Option<String>,
     /// The one amendment given after a refusal whose compile error lay in a
     /// file this contract does not write (`outside_error.rs`): quoted in every
     /// later attempt's brief. Set at most once, so a contract is amended once.
@@ -398,6 +406,7 @@ impl OpenContract {
             task_kind: None,
             last_refusal: None,
             last_stop: None,
+            last_attempt_digest: None,
             outside_error_note: None,
             scope_violation: None,
             gate_commands: Vec::new(),

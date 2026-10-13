@@ -988,12 +988,16 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             extended,
             mut blocks,
         } => {
-            for checkpoint in &mut blocks.checkpoints {
-                checkpoint.measure.checks_improved =
-                    std::mem::take(&mut checkpoint.measure.checks_improved)
-                        .into_iter()
-                        .map(s)
-                        .collect();
+            let measures = blocks
+                .checkpoints
+                .iter_mut()
+                .map(|c| &mut c.measure)
+                .chain(blocks.probe.iter_mut().map(|p| &mut p.measure));
+            for measure in measures {
+                measure.checks_improved = std::mem::take(&mut measure.checks_improved)
+                    .into_iter()
+                    .map(s)
+                    .collect();
             }
             TraceEvent::WorkerCheckpoints {
                 at_ms,

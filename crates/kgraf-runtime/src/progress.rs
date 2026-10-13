@@ -64,6 +64,20 @@
 //! passing leaves (a) as it is. With no midpoint capture (a resumed attempt, a
 //! block too short to have one) (a) falls back to the compare with the start.
 //!
+//! **The early probe.** Inside the first block, one more measurement falls at
+//! round `ceil(B / 3)` (round 10 of 30, round 4 of 12), when `B` is at least
+//! [`PROBE_MIN_BLOCK`]: below that the probe would leave fewer than three
+//! rounds before the first checkpoint for the model to act on what it was
+//! told. It uses the same measure as a checkpoint against the start of the
+//! block, without the first block's midpoint and discount rules (a worker that
+//! wrote its files and runs a failing test at round 10 is working, not idle).
+//! Progressing is [`ProbeVerdict::ProbeOk`] and nothing happens. Not
+//! progressing, or a sloppy pattern, is [`ProbeVerdict::ProbeNudge`]: one
+//! notice to the model ([`probe_notice`]) and the attempt goes on; the probe
+//! never ends a worker, grants rounds or changes the checkpoint that follows.
+//! It is a [`crate::event::WorkerEvent::Probe`] in the transcript, so a resume
+//! does not measure it again, and the result's [`RoundBlocks::probe`].
+//!
 //! **Verdicts** (one per checkpoint):
 //!
 //! ```text
@@ -104,6 +118,16 @@ pub const FAILED_WRITE_LIMIT: u32 = 3;
 /// One identical call with an identical, unmasked result, this many times in a
 /// block, is a sloppy pattern.
 pub const REPEATED_CALL_LIMIT: u32 = 3;
+/// The smallest block that gets an early probe. The probe falls at round
+/// `ceil(B / 3)` and the first checkpoint at `B - 3`; from 9 rounds up at least
+/// three rounds lie between them, so a nudged model has rounds to act on it.
+pub const PROBE_MIN_BLOCK: u32 = 9;
+
+/// The round of the first block's early probe, `ceil(block / 3)`, or `None`
+/// for a block under [`PROBE_MIN_BLOCK`].
+pub fn probe_round(block: u32) -> Option<u32> {
+    (block >= PROBE_MIN_BLOCK).then(|| block.div_ceil(3))
+}
 
 /// How a check run was scored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +509,27 @@ pub enum SloppyPattern {
     RepeatedCalls { tool: String, times: u32 },
 }
 
+impl SloppyPattern {
+    /// The pattern in plain words, for a notice to the model.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::RepeatedError { tool, times } => {
+                format!("{tool} gave the same error {times} times")
+            }
+            Self::FailedWrites { failed, succeeded } => {
+                format!("{failed} write(s) failed against {succeeded} that succeeded")
+            }
+            Self::WriteThenRevert { paths } => format!(
+                "{} file(s) written and put back with no net change",
+                paths.len()
+            ),
+            Self::RepeatedCalls { tool, times } => {
+                format!("the same {tool} call gave the same result {times} times")
+            }
+        }
+    }
+}
+
 /// What one checkpoint measured over its block.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressMeasure {
@@ -589,6 +634,50 @@ pub struct CheckpointBaseline {
     pub checks: BTreeMap<String, CheckScore>,
 }
 
+/// What the early probe decided. Neither verdict ends the attempt or grants
+/// rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeVerdict {
+    /// Progressing: nothing is said.
+    ProbeOk,
+    /// Not progressing, or a sloppy pattern: one notice to the model.
+    ProbeNudge,
+}
+
+/// The first block's early probe, as the result and the transcript report it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressProbe {
+    /// Model rounds used when it was measured.
+    pub at_round: u32,
+    pub measure: ProgressMeasure,
+    pub verdict: ProbeVerdict,
+}
+
+impl ProgressProbe {
+    /// One line for a person.
+    pub fn render(&self) -> String {
+        let mut parts = vec![format!(
+            "probe at round {}: {:?}",
+            self.at_round, self.verdict
+        )];
+        parts.push(format!(
+            "{} file(s) changed",
+            self.measure.files_changed.len()
+        ));
+        if !self.measure.checks_improved.is_empty() {
+            parts.push(format!(
+                "checks improved: {}",
+                self.measure.checks_improved.join("; ")
+            ));
+        }
+        if !self.measure.sloppy.is_empty() {
+            parts.push(format!("sloppy: {:?}", self.measure.sloppy));
+        }
+        parts.join(", ")
+    }
+}
+
 /// The checkpoints a worker reached, on its result (decision 0096).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundBlocks {
@@ -597,6 +686,10 @@ pub struct RoundBlocks {
     /// The most checkpoints the worker could reach.
     pub ceiling: u32,
     pub checkpoints: Vec<Checkpoint>,
+    /// The first block's early probe, when it was measured. Not a checkpoint:
+    /// it is not counted in `checkpoints`, grants nothing and ends nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProgressProbe>,
 }
 
 impl RoundBlocks {
@@ -648,7 +741,7 @@ pub(crate) trait CallFacts {
 
 /// Whether a result says the call did nothing, or nothing reliable: denied,
 /// refused, invalid, never run, or cut off by a steer.
-fn did_not_run(output: &str) -> bool {
+pub(crate) fn did_not_run(output: &str) -> bool {
     output.starts_with(crate::worker::DENIED_PREFIX)
         || output.starts_with(crate::worker::REFUSED_PREFIX)
         || output.starts_with(crate::worker::INVALID_CALL_PREFIX)
@@ -793,6 +886,9 @@ pub(crate) struct ProgressGate {
     checkpoints: Vec<Checkpoint>,
     baseline: CheckpointBaseline,
     log: BlockLog,
+    /// Rounds used at which the early probe is measured; `None`: no probe.
+    probe_at: Option<u32>,
+    probe: Option<ProgressProbe>,
 }
 
 impl ProgressGate {
@@ -801,14 +897,60 @@ impl ProgressGate {
     pub(crate) fn new(block: u32, ceiling: u32) -> Self {
         let block = block.max(crate::brief::MIN_STEP_BUDGET);
         let reserve = crate::step::WARN_AT_ROUNDS_LEFT.min(block - 1);
+        let next_at = block - reserve;
         Self {
             block,
             ceiling: ceiling.max(1),
-            next_at: block - reserve,
+            next_at,
             checkpoints: Vec::new(),
             baseline: CheckpointBaseline::default(),
             log: BlockLog::default(),
+            probe_at: probe_round(block).filter(|at| *at < next_at),
+            probe: None,
         }
+    }
+
+    /// No early probe for this worker: a contract that declares no writes
+    /// (a check-only contract), which a nudge to write its files would
+    /// contradict.
+    pub(crate) fn without_probe(mut self) -> Self {
+        self.probe_at = None;
+        self
+    }
+
+    /// Whether the early probe is due before the next round: the first block
+    /// only, once, at or after its round and before the first checkpoint.
+    pub(crate) fn probe_due(&self, used: u32) -> bool {
+        self.probe.is_none()
+            && self.checkpoints.is_empty()
+            && self
+                .probe_at
+                .is_some_and(|at| used >= at && used < self.next_at)
+    }
+
+    /// Measure the early probe and record it. The block's log and baseline
+    /// are left as they were, so the first checkpoint measures the whole
+    /// block as before. Measured like a later block (no midpoint, no
+    /// discount), against the start. Pure: the caller reads the files.
+    pub(crate) fn probe(
+        &mut self,
+        used: u32,
+        now: &BTreeMap<PathBuf, Option<String>>,
+        dirty: Option<&BTreeSet<PathBuf>>,
+    ) -> ProgressProbe {
+        let (measure, _) = measure_log(&self.log, &self.baseline, false, used, now, dirty);
+        let verdict = if measure.progressing() {
+            ProbeVerdict::ProbeOk
+        } else {
+            ProbeVerdict::ProbeNudge
+        };
+        let probe = ProgressProbe {
+            at_round: used,
+            measure,
+            verdict,
+        };
+        self.probe = Some(probe.clone());
+        probe
     }
 
     /// Rebuild from a stored transcript: the checkpoints it records, then the
@@ -820,12 +962,14 @@ impl ProgressGate {
             .iter()
             .rposition(|e| matches!(e, WorkerEvent::Checkpoint { .. }));
         for event in events {
-            if let WorkerEvent::Checkpoint {
-                checkpoint,
-                baseline,
-            } = event
-            {
-                self.record(checkpoint.as_ref().clone(), baseline.as_ref().clone());
+            match event {
+                WorkerEvent::Checkpoint {
+                    checkpoint,
+                    baseline,
+                } => self.record(checkpoint.as_ref().clone(), baseline.as_ref().clone()),
+                // Measured once: a resume after it does not measure it again.
+                WorkerEvent::Probe { probe } => self.probe = Some(probe.as_ref().clone()),
+                _ => {}
             }
         }
         let after = last.map_or(0, |i| i + 1);
@@ -1003,10 +1147,11 @@ impl ProgressGate {
 
     /// The report for the result, when any checkpoint was reached.
     pub(crate) fn report(&self) -> Option<RoundBlocks> {
-        (!self.checkpoints.is_empty()).then(|| RoundBlocks {
+        (!self.checkpoints.is_empty() || self.probe.is_some()).then(|| RoundBlocks {
             block_rounds: self.block,
             ceiling: self.ceiling,
             checkpoints: self.checkpoints.clone(),
+            probe: self.probe.clone(),
         })
     }
 }
@@ -1236,6 +1381,41 @@ pub fn grace_notice(block: u32) -> String {
         "kGraf measured no progress since the last checkpoint: no file changed on net and no \
          check improved, or the same failure repeated. You have {block} more rounds. If the \
          next checkpoint measures no progress either, this attempt ends."
+    )
+}
+
+/// The notice a worker gets when the early probe measured no progress.
+/// `files`: the contract's declared write paths, comma separated (empty when
+/// it declares none). Says what was measured, never what the model said.
+pub fn probe_notice(rounds: u32, files: &str, measure: &ProgressMeasure) -> String {
+    let target = if files.is_empty() {
+        "the files the task needs".to_owned()
+    } else {
+        format!("the contract's files ({files})")
+    };
+    let (measured, stop) = if measure.sloppy.is_empty() {
+        (
+            format!("{rounds} rounds have run and no file changed and no check improved."),
+            "Stop exploring",
+        )
+    } else {
+        (
+            format!(
+                "{rounds} rounds have run and kGraf measured the same failure repeating ({}).",
+                measure
+                    .sloppy
+                    .iter()
+                    .map(SloppyPattern::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            "Stop repeating it",
+        )
+    };
+    format!(
+        "{measured} {stop}: write your best attempt at {target} now, then check it. If you \
+         are blocked, call report_shortfall and say what blocks you. The attempt goes on; this \
+         notice is sent once."
     )
 }
 
@@ -1503,6 +1683,35 @@ mod tests {
         assert_eq!(ProgressGate::new(30, 10).next_at, 27);
         assert_eq!(ProgressGate::new(4, 10).next_at, 1);
         assert_eq!(ProgressGate::new(2, 10).next_at, 1);
+    }
+
+    #[test]
+    fn the_probe_falls_at_a_third_of_the_block_from_nine_rounds_up() {
+        assert_eq!(probe_round(30), Some(10));
+        assert_eq!(probe_round(12), Some(4));
+        assert_eq!(probe_round(10), Some(4));
+        assert_eq!(probe_round(9), Some(3));
+        assert_eq!(probe_round(8), None);
+        assert_eq!(probe_round(2), None);
+        // At least three rounds between the probe and the first checkpoint.
+        for block in PROBE_MIN_BLOCK..200 {
+            let g = ProgressGate::new(block, 10);
+            assert!(
+                g.next_at - probe_round(block).expect("probe") >= 3,
+                "{block}"
+            );
+        }
+        let mut g = ProgressGate::new(30, 10);
+        assert!(!g.probe_due(9));
+        assert!(g.probe_due(10));
+        let probe = g.probe(10, &BTreeMap::new(), None);
+        assert_eq!(probe.verdict, ProbeVerdict::ProbeNudge);
+        assert!(!g.probe_due(11), "once");
+        assert!(!ProgressGate::new(30, 10).without_probe().probe_due(10));
+        // The probe leaves the block's log alone: the checkpoint still
+        // measures the whole block.
+        assert_eq!(g.next_at, 27);
+        assert!(g.checkpoints.is_empty());
     }
 
     #[test]

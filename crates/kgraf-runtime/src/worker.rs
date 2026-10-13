@@ -563,6 +563,11 @@ async fn prepare(
     // carry over.
     let mut progress =
         crate::progress::ProgressGate::new(brief.step_budget, env.settings.max_checkpoints);
+    // A check-only contract (an empty write scope) gets no early probe: its
+    // nudge says to write the contract's files.
+    if brief.write_scope.as_ref().is_some_and(Vec::is_empty) {
+        progress = progress.without_probe();
+    }
     if let Some(events) = options.resume_from.as_deref() {
         progress.resume(events, &EnvFacts(env));
     }
@@ -1980,6 +1985,12 @@ impl Worker {
             // Decision 0096: the round budget is a checkpoint. Measured where
             // the budget would warn that three rounds remain, after the
             // context check, so a full context still hands back first.
+            // The first block's early probe (amendment of 2026-10-13): one
+            // measurement about a third of the way in, a notice when it shows
+            // no progress, never an end.
+            if self.progress.probe_due(self.budget.used()) {
+                self.probe(ep).await?;
+            }
             if self.progress.midpoint_due(self.budget.used()) {
                 let (digests, _) = self.read_tree_state().await;
                 self.progress.capture_midpoint(digests);
@@ -2732,6 +2743,37 @@ impl Worker {
             | CheckpointVerdict::EndNoProgress
             | CheckpointVerdict::Ceiling => Ok(None),
         }
+    }
+
+    /// Measure the first block's early probe (decision 0096, amendment of
+    /// 2026-10-13), record it, and, when it shows no progress, tell the model
+    /// once to write its best attempt or report a shortfall. Never ends the
+    /// attempt.
+    async fn probe(&mut self, ep: &WorkerEndpoint) -> Result<(), Halt> {
+        let used = self.budget.used();
+        let (now, dirty) = self.read_tree_state().await;
+        let probe = self.progress.probe(used, &now, dirty.as_ref());
+        let nudge = (probe.verdict == crate::progress::ProbeVerdict::ProbeNudge).then(|| {
+            crate::progress::probe_notice(used, &self.write_scope_paths(), &probe.measure)
+        });
+        self.emit(
+            ep,
+            WorkerEvent::Probe {
+                probe: Box::new(probe),
+            },
+        )
+        .await?;
+        if let Some(text) = nudge {
+            self.emit(
+                ep,
+                WorkerEvent::Notice {
+                    kind: crate::event::NoticeKind::ProgressProbe,
+                    text,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Record, for the progress gate, the content of each path a call is

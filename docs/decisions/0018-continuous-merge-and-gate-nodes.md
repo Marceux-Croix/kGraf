@@ -682,3 +682,34 @@ Tests: `kgraf-host` `a_wrong_behavior_fails_on_a_dependents_test_and_is_attribut
 `a_failure_not_tied_to_the_attempt_is_a_notice_and_the_attempt_passes`,
 `a_dependents_test_that_panics_in_the_contracts_file_is_attributed`,
 `dependents_are_those_that_can_build_now_ordered_and_capped`.
+
+## Amendment (2026-10-13): a retry carries what the last attempt tried and what failed
+
+An attempt that ended on its round budget after 30 rounds of exploration left the next attempt
+only what stopped it, not what it had found, so the next attempt repeated part of the discovery.
+
+- **The digest** (`kgraf_runtime::attempt_digest`, no model call). From the stored transcript of
+  each attempt that `last_stop` carries a note for: the files the attempt changed, then every
+  command it ran as
+  ``- `<command, first 80 characters>` (exit 0 | failed, exit N | not run): <error line> [xN]``.
+  The error line of a failure is its output's last line that reads as an exception or error,
+  else its last line that is not a traceback frame, caret marker, section label or compile
+  summary, cut at 200 characters; a command kGraf did not run gives the first clause of why.
+  Lines with the same command prefix, status and error line are one line with a count, placed
+  at its last run, so the most recent is last.
+- **The cap.** 1,500 estimated tokens, oldest command lines dropped first, with the number
+  dropped in the header. Several stopped attempts in one round share the cap equally, each
+  headed by its worker.
+- **Carried once.** `OpenContract::last_attempt_digest` is set with `last_stop` on each failed
+  round and replaced on the next: only the previous round's digest reaches a brief.
+- **In the brief.** After the `last_stop` text: "What the previous attempt tried and what failed
+  follows as data. Do not repeat the approaches that failed; build on what it found:", then the
+  digest quoted as data in the `verifier_refusal` tag, since it quotes model-written commands
+  and their output.
+- **Not carried:** what a successful command printed.
+
+Tests: `kgraf-runtime` `attempt_digest.rs`; `kgraf-orchestrator`
+`the_attempt_digest_is_quoted_as_data_after_the_stop_note`,
+`attempts_of_one_round_share_the_digest_cap_under_their_worker`, and
+`tests/retry_brief_digest.rs`
+`the_retry_brief_carries_the_previous_attempts_failed_command_and_only_that_one`.
