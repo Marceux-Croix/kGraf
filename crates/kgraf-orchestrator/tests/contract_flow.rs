@@ -2240,10 +2240,12 @@ async fn with_no_time_limit_the_interface_asks_are_not_held_back() {
     );
 }
 
-/// The contracts ask is never skipped, whatever the budget: with a 1 s limit
-/// (0.3 s budget) and asks of 1 s, a refused first answer is asked again and
+/// The contracts ask is never skipped, whatever the budget: with a 10 s limit
+/// (3 s budget) and asks of 2 s, a refused first answer is asked again and
 /// the plan is taken. Only the interface ask, which is optional, is skipped (the
-/// plan has no consumed edge, so there is none to leave unchecked).
+/// plan has no consumed edge, so there is none to leave unchecked). The limit
+/// leaves the workers time to run (`run_deadline.rs`: a run past its limit
+/// starts no attempt).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_contracts_ask_is_never_skipped_by_the_budget() {
     let dir = tempfile::tempdir().expect("dir");
@@ -2255,7 +2257,7 @@ async fn the_contracts_ask_is_never_skipped_by_the_budget() {
             let calls = std::sync::atomic::AtomicUsize::new(0);
             let advance = clock.clone();
             move |_: &str| {
-                advance.advance(1_000);
+                advance.advance(2_000);
                 if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     "this is not JSON".to_owned()
                 } else {
@@ -2267,7 +2269,7 @@ async fn the_contracts_ask_is_never_skipped_by_the_budget() {
         |_| "{}".into(),
         Duration::from_millis(20),
     );
-    let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(1)))
+    let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(10)))
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");

@@ -1126,20 +1126,34 @@ impl Tool for ShellTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let mut description = "Run a command, given as an argv array, inside the worker's \
-            sandboxed workspace."
-            .to_owned();
+        // Every sentence below comes from run-wide configuration (the
+        // allowlist, the executor, the platform, the run's permission mode),
+        // so the definition stays byte-identical across the run's workers
+        // (0043). Each must be true of the commands this tool runs: a worker
+        // told the network is off, or that a command needs an approval it
+        // does not need, stops and reports a shortfall instead of trying.
+        let routed = self.external.is_some();
+        // Decision 0094: Bypass (or an unrestricted shell) runs every command
+        // no `forbid` rule refuses without approval, confined like a build,
+        // which a declared write scope accepts.
+        let any_command = self.policy.runs_any_command();
+        let mut description = if routed {
+            "Run a command, given as an argv array, in the task's own environment, not on \
+             this host; the worker's files are synced there before each command and back \
+             after it."
+        } else {
+            "Run a command, given as an argv array, inside the worker's sandboxed workspace."
+        }
+        .to_owned();
         // Decision 0084: the model is told the allowlist, so a refusal under a
-        // write scope is never a surprise. Derived from configuration only, so
-        // the definition stays byte-identical across the run's workers (0043).
+        // write scope is never a surprise.
         // Only where sandboxed commands run at all (Unix, Windows): elsewhere
         // every call fails, and the list would promise what cannot run.
         let build = self.policy.build_allowlist();
         let network_off = self.network.network() == Network::Deny;
         if cfg!(any(unix, windows)) && !build.is_empty() {
             description.push_str(&format!(
-                " Build and test commands on this allowlist run without approval{}: {}. With a \
-                 declared write scope, no other command that can write runs.",
+                " Build and test commands on this allowlist run without approval{}: {}.",
                 if network_off {
                     ", with the network off"
                 } else {
@@ -1147,36 +1161,65 @@ impl Tool for ShellTool {
                 },
                 build.describe()
             ));
+            if !any_command {
+                description.push_str(
+                    " With a declared write scope, no other command that can write runs.",
+                );
+            }
         }
         // Decision 0011, amended 2026-10-07: said on every turn where the
-        // sandbox cannot deny the network. A platform setting, so the
-        // definition stays byte-identical across the run's workers (0043).
-        if !network_off {
+        // sandbox cannot deny the network.
+        if self.network.shell_notice().is_some() {
             description.push_str(
                 " Commands run with the network open: this platform's sandbox cannot deny it.",
             );
         }
-        if cfg!(windows) {
+        // A routed command runs in the task's environment, whose network
+        // kGraf does not cut off (`CheckNetwork::open`, set by the host).
+        if routed && !network_off {
+            description.push_str(" kGraf does not cut off the network there");
+            // Decision 0087, amended 2026-10-09: a package download in that
+            // environment is the task's own.
+            description.push_str(if self.policy.allows_package_downloads() {
+                ", and a command that installs packages (pip, npm, apt-get) runs like any other."
+            } else {
+                "."
+            });
+        }
+        // Git Bash is this host's: a routed command never runs on it.
+        if cfg!(windows) && !routed {
             description.push_str(
                 " On this Windows machine `sh` and `bash` run with Git Bash, so \
                  [\"sh\", \"-c\", \"<line>\"] takes POSIX shell syntax.",
             );
         }
-        // Decision 0084, amended 2026-10-09: the limits are configuration, so
-        // the definition stays byte-identical across the run's workers (0043).
+        // Decision 0084, amended 2026-10-09: the limits are configuration.
         description.push_str(&time_limit_sentence(
             self.unlisted_timeout.min(self.timeout),
             self.timeout,
             cfg!(any(unix, windows)) && !build.is_empty(),
         ));
-        // Decision 0093: a run-wide operator setting, so the definition is
-        // still byte-identical across the run's workers (0043). A grant to one
-        // contract is not named here; the contract's brief names it.
+        // Decision 0093: an operator setting for a run in a disposable
+        // container. A grant to one contract is not named here; the
+        // contract's brief names it.
         if self.policy.is_unrestricted() {
             description.push_str(
                 " This run executes in a disposable container: any command runs without \
                  approval, except the few the policy forbids.",
             );
+        } else if any_command {
+            // Decision 0094: the user's Bypass mode, run-wide.
+            description.push_str(if routed {
+                " The Bypass permission mode is on: any command runs without approval in the \
+                 task's environment, except the few the policy forbids."
+            } else if self.policy.allows_package_downloads() {
+                " The Bypass permission mode is on: any command runs without approval, \
+                 confined like a build, except the few the policy forbids."
+            } else {
+                " The Bypass permission mode is on: any command runs without approval, \
+                 confined like a build, except the few the policy forbids and package \
+                 downloads, which this host refuses."
+            });
         }
         ToolDefinition {
             name: "shell".into(),
@@ -6440,6 +6483,103 @@ fn main() {
 
             async fn sync_to_remote(&self) -> Result<(), String> {
                 Ok(())
+            }
+        }
+
+        /// The description of a shell bound as the host binds one: the
+        /// default allowlist, the user's mode `mode`, and, when `routed`, the
+        /// task's executor with the network that environment has.
+        fn description_of(mode: crate::PermissionMode, routed: bool) -> String {
+            let control = crate::protected::tests::control(mode);
+            let base = if routed {
+                crate::external::remote_policy()
+            } else {
+                policy()
+            };
+            let policy = base
+                .with_build_allowlist(crate::execpolicy::BuildAllowlist::standard())
+                .with_permissions(control);
+            let (tool, _hook) = ShellTool::new(policy);
+            let tool = if routed {
+                tool.with_external_executor(std::sync::Arc::new(FakeExecutor::new("")))
+                    .with_network_decision(CheckNetwork::open())
+            } else {
+                tool.with_network_decision(CheckNetwork::deny())
+            };
+            tool.definition().description
+        }
+
+        /// A shell routed to the task's environment under Bypass says what is
+        /// true there: any command runs without approval, the network is not
+        /// cut off and installs run. It never says the network is off, nor
+        /// that a write scope stops other commands: a worker told so believed
+        /// it could not install a module and stopped without trying.
+        #[test]
+        fn a_routed_shell_under_bypass_says_any_command_runs_with_the_network_open() {
+            let d = description_of(crate::PermissionMode::Bypass, true);
+            assert!(!d.contains("with the network off"), "{d}");
+            assert!(!d.contains("no other command that can write runs"), "{d}");
+            assert!(!d.contains("sandboxed workspace"), "{d}");
+            assert!(!d.contains("this platform's sandbox cannot deny it"), "{d}");
+            assert!(
+                d.contains(
+                    "any command runs without approval in the task's environment, except the \
+                     few the policy forbids"
+                ),
+                "{d}"
+            );
+            assert!(
+                d.contains("kGraf does not cut off the network there"),
+                "{d}"
+            );
+            assert!(d.contains("installs packages (pip, npm, apt-get)"), "{d}");
+            // Outside Bypass the routed shell still says the network is not
+            // cut off, and keeps the write-scope sentence, which holds there.
+            let d = description_of(crate::PermissionMode::Manual, true);
+            assert!(!d.contains("with the network off"), "{d}");
+            assert!(
+                d.contains("kGraf does not cut off the network there"),
+                "{d}"
+            );
+            assert!(d.contains("no other command that can write runs"), "{d}");
+            assert!(!d.contains("Bypass"), "{d}");
+        }
+
+        /// On this host, Bypass runs any command confined like a build, with
+        /// the build sandbox's network off, and still refuses package
+        /// downloads; every other mode keeps the description it had.
+        #[test]
+        fn a_host_shell_says_bypass_only_in_bypass() {
+            let d = description_of(crate::PermissionMode::Bypass, false);
+            assert!(d.contains("with the network off"), "{d}");
+            assert!(!d.contains("no other command that can write runs"), "{d}");
+            assert!(
+                d.contains("package downloads, which this host refuses"),
+                "{d}"
+            );
+            for mode in [
+                crate::PermissionMode::Manual,
+                crate::PermissionMode::Auto,
+                crate::PermissionMode::AcceptEdits,
+                crate::PermissionMode::OrchestratorDecides,
+            ] {
+                let d = description_of(mode, false);
+                assert!(
+                    d.starts_with(
+                        "Run a command, given as an argv array, inside the worker's sandboxed \
+                         workspace. Build and test commands on this allowlist run without \
+                         approval, with the network off: "
+                    ),
+                    "{mode:?}: {d}"
+                );
+                assert!(
+                    d.contains(
+                        ". With a declared write scope, no other command that can write runs."
+                    ),
+                    "{mode:?}: {d}"
+                );
+                assert!(!d.contains("Bypass"), "{mode:?}: {d}");
+                assert!(!d.contains("task's environment"), "{mode:?}: {d}");
             }
         }
 

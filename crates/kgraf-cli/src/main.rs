@@ -406,7 +406,11 @@ enum Command {
         /// past it, is not made: the interface edges go unchecked, with a
         /// notice, and a held plan is not planned again (its failing checks are
         /// dropped with a notice and the contracts run). The first plan is
-        /// never skipped. Without this flag nothing is held back.
+        /// never skipped. The last tenth of the limit (at most 120 s) is kept
+        /// for verification, merge and the gate; every worker gets the rest as
+        /// its deadline and stops at a round boundary before it, and its tree
+        /// is verified as it stands. No attempt starts when the time left is
+        /// shorter than one round. Without this flag nothing is held back.
         #[arg(long)]
         time_limit: Option<u64>,
         /// Output ceiling, in tokens, of each orchestrator call, lowered to the

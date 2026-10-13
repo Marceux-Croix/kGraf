@@ -73,6 +73,29 @@ pub(super) enum Worker {
     /// reports a permission shortfall naming `pip`; with a grant, runs it
     /// again.
     Downloads,
+    /// The first attempt reports a gap in the instruction (amended); the
+    /// next reports an environment fact, a missing Python module, as a paid
+    /// run's worker did; answered with the facts, it writes its file.
+    ModuleAfterAmendment,
+    /// Every attempt reports the same gap in the instruction.
+    GapTwice,
+}
+
+/// What [`Worker::ModuleAfterAmendment`] and [`Worker::GapTwice`] report.
+fn gap_report() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "instructions",
+        "need": "the expected output format",
+        "why": "the instruction does not say whether a.txt holds a number or a sentence"
+    })
+}
+
+fn module_report() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "instructions",
+        "need": "The required Python dependency (datasets) is unavailable in this workspace.",
+        "why": "Running the script failed with ModuleNotFoundError: No module named 'datasets'."
+    })
 }
 
 pub(super) struct Script {
@@ -369,6 +392,23 @@ impl Provider for Script {
                     input["need"] = "pip".into();
                     input["why"] = "the contract installs vectorops and checks the import".into();
                     Some(tool(kgraf_runtime::SHORTFALL_TOOL, input, round))
+                }
+                // The brief of an attempt after an amendment quotes the
+                // earlier report in its tagged block.
+                (Worker::ModuleAfterAmendment, _, 0) if !seen.contains("<worker_shortfall>") => {
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, gap_report(), round))
+                }
+                (Worker::ModuleAfterAmendment, _, 0) => {
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, module_report(), round))
+                }
+                // Writes only when answered: a held worker is told to stop.
+                (Worker::ModuleAfterAmendment, _, 1)
+                    if seen.contains("Nothing was amended or held") =>
+                {
+                    Some(tool("apply_patch", patch(), round))
+                }
+                (Worker::GapTwice, _, 0) => {
+                    Some(tool(kgraf_runtime::SHORTFALL_TOOL, gap_report(), round))
                 }
                 (Worker::RunsScript, _, 0) => Some(tool("shell", script(), round)),
                 (Worker::RunsScript, _, 1) if !seen.contains("exit status: 0") => {
@@ -1047,6 +1087,78 @@ async fn an_instructions_report_about_a_sibling_contracts_file_is_answered_not_a
         2,
         "one attempt per contract: the report did not re-dispatch `a`"
     );
+}
+
+/// An unattended Bypass run whose worker, after one amendment, reports a
+/// missing Python module as an `instructions` shortfall: the report states
+/// an environment fact, so it is answered with the facts (the mode, how to
+/// install) and the worker keeps working. Holding it stopped a paid run
+/// whose worker never tried `pip`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_fact_after_an_amendment_is_answered_not_held() {
+    let (report, trace, script) = run(
+        Worker::ModuleAfterAmendment,
+        control(kgraf_tools::PermissionMode::Bypass),
+        "test -f a.txt",
+        "sf-env-fact",
+    )
+    .await;
+    assert_eq!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}\n{}",
+        script.failed_tool_results()
+    );
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 2, "{trace}");
+    assert!(
+        lines[0].contains("the contract was amended"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("answered: Nothing was amended or held"),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[1].contains("a missing module, package or program"),
+        "the trace names the classification: {}",
+        lines[1]
+    );
+    assert!(!trace.contains("reported insufficient again"), "{trace}");
+    assert_eq!(script.attempts.load(Ordering::SeqCst), 2);
+}
+
+/// A genuine gap in the instruction, reported again after its amendment,
+/// still holds the contract in an unattended Bypass run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_instruction_gap_reported_twice_still_holds() {
+    let (report, trace, _script) = run(
+        Worker::GapTwice,
+        control(kgraf_tools::PermissionMode::Bypass),
+        "test -f a.txt",
+        "sf-gap-twice",
+    )
+    .await;
+    assert_ne!(
+        report.status,
+        kgraf_orchestrator::RunStatus::Completed,
+        "{report:?}\n{trace}"
+    );
+    let lines = shortfall_lines(&trace);
+    assert_eq!(lines.len(), 2, "{trace}");
+    assert!(
+        lines[0].contains("the contract was amended"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("held: the instructions were reported insufficient again"),
+        "{}",
+        lines[1]
+    );
+    assert!(!trace.contains("Nothing was amended or held"), "{trace}");
 }
 
 /// A worker refused `cp` that wrote the file another way, and whose real

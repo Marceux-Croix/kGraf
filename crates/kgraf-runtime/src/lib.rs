@@ -43,6 +43,7 @@ mod bridge;
 mod brief;
 mod compaction;
 mod context;
+mod deadline;
 mod dispatch;
 mod event;
 mod fence;
@@ -65,8 +66,8 @@ mod worktree;
 
 pub use bridge::{StreamPump, StreamSink, stream_bridge};
 pub use brief::{
-    BriefError, Handoff, HandoffCause, MIN_STEP_BUDGET, RATIONALE_WORD_CAP, Rationale, WorkerBrief,
-    WorkerOutcome, WorkerResult, parse_rationale,
+    BriefError, Handoff, HandoffCause, MIN_STEP_BUDGET, OutOfTime, RATIONALE_WORD_CAP, Rationale,
+    WorkerBrief, WorkerOutcome, WorkerResult, parse_rationale,
 };
 pub use compaction::{
     COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CompactionNotice, CompactionStop,
@@ -81,6 +82,7 @@ pub use context::{
     PrefixRegistry, PrefixSnapshot, RenderedSlice, SliceError, SliceLeftOut, SliceRendering,
     SliceSource, left_out_notice, opening_messages, opening_messages_with, render_system,
 };
+pub use deadline::{RECENT_ROUNDS, WorkerDeadline};
 pub use dispatch::dependencies;
 pub use event::{CancelPhase, EventSequence, NoticeKind, SequenceError, WorkerEvent};
 pub use fence::{FenceGuard, ScopeFence};
@@ -112,8 +114,9 @@ pub use thresholds::{
     MAX_COMPACTION_POINT_PERCENT, MIN_COMPACTION_POINT_PERCENT, PointSource, ThresholdError,
 };
 pub use worker::{
-    AskResolver, CANCEL_BEFORE_SEND_REASON, CallMode, EMPTY_TURN_ABANDON_REASON, EMPTY_TURN_NOTICE,
-    LOST_OUTPUT_ABANDON_REASON, LOST_OUTPUT_MIN_TOKENS, LoopSettings,
+    AskResolver, CANCEL_BEFORE_SEND_REASON, CallMode, DEADLINE_ABANDON_BEFORE_SEND_REASON,
+    DEADLINE_ABANDON_REASON, DEADLINE_INTERRUPTED, DEADLINE_NOT_RUN, EMPTY_TURN_ABANDON_REASON,
+    EMPTY_TURN_NOTICE, LOST_OUTPUT_ABANDON_REASON, LOST_OUTPUT_MIN_TOKENS, LoopSettings,
     MALFORMED_OUTPUT_ABANDON_REASON, MAX_LOST_OUTPUT_RETRIES, MAX_NO_CHANGE_NOTICES,
     OUTPUT_LIMIT_ABANDON_REASON, OUTPUT_LIMIT_NOTICE, REASONING_OFF_IGNORED_NOTICE,
     REASONING_OFF_NOTICE, STEER_ABANDON_BEFORE_SEND_REASON, STEER_ABANDON_REASON,

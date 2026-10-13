@@ -6,7 +6,9 @@
 //!    path needing no grant or owned by another contract, is answered and the
 //!    worker continues (`answer_shortfall`, bounded), unless the path is one
 //!    the contract's cargo acceptance cannot pass without and only a later
-//!    contract writes it: that holds for a re-plan (`member_hold`). Otherwise the
+//!    contract writes it: that holds for a re-plan (`member_hold`). So is an
+//!    `instructions` report of an environment fact in an unattended Bypass
+//!    run (`environment_answer`). Otherwise the
 //!    orchestrator decides at once under the user's permission mode (grant,
 //!    amend, ask the user, or hold), records the decision on the contract and
 //!    in the trace, answers the worker, then cancels the attempt so the
@@ -27,8 +29,8 @@ use super::*;
 use crate::challenge::ContractReply;
 use crate::shortfall::{
     Grounding, MAX_ANSWERED_SHORTFALLS, RequestScope, ShortfallDecision, ShortfallKind,
-    decide_in_plan, instructions_answer, package_fetch_hold, path_answer, skill_hold_reason,
-    stored,
+    decide_in_plan, environment_answer, instructions_answer, package_fetch_hold, path_answer,
+    skill_hold_reason, stored,
 };
 
 /// The longest part of a failed check quoted in a shortfall's hold, in
@@ -160,7 +162,16 @@ impl RunLoop {
                             judge.as_deref(),
                         )
                     })
-                    .flatten();
+                    .flatten()
+                    // An environment fact in an unattended Bypass run is
+                    // answered with the facts, not amended or held; the
+                    // answer names the fact, so the trace records it.
+                    .or_else(|| {
+                        plan_shape_hold
+                            .is_none()
+                            .then(|| environment_answer(&asked, &why, &self.authority()))
+                            .flatten()
+                    });
                 if let Some(answer) = answer {
                     return self
                         .answer_shortfall(&contract_id, &worker, kind, &asked, &why, answer, false)

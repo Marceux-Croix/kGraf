@@ -229,6 +229,35 @@ pub enum TraceEvent {
         extended: bool,
         blocks: kgraf_runtime::RoundBlocks,
     },
+    /// The run's time limit acted (`run_deadline.rs`): `action` is
+    /// `worker_stopped` (a worker stopped at its deadline; `worker` names it)
+    /// or `attempt_refused` (no attempt of `contract` started: the time left
+    /// was below the floor). Times are from when the run opened.
+    TimeLimit {
+        at_ms: i64,
+        contract: String,
+        #[serde(default)]
+        worker: String,
+        action: String,
+        limit_ms: u64,
+        /// The worker deadline.
+        deadline_ms: u64,
+        elapsed_ms: u64,
+        /// Time left before the worker deadline: when the worker stopped, or
+        /// when the attempt was refused.
+        remaining_ms: u64,
+        /// `worker_stopped`: the worker's last round, when measured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_round_ms: Option<u64>,
+        /// `worker_stopped`: what its next round was expected to take;
+        /// `attempt_refused`: the floor one round needs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_round_ms: Option<u64>,
+        /// `worker_stopped`: whether the deadline cut a round in flight (its
+        /// call settled as cancelled).
+        #[serde(default)]
+        cut: bool,
+    },
     /// Question 3.
     Regrounding {
         at_ms: i64,
@@ -1029,6 +1058,8 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         | TraceEvent::RouteRecovered { .. }
         | TraceEvent::AnswerRepaired { .. }
         | TraceEvent::WorkerFinished { .. }
+        // Numbers and fixed names only.
+        | TraceEvent::TimeLimit { .. }
         | TraceEvent::Compaction { .. }
         | TraceEvent::ExtractorChanged { .. }
         | TraceEvent::RateLimitWaits { .. }

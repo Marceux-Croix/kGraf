@@ -81,11 +81,13 @@ pub struct ReplayCall {
 }
 
 impl ReplayCall {
-    /// Whether an interrupt-mode message cut the call off while it ran: it
-    /// started and may have written, and the loop treated its declared writes
-    /// as changes.
+    /// Whether an interrupt-mode message, or the worker's deadline, cut the
+    /// call off while it ran: it started and may have written, and the loop
+    /// treated its declared writes as changes.
     pub fn interrupted_by_steer(&self) -> bool {
-        self.is_error && self.output.starts_with(crate::worker::STEER_INTERRUPTED)
+        self.is_error
+            && (self.output.starts_with(crate::worker::STEER_INTERRUPTED)
+                || self.output.starts_with(crate::worker::DEADLINE_INTERRUPTED))
     }
 }
 
@@ -475,7 +477,9 @@ impl TranscriptBuilder {
             // A record for the transcript file and the live view, not text
             // the loop added to the user turn.
             WorkerEvent::Notice {
-                kind: crate::event::NoticeKind::EstimateOverStopPoint,
+                kind:
+                    crate::event::NoticeKind::EstimateOverStopPoint
+                    | crate::event::NoticeKind::TimeLimit,
                 ..
             } => {}
             WorkerEvent::Notice { text, .. } => {
@@ -520,6 +524,7 @@ impl TranscriptBuilder {
                 // listed in `calls`, and a later report for the same call does
                 // not count it again (`count_round`).
                 if reason == crate::worker::STEER_ABANDON_BEFORE_SEND_REASON
+                    || reason == crate::worker::DEADLINE_ABANDON_BEFORE_SEND_REASON
                     || reason == crate::worker::CANCEL_BEFORE_SEND_REASON
                 {
                     self.rounds = self.rounds.saturating_sub(1);

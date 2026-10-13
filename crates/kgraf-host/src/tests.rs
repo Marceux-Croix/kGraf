@@ -2004,6 +2004,152 @@ async fn the_assembled_prefix_digest_with_the_flag_off_is_pinned() {
     );
 }
 
+/// A task container that is never reached: the test reads definitions only.
+struct UnreachedExecutor;
+
+#[async_trait::async_trait]
+impl kgraf_tools::external::ExternalExecutor for UnreachedExecutor {
+    async fn exec(
+        &self,
+        _cmd: &[String],
+        _timeout: std::time::Duration,
+    ) -> std::result::Result<kgraf_tools::external::ExternalOutcome, String> {
+        Err("not reached in this test".into())
+    }
+
+    async fn sync_to_remote(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The shell and system prompt a worker is assembled with, under `mode`,
+/// routed to a task container or not.
+async fn assembled_shell_and_prompt(
+    mode: kgraf_tools::PermissionMode,
+    routed: bool,
+) -> (String, String) {
+    let r = repo();
+    let state = r._dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let ledger = Arc::new(Ledger::open(&state.join("ledger.db")).expect("ledger"));
+    let mut routes = BTreeMap::new();
+    routes.insert(
+        "fake:m".to_owned(),
+        RouteParts {
+            provider: Arc::new(CallsOneTool("noop", serde_json::json!({}))),
+            vendor: "fake (fake)".into(),
+            vendor_name: "fake".into(),
+            model: "m".into(),
+        },
+    );
+    let permissions = Arc::new(
+        kgraf_tools::PermissionControl::new(
+            kgraf_tools::PermissionSettings {
+                mode,
+                ..kgraf_tools::PermissionSettings::default()
+            },
+            kgraf_tools::ModeSource::CommandLine,
+            kgraf_tools::permissions::ProcessFacts::default(),
+        )
+        .expect("control"),
+    );
+    let assembler = AttemptAssembler {
+        root: r.root.clone(),
+        state: state.clone(),
+        graph_path: state.join("graph.db"),
+        indexed: false,
+        ledger,
+        config: WorkerConfig::default(),
+        max_output_tokens: 1_000,
+        max_checkpoints: crate::limits::DEFAULT_MAX_CHECKPOINTS,
+        reasoning: Default::default(),
+        read_denies: vec![state.clone()],
+        workspaces: r.workspaces.clone(),
+        routes,
+        extra_tools: Vec::new(),
+        session_line: None,
+        prefixes: Arc::new(kgraf_runtime::PrefixRegistry::new()),
+        machine_gate: test_machine_gate(),
+        tbench_bridge_socket: None,
+        dependency_refetch: crate::deps::inert_refetch(),
+        skills: None,
+        skill_directory: Default::default(),
+        refusal_directory: Default::default(),
+        permissions,
+    };
+    let path = worktree(&r, "w-routed").await;
+    let ws = r.workspaces.get(&path).expect("a live worktree");
+    let mut assembly = assembler
+        .assembly("fake:m", ws, "w-routed", "r9/c-routed")
+        .expect("assembly");
+    if routed {
+        assembly.external_executor = Some(Arc::new(UnreachedExecutor));
+    }
+    let built = crate::worker::assemble::assemble(assembly)
+        .await
+        .expect("assembled");
+    let shell = built
+        .env
+        .tools
+        .prefix_definitions()
+        .into_iter()
+        .find(|d| d.name == "shell")
+        .expect("a shell tool")
+        .description;
+    let prompt: String = built
+        .env
+        .prefix
+        .system()
+        .iter()
+        .filter_map(kgraf_provider::Content::as_text)
+        .collect();
+    (shell, prompt)
+}
+
+/// A worker whose commands run in the task's container under Bypass is told
+/// the truth about that environment: any command runs without approval and
+/// the network there is not cut off. Before, its shell was described for
+/// this host (network off, a write scope stops other commands) and its
+/// system prompt said other commands need approval, so a worker never
+/// tried to install the module it lacked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routed_bypass_worker_is_told_the_container_s_facts() {
+    let (shell, prompt) =
+        assembled_shell_and_prompt(kgraf_tools::PermissionMode::Bypass, true).await;
+    assert!(!shell.contains("with the network off"), "{shell}");
+    assert!(
+        !shell.contains("no other command that can write runs"),
+        "{shell}"
+    );
+    assert!(
+        shell.contains("kGraf does not cut off the network there"),
+        "{shell}"
+    );
+    assert!(
+        shell.contains("any command runs without approval in the task's environment"),
+        "{shell}"
+    );
+    assert!(
+        !prompt.contains("need approval and may be denied"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("so do other commands in this run"),
+        "{prompt}"
+    );
+
+    // On this host, outside Bypass, the prompt is the pinned one, byte for
+    // byte, and the shell keeps its host sentences.
+    let (shell, prompt) =
+        assembled_shell_and_prompt(kgraf_tools::PermissionMode::Manual, false).await;
+    assert_eq!(prompt, crate::worker::assemble::SYSTEM_PROMPT);
+    assert!(
+        shell.contains("no other command that can write runs"),
+        "{shell}"
+    );
+    assert!(!shell.contains("Bypass"), "{shell}");
+}
+
 /// The real MCP server over stdio, as `kgraf worker`'s tests use it.
 fn echo_server() -> kgraf_mcp::McpServerConfig {
     kgraf_mcp::McpServerConfig::new(

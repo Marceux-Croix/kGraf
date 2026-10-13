@@ -135,7 +135,8 @@ pub struct RunConfig {
     pub shell_timeout: Option<Duration>,
     /// The run's wall-clock limit (`--time-limit`, in seconds on disk). A
     /// share of it is the planner's time for the optional asks (interface
-    /// asks, re-plans); `None` holds nothing back.
+    /// asks, re-plans), and the rest, less a reserve for verification and the
+    /// gate, is every worker's deadline; `None` holds nothing back.
     #[serde(default, with = "opt_seconds", skip_serializing_if = "Option::is_none")]
     pub time_limit: Option<Duration>,
     /// Every agent is an addressable session (decision 0067): registers the

@@ -144,7 +144,8 @@ pub enum WorkerOutcome {
     /// The step budget ran out: a progress checkpoint stopped granting blocks
     /// and the final round issued tool calls, or two checkpoints in a row
     /// measured no progress after a productive one (decision 0096;
-    /// `WorkerResult::round_blocks` says which).
+    /// `WorkerResult::round_blocks` says which). Also the time budget: the
+    /// worker's deadline stopped it, and `WorkerResult::out_of_time` says so.
     BudgetExhausted,
     /// The same tool call repeated inside the budget (0056 stall detection).
     Stalled {
@@ -159,6 +160,28 @@ pub enum WorkerOutcome {
     Cancelled,
     /// The run failed.
     Failed { error: String },
+}
+
+/// The worker's deadline stopped it at a round boundary (`deadline.rs`): the
+/// next round was not expected to end before the deadline, or the deadline
+/// cut the round in flight (`cut`). The tree is as the last round left it.
+/// Carried on [`WorkerResult::out_of_time`] with the outcome
+/// [`WorkerOutcome::BudgetExhausted`]: the time budget is spent, and every
+/// reader of the outcome treats the tree as a spent worker's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutOfTime {
+    /// Time left before the deadline when the worker stopped.
+    pub remaining_ms: u64,
+    /// The last round's duration, when one was measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_ms: Option<u64>,
+    /// What the next round was expected to take, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_round_ms: Option<u64>,
+    /// Whether the deadline cut a round in flight (its model call is settled
+    /// as cancelled in the ledger).
+    #[serde(default)]
+    pub cut: bool,
 }
 
 /// Word cap the return instructions ask a worker to keep its rationale
@@ -373,6 +396,16 @@ pub struct WorkerResult {
     /// loop alone, never from model output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kgraf_shortfall: Option<crate::shortfall::KgrafShortfall>,
+    /// For a worker given a deadline: the longest of its last rounds
+    /// (`deadline.rs`), what its next round was expected to take. The caller
+    /// seeds the next worker on the route with it. `None` without a deadline
+    /// or before a round was measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_round_ms: Option<u64>,
+    /// Set when the worker's deadline stopped it (the outcome is then
+    /// `BudgetExhausted`). `None` for every other end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_time: Option<OutOfTime>,
 }
 
 impl WorkerResult {
@@ -407,6 +440,8 @@ impl WorkerResult {
             round_blocks: None,
             peak_context_tokens: 0,
             kgraf_shortfall: None,
+            recent_round_ms: None,
+            out_of_time: None,
         }
     }
 }

@@ -1424,6 +1424,8 @@ impl RunLoop {
         let attempt_env = self.attempt_envs.clone().map(|envs| (envs, route.clone()));
         let path = self.files.worker_transcript(id.as_str());
         let parent_call = facts.parent_call.map(CallId::new);
+        // A child runs under the run's time limit as its parent does.
+        let deadline = self.attempt_deadline(&facts.route);
         let tx = self.tx.clone();
         let board = self.frugal.board.clone();
         let graph = self.s.graph.clone();
@@ -1478,6 +1480,7 @@ impl RunLoop {
                         // A subagent's hand-back returns to its parent, which
                         // decides what to do with the rest.
                         kgraf_runtime::StopPointPolicy::HandBack,
+                        deadline,
                         // A subagent's brief carries no mailbox note, so
                         // nothing reads when its first request left.
                         Arc::new(OnceLock::new()),

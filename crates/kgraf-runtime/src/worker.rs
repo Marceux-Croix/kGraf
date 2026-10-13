@@ -5,6 +5,9 @@
 //!
 //! ```text
 //!   BetweenRounds --cancelled--------------------------------> Cancelled
+//!        | deadline passed, or the next round is not expected
+//!        |   to end before it (`deadline.rs`) ----------------> BudgetExhausted
+//!        |                                                      (out_of_time)
 //!        | context >= stop point ----------------------------> HandedBack
 //!        | progress checkpoint due (decision 0096, `progress.rs`):
 //!        |   progressing, or grace: the budget grows a block
@@ -16,8 +19,8 @@
 //!   ModelStream (ledger row open; stream raced against cancel and
 //!                against an interrupt-mode message)
 //!        | cancelled: drop the stream, settle partial usage -> Cancelled
-//!        | interrupt: drop the stream, settle partial usage,
-//!        |   append RoundAbandoned ---------------------------> BetweenRounds
+//!        | interrupt or deadline: drop the stream, settle
+//!        |   partial usage, append RoundAbandoned ------------> BetweenRounds
 //!        | provider error / overflow / bad stop -------------> Failed
 //!        | stop without tool calls --------------------------> Completed
 //!        | tool calls in the final round --------------------> BudgetExhausted
@@ -29,9 +32,9 @@
 //!        |   since the last successful write or compaction --> Stalled
 //!        | cancelled: record calls that finish within the
 //!        |   grace, mark the rest ----------------------------> Cancelled
-//!        | interrupt: record calls that finish within the
-//!        |   grace, give the rest a synthetic result,
-//!        |   append RoundAbandoned ---------------------------> BetweenRounds
+//!        | interrupt or deadline: record calls that finish
+//!        |   within the grace, give the rest a synthetic
+//!        |   result, append RoundAbandoned -------------------> BetweenRounds
 //!        v
 //!   BetweenRounds
 //! ```
@@ -464,6 +467,11 @@ pub struct SpawnOptions {
     /// The worker's transcript file, named in a compaction notice so the
     /// orchestrator and the user can find the full pre-compaction history.
     pub transcript_path: Option<PathBuf>,
+    /// When the worker must have stopped (`deadline.rs`): no round starts
+    /// that is not expected to end by then, and a round in flight at it is
+    /// cut. The worker then ends [`WorkerOutcome::BudgetExhausted`] with
+    /// [`WorkerResult::out_of_time`] set. `None`: no deadline.
+    pub deadline: Option<crate::deadline::WorkerDeadline>,
 }
 
 /// Check a brief against its environment and start its worker on the current
@@ -879,6 +887,8 @@ async fn prepare(
         compactions,
         segment,
         slices_left_out,
+        round_clock: crate::deadline::RoundClock::new(options.deadline),
+        out_of_time: None,
     };
     Ok((worker, endpoint, handle))
 }
@@ -1029,6 +1039,42 @@ pub const STEER_STOP_WINDOW: std::time::Duration = std::time::Duration::from_sec
 
 /// The `RoundAbandoned` reason.
 pub const STEER_ABANDON_REASON: &str = "an interrupt-mode message arrived";
+
+/// The `RoundAbandoned` reason for a round the worker's deadline cut
+/// (`deadline.rs`).
+pub const DEADLINE_ABANDON_REASON: &str = "the worker's time limit was reached";
+
+/// As [`DEADLINE_ABANDON_REASON`], for a round whose request never left the
+/// process: it bought no model turn, so a rebuild does not count it.
+pub const DEADLINE_ABANDON_BEFORE_SEND_REASON: &str =
+    "the worker's time limit was reached before the request was sent";
+
+/// The result a call gets when the worker's deadline stops its round before
+/// the call started.
+pub const DEADLINE_NOT_RUN: &str = "ERROR: not run: the worker's time limit was reached";
+
+/// The result a call gets when the worker's deadline stops its round while
+/// the call runs and the call does not return within the cancel grace. Read
+/// back on a resume as [`STEER_INTERRUPTED`] is: the call may have written.
+pub const DEADLINE_INTERRUPTED: &str = "ERROR: interrupted: the worker's time limit was reached \
+     before this call returned a result";
+
+/// Resolves when `steer` does or the deadline passes, whichever is first.
+async fn until_interrupted(
+    steer: impl std::future::Future<Output = ()>,
+    deadline: Option<tokio::time::Instant>,
+) {
+    let time = async move {
+        match deadline {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        () = steer => {}
+        () = time => {}
+    }
+}
 
 /// The `RoundAbandoned` reason for a round whose request never left the
 /// process. The round bought no model turn, so a rebuild does not count it
@@ -1336,6 +1382,11 @@ struct Worker {
     /// The brief's slices this worker was not given, with the reason each
     /// was left out; recorded in the `Context` event and on the result.
     slices_left_out: Vec<crate::context::SliceLeftOut>,
+    /// The round durations and the deadline, when the caller set one
+    /// (`deadline.rs`).
+    round_clock: crate::deadline::RoundClock,
+    /// Set when the deadline stopped the worker, for the result.
+    out_of_time: Option<crate::brief::OutOfTime>,
     /// The provider error that ended the run when it says the route is
     /// unreachable (`ProviderError::is_route_fault`), reported on the result.
     route_fault: Option<String>,
@@ -1607,6 +1658,13 @@ impl Worker {
             later_compactions: self.compactions.iter().skip(1).cloned().collect(),
             round_blocks: self.progress.report(),
             peak_context_tokens: self.peak_context.max(self.builder.context_tokens()),
+            // Only under a deadline, so a run without one records nothing new.
+            recent_round_ms: self
+                .round_clock
+                .deadline()
+                .and(self.round_clock.measured())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            out_of_time: self.out_of_time.take(),
         };
         // `Err` means the handle is gone: nobody is waiting for the result, and the
         // ledger already holds every call it names.
@@ -1818,6 +1876,15 @@ impl Worker {
                     partial: None,
                 });
             }
+            // The deadline (`deadline.rs`), checked first: every step from
+            // here (a compaction, a round) is a model call. The time from one
+            // boundary to the next is one round's measure.
+            let now = tokio::time::Instant::now();
+            self.round_clock.boundary(now);
+            if let Err(stop) = self.round_clock.check(now) {
+                return Ok((self.out_of_time(ep, stop).await?, String::new()));
+            }
+            self.round_clock.start(now);
             // The queued messages are drained after these checks,
             // so their size is counted here without draining them. A round
             // they would push past the stop point is not run; the worker hands
@@ -1979,10 +2046,17 @@ impl Worker {
                         // `BudgetExhausted` with the model never having acted.
                         self.budget.refund_round();
                     }
-                    let reason = if sent {
-                        STEER_ABANDON_REASON
-                    } else {
-                        STEER_ABANDON_BEFORE_SEND_REASON
+                    // The deadline abandons a round as a steer does; the
+                    // boundary it returns to then stops the worker.
+                    let by_deadline = self.round_clock.passed(tokio::time::Instant::now());
+                    if by_deadline {
+                        self.round_clock.mark_cut();
+                    }
+                    let reason = match (by_deadline, sent) {
+                        (true, true) => DEADLINE_ABANDON_REASON,
+                        (true, false) => DEADLINE_ABANDON_BEFORE_SEND_REASON,
+                        (false, true) => STEER_ABANDON_REASON,
+                        (false, false) => STEER_ABANDON_BEFORE_SEND_REASON,
                     };
                     // A round that never left still records its zero usage (the
                     // call is settled as a known zero); the rebuild does not let
@@ -2399,8 +2473,13 @@ impl Worker {
                     // Reached only from `dispatch`'s own `Halt::Abandoned` (below),
                     // which always fires after the round's model call already ran;
                     // the round stays spent, so no refund here.
-                    self.abandon(ep, phase, partial, STEER_ABANDON_REASON)
-                        .await?;
+                    let reason = if self.round_clock.passed(tokio::time::Instant::now()) {
+                        self.round_clock.mark_cut();
+                        DEADLINE_ABANDON_REASON
+                    } else {
+                        STEER_ABANDON_REASON
+                    };
+                    self.abandon(ep, phase, partial, reason).await?;
                 }
                 Err(halt) => return Err(halt),
             }
@@ -2873,6 +2952,33 @@ impl Worker {
             && !self.made_progress()
     }
 
+    /// The deadline stopped the worker at a round boundary (`deadline.rs`):
+    /// one notice with the numbers, then the outcome. The tree is as the last
+    /// round left it.
+    async fn out_of_time(
+        &mut self,
+        ep: &WorkerEndpoint,
+        stop: crate::deadline::DeadlineStop,
+    ) -> Result<WorkerOutcome, Halt> {
+        let cut = self.round_clock.was_cut();
+        self.emit(
+            ep,
+            WorkerEvent::Notice {
+                kind: crate::event::NoticeKind::TimeLimit,
+                text: crate::deadline::stop_text(&stop, cut),
+            },
+        )
+        .await?;
+        self.out_of_time = Some(crate::brief::OutOfTime {
+            remaining_ms: stop.remaining_ms,
+            last_round_ms: stop.last_round_ms,
+            expected_round_ms: stop.expected_round_ms,
+            cut,
+        });
+        // The time budget is spent: the tree is judged as a spent worker's.
+        Ok(WorkerOutcome::BudgetExhausted)
+    }
+
     fn hand_back(
         &self,
         context_tokens: u64,
@@ -3318,7 +3424,10 @@ impl Worker {
         // leave the message undelivered. The final answer is let finish, and
         // the message is a leftover the caller reads from
         // `Injector::undelivered` and routes to the orchestrator.
-        if !final_round && self.steering.is_armed() {
+        // The deadline passed in the same window is the same case.
+        if (!final_round && self.steering.is_armed())
+            || self.round_clock.passed(tokio::time::Instant::now())
+        {
             let zero = TokenUsage::default();
             self.settle_unsent(&call, &token).await;
             return Err(Halt::Abandoned {
@@ -3344,13 +3453,16 @@ impl Worker {
         }
         // An interrupt-mode message abandons the call in flight. Raced after
         // cancel, which outranks it. Not raced in the final round (above).
+        // The deadline abandons it the same way, in every round: a final
+        // answer is not let run past it.
         let steering = self.steering.clone();
-        let interrupt = async move {
+        let steer = async move {
             if final_round {
                 std::future::pending::<()>().await;
             }
             steering.interrupt_armed().await;
         };
+        let interrupt = until_interrupted(steer, self.round_clock.deadline());
         tokio::pin!(interrupt);
         let response = match self.env.settings.call_mode {
             CallMode::Complete => {
@@ -3788,7 +3900,9 @@ impl Worker {
         // channel, and this loop is the sole place that calls `self.emit`.
         let (progress_tx, mut progress_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, Option<String>)>();
-        let interrupt = self.steering.interrupt_armed();
+        // The deadline stops the round's calls as a steer does.
+        let interrupt =
+            until_interrupted(self.steering.interrupt_armed(), self.round_clock.deadline());
         tokio::pin!(interrupt);
         let mut calls: Vec<Option<ApprovedCall>> = approved.into_iter().map(Some).collect();
         let mut done = vec![false; calls.len()];
@@ -4009,7 +4123,14 @@ impl Worker {
             }
             Interruption::Steer => {
                 // Decision 0067: no tool use is left without a result, because
-                // the worker goes on to another request.
+                // the worker goes on to another request. A round the deadline
+                // stopped says so instead of naming a message.
+                let (interrupted, not_run) = if self.round_clock.passed(tokio::time::Instant::now())
+                {
+                    (DEADLINE_INTERRUPTED, DEADLINE_NOT_RUN)
+                } else {
+                    (STEER_INTERRUPTED, STEER_NOT_RUN)
+                };
                 let mut synthetic: Vec<(String, String)> = Vec::new();
                 for j in outlived {
                     let declared: Vec<String> = accesses[j]
@@ -4024,14 +4145,14 @@ impl Worker {
                             .map(|n| n.as_str())
                             .collect();
                         let output = if accesses[j].is_exclusive() {
-                            format!("{STEER_INTERRUPTED} {STEER_MAY_HAVE_WRITTEN_ANYWHERE}")
+                            format!("{interrupted} {STEER_MAY_HAVE_WRITTEN_ANYWHERE}")
                         } else if !nodes.is_empty() {
                             format!(
-                                "{STEER_INTERRUPTED} It may have written graph nodes: {}.",
+                                "{interrupted} It may have written graph nodes: {}.",
                                 nodes.join(", ")
                             )
                         } else {
-                            STEER_INTERRUPTED.to_owned()
+                            interrupted.to_owned()
                         };
                         synthetic.push((ids[j].clone(), output));
                         continue;
@@ -4050,16 +4171,12 @@ impl Worker {
                     synthetic.push((
                         ids[j].clone(),
                         format!(
-                            "{STEER_INTERRUPTED} It may have written: {}.",
+                            "{interrupted} It may have written: {}.",
                             declared.join(", ")
                         ),
                     ));
                 }
-                synthetic.extend(
-                    unstarted
-                        .into_iter()
-                        .map(|id| (id, STEER_NOT_RUN.to_owned())),
-                );
+                synthetic.extend(unstarted.into_iter().map(|id| (id, not_run.to_owned())));
                 for (call_id, mut output) in synthetic {
                     if let Some(j) = ids.iter().position(|id| *id == call_id)
                         && let Some(own) = after_stop.get(&j)
@@ -4088,7 +4205,9 @@ impl Worker {
     /// Whether no further tool call may start: the worker is cancelled or an
     /// interrupt-mode message is pending.
     fn stopping(&self, ep: &WorkerEndpoint) -> bool {
-        ep.is_cancelled() || self.steering.is_armed()
+        ep.is_cancelled()
+            || self.steering.is_armed()
+            || self.round_clock.passed(tokio::time::Instant::now())
     }
 
     /// Emit a result at the end of a stopped round. Once the

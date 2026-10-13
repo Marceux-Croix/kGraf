@@ -5691,3 +5691,201 @@ async fn a_configured_off_that_is_ignored_still_fails_with_reasoning_not_off() {
             .load(std::sync::atomic::Ordering::Relaxed)
     );
 }
+
+// ---------------------------------------------------------------- deadline
+
+/// A provider whose every round writes a new version of one file and takes
+/// `delay`, and never answers inside the budget.
+fn slow_writer(delay: Duration) -> Arc<Fake> {
+    Fake::new(false, move |request| {
+        let r = round_of(request);
+        let mut round = Round::tool(vec![(
+            &format!("t{r}"),
+            "write_file",
+            json!({"path": "src/out.txt", "content": format!("v{r}")}),
+        )]);
+        round.delay = delay;
+        round
+    })
+}
+
+fn deadline_in(after: Duration, expected_round: Option<Duration>) -> SpawnOptions {
+    SpawnOptions {
+        deadline: Some(kgraf_runtime::WorkerDeadline {
+            at: tokio::time::Instant::now() + after,
+            expected_round,
+        }),
+        ..SpawnOptions::default()
+    }
+}
+
+/// A worker whose rounds take 400 ms, given a deadline 1.4 s away, stops at
+/// the boundary where the next round would end past it (after three rounds,
+/// with about 200 ms left), keeps what it wrote, and says why once. Without
+/// the deadline check it runs on to its round budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_worker_stops_before_its_deadline_and_keeps_its_tree() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = slow_writer(Duration::from_millis(400));
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let started = Instant::now();
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "write src/out.txt", dir.path(), 30),
+        deadline_in(Duration::from_millis(1_400), None),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    let took = started.elapsed();
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    let stop = result.out_of_time.expect("stopped by the deadline");
+    assert!(!stop.cut, "stopped at a boundary, not cut: {result:?}");
+    let expected = stop.expected_round_ms.expect("measured");
+    assert!(expected >= 400, "{expected}");
+    assert!(stop.remaining_ms < expected, "{stop:?}");
+    assert!(stop.last_round_ms.is_some());
+    assert!(result.steps < 30, "{result:?}");
+    assert!(took < Duration::from_millis(1_400), "stopped in {took:?}");
+    assert!(result.recent_round_ms.is_some_and(|ms| ms >= 400));
+    assert_eq!(
+        result.changed_paths,
+        vec![std::path::PathBuf::from("src/out.txt")]
+    );
+    assert_eq!(notices_of(&events, NoticeKind::TimeLimit), 1);
+    let text = events
+        .iter()
+        .find_map(|e| match e {
+            WorkerEvent::Notice {
+                kind: NoticeKind::TimeLimit,
+                text,
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("notice");
+    assert!(text.contains("left before its deadline"), "{text}");
+    // Every round it started was answered and settled.
+    assert!(env.ledger.unreconciled().expect("query").is_empty());
+    assert!(
+        env.ledger
+            .calls()
+            .expect("rows")
+            .iter()
+            .all(|r| r.settlement != Settlement::Cancelled)
+    );
+}
+
+/// A round in flight when the deadline passes is cut: its streamed call is
+/// dropped and settled cancelled with the usage the stream reported (every
+/// token attributed), and the worker ends out of time with `cut` set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_in_flight_at_the_deadline_is_cut_and_settled_cancelled() {
+    let dir = tempfile::tempdir().expect("dir");
+    let hang = Fake::new(true, |_| {
+        let mut round = Round::answer("a long answer that never finishes");
+        round.deltas = 8;
+        round.hang_after = Some(2);
+        round.usage = usage(1_234, 0);
+        round
+    });
+    let env = Arc::new(env_with(hang, vec![], CallMode::Stream));
+    let started = Instant::now();
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "answer", dir.path(), 5),
+        deadline_in(Duration::from_millis(300), None),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    assert!(
+        matches!(
+            result.out_of_time,
+            Some(kgraf_runtime::OutOfTime {
+                cut: true,
+                remaining_ms: 0,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        WorkerEvent::RoundAbandoned { reason, .. }
+            if reason == kgraf_runtime::DEADLINE_ABANDON_REASON
+    )));
+    let rows = env.ledger.calls().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].settlement, Settlement::Cancelled);
+    assert_eq!(rows[0].usage.uncached_input, 1_234);
+    assert!(env.ledger.unreconciled().expect("query").is_empty());
+}
+
+/// A worker seeded with a round longer than the time it has does not start
+/// one: nothing is called, nothing is written.
+#[tokio::test]
+async fn a_worker_whose_seeded_round_does_not_fit_starts_none() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = slow_writer(Duration::ZERO);
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "write src/out.txt", dir.path(), 30),
+        deadline_in(Duration::from_secs(5), Some(Duration::from_secs(60))),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    assert!(
+        matches!(
+            result.out_of_time,
+            Some(kgraf_runtime::OutOfTime {
+                cut: false,
+                last_round_ms: None,
+                expected_round_ms: Some(60_000),
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(provider.requests().is_empty());
+    assert!(result.changed_paths.is_empty());
+}
+
+/// Without a deadline the same worker runs to its round budget, and its
+/// result carries no round measure.
+#[tokio::test]
+async fn without_a_deadline_a_worker_runs_to_its_budget() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = slow_writer(Duration::ZERO);
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "write src/out.txt", dir.path(), 4),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    // Four rounds, then the blocks the progress checkpoints grant.
+    assert!(result.steps >= 4, "{result:?}");
+    assert_eq!(result.out_of_time, None);
+    assert_eq!(result.recent_round_ms, None);
+    assert_eq!(notices_of(&events, NoticeKind::TimeLimit), 0);
+}

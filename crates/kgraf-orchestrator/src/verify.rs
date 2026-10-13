@@ -153,8 +153,9 @@ pub fn status_of(result: &WorkerResult) -> AttemptStatus {
 }
 
 /// Whether a worker that ended without finishing left a tree the verifier
-/// should still judge: it was stopped by the stall check or ran out of rounds,
-/// and it changed files.
+/// should still judge: it was stopped by the stall check or ran out of rounds
+/// (or out of time: a deadline stop is `BudgetExhausted` with
+/// `WorkerResult::out_of_time`), and it changed files.
 ///
 /// A worker's claim of completion is not progress, and neither is its lack of
 /// one: the verifier's verdict on the tree is. A worker can deliver a tree that

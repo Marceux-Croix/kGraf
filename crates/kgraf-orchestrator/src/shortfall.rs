@@ -20,7 +20,10 @@
 //!   set; Accept edits grants file-scope widenings and the common file
 //!   programs; anything else asks the user, or, in a run nobody attends, is
 //!   held with the question. An `instructions` report amends the contract
-//!   once, additively.
+//!   once, additively. One that states an environment fact (a missing
+//!   module, no network, a command believed not allowed) in an unattended
+//!   Bypass run is answered with the facts instead, and the worker keeps
+//!   working ([`environment_answer`]).
 //! - **Bounded.** A contract is re-dispatched after a shortfall at most
 //!   [`MAX_SHORTFALL_REDISPATCHES`] times; a grant that did not help, or a
 //!   second `instructions` report, holds it. Under Orchestrator decides these
@@ -724,6 +727,134 @@ pub fn instructions_answer<'a>(
          existing code defines it, and change your own files so that it compiles as it is.{}",
         holder.contract,
         judge_sentence(judge)
+    ))
+}
+
+/// A fact of the environment that an `instructions` report gives as its
+/// reason, found by [`environment_fact`]. Such a report is not a gap in the
+/// instruction: amending the instruction cannot install a module or open a
+/// network, and a worker that believed a command was refused never tried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentFact {
+    /// A module, package or program is missing (`ModuleNotFoundError`,
+    /// `command not found`).
+    MissingModule,
+    /// The worker believes it has no network.
+    Network,
+    /// The worker believes a command it needs is not allowed to run.
+    BelievedForbidden,
+}
+
+impl EnvironmentFact {
+    /// For the answer and the trace.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MissingModule => "a missing module, package or program",
+            Self::Network => "no network",
+            Self::BelievedForbidden => "a command believed not allowed",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::MissingModule => {
+                "Install what is missing (for example `pip install <package>`, or the \
+                 project's own package manager), then run your command again."
+            }
+            Self::Network => {
+                "Run the command that needs the network and read its result; do not assume \
+                 the network is off."
+            }
+            Self::BelievedForbidden => {
+                "Run the command you believed was not allowed and read its result."
+            }
+        }
+    }
+}
+
+/// Words that mark each [`EnvironmentFact`], lowercase. Kept to phrases a
+/// report of that fact uses and a gap in an instruction does not: a word such
+/// as "package" or "unavailable" alone also names what an instruction lacks.
+const MISSING_MODULE_MARKS: &[&str] = &[
+    "modulenotfounderror",
+    "no module named",
+    "importerror:",
+    "cannot find module",
+    "command not found",
+    "not installed",
+];
+const NETWORK_MARKS: &[&str] = &[
+    "no network",
+    "network access",
+    "network is off",
+    "network off",
+    "without network",
+    "no internet",
+    "internet access",
+    "web access",
+];
+const FORBIDDEN_MARKS: &[&str] = &[
+    "shell allowlist",
+    "not on the allowlist",
+    "not allowed to run",
+    "not allowed to install",
+    "not permitted to run",
+    "not permitted to install",
+    "does not permit",
+    "requires approval",
+    "need approval",
+    "needs approval",
+    "would be denied",
+    "cannot install",
+    "can't install",
+    "unable to install",
+];
+
+/// The environment fact an `instructions` report's `need` and `why` give,
+/// if any (see [`EnvironmentFact`]). A missing module is checked first: its
+/// error text is the most specific.
+pub fn environment_fact(need: &str, why: &str) -> Option<EnvironmentFact> {
+    let text = format!("{need} {why}").to_lowercase();
+    let has = |marks: &[&str]| marks.iter().any(|m| text.contains(m));
+    if has(MISSING_MODULE_MARKS) {
+        Some(EnvironmentFact::MissingModule)
+    } else if has(NETWORK_MARKS) {
+        Some(EnvironmentFact::Network)
+    } else if has(FORBIDDEN_MARKS) {
+        Some(EnvironmentFact::BelievedForbidden)
+    } else {
+        None
+    }
+}
+
+/// The answer to an `instructions` report that states an environment fact
+/// ([`environment_fact`]) in a run nobody attends whose mode is Bypass: there
+/// every command no `forbid` rule refuses runs without approval, so the
+/// remedy is the worker's own to try. The worker is told the facts and keeps
+/// working; nothing is amended, granted or held. Holding instead stopped a
+/// run whose worker never tried to install the module it lacked. An answer,
+/// not a grant (decision 0093): a command a policy then refuses is recorded
+/// and can be reported as a permission shortfall, decided on that record.
+///
+/// `None`: the report states no such fact, a person attends (who can answer
+/// the question a hold puts), or the mode does not run every command, and
+/// the report goes on to [`decide`].
+pub fn environment_answer(need: &str, why: &str, authority: &Authority) -> Option<String> {
+    if authority.attended || authority.mode != PermissionMode::Bypass {
+        return None;
+    }
+    let fact = environment_fact(need, why)?;
+    Some(format!(
+        "Nothing was amended or held: this report states an environment fact ({}), not a gap \
+         in the instruction. This run's permission mode is Bypass: any command runs without \
+         approval, except the few the command policy forbids. The shell tool's description \
+         says where commands run and whether the network there is open. {} If a policy \
+         refuses the command, the refusal is recorded: report it as kind permission, naming \
+         the program. If the command runs and fails, its output is the environment's answer: \
+         work from it, and report kind instructions only for what the instruction itself \
+         lacks.",
+        fact.label(),
+        fact.remedy()
     ))
 }
 
@@ -2548,6 +2679,110 @@ mod tests {
         assert_eq!(d(&c), ShortfallDecision::Amend);
         c.shortfall_notes.push("the dataset".into());
         assert!(matches!(d(&c), ShortfallDecision::Hold { .. }));
+    }
+
+    /// The two reports of a paid run whose worker never tried `pip`: each
+    /// states an environment fact, and in an unattended Bypass run each is
+    /// answered with the facts (mode, where the shell says commands run, how
+    /// to install), naming the fact, instead of being amended or held.
+    #[test]
+    fn an_unattended_bypass_environment_report_is_answered_with_the_facts() {
+        let reports = [
+            (
+                "The required Python dependencies (datasets and transformers) and access to the \
+                 Hugging Face dataset/tokenizer are unavailable in this workspace.",
+                "The script was created, but running it failed immediately with \
+                 ModuleNotFoundError: No module named 'datasets'.",
+                EnvironmentFact::MissingModule,
+            ),
+            (
+                "A way to access the Hugging Face README/dataset and execute the requested \
+                 standalone script",
+                "The available tools provide no web access. The shell allowlist does not \
+                 permit running a standalone Python script.",
+                EnvironmentFact::Network,
+            ),
+            (
+                "permission to run python3",
+                "the shell allowlist does not permit running a standalone script",
+                EnvironmentFact::BelievedForbidden,
+            ),
+        ];
+        let unattended = authority(PermissionMode::Bypass, false);
+        for (need, why, fact) in reports {
+            assert_eq!(environment_fact(need, why), Some(fact), "{need}");
+            let answer = environment_answer(need, why, &unattended).expect("answered");
+            assert!(answer.contains("Nothing was amended or held"), "{answer}");
+            assert!(answer.contains(fact.label()), "{answer}");
+            assert!(answer.contains("permission mode is Bypass"), "{answer}");
+            assert!(
+                answer.contains("any command runs without approval"),
+                "{answer}"
+            );
+        }
+        let answer = environment_answer(reports[0].0, reports[0].1, &unattended).expect("answer");
+        assert!(answer.contains("pip install"), "{answer}");
+    }
+
+    /// The answer is given only where it is true and nobody can answer a
+    /// hold: a person attending is asked as before, and outside Bypass a
+    /// command may need approval, so the report goes on to `decide`.
+    #[test]
+    fn an_environment_report_is_not_answered_attended_or_outside_bypass() {
+        let need = "the datasets module";
+        let why = "ModuleNotFoundError: No module named 'datasets'";
+        assert!(environment_answer(need, why, &authority(PermissionMode::Bypass, true)).is_none());
+        for mode in [
+            PermissionMode::Manual,
+            PermissionMode::Auto,
+            PermissionMode::AcceptEdits,
+            PermissionMode::OrchestratorDecides,
+        ] {
+            assert!(
+                environment_answer(need, why, &authority(mode, false)).is_none(),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A genuine gap in the instruction is not an environment fact, even
+    /// when it names a package or something unavailable: it still amends
+    /// once and then holds in an unattended Bypass run.
+    #[test]
+    fn a_genuine_instruction_gap_still_amends_then_holds() {
+        let gaps = [
+            (
+                "which package name to publish under",
+                "the instruction names two and they differ",
+            ),
+            (
+                "the expected output format",
+                "the instruction does not say whether answer.txt holds a number or a sentence",
+            ),
+            (
+                "the input file",
+                "data.csv named in the instruction is unavailable in the repository",
+            ),
+        ];
+        let unattended = authority(PermissionMode::Bypass, false);
+        for (need, why) in gaps {
+            assert_eq!(environment_fact(need, why), None, "{need}: {why}");
+            assert!(environment_answer(need, why, &unattended).is_none());
+            let mut c = contract();
+            let d = |c: &OpenContract| {
+                decide(
+                    ShortfallKind::Instructions,
+                    RequestScope::Command,
+                    need,
+                    why,
+                    c,
+                    &unattended,
+                )
+            };
+            assert_eq!(d(&c), ShortfallDecision::Amend);
+            c.shortfall_notes.push(format!("{need}: {why}"));
+            assert!(matches!(d(&c), ShortfallDecision::Hold { .. }));
+        }
     }
 
     /// Bounded in every mode: after the limit every report holds, and a grant

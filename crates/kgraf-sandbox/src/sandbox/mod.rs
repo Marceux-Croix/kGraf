@@ -1172,6 +1172,17 @@ impl CheckNetwork {
         }
     }
 
+    /// The network open by the environment's own design, not because a
+    /// backend cannot deny it: commands that run outside this host (a task
+    /// container) get whatever network that environment has, and kGraf does
+    /// not cut it off. No notice: nothing here is a sandbox gap to warn of.
+    pub fn open() -> Self {
+        Self {
+            network: Network::Allow,
+            notice: None,
+        }
+    }
+
     /// What every other backend gets: the network denied, no notice.
     pub fn deny() -> Self {
         Self {

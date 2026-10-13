@@ -139,6 +139,8 @@ mod compaction_hooks;
 mod checkpoint_hooks;
 use checkpoint_hooks::checkpoint_note;
 mod speculate;
+// The run's time limit applied to its workers (`run_deadline.rs`).
+mod time_limit;
 
 /// Default cap on contracts in one plan (one decomposition answer).
 pub const DEFAULT_MAX_CONTRACTS_PER_PLAN: usize = 32;
@@ -616,7 +618,10 @@ pub struct OrchestratorConfig {
     /// The run's wall-clock limit, when the caller knows one (a benchmark
     /// task window, `kgraf orchestrate --time-limit`). A share of it is the
     /// budget of the optional planner asks: the interface asks and the
-    /// re-plans ([`crate::planner_budget`]). `None`: no ask is held back.
+    /// re-plans ([`crate::planner_budget`]). The rest, less a reserve for the
+    /// last verification, merge and gate, is every attempt's deadline, and no
+    /// attempt starts that cannot run one round before it
+    /// ([`crate::run_deadline`]). `None`: nothing is held back or stopped.
     pub time_limit: Option<Duration>,
 }
 
@@ -2548,6 +2553,15 @@ struct RunLoop {
     intake_notices: Vec<String>,
     /// Planner time spent against the share of the run's time limit.
     planner_budget: crate::planner_budget::PlannerBudget,
+    /// The run's time limit applied to its workers (`run_deadline.rs`).
+    /// `None`: the run has no limit.
+    run_deadline: Option<crate::run_deadline::RunDeadline>,
+    /// Why no attempt could start for lack of time, once one could not: the
+    /// reason a run that ends blocked on it states.
+    out_of_time: Option<String>,
+    /// Contracts whose attempt the time limit refused: one notice and one
+    /// trace record each, though the dispatch round asks every tick.
+    time_refused: BTreeSet<String>,
     /// Worktrees that could not be removed after use (`Workspaces::take_problems`),
     /// reported as warnings with the run.
     workspace_problems: Vec<String>,
@@ -2840,6 +2854,9 @@ impl RunLoop {
         let route_fault_cooldown_ms =
             i64::try_from(config.route_fault_cooldown.as_millis()).unwrap_or(i64::MAX);
         let time_limit = config.time_limit;
+        // The run's clock starts as it opens.
+        let run_deadline =
+            crate::run_deadline::RunDeadline::new(time_limit, services.clock.now_ms());
         let mut me = Self {
             since_reground: 0,
             reground_on_resume: resumed,
@@ -2880,6 +2897,9 @@ impl RunLoop {
             notices: BTreeSet::new(),
             intake_notices: Vec::new(),
             planner_budget: crate::planner_budget::PlannerBudget::new(time_limit),
+            run_deadline,
+            out_of_time: None,
+            time_refused: BTreeSet::new(),
             workspace_problems: Vec::new(),
             subagents: subagents::Subagents::default(),
             spec: speculate::SpecRuntime::default(),
@@ -4947,7 +4967,7 @@ impl RunLoop {
             return None;
         }
         let held = self.held();
-        let reason = if held.is_empty() {
+        let mut reason = if held.is_empty() {
             "no open contract can be dispatched".to_owned()
         } else {
             held.iter()
@@ -4955,6 +4975,10 @@ impl RunLoop {
                 .collect::<Vec<_>>()
                 .join("; ")
         };
+        // The run's time limit refused the next attempt (`run_deadline.rs`).
+        if let Some(why) = &self.out_of_time {
+            reason = format!("{reason}; {why}");
+        }
         Some(RunStatus::Blocked {
             reason: kgraf_secrets::scrub_persist_owned(reason),
         })
@@ -5590,6 +5614,11 @@ impl RunLoop {
         let Some(contract) = self.record.contract(id).cloned() else {
             return Ok(());
         };
+        // The run's time limit: no attempt starts that cannot run one round
+        // (`run_deadline.rs`). First, since the checks below can call models.
+        if !self.time_for_attempt(id).await? {
+            return Ok(());
+        }
         // Pre-dispatch contract checks (0030, 0031), cheapest first.
         if !self.contract_gate(&contract).await? {
             return Ok(());
@@ -6492,6 +6521,8 @@ impl RunLoop {
             &brief.instruction,
             route.context.worker_stop_tokens(),
         );
+        // The run's time limit, as this attempt's deadline (`run_deadline.rs`).
+        let deadline = self.attempt_deadline(&route_name);
         let cancel = Arc::new(Notify::new());
         flight.cancels.insert(worker.clone(), cancel.clone());
         let first_call: Arc<OnceLock<i64>> = Arc::new(OnceLock::new());
@@ -6625,6 +6656,7 @@ impl RunLoop {
                         graph,
                         None,
                         stop_point,
+                        deadline,
                         first_call,
                     )
                     .await;
@@ -6893,6 +6925,8 @@ impl RunLoop {
             tool_calls: f.result.tool_calls,
         })
         .await?;
+        on_heap(|| self.note_worker_time(&f.contract, &f.worker, &route_name, &f.result, now))
+            .await?;
         self.trace_slices_left_out(
             &f.contract,
             f.worker.as_str(),
@@ -7424,11 +7458,13 @@ impl RunLoop {
                 // A model that ran out of steps or stalled failed its brief
                 // before any verifier saw it; left out, it would inflate the
                 // model's live rate (0075). A provider error (`Failed`) is not
-                // the model's measure and is not recorded.
+                // the model's measure and is not recorded. Neither is a stop at
+                // the run's time limit: the limit is the run's, not the brief's.
                 if matches!(
                     other,
                     WorkerOutcome::BudgetExhausted | WorkerOutcome::Stalled { .. }
-                ) && let Some(i) = idx
+                ) && f.result.out_of_time.is_none()
+                    && let Some(i) = idx
                 {
                     let route = flight.attempts[i].route.clone();
                     self.record_live_outcome(
@@ -7442,7 +7478,11 @@ impl RunLoop {
                 }
                 let note = format!(
                     "{} ({}){}",
-                    outcome_name(other),
+                    if f.result.out_of_time.is_some() {
+                        "out of time"
+                    } else {
+                        outcome_name(other)
+                    },
                     f.worker,
                     checkpoint_note(f.result.round_blocks.as_ref())
                 );
@@ -7830,6 +7870,14 @@ impl RunLoop {
     ) -> Result<(), OrchestratorError> {
         flight.running = flight.running.saturating_sub(1);
         let id = contract.contract.clone();
+        // A throttled attempt is a new attempt: none starts past the floor.
+        if flight.queued > 0
+            && !self.stopping
+            && !flight.lease_lost
+            && !self.time_for_attempt(&id).await?
+        {
+            flight.queued = 0;
+        }
         if flight.queued > 0 && !self.stopping && !flight.lease_lost {
             flight.queued -= 1;
             let n = flight.attempts.len();
@@ -8451,6 +8499,9 @@ impl RunLoop {
         parent: &OpenContract,
         handoff: &kgraf_runtime::Handoff,
     ) -> Option<String> {
+        if let Some(no_time) = self.no_time_for_continuation() {
+            return Some(no_time);
+        }
         match self.plan_children(parent, handoff) {
             Ok(children) if children.is_empty() => {
                 Some("the handoff listed nothing remaining".to_owned())
@@ -9269,6 +9320,9 @@ fn last_refusal(attempts: &[Attempt]) -> Option<String> {
 /// (decision 0018, retry briefs).
 fn stop_note_of(worker: &str, r: &WorkerResult) -> Option<String> {
     let what = match &r.outcome {
+        WorkerOutcome::BudgetExhausted if r.out_of_time.is_some() => {
+            "stopped at the run's time limit before finishing".to_owned()
+        }
         WorkerOutcome::Stalled { repeats, call, .. } if call.is_empty() => {
             format!("stalled: one call repeated {repeats} times")
         }
@@ -9616,7 +9670,7 @@ pub(crate) struct AttemptSkills {
 /// (resuming from the transcript when there is one), forward every event to the
 /// transcript, and return its result and peak context.
 ///
-/// Twelve positional arguments (five over clippy's default): each is a
+/// Thirteen positional arguments (six over clippy's default): each is a
 /// distinct piece of per-attempt state the dispatch site already holds
 /// separately (`InFlight`'s own maps keyed by worker, not a single struct);
 /// grouping them into a new type here would only move the naming, not
@@ -9634,6 +9688,7 @@ async fn run_attempt(
     graph: SharedGraph,
     parent_call: Option<CallId>,
     stop_point: kgraf_runtime::StopPointPolicy,
+    deadline: Option<kgraf_runtime::WorkerDeadline>,
     first_call: Arc<OnceLock<i64>>,
 ) -> Result<(WorkerResult, u64), String> {
     // A kill mid-append leaves a torn last line: repaired (dropped) rather
@@ -9724,6 +9779,7 @@ async fn run_attempt(
             // pre-compaction history can be found.
             transcript_path: Some(path.clone()),
             stop_point,
+            deadline,
             ..SpawnOptions::default()
         },
     )

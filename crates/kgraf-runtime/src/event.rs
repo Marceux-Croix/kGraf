@@ -292,6 +292,10 @@ pub enum NoticeKind {
     /// design); the text carries both numbers. Loop-only: never model input
     /// (the transcript builder skips it).
     EstimateOverStopPoint,
+    /// The worker's deadline stopped it (`deadline.rs`); the text carries the
+    /// time left, the last round and the expected round. Loop-only: never
+    /// model input (a resumed worker runs under its own deadline).
+    TimeLimit,
 }
 
 impl WorkerEvent {

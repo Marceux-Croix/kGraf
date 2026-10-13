@@ -150,7 +150,7 @@ overwrites a node you changed.
 | `--gate-command CMD` | discovered | A quality gate. Repeatable. Without one, kGraf finds the project's test commands. |
 | `--gate-timeout SECS` | 1800 | Longest one gate or one `--verify` run. |
 | `--shell-timeout SECS` | 600 | Longest one worker shell command. |
-| `--time-limit SECS` | none | The run's wall-clock budget. The planner skips optional asks that would pass 30 percent of it. It does not stop the run. |
+| `--time-limit SECS` | none | The run's wall-clock budget, from when the run opens. The planner skips optional asks that would pass 30 percent of it. The last tenth (at most 120 s) is kept for verification, merge and the gate; every worker gets the rest as its deadline and stops at a round boundary before it, when its next round (the longest of its last three) would not end in time. A round still running at the deadline is cut, and its call is recorded as cancelled. The tree a stopped worker leaves is verified as it stands. No new attempt starts when the time left is shorter than one round (the fastest route's last measured round, else 15 s or 5 percent of the limit); a notice says so and the run ends with what it has. Trace records: `time_limit`. |
 | `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` | none | Limit one route's call rate. A call that would wait longer than MAX_WAIT_MS (default 60000) fails. Repeatable. |
 | `--routing rotation\|fitness` | `rotation` | `rotation` rotates workers across routes. `fitness` sends coupled contracts to one vendor and picks each worker's model by measured cost per satisfied task. |
 | `--sessions true\|false` | true | Give every agent the session tools `ask_user_question`, `spawn_subagent`, `send_message` and `request_connection`. |
@@ -595,7 +595,16 @@ The run's own `--verify` and `--gate-command` commands run as written. Change th
 report is judged by what was actually refused, never by its wording. Your mode then decides:
 you answer, the mode grants, or the orchestrator decides. A grant your deny or ask rule would
 meet again is never made. A contract is re-dispatched at most twice for shortfalls. Every
-grant, hold and answer is in the run's trace.
+grant, hold and answer is in the run's trace. In a run nobody attends, under Bypass, a report
+that the instruction falls short because of the environment (a missing module, no network, a
+command the worker believed was not allowed) is answered with the facts, and the worker keeps
+working; the trace names the fact. A real gap in the instruction is amended once, then held.
+
+**What a worker is told.** The shell's description and the worker's system prompt match the
+run. In Bypass they say any command runs without approval. When commands run in a task
+container (the Terminal-Bench bridge), they say so, and say that kGraf does not cut off the
+network there and that installing packages is allowed. A worker on this machine outside
+Bypass is told what it was before.
 
 ## The desktop app
 

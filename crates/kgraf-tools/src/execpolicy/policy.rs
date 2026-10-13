@@ -209,8 +209,10 @@ impl ExecPolicy {
     /// in Bypass every command no `forbid` rule refuses runs as a confined,
     /// granted command; in Auto the allow set's programs do; in Accept edits
     /// the common file programs do. The mode is read per call, so a change
-    /// reaches a running worker's next command. The tool's description does
-    /// not change with it: the shared prefix stays byte-identical (0043).
+    /// reaches a running worker's next command. The shell's description,
+    /// built when a worker is assembled, says whether every command runs
+    /// without approval ([`Self::runs_any_command`]); the mode is run-wide,
+    /// so every worker assembled under one mode shares one prefix (0043).
     pub fn with_permissions(
         mut self,
         control: std::sync::Arc<crate::permissions::PermissionControl>,
@@ -307,6 +309,20 @@ impl ExecPolicy {
     /// Whether [`Self::with_unrestricted_shell`] is on.
     pub fn is_unrestricted(&self) -> bool {
         self.unrestricted
+    }
+
+    /// Whether every command no `forbid` rule refuses runs without approval
+    /// right now: the shell is unrestricted, or the user's live mode is
+    /// Bypass (decision 0094). Both are run-wide, so a description built from
+    /// this is the same for every worker assembled under one mode (0043).
+    pub fn runs_any_command(&self) -> bool {
+        self.unrestricted || self.live.as_ref().is_some_and(|l| l.0.shell_unrestricted())
+    }
+
+    /// Whether a command that downloads packages is decided like any other
+    /// ([`Self::with_package_downloads`], or an unrestricted shell).
+    pub fn allows_package_downloads(&self) -> bool {
+        self.package_downloads || self.unrestricted
     }
 
     /// Allow these build and test commands without approval (decision 0084).

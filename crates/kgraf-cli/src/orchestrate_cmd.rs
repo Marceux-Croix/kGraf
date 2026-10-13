@@ -73,7 +73,8 @@ pub struct OrchestrateArgs {
     /// `--shell-timeout` (decision 0084): wins over the worker configuration.
     pub shell_timeout: Option<Duration>,
     /// `--time-limit`: the run's wall-clock limit, whose share is the planner's
-    /// time for the optional asks.
+    /// time for the optional asks and whose rest, less a reserve, is every
+    /// worker's deadline.
     pub time_limit: Option<Duration>,
     /// Output ceiling of each orchestrator call.
     pub planner_max_tokens: u32,
