@@ -2507,10 +2507,13 @@ async fn a_handshake_failure_before_any_work_is_sent_back_to_the_planner_once() 
     }
 }
 
-/// Parties that keep disagreeing: the plan and its one re-plan are both held,
-/// and the run ends on the hold without a third plan or any worker.
+/// Parties that keep disagreeing: the plan is re-planned once, and the
+/// re-plan's interface fails its handshake too. No third plan is asked for;
+/// the re-plan's interface checks are dropped with a notice naming the
+/// interface and its finding, its edge is counted as not run, and the
+/// contracts are dispatched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_handshake_that_keeps_failing_is_held_after_one_re_plan() {
+async fn a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_dispatches() {
     let dir = tempfile::tempdir().expect("dir");
     let rig = Rig::new(
         dir.path(),
@@ -2536,19 +2539,136 @@ async fn a_handshake_that_keeps_failing_is_held_after_one_re_plan() {
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
-    assert!(
-        matches!(report.status, RunStatus::Blocked { .. }),
-        "{report:?}"
-    );
     assert_eq!(
         rig.parts.planner.prompts().len(),
         4,
         "one plan, one re-plan, each a contracts and an interface call"
     );
     assert_eq!(report.contracts.handshake_failures, 2, "{report:?}");
+    assert_checks_dropped(&rig, &report, "re1.config", "Optional[Config]").await;
+}
+
+/// A re-planned interface whose handshake cannot run at all (a party's
+/// answer is never a statement) degrades the same way after the one
+/// re-plan: its checks are dropped, counted as not run, and the contracts
+/// are dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_dispatches() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&py_ic()),
+        |prompt| {
+            if prompt.contains("You are party `re1.cons`") {
+                "no statement here".to_owned()
+            } else if prompt.contains("You are party `cons`") {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing(&prompt.replace("`re1.", "`"))
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(rig.parts.planner.prompts().len(), 4, "one re-plan");
+    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
+    assert_checks_dropped(&rig, &report, "re1.config", "could not run").await;
+}
+
+/// The run went on past a check that still failed after the re-plan: workers
+/// ran, the interface's checks were dropped once with the finding named in a
+/// notice and a trace event, and its edge was counted as not run.
+async fn assert_checks_dropped(rig: &Rig, report: &RunReport, interface: &str, finding: &str) {
     assert!(
-        worker_requests(&rig.parts).is_empty(),
-        "no worker was spent"
+        !matches!(report.status, RunStatus::Blocked { .. }),
+        "the run is not blocked on the check: {report:?}"
+    );
+    assert!(
+        !worker_requests(&rig.parts).is_empty(),
+        "the contracts were dispatched: {report:?}"
+    );
+    assert_eq!(report.contracts.interface_checks_dropped, 1, "{report:?}");
+    assert!(report.contracts.checks_not_run >= 1, "{report:?}");
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains(&format!("interface {interface}@v1")) && n.contains("dropped"))
+        .unwrap_or_else(|| panic!("a notice names the interface: {:?}", report.notices));
+    assert!(notice.contains(finding), "{notice}");
+    let events = rig.contract_events().await;
+    assert!(
+        events.iter().any(|e| matches!(e,
+            ContractEvent::ChecksDropped { interface: i, reason, .. }
+                if i == interface && reason.contains(finding))),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e,
+            ContractEvent::Unchecked { reason, .. } if reason.contains(interface))),
+        "{events:?}"
+    );
+}
+
+/// An interface symbol written as a bare file name (`config.py`) while the
+/// stub is `pkg/config.py` is registered under the stub's path, with a
+/// notice, so the parties are asked about the file their sentences name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bare_file_name_symbol_is_registered_as_its_stub_path() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan: serde_json::Value = serde_json::from_str(&plan_json(&[
+        c("prod", "implement the parser", "pkg/config.py", &[]),
+        c("cons", "use the parser", "consumer.py", &[]),
+    ]))
+    .expect("the plan is JSON");
+    let mut ic = py_ic();
+    ic.symbols = s(&["parse_config", "Config", "config.py"]);
+    ic.stub[0].path = "pkg/config.py".into();
+    ic.reference[0].path = "pkg/config.py".into();
+    ic.consumer[0].content = "from pkg.config import parse_config, Config\n".into();
+    ic.tests[0].content = PY_TEST.replace("from config import", "from pkg.config import");
+    plan["interfaces"] = serde_json::json!([serde_json::to_value(ic).expect("json")]);
+    let rig = Rig::new(
+        dir.path(),
+        plan.to_string(),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    let registered = rig
+        .contract_events()
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ContractEvent::Registered { interface } => Some(interface),
+            _ => None,
+        })
+        .expect("registered");
+    assert_eq!(
+        registered.symbols,
+        s(&["parse_config", "Config", "pkg/config.py"]),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("symbol `config.py` is read as `pkg/config.py`")),
+        "{:?}",
+        report.notices
     );
 }
 

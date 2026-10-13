@@ -282,6 +282,11 @@ pub struct ContractCounters {
     /// program is not installed ([`ContractEvent::ChecksSkipped`]); their
     /// parties ran without contract checks.
     pub interface_checks_skipped: u64,
+    /// Interfaces whose pre-dispatch checks still failed after the one
+    /// re-plan and were dropped ([`ContractEvent::ChecksDropped`]); their
+    /// parties ran without contract checks, and their edges are counted in
+    /// `checks_not_run` through [`ContractEvent::Unchecked`].
+    pub interface_checks_dropped: u64,
     /// Optional planner asks (interface asks, re-plans) not made because the
     /// run's planner time budget was spent
     /// ([`ContractEvent::PlannerBudgetSkipped`]).
@@ -381,6 +386,23 @@ pub enum ContractEvent {
         version: u32,
         program: String,
         detail: String,
+    },
+    /// The interface's checks failed again after the plan's one re-plan, and
+    /// the run would otherwise end on the hold with its contracts undone. The
+    /// checks are dropped: the interface takes the path of a run with
+    /// contract checks off, its held parties are released, and the run's
+    /// verify gate still judges the work. `stage` is the failing stage
+    /// (`handshake`, `stub_compile`, ...; `not_run` when the checks could not
+    /// run) and `reason` the failure, its first finding included. Counted in
+    /// `interface_checks_dropped`; the edges are counted as not run by the
+    /// [`ContractEvent::Unchecked`] events recorded with it.
+    ChecksDropped {
+        interface: String,
+        version: u32,
+        stage: String,
+        reason: String,
+        /// The parties released.
+        released: Vec<String>,
     },
     Inadequate {
         interface: String,
@@ -501,8 +523,9 @@ struct Entry {
     /// `false`, so a revised stub lands again under its own version; the
     /// prior version's landed commit stays reachable, never rewritten.
     stub_landed: bool,
-    /// The missing check program that made the current version's checks be
-    /// skipped (`ContractEvent::ChecksSkipped`). While set, the interface
+    /// Why the current version's checks are not run: the missing check
+    /// program (`ContractEvent::ChecksSkipped`), or the failure that still
+    /// held after the re-plan (`ContractEvent::ChecksDropped`). While set, the interface
     /// takes the path of a run with contract checks off: no stub landing, no
     /// consumer tests, no hold.
     checks_skipped: Option<String>,
@@ -586,8 +609,9 @@ impl ContractBook {
         self.entries.get(id).is_some_and(|e| e.checked)
     }
 
-    /// The missing check program that made `id`'s checks be skipped, if they
-    /// were (`ContractEvent::ChecksSkipped`).
+    /// Why `id`'s checks are not run, if they are not: the missing check
+    /// program (`ContractEvent::ChecksSkipped`) or the failure they were
+    /// dropped on (`ContractEvent::ChecksDropped`).
     pub fn checks_skipped(&self, id: &str) -> Option<&str> {
         self.entries
             .get(id)
@@ -781,6 +805,24 @@ impl ContractBook {
                     e.checks_skipped = Some(program.clone());
                     c.interface_checks_skipped += 1;
                 }
+            }
+            ContractEvent::ChecksDropped {
+                interface,
+                version,
+                reason,
+                released,
+                ..
+            } => {
+                if let Some(e) = self.entries.get_mut(interface)
+                    && e.current.version == *version
+                    && e.checks_skipped.is_none()
+                {
+                    e.state = InterfaceState::Active;
+                    e.checked = false;
+                    e.checks_skipped = Some(reason.clone());
+                    c.interface_checks_dropped += 1;
+                }
+                self.release(released);
             }
             ContractEvent::Inadequate {
                 interface,
@@ -2010,6 +2052,47 @@ mod tests {
         assert_eq!(book.blocked("p"), None);
         let c = book.counters();
         assert_eq!((c.interface_checks_skipped, c.checks_not_run), (1, 0));
+    }
+
+    /// Checks dropped after a re-plan are event-sourced: the failed interface
+    /// becomes active with its checks off, its holds are released, and a
+    /// replay counts the drop once.
+    #[test]
+    fn dropped_checks_release_the_hold_and_replay_once() {
+        let mut book = ContractBook::new(Vec::new(), DEFAULT_MAX_SUPERSESSIONS).expect("book");
+        book.apply(&ContractEvent::Registered {
+            interface: Box::new(ic()),
+        });
+        book.apply(&ContractEvent::CheckFailed {
+            interface: "config".into(),
+            version: 1,
+            failure: CheckFailure {
+                stage: CheckStage::Handshake,
+                artifact: "a".into(),
+                detail: "1 mismatch".into(),
+            },
+            findings: vec![],
+            handshake: vec![],
+            held: vec!["p".into(), "c".into()],
+            parties: Vec::new(),
+        });
+        assert_eq!(book.held_by("config").len(), 2);
+        let dropped = ContractEvent::ChecksDropped {
+            interface: "config".into(),
+            version: 1,
+            stage: "handshake".into(),
+            reason: "1 mismatch".into(),
+            released: vec!["p".into(), "c".into()],
+        };
+        book.apply(&dropped);
+        book.apply(&dropped);
+        assert_eq!(book.state("config"), Some(&InterfaceState::Active));
+        assert_eq!(book.checks_skipped("config"), Some("1 mismatch"));
+        assert!(book.held_by("config").is_empty());
+        let c = book.counters();
+        assert_eq!((c.interface_checks_dropped, c.handshake_failures), (1, 1));
+        let json = serde_json::to_value(&dropped).expect("json");
+        assert_eq!(json["kind"], "checks_dropped");
     }
 
     /// Registration is the live path's way in: applied once, so a plan step

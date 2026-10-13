@@ -1007,6 +1007,156 @@ impl RunLoop {
         self.save()
     }
 
+    /// Drop the checks of every interface whose pre-dispatch check still
+    /// holds parties after the plan's one re-plan ([`super::MAX_REPLANS`]),
+    /// instead of ending the run on the hold with its contracts undone. Each
+    /// such interface (state `Failed` at any stage, or `NotRun`) records
+    /// [`ContractEvent::ChecksDropped`] and one [`ContractEvent::Unchecked`]
+    /// per edge between its parties, a notice names it with its failure, and
+    /// its held parties go back to planned. The interface then takes the path
+    /// of a run with contract checks off; the run's verify gate still judges
+    /// the work. Holds with another cause (review, escalation, a withdrawn
+    /// build) are kept. `true`: some party was released, and the loop goes on.
+    ///
+    /// Before the re-plan is spent the failure goes back to the planner
+    /// first ([`RunLoop::replan`]); a run whose plan the user approved, or
+    /// whose interfaces were given before planning, is never re-planned, and
+    /// keeps its holds.
+    pub(super) async fn drop_failed_checks(&mut self) -> Result<bool, OrchestratorError> {
+        if self.record.replans < super::MAX_REPLANS || self.record.source_plan.is_some() {
+            return Ok(false);
+        }
+        let Some(desk) = self.contracts.as_ref() else {
+            return Ok(false);
+        };
+        // (interface, stage, reason) of each failed interface holding a party.
+        let mut failed: BTreeMap<String, (InterfaceContract, String, String)> = BTreeMap::new();
+        for c in &self.record.open_contracts {
+            let ContractStatus::Held { reason } = &c.status else {
+                continue;
+            };
+            for id in desk.book.interfaces_of(&c.contract) {
+                if failed.contains_key(&id) || !held_under(reason, &id) || desk.seeded.contains(&id)
+                {
+                    continue;
+                }
+                let (Some(ic), Some(state)) = (desk.book.get(&id), desk.book.state(&id)) else {
+                    continue;
+                };
+                let (stage, why) = match state {
+                    InterfaceState::Failed { failure } => (
+                        serde_json::to_value(failure.stage)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default(),
+                        failure.to_string(),
+                    ),
+                    InterfaceState::NotRun { error } => (
+                        "not_run".to_owned(),
+                        format!("checks could not run: {error}"),
+                    ),
+                    _ => continue,
+                };
+                failed.insert(id, (ic.clone(), stage, why));
+            }
+        }
+        let mut any = false;
+        for (id, (ic, stage, why)) in failed {
+            let released = self.release_parties(&id);
+            if released.is_empty() {
+                continue;
+            }
+            any = true;
+            let edges = self.party_edges(&ic);
+            let consumers = edges
+                .iter()
+                .map(|(c, p)| format!("{c} <- {}", p.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let label = ic.label();
+            self.session_notice(
+                "",
+                "",
+                format!(
+                    "interface {label}: its checks still fail after the re-plan ({why}); kGraf \
+                     dropped them so the work can run: {} counted as not run, and the run's \
+                     verify gate still judges the work",
+                    if consumers.is_empty() {
+                        "its parties are".to_owned()
+                    } else {
+                        consumers
+                    }
+                ),
+            );
+            self.contract_event(ContractEvent::ChecksDropped {
+                interface: id.clone(),
+                version: ic.version,
+                stage,
+                reason: why.clone(),
+                released,
+            })
+            .await?;
+            for (consumer, producers) in edges {
+                let reason = producers
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{consumer} <- {p}: interface {label} checks dropped after the \
+                             re-plan: {why}"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.contract_event(ContractEvent::Unchecked {
+                    consumer,
+                    producers,
+                    reason: kgraf_secrets::scrub_persist_owned(reason),
+                })
+                .await?;
+            }
+        }
+        if any {
+            self.save()?;
+        }
+        Ok(any)
+    }
+
+    /// The edges between `ic`'s parties, as (consumer, producers): each
+    /// party's dependencies among the parties, or, when no dependency joins
+    /// them, every other party on the interface's producer (the party writing
+    /// its stub files, else the first party).
+    fn party_edges(&self, ic: &InterfaceContract) -> Vec<(String, Vec<String>)> {
+        let mut edges: Vec<(String, Vec<String>)> = ic
+            .parties
+            .iter()
+            .filter_map(|p| {
+                let deps: Vec<String> = self
+                    .record
+                    .contract(p)?
+                    .depends_on
+                    .iter()
+                    .filter(|d| *d != p && ic.parties.contains(d))
+                    .cloned()
+                    .collect();
+                (!deps.is_empty()).then(|| (p.clone(), deps))
+            })
+            .collect();
+        if edges.is_empty() {
+            let writes = self.party_writes(ic);
+            if let Some(producer) =
+                consumer_tests::producer_of(ic, &writes).or_else(|| ic.parties.first().cloned())
+            {
+                edges = ic
+                    .parties
+                    .iter()
+                    .filter(|p| **p != producer)
+                    .map(|p| (p.clone(), vec![producer.clone()]))
+                    .collect();
+            }
+        }
+        edges
+    }
+
     /// The failures a re-plan sends back to the planner, or `None` when the
     /// run's holds are not the planner's to correct by planning again.
     ///

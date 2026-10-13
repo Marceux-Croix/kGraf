@@ -1,0 +1,108 @@
+{
+  "interface": {
+    "id": "re1.i_vecops_build",
+    "version": 1,
+    "parties": [
+      "re1.c_pkg",
+      "re1.c_server"
+    ],
+    "symbols": [
+      "vectorops/__init__.py",
+      "pyproject.toml"
+    ],
+    "stub": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "def dotproduct(a, b):\n    return 0\n"
+      },
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = []\nbuild-backend = \"setuptools.build_meta\"\n[project]\nname = \"wrong\"\nversion = \"0.1.0\"\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "def dotproduct(a, b):\n    return sum(x * y for x, y in zip(a, b))\n"
+      },
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"vectorops\"\nversion = \"0.1.0\"\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "tests/test_vecops.py",
+        "content": "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n\nfrom vectorops import dotproduct\n\ndef test_dotproduct():\n    assert 1 == dotproduct([1, 1], [0, 1])\n"
+      }
+    ],
+    "compile": [
+      "python",
+      "-m",
+      "py_compile",
+      "vectorops/__init__.py",
+      "tests/test_vecops.py"
+    ],
+    "test": [
+      "pytest",
+      "-xvs",
+      "tests/test_vecops.py"
+    ],
+    "consulted": []
+  },
+  "handshake": [
+    {
+      "party": "re1.c_pkg",
+      "provide": [
+        "I will provide `pyproject.toml` with project name vectorops and version 0.1.0, using setuptools as the build backend.",
+        "I will provide `vectorops/__init__.py` containing a function dotproduct(a, b) that computes and returns the dot product of two list arguments."
+      ],
+      "expect": [],
+      "consume": [],
+      "touch": [
+        "pyproject.toml",
+        "vectorops/__init__.py"
+      ]
+    },
+    {
+      "party": "re1.c_server",
+      "provide": [],
+      "expect": [
+        "I assume you provide `vectorops/__init__.py` as type `Code` and `pyproject.toml` as type `Config`."
+      ],
+      "consume": [
+        "I consume `vectorops/__init__.py` as code source and `pyproject.toml` as configuration data to build vectorops."
+      ],
+      "touch": []
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "disagree",
+      "symbol": "vectorops/__init__.py",
+      "expecting": "re1.c_server",
+      "expects": "I assume you provide `vectorops/__init__.py` as type `Code` and `pyproject.toml` as type `Config`.",
+      "providing": "re1.c_pkg",
+      "provides": "I will provide `vectorops/__init__.py` containing a function dotproduct(a, b) that computes and returns the dot product of two list arguments."
+    }
+  ],
+  "writes": {
+    "re1.c_pkg": [
+      {
+        "path": "pyproject.toml"
+      },
+      {
+        "path": "vectorops/__init__.py"
+      }
+    ],
+    "re1.c_server": []
+  },
+  "depends_on": {
+    "re1.c_pkg": [],
+    "re1.c_server": [
+      "re1.c_pkg"
+    ]
+  }
+}

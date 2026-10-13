@@ -915,6 +915,27 @@ impl RunLoop {
                     ));
                 }
             }
+            // A symbol written as a bare file name names the one stub or
+            // reference file of that name; the parties are asked about the
+            // path. Two such files leave the planner to say which it meant.
+            let files = crate::checks::resolve_file_symbols(&ic);
+            for (bare, path) in &files.resolved {
+                self.intake_notice(format!(
+                    "interface `{}` symbol `{bare}` is read as `{path}`, its only stub or \
+                     reference file of that name",
+                    ic.id
+                ));
+            }
+            for (bare, paths) in &files.ambiguous {
+                problems.push(format!(
+                    "interface `{}` names symbol `{bare}`, a file name that {} stub or \
+                     reference files have ({}): name the file by its path",
+                    ic.id,
+                    paths.len(),
+                    paths.join(", ")
+                ));
+            }
+            ic.symbols = files.symbols;
             problems.extend(interface_plan::shape_problems(&ic, writes_of));
             if problems.is_empty() {
                 problems.extend(self.fill_from_repository(&mut ic, &from_repository).await);

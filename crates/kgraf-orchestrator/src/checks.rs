@@ -1369,10 +1369,86 @@ fn resolve_path<'s>(a: &str, surface: &BTreeSet<&'s str>) -> Option<&'s str> {
         return Some(s);
     }
     let a = norm_path(a);
-    surface
+    if let Some(s) = surface
         .iter()
         .find(|s| is_path(s) && norm_path(s) == a)
         .copied()
+    {
+        return Some(s);
+    }
+    // A bare file name names the one surface path with that file name
+    // (`__init__.py` for `vectorops/__init__.py`); with two, it names neither.
+    if a.contains('/') {
+        return None;
+    }
+    let mut named = surface
+        .iter()
+        .filter(|s| is_path(s) && file_name(s) == a)
+        .copied();
+    match (named.next(), named.next()) {
+        (Some(s), None) => Some(s),
+        _ => None,
+    }
+}
+
+/// The file name of a path: its last `/` segment.
+fn file_name(p: &str) -> &str {
+    let p = norm_path(p);
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// An interface's symbols with each bare file name resolved to the stub or
+/// reference path of that name ([`resolve_file_symbols`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileSymbols {
+    /// The symbols, in order, each resolved one replaced by its path.
+    pub symbols: Vec<String>,
+    /// (bare name, path) of each symbol replaced.
+    pub resolved: Vec<(String, String)>,
+    /// (bare name, every stub or reference path of that name) of each bare
+    /// name that more than one file has. Such a symbol is kept as written.
+    pub ambiguous: Vec<(String, Vec<String>)>,
+}
+
+/// Resolve each symbol written as a bare file name (`__init__.py`) to the
+/// stub or reference path with that file name (`vectorops/__init__.py`),
+/// when exactly one such path exists. A symbol with a `/`, a symbol that is
+/// itself a stub or reference path, and a symbol that is not a path are kept.
+/// The same rule names a graph file by its file name when no other file has
+/// that name (`planner_context::named_files`).
+pub fn resolve_file_symbols(ic: &InterfaceContract) -> FileSymbols {
+    let paths: BTreeSet<&str> = ic
+        .stub
+        .iter()
+        .chain(&ic.reference)
+        .map(|f| norm_path(&f.path))
+        .collect();
+    let mut out = FileSymbols::default();
+    for sym in &ic.symbols {
+        let bare = norm_path(sym);
+        if !is_path(sym) || bare.contains('/') || paths.contains(bare) {
+            out.symbols.push(sym.clone());
+            continue;
+        }
+        let named: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|p| file_name(p) == bare)
+            .collect();
+        match named[..] {
+            [one] => {
+                out.resolved.push((sym.clone(), one.to_owned()));
+                out.symbols.push(one.to_owned());
+            }
+            [] => out.symbols.push(sym.clone()),
+            _ => {
+                out.ambiguous
+                    .push((sym.clone(), named.into_iter().map(str::to_owned).collect()));
+                out.symbols.push(sym.clone());
+            }
+        }
+    }
+    out
 }
 
 /// The segments of an identifier path: `::` (Rust, C++, Ruby, PHP), `.`
@@ -2160,13 +2236,18 @@ fn read_sentence<'s>(
             (named, sig)
         };
         let between = std::mem::take(&mut since_anchor);
-        let listed = std::mem::replace(&mut after_provided, false) && lists(&between);
+        let was_after_provided = std::mem::replace(&mut after_provided, false);
+        let listed = was_after_provided && lists(&between);
         // A bare function type (`fn(i64) -> i64`) claims its types.
         let unnamed = sig.as_ref().is_some_and(|s| s.name.is_empty());
         let sig_claims: Vec<String> = sig
             .map(|s| s.canonical.into_iter().chain(s.types).collect())
             .unwrap_or_default();
         let Some(sym) = named else {
+            // A claim inside the same clause as a provided symbol keeps the
+            // list open: in "`a` implementing `f(x)` and `b`", `b` is listed
+            // after `a` as in "`a` and `b`".
+            after_provided = was_after_provided && after_last_boundary(&between).is_none();
             // Not a surface symbol: a claim about what the sentence names.
             let new: Vec<String> = if unnamed {
                 sig_claims
@@ -2331,6 +2412,44 @@ fn kind_label_satisfied(claim: &str, text: &str, theirs: &BTreeSet<String>) -> b
             .iter()
             .any(|w| words.contains(&w.as_str()))
         || theirs.iter().any(|c| words.contains(&c.as_str()))
+}
+
+/// The anchors a sentence writes right after the word "type" or "kind"
+/// ("as type `Code`", "of kind `Config`"): the kind the sentence gives
+/// what it is about.
+fn kind_anchors(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut after_kind_word = false;
+    for piece in pieces(text) {
+        match piece {
+            Piece::Prose(chunk) => {
+                after_kind_word = chunk
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|w| matches!(w.to_lowercase().as_str(), "type" | "kind"));
+            }
+            Piece::Code(code) => {
+                if after_kind_word {
+                    out.insert(code.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                after_kind_word = false;
+            }
+        }
+    }
+    out
+}
+
+/// Whether `claim` only gives a file symbol its kind ("I assume you provide
+/// `pkg/__init__.py` as type `Code`"), and the provision does not give the
+/// file another kind. A file has no type in a programming language, so a
+/// word written as its type names a category the provider need not repeat.
+/// On a symbol that is not a file the same words are a type claim
+/// ("`rate` of type `f64`") and are compared as any other claim.
+fn file_kind_satisfied(symbol: &str, claim: &str, expects: &str, provides: &str) -> bool {
+    if !is_path(symbol) || !kind_anchors(expects).contains(claim) {
+        return false;
+    }
+    kind_anchors(provides).iter().all(|k| k == claim)
 }
 
 /// One provision: (party, sentence, the sentence's claims).
@@ -2676,6 +2795,12 @@ pub fn compare_handshake(
 ///   disagreement when the interface's own files state it (a type the stub's
 ///   signature gives, a crate name its test imports), unless the provider
 ///   states a signature for the symbol that the files do not give;
+/// - a surface symbol written as a bare file name is compared as the one stub
+///   or reference path with that file name ([`resolve_file_symbols`]);
+/// - on a file symbol, an expectation's word after "type" or "kind" is the
+///   file's kind, met unless the provision gives the file another kind
+///   ([`file_kind_satisfied`]); another surface symbol the expectation lists
+///   is met when the same party provides it in any sentence;
 /// - a touch shared by two parties overlaps only when no dependency orders
 ///   them: parties in order never write at once;
 /// - [`HandshakeFinding::Unanchored`] and [`HandshakeFinding::OutsideSurface`]
@@ -2691,6 +2816,20 @@ pub fn compare_handshake_ordered(
     writes: &BTreeMap<String, Vec<WriteTarget>>,
     ordered: &BTreeSet<(String, String)>,
 ) -> Vec<HandshakeFinding> {
+    // A symbol written as a bare file name is compared as the stub path it
+    // names, the form the parties' sentences use. An ambiguous one is kept,
+    // and with no party able to name it, it is `SymbolUnprovided`.
+    let files = resolve_file_symbols(ic);
+    let resolved_ic;
+    let ic = if files.resolved.is_empty() {
+        ic
+    } else {
+        resolved_ic = InterfaceContract {
+            symbols: files.symbols,
+            ..ic.clone()
+        };
+        &resolved_ic
+    };
     let artifact = ArtifactText::of(ic);
     let party_ids: Vec<&str> = ic.parties.iter().map(String::as_str).collect();
     let surface: BTreeSet<&str> = ic.symbols.iter().map(String::as_str).collect();
@@ -2833,12 +2972,24 @@ pub fn compare_handshake_ordered(
             }
             let same: Vec<&&Provision<'_>> = others
                 .iter()
-                .filter(|(_, t, theirs)| {
+                .filter(|(p, t, theirs)| {
                     let silent_ok = artifact.provision_consistent(sym, theirs);
+                    // Another surface symbol the expectation lists with this
+                    // one ("`a` ... and `b`") is met when the same party
+                    // provides it, in this sentence or another; whether it
+                    // is provided at all is `SymbolUnprovided`'s question.
+                    let co_provided = |c: &str| {
+                        surface.contains(c)
+                            && provided
+                                .get(c)
+                                .is_some_and(|l| l.iter().any(|(q, _, _)| q == p))
+                    };
                     mine.iter().all(|c| {
                         theirs.contains(c)
                             || stated_in_prose(c, t)
                             || kind_label_satisfied(c, t, theirs)
+                            || file_kind_satisfied(sym, c, text, t)
+                            || co_provided(c)
                             || (silent_ok && artifact.states(sym, c))
                     })
                 })
@@ -3716,3 +3867,8 @@ mod handshake_diagnosis_tests;
 /// (decision 0078).
 #[path = "handshake_forms_tests.rs"]
 mod handshake_forms_tests;
+
+#[cfg(test)]
+/// Interfaces over files: bare file-name symbols and kind-only expectations.
+#[path = "handshake_paths_tests.rs"]
+mod handshake_paths_tests;

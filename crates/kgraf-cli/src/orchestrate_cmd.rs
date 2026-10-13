@@ -908,6 +908,13 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
                 c.interface_checks_skipped
             ));
         }
+        if c.interface_checks_dropped > 0 {
+            out.push(format!(
+                "interface checks dropped  {} (still failing after the re-plan; those parties \
+                 ran without contract checks, and their edges are counted as not run)",
+                c.interface_checks_dropped
+            ));
+        }
     } else {
         out.push("contracts  off: no interface contract was written or checked".to_owned());
     }

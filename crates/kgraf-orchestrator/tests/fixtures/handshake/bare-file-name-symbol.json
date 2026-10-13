@@ -1,0 +1,126 @@
+{
+  "interface": {
+    "id": "i_pkg",
+    "version": 1,
+    "parties": [
+      "c_package_structure",
+      "c_build_package"
+    ],
+    "symbols": [
+      "__init__.py",
+      "setup.py"
+    ],
+    "stub": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "def dotproduct(a, b):\n    return 0\n"
+      },
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup\nsetup(name='vectorops', version='0.0.0')\n"
+      }
+    ],
+    "wrong": [],
+    "reference": [
+      {
+        "path": "vectorops/__init__.py",
+        "content": "def dotproduct(a, b):\n    return sum(x * y for x, y in zip(a, b))\n"
+      },
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup, find_packages\n\nsetup(\n    name='vectorops',\n    version='0.1.0',\n    packages=find_packages(),\n)\n"
+      }
+    ],
+    "consumer": [],
+    "tests": [
+      {
+        "path": "test_i_pkg.py",
+        "content": "import ast, os\n\ndef test_init():\n    assert os.path.exists('vectorops/__init__.py')\n    with open('vectorops/__init__.py') as f:\n        code = f.read()\n    local_dict = {}\n    exec(compile(code, 'test', 'exec'), local_dict)\n    assert local_dict['dotproduct']([1, 2], [3, 4]) == 11\n\ndef test_setup():\n    assert os.path.exists('setup.py')\n    with open('setup.py') as f:\n        code = f.read()\n    tree = ast.parse(code)\n    for node in ast.walk(tree):\n        if isinstance(node, ast.Call) and hasattr(node.func, 'id') and node.func.id == 'setup':\n            for kw in node.keywords:\n                if kw.arg == 'version' and isinstance(kw.value, ast.Constant):\n                    assert kw.value.value == '0.1.0'\n\n\nif __name__ == \"__main__\":\n    test_init()\n    test_setup()\n"
+      }
+    ],
+    "compile": [
+      "python",
+      "-m",
+      "py_compile",
+      "test_i_pkg.py"
+    ],
+    "test": [
+      "python",
+      "test_i_pkg.py"
+    ],
+    "consulted": []
+  },
+  "handshake": [
+    {
+      "party": "c_package_structure",
+      "provide": [
+        "I will provide `vectorops/__init__.py` implementing `dotproduct(a: list, b: list) -> float` and `setup.py` defining package metadata."
+      ],
+      "expect": [
+        "I assume you (party `c_build_package`) consume `setup.py` for standard packaging and distribution workflows."
+      ],
+      "consume": [],
+      "touch": [
+        "vectorops/__init__.py",
+        "setup.py"
+      ]
+    },
+    {
+      "party": "c_build_package",
+      "provide": [
+        "I will provide `dist/vectorops-0.1.0.tar.gz` and `dist/vectorops-0.1.0-py3-none-any.whl`."
+      ],
+      "expect": [
+        "I assume you provide `__init__.py` and `setup.py` containing valid Python module code and packaging configuration, and that the repository root is correctly structured for build tooling."
+      ],
+      "consume": [
+        "I assume `setup.py` is in the working directory and contains a valid setuptools script that can be executed to generate distribution artifacts."
+      ],
+      "touch": [
+        "dist/vectorops-0.1.0.tar.gz",
+        "dist/vectorops-0.1.0-py3-none-any.whl"
+      ]
+    }
+  ],
+  "recorded_findings": [
+    {
+      "finding": "unanchored",
+      "party": "c_build_package",
+      "text": "I will provide `dist/vectorops-0.1.0.tar.gz` and `dist/vectorops-0.1.0-py3-none-any.whl`."
+    },
+    {
+      "finding": "symbol_unprovided",
+      "symbol": "__init__.py"
+    },
+    {
+      "finding": "unprovided",
+      "party": "c_build_package",
+      "symbol": "__init__.py",
+      "text": "I assume you provide `__init__.py` and `setup.py` containing valid Python module code and packaging configuration, and that the repository root is correctly structured for build tooling."
+    }
+  ],
+  "writes": {
+    "c_package_structure": [
+      {
+        "path": "vectorops/__init__.py"
+      },
+      {
+        "path": "setup.py"
+      }
+    ],
+    "c_build_package": [
+      {
+        "path": "dist/vectorops-0.1.0.tar.gz"
+      },
+      {
+        "path": "dist/vectorops-0.1.0-py3-none-any.whl"
+      }
+    ]
+  },
+  "depends_on": {
+    "c_package_structure": [],
+    "c_build_package": [
+      "c_package_structure"
+    ]
+  }
+}

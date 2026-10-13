@@ -4436,10 +4436,12 @@ impl RunLoop {
                     && let Some(status) = self.terminal_status()
                 {
                     // A plan its interface checks held before any work
-                    // started goes back to the planner once before the run
-                    // ends on the hold.
+                    // started goes back to the planner once. A check that
+                    // still holds after that re-plan is dropped, loudly, and
+                    // the contracts run: the run does not end on it.
                     if matches!(status, RunStatus::Blocked { .. })
-                        && on_heap(|| self.replan()).await?
+                        && (on_heap(|| self.replan()).await?
+                            || on_heap(|| self.drop_failed_checks()).await?)
                     {
                         continue;
                     }
@@ -4550,9 +4552,10 @@ impl RunLoop {
     /// only at the gate, and the last ask's plan is taken without its
     /// mechanical checks. The re-plan is one ask, taken as it is, under ids of
     /// its own ([`renamed_for_replan`]); the gate checks it as it checks any
-    /// plan, and a hold on it ends the run. A re-plan the planner answers
-    /// with a plan that is refused outright leaves the held plan, and the run
-    /// ends on its hold, with the refusal noticed.
+    /// plan. A re-plan the planner answers with a plan that is refused
+    /// outright leaves the held plan, with the refusal noticed. Either way, a
+    /// check that still holds once the re-plan is spent is dropped
+    /// ([`RunLoop::drop_failed_checks`]) rather than ending the run.
     async fn replan(&mut self) -> Result<bool, OrchestratorError> {
         if self.record.replans >= MAX_REPLANS || self.record.source_plan.is_some() {
             return Ok(false);

@@ -241,3 +241,38 @@ Tests: `tests/check_python_path.rs`
 `a_pytest_run_of_a_test_in_tests_imports_the_package_at_the_tree_root` (real Python; skipped
 without `python3` or `pytest`); `check_runner.rs`
 `the_tree_root_comes_first_on_the_python_path_and_the_host_value_stays`.
+
+## Amendment (2026-10-13): a check that still fails after the one re-plan is dropped, and the contracts run
+
+An interface check that still holds parties after the plan's one re-plan no longer ends the run.
+Its checks are dropped, loudly, and its contracts are dispatched.
+
+- **When.** The run would end on a hold, the one re-plan (`MAX_REPLANS = 1`) is spent, and a party
+  is held by an interface check of the plan: a failed stage (artifact, stub-compile, vacuity,
+  handshake, stub land) or a check that could not run, a handshake call that fails included. The
+  first failure still goes back to the planner once, as before.
+- **What.** For each such interface the loop records `ContractEvent::ChecksDropped` (interface,
+  version, stage, the failure with its first finding, the parties released) and one
+  `ContractEvent::Unchecked` per edge between its parties, so each edge is counted in
+  `checks_not_run` with the reason. A notice names the interface and the failure. The held parties go
+  back to planned, and the interface takes the path of a run with contract checks off: no handshake,
+  stub landing or consumer test. The run's verify gate and acceptance checks still judge the work.
+  The count is `interface_checks_dropped`, and the run report shows it. The earlier `CheckFailed`
+  event, with its findings and statements, stays in the trace.
+- **Why.** A failure path recovers, retries within a bound, or continues with less, loudly. A
+  pre-dispatch check judges the plan's interface, not the work, and when it holds after the re-plan no
+  work has started. Ending the run there produced runs with zero work done after many minutes of
+  planning, often on a mismatch between two parties that agreed.
+- **Kept.** A hold with any other cause (review, escalation, a build against a superseded version)
+  still holds. A run from a plan the user approved, or with interfaces given before planning, is
+  never re-planned and keeps its holds.
+- **Supersedes** the lines of the 2026-09-30 and 2026-10-02 amendments above that a hold on the
+  re-plan ends the run, and, in decision 0030's amendment of 2026-10-11 (third), the hold on "a
+  handshake call that fails" once the re-plan is spent.
+
+Tests: `contract_flow.rs`
+`a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_dispatches` (formerly
+`a_handshake_that_keeps_failing_is_held_after_one_re_plan`),
+`a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_dispatches`; `challenge.rs`
+`dropped_checks_release_the_hold_and_replay_once`. Both flow tests failed on the code before this
+change: the run ended Blocked with no dispatch.
