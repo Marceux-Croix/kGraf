@@ -1711,7 +1711,12 @@ mod tests {
         let rows = ledger.calls().expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].settlement, Settlement::Cancelled);
-        assert!(ledger.unreconciled().expect("query").is_empty());
+        // The embedder never answered, so the call was cut before any usage:
+        // its spend is unknown and it is listed for a resolve.
+        assert!(rows[0].cancelled_without_usage());
+        let open = ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, rows[0].id);
     }
 
     fn one_embedder(ledger: Arc<Ledger>, embedder: Arc<dyn Embedder>) -> ModelCalls {

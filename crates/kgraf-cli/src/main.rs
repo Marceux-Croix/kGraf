@@ -2382,30 +2382,44 @@ fn total_line(total: &str, models: usize, priced_models: usize, incomplete: bool
 
 /// The state name a listing shows for an open call.
 fn open_state(ledger: &Ledger, call: &kgraf_provider::CallRecord) -> Result<&'static str> {
-    Ok(
-        if ledger
-            .is_in_flight(&call.id)
-            .context("cannot read the ledger")?
-        {
-            "in_flight"
-        } else {
-            "unreconciled"
-        },
-    )
+    Ok(if call.cancelled_without_usage() {
+        // Cut on purpose (a deadline, a cancel) before the provider reported
+        // usage: listed because its spend is unknown, not because the
+        // accounting lost it.
+        "cancelled"
+    } else if ledger
+        .is_in_flight(&call.id)
+        .context("cannot read the ledger")?
+    {
+        "in_flight"
+    } else {
+        "unreconciled"
+    })
 }
 
 fn unreconciled(root: &Path) -> Result<()> {
     let ledger = open_ledger(root)?;
+    print!("{}", unreconciled_listing(&ledger)?);
+    Ok(())
+}
+
+/// The text `kgraf unreconciled` prints: one entry per open call, then a
+/// summary that counts calls cut before any usage apart from the others.
+fn unreconciled_listing(ledger: &Ledger) -> Result<String> {
+    use std::fmt::Write as _;
     let open = ledger.unreconciled().context("cannot read the ledger")?;
     if open.is_empty() {
-        println!("every recorded call is accounted for");
-        return Ok(());
+        return Ok("every recorded call is accounted for\n".to_owned());
     }
+    // `write!` into a `String` cannot fail, so its result is discarded.
+    let mut out = String::new();
+    let mut cut = 0usize;
     for call in &open {
         // A record reads an in_flight row as unreconciled; the ledger is the
         // only place that tells the two apart, and `resolve` needs the difference.
-        let state = open_state(&ledger, call)?;
-        println!(
+        let state = open_state(ledger, call)?;
+        let _ = writeln!(
+            out,
             "{}  {}  {}  agent {}  task {}  request {}",
             call.id,
             call.model,
@@ -2414,20 +2428,40 @@ fn unreconciled(root: &Path) -> Result<()> {
             call.task_id,
             call.request_id.as_deref().unwrap_or("<none>")
         );
+        if call.cancelled_without_usage() {
+            cut += 1;
+            let _ = writeln!(
+                out,
+                "    cancelled before any usage was reported: spend unknown, not zero"
+            );
+        }
         // The recorded figure is a lower bound (a partial stream, or zero).
-        println!("    {}", usage_line(&call.usage));
+        let _ = writeln!(out, "    {}", usage_line(&call.usage));
     }
-    println!(
-        "\n{} call(s) billed without a recorded usage figure. These are holes in the \
-         accounting, not zero-cost calls. The usage shown is a lower bound.",
-        open.len()
+    let holes = open.len() - cut;
+    if holes > 0 {
+        let _ = writeln!(
+            out,
+            "\n{holes} call(s) billed without a recorded usage figure. These are holes in the \
+             accounting, not zero-cost calls. The usage shown is a lower bound."
+        );
+    }
+    if cut > 0 {
+        let _ = writeln!(
+            out,
+            "\n{cut} call(s) cancelled by kGraf before the provider reported any usage. \
+             The provider may have billed what it processed before the cut, so their \
+             spend is unknown, not zero."
+        );
+    }
+    let _ = writeln!(
+        out,
+        "Close one with `kgraf unreconciled resolve <call-id>`, using the usage the \
+         provider's console shows. There is no bulk resolve: each call needs its own \
+         figure from the provider, or --no-charge. A call shown as in_flight needs \
+         --abandoned."
     );
-    println!(
-        "Close one with `kgraf unreconciled resolve <call-id>`. There is no bulk \
-         resolve: each call needs its own figure from the provider, or --no-charge. \
-         A call shown as in_flight needs --abandoned."
-    );
-    Ok(())
+    Ok(out)
 }
 
 /// One line of usage figures, in the normal form.
@@ -3402,6 +3436,85 @@ mod tests {
             };
             assert_eq!(open_state(&ledger, row).expect("state"), expected);
         }
+    }
+
+    /// A call kGraf cut before any usage is listed as `cancelled`, with its
+    /// spend named unknown and counted apart from the accounting holes, and
+    /// `resolve` prices it once. A cancelled call with usage is not listed.
+    #[test]
+    fn a_call_cut_before_usage_is_listed_and_resolved() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let begin = || {
+            ledger
+                .begin(
+                    "t",
+                    kgraf_core::Protocol::Additive,
+                    "model-a",
+                    "agent",
+                    "task",
+                )
+                .expect("begin")
+        };
+        let cut = begin();
+        cut.cancel(None).expect("cancel");
+        let cut = cut.id().as_str().to_owned();
+        let priced = begin();
+        let partial = kgraf_core::TokenUsage {
+            uncached_input: 10,
+            ..kgraf_core::TokenUsage::default()
+        };
+        priced.cancel(Some(&partial)).expect("cancel");
+        let hole = open_call(&ledger, kgraf_core::Protocol::Additive);
+
+        let rows = ledger.unreconciled().expect("open");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the cut call and the hole, not the priced one"
+        );
+        for row in &rows {
+            let expected = if row.id.as_str() == cut {
+                "cancelled"
+            } else {
+                assert_eq!(row.id.as_str(), hole);
+                "unreconciled"
+            };
+            assert_eq!(open_state(&ledger, row).expect("state"), expected);
+        }
+        let text = unreconciled_listing(&ledger).expect("listing");
+        assert!(
+            text.contains(&format!("{cut}  model-a  cancelled")),
+            "{text}"
+        );
+        assert!(
+            text.contains("cancelled before any usage was reported: spend unknown"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 call(s) billed without a recorded usage figure"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 call(s) cancelled by kGraf before the provider reported any usage"),
+            "{text}"
+        );
+        assert!(!text.contains(priced.id().as_str()), "{text}");
+
+        resolve_unreconciled(&ledger, &cut, stated(Some(80), Some(4), false)).expect("resolve");
+        let record = ledger
+            .call(&kgraf_core::CallId::new(cut.clone()))
+            .expect("read")
+            .expect("present");
+        assert_eq!(record.usage.uncached_input, 80);
+        assert!(!record.cancelled_without_usage());
+        ledger.verify().expect("chain still verifies");
+        assert!(resolve_unreconciled(&ledger, &cut, stated(Some(1), None, false)).is_err());
+        assert!(
+            resolve_unreconciled(&ledger, priced.id().as_str(), stated(Some(1), None, false))
+                .is_err()
+        );
+        let text = unreconciled_listing(&ledger).expect("listing");
+        assert!(!text.contains("cancelled by kGraf"), "{text}");
     }
 
     /// A call still in flight may be live: resolve refuses it without

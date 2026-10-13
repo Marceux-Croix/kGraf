@@ -193,8 +193,8 @@ The permission flags (`--permission-mode`, `--allow`, `--allow-path`, `--deny`, 
 | `kgraf providers [--verified-only]` | List routes with vendor, wire, usage shape, confidence and model kinds. |
 | `kgraf call --provider R --model M [--max-tokens N] [--record FILE] [prompt]` | Make one ledgered call. Max tokens default 256. The credential is never written to the record. |
 | `kgraf spend [--prices FILE]` | Total the ledger. Without prices, or for a model with no price, it says unpriced. |
-| `kgraf unreconciled` | List calls whose spend is not settled, with the partial usage recorded for each. |
-| `kgraf unreconciled resolve <call-id> [--input N] [--cache-read N] [--cache-write N] [--output N] [--reasoning N] [--no-charge] [--abandoned]` | Close one call with the usage the provider's invoice shows. A field you omit keeps the recorded figure. `--no-charge` states the provider billed nothing. A call marked in flight needs `--abandoned`, which states its process is gone. There is no bulk form. |
+| `kgraf unreconciled` | List calls whose spend is not known, with the partial usage recorded for each: calls left `unreconciled` or `in_flight`, and calls shown as `cancelled` that kGraf stopped (a cancel, a deadline, a steer) before the provider reported any usage. The provider may have billed a cancelled call for what it processed before the stop, so its spend is unknown, not zero. |
+| `kgraf unreconciled resolve <call-id> [--input N] [--cache-read N] [--cache-write N] [--output N] [--reasoning N] [--no-charge] [--abandoned]` | Close one listed call with the usage the provider's invoice shows. A field you omit keeps the recorded figure. `--no-charge` states the provider billed nothing. A call marked in flight needs `--abandoned`, which states its process is gone. The call is then counted at the stated usage. A call cancelled after usage was reported is already priced at that usage and is refused. There is no bulk form. |
 | `kgraf ledger verify` | Walk the hash chain and report the first broken row. |
 | `kgraf ledger redact <call-id> --reason TEXT` | Remove a payload captured by accident. The chain still verifies. |
 | `kgraf demand` | Report whether runs offered workflow templates started more work than runs without. It claims no saving. |
@@ -403,8 +403,9 @@ Press Ctrl-C, or send SIGTERM, to stop `orchestrate` or `schedule run-now`. Noth
 starts, every worker and model call in flight is cancelled, and the ledger settles each call.
 A worker's call stopped this way settles as cancelled, with the usage its stream reported
 before the stop. One stopped before any usage arrived is charged at its worst case, since the
-provider may have billed it. A call that ended for another reason and may have billed appears in
-`kgraf unreconciled`. The report prints with status
+provider may have billed it, and `kgraf unreconciled` lists it as `cancelled` so you can resolve
+it with the provider's figure. A call that ended for another reason and may have billed also
+appears in `kgraf unreconciled`. The report prints with status
 `Stopped`. Each worktree the run left is named with how to continue or remove it. The exit
 code is 128 plus the signal number (130 for Ctrl-C, 143 for SIGTERM). Stopping can take up to
 30 seconds. A second interrupt exits at once.

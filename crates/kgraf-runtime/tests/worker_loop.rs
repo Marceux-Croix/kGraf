@@ -2494,7 +2494,10 @@ async fn a_cancel_before_any_usage_settles_the_call_cancelled_at_zero_in_both_mo
             "{mode:?}: kGraf stopped the call, so it is cancelled, not unreconciled"
         );
         assert_eq!(rows[0].usage, TokenUsage::default(), "{mode:?}");
-        assert!(env.ledger.unreconciled().expect("query").is_empty());
+        // Cut before any usage: spend unknown, so it is listed for a resolve.
+        let open = env.ledger.unreconciled().expect("query");
+        assert_eq!(open.len(), 1, "{mode:?}");
+        assert_eq!(open[0].id, rows[0].id, "{mode:?}");
         if mode == CallMode::Stream {
             assert_eq!(rows[0].request_id.as_deref(), Some("req-fake-1"));
         }
@@ -5874,7 +5877,10 @@ async fn a_deadline_cut_before_any_usage_settles_the_call_cancelled_at_zero() {
     assert_eq!(rows[0].settlement, Settlement::Cancelled);
     assert_eq!(rows[0].usage, TokenUsage::default());
     assert_eq!(rows[0].request_id.as_deref(), Some("req-fake-1"));
-    assert!(env.ledger.unreconciled().expect("query").is_empty());
+    // Cut before any usage: spend unknown, so it is listed for a resolve.
+    let open = env.ledger.unreconciled().expect("query");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, rows[0].id);
 }
 
 /// A stream that breaks on its own, after reporting its input side, is an

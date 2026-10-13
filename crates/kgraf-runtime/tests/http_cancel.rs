@@ -261,5 +261,9 @@ async fn a_streaming_call_cut_by_the_deadline_settles_cancelled() {
     assert_eq!(rows[0].settlement, kgraf_provider::Settlement::Cancelled);
     assert_eq!(rows[0].usage, kgraf_core::TokenUsage::default());
     assert_eq!(rows[0].request_id.as_deref(), Some("chatcmpl-cut"));
-    assert!(env.ledger.unreconciled().expect("query").is_empty());
+    // Cut before any usage: its spend is unknown, so it is listed for a
+    // resolve against the provider's figure.
+    let open = env.ledger.unreconciled().expect("query");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, rows[0].id);
 }

@@ -741,7 +741,10 @@ async fn an_interrupt_during_a_complete_call_abandons_it_and_settles_it_cancelle
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].settlement, Settlement::Cancelled);
     assert_eq!(rows[0].usage, TokenUsage::default());
-    assert!(env.ledger.unreconciled().expect("query").is_empty());
+    // Cut before any usage, so its spend is unknown and it is listed.
+    let open = env.ledger.unreconciled().expect("query");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, rows[0].id);
     // The first call was sent with the opening message alone, so the note is
     // a turn of its own after it: the opening instruction is not extended.
     let requests = provider.requests();
@@ -1663,7 +1666,22 @@ mod review {
                 .all(|r| matches!(r.settlement, Settlement::Cancelled | Settlement::Failed)),
             "{rows:?}"
         );
-        assert!(env.ledger.unreconciled().expect("query").is_empty());
+        // The calls cut before any usage have unknown spend and are listed;
+        // a `Failed` one (never sent) is not.
+        let listed: Vec<_> = env
+            .ledger
+            .unreconciled()
+            .expect("query")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let cut: Vec<_> = rows
+            .iter()
+            .filter(|r| r.cancelled_without_usage())
+            .map(|r| r.id.clone())
+            .collect();
+        assert!(cut.len() >= n, "{rows:?}");
+        assert_eq!(listed, cut);
     }
 
     #[tokio::test]

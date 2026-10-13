@@ -136,7 +136,7 @@ pub enum LedgerError {
 
     /// A settlement or reconciliation named a call whose state does not allow it:
     /// a settle needs an `in_flight` row, a reconcile an `unreconciled` or
-    /// `in_flight` one. Refused so a resolve cannot overwrite a counted row and a
+    /// `in_flight` one, or a `cancelled` one with no usage. Refused so a resolve cannot overwrite a counted row and a
     /// late settle cannot overwrite a reconciled figure.
     #[error("call `{call}` is `{state}`; {wanted}")]
     WrongState {
@@ -1806,6 +1806,15 @@ impl Ledger {
 
     /// Resolve an unreconciled call by supplying the usage it turned out to have.
     ///
+    /// Also accepts a call cancelled before any usage was reported
+    /// ([`CallRecord::cancelled_without_usage`]), whose spend is just as
+    /// unknown. Either way the row settles `counted` at the supplied usage, so
+    /// a reconciled figure, zero included, is known spend in every total. A
+    /// cancelled row that kept `cancelled` would read as unknown again after a
+    /// zero-usage reconcile, with no second reconcile allowed. A cancelled
+    /// call that already carries usage, a counted call and a failed call are
+    /// refused.
+    ///
     /// Chained as its own `reconcile` event, distinct from the `settle` event
     /// that made the call unreconciled in the first place: a `UNIQUE(event,
     /// call_id)` index on `ledger_chain` means each of `begin`, `settle`,
@@ -2100,12 +2109,19 @@ impl Ledger {
     /// Surfaced rather than dropped, per the accounting rule and decision 0006's requirement
     /// that an interrupted stream be reconciled rather than lose its spend. Rows
     /// still in flight are included, because a process that died mid-call leaves
-    /// exactly that state behind.
+    /// exactly that state behind. So are calls cancelled before any usage was
+    /// reported ([`CallRecord::cancelled_without_usage`]): kGraf cut them on
+    /// purpose, but the vendor may have billed what it processed before the
+    /// cut, and this list is where a user finds them to [`Self::reconcile`].
+    /// A cancelled call with partial usage is priced at that usage and is not
+    /// listed.
     pub fn unreconciled(&self) -> Result<Vec<CallRecord>, LedgerError> {
         self.read(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {CALL_COLUMNS} FROM calls
-                 WHERE settlement IN ('unreconciled', 'in_flight') ORDER BY rowid"
+                 WHERE settlement IN ('unreconciled', 'in_flight')
+                    OR (settlement = 'cancelled' AND {NO_USAGE_SQL})
+                 ORDER BY rowid"
             ))?;
             let rows = stmt.query_map([], record_from_row)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -2982,10 +2998,17 @@ fn apply_tool_round(conn: &Connection, id: &CallId, tools: &[String]) -> Result<
 enum SettleFrom {
     /// A live call settling: only an `in_flight` row.
     InFlight,
-    /// A reconcile: an `unreconciled` row, or an `in_flight` one the caller has
-    /// decided is abandoned.
+    /// A reconcile: an `unreconciled` row, an `in_flight` one the caller has
+    /// decided is abandoned, or a `cancelled` one with no usage (its spend is
+    /// unknown, as for an unreconciled row).
     Open,
 }
+
+/// The SQL form of [`TokenUsage::is_empty`] over a `calls` row: every token
+/// column is zero. Shared by [`Ledger::unreconciled`] and the reconcile
+/// predicate so the row listed is exactly the row that can be reconciled.
+const NO_USAGE_SQL: &str = "uncached_input = 0 AND cache_read = 0 AND cache_write = 0
+     AND text_output = 0 AND reasoning_output = 0";
 
 fn apply_settlement(
     conn: &Connection,
@@ -3002,7 +3025,7 @@ fn apply_settlement(
     let finished_ms = now_ms();
 
     let changed = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "UPDATE calls SET settlement = ?2,
                           uncached_input = ?3, cache_read = ?4, cache_write = ?5,
                           text_output = ?6, reasoning_output = ?7,
@@ -3010,8 +3033,9 @@ fn apply_settlement(
                           request_id = COALESCE(?10, request_id),
                           finished_ms = ?11,
                           unsplit_reasoning_chars = ?14
-         WHERE id = ?1 AND settlement IN (?12, ?13)",
-        )?
+         WHERE id = ?1 AND (settlement IN (?12, ?13)
+                            OR (?15 AND settlement = 'cancelled' AND {NO_USAGE_SQL}))"
+        ))?
         .execute(params![
             id.as_str(),
             settlement.as_str(),
@@ -3030,6 +3054,7 @@ fn apply_settlement(
                 SettleFrom::Open => "unreconciled",
             },
             usage.unsplit_reasoning_chars.map(|n| n as i64),
+            matches!(from, SettleFrom::Open),
         ])?;
     if changed == 0 {
         let state = raw_row(conn, id)?.map(|r| r.settlement);
@@ -3043,7 +3068,9 @@ fn apply_settlement(
                 state,
                 wanted: match from {
                     SettleFrom::InFlight => "only an in-flight call can be settled",
-                    SettleFrom::Open => "only an open call can be reconciled",
+                    SettleFrom::Open => {
+                        "only an open call, or one cancelled before any usage, can be reconciled"
+                    }
                 },
             },
         });
@@ -4465,7 +4492,9 @@ mod tests {
         assert_eq!(read(&stopped).usage, TokenUsage::default());
         assert_eq!(read(&probed).settlement, Settlement::Cancelled);
         assert_eq!(read(&dropped).settlement, Settlement::Unreconciled);
-        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+        // All three are listed: the two stopped calls were cut before any
+        // usage, so their spend is unknown and needs the same reconcile.
+        assert_eq!(ledger.unreconciled().expect("query").len(), 3);
         assert!(ledger.verify().expect("verify").ok);
     }
 
@@ -6099,6 +6128,112 @@ mod tests {
         let read = |id: &CallId| ledger.call(id).expect("read").expect("present");
         assert!(read(&cut).cancelled_without_usage());
         assert!(!read(&with_usage).cancelled_without_usage());
+    }
+
+    /// A call cut before any usage is listed by `unreconciled`, can be
+    /// reconciled once against the vendor's figure, and is then priced; the
+    /// chain still verifies. A cancelled call with usage is neither listed nor
+    /// reconcilable.
+    #[test]
+    fn a_call_cancelled_without_usage_is_listed_and_reconciled_once() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let prices = price_m();
+        let cancel = |partial: Option<&TokenUsage>| {
+            let t = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("b");
+            t.cancel(partial).expect("cancel");
+            t.id().clone()
+        };
+        let cut = cancel(None);
+        let with_usage = cancel(Some(&usage()));
+        let listed: Vec<CallId> = ledger
+            .unreconciled()
+            .expect("query")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(listed, vec![cut.clone()], "only the cut-before-usage call");
+
+        ledger
+            .reconcile(&cut, &usage())
+            .expect("reconcile the cut call");
+        let row = ledger.call(&cut).expect("read").expect("present");
+        assert!(!row.cancelled_without_usage());
+        assert_eq!(row.settlement, Settlement::Counted);
+        assert_eq!(row.usage, usage());
+        assert!(ledger.unreconciled().expect("query").is_empty());
+        let spend = ledger
+            .spend_of(&[cut.clone(), with_usage.clone()], &prices)
+            .expect("spend");
+        assert!(spend.unknown.is_empty(), "both are priced now");
+        let one = prices.cost_exact_on(None, "m", &usage()).expect("price");
+        assert_eq!(spend.total, (one + one).to_money());
+
+        assert!(
+            matches!(
+                ledger.reconcile(&cut, &usage()),
+                Err(LedgerError::WrongState { .. })
+            ),
+            "a second reconcile is refused"
+        );
+        assert!(
+            matches!(
+                ledger.reconcile(&with_usage, &usage()),
+                Err(LedgerError::WrongState { .. })
+            ),
+            "a cancelled call with usage is already priced"
+        );
+        let kept = ledger.call(&with_usage).expect("read").expect("present");
+        assert_eq!(kept.settlement, Settlement::Cancelled);
+        assert!(
+            ledger.verify().expect("verify").ok,
+            "the reconcile verifies"
+        );
+    }
+
+    /// A reconcile at zero usage (the vendor console shows nothing billed)
+    /// makes a cut call's spend known as `$0`, not unknown with no way left
+    /// to resolve it.
+    #[test]
+    fn a_cut_call_reconciled_at_zero_is_known_zero_spend() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let id = {
+            let t = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("b");
+            t.cancel(None).expect("cancel");
+            t.id().clone()
+        };
+        ledger
+            .reconcile(&id, &TokenUsage::default())
+            .expect("reconcile");
+        let spend = ledger.spend_of(&[id], &price_m()).expect("spend");
+        assert!(spend.unknown.is_empty());
+        assert_eq!(spend.total, Money::ZERO);
+        assert!(ledger.unreconciled().expect("query").is_empty());
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
+    /// A counted call and a failed call stay refused by reconcile.
+    #[test]
+    fn reconcile_refuses_counted_and_failed_calls() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let begin = || {
+            ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("b")
+        };
+        let counted = begin();
+        counted.settle(&usage(), None).expect("settle");
+        let failed = begin();
+        failed.fail().expect("fail");
+        for id in [counted.id(), failed.id()] {
+            assert!(matches!(
+                ledger.reconcile(id, &usage()),
+                Err(LedgerError::WrongState { .. })
+            ));
+        }
     }
 
     #[test]
