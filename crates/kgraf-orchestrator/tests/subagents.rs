@@ -2952,15 +2952,22 @@ async fn a_paused_and_resumed_child_is_charged_once_for_its_calls() {
         2,
         "the child's first round before the pause, its last after: {calls:#?}"
     );
-    // The call the stop cut short stays unreconciled, so the pause charges
-    // the child's hold (the dispatch estimate) for its calls so far, in place
-    // of their ledger cost. After the resume only the new call is added.
-    let unreconciled: Vec<_> = calls
+    // The call the stop cut short is cancelled before any usage arrived, so
+    // its spend is unknown, not zero: the pause charges the child's hold (the
+    // dispatch estimate) for its calls so far, in place of their ledger cost.
+    // After the resume only the new call is added.
+    let cut: Vec<_> = calls
         .iter()
-        .filter(|c| c.settlement == Settlement::Unreconciled)
+        .filter(|c| c.cancelled_without_usage())
         .collect();
-    assert_eq!(unreconciled.len(), 1, "{calls:#?}");
-    assert_eq!(unreconciled[0].agent_id, child.as_str());
+    assert_eq!(cut.len(), 1, "{calls:#?}");
+    assert_eq!(cut[0].agent_id, child.as_str());
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.settlement != Settlement::Unreconciled),
+        "{calls:#?}"
+    );
     let events = kgraf_orchestrator::TraceLog::open(
         &rig.parts.dir.join("runs").join(RUN).join("trace.jsonl"),
     )

@@ -21,7 +21,10 @@
 //!   [`crate::CallToken::leave_unreconciled_with`] with whatever usage and
 //!   request id are already known, never through `CallToken`'s own `Drop`, which
 //!   always records zero usage because it cannot be handed a partial figure after
-//!   the fact (every call is attributed to the ledger).
+//!   the fact (every call is attributed to the ledger). A call its caller
+//!   stopped on purpose ([`crate::CallToken::stop_on_purpose`]) settles
+//!   through [`crate::CallToken::cancel_with_async`] instead, with the same
+//!   usage and request id.
 
 use std::cell::{Cell, RefCell};
 
@@ -232,7 +235,9 @@ impl SseDecoder {
 /// [`CallToken::leave_unreconciled_with`] with whatever was last recorded:
 /// `Some(usage)` if any usage was ever observed, `None` otherwise. So a known
 /// partial cost is never silently zeroed and the row still carries its
-/// request id for reconciliation.
+/// request id for reconciliation. When the caller stopped the call on purpose
+/// ([`CallToken::stop_on_purpose`]) before dropping it, the row settles
+/// `Cancelled` through [`CallToken::cancel_with_async`] with the same figures.
 pub struct StreamGuard<'a, 'ledger> {
     token: &'a CallToken<'ledger>,
     usage: RefCell<TokenUsage>,
@@ -297,15 +302,58 @@ impl Drop for StreamGuard<'_, '_> {
         } else {
             None
         };
-        let _not_awaited = self
-            .token
-            .leave_unreconciled_with_async(partial, self.request_id.borrow().as_deref());
+        // A caller that stopped the call on purpose (`CallToken::stop_on_purpose`)
+        // gets it cancelled, with the same partial usage; anything else that
+        // ended the stream early leaves it unreconciled.
+        let request_id = self.request_id.borrow();
+        let _not_awaited = if self.token.stopped_on_purpose() {
+            self.token.cancel_with_async(partial, request_id.as_deref())
+        } else {
+            self.token
+                .leave_unreconciled_with_async(partial, request_id.as_deref())
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounting::{Ledger, Settlement};
+    use kgraf_core::Protocol;
+
+    /// A guard dropped armed settles the row it guards: cancelled, with the
+    /// partial usage and request id, when the caller stopped the call on
+    /// purpose; unreconciled, with the same figures, otherwise.
+    #[test]
+    fn an_armed_guard_cancels_a_stopped_call_and_leaves_any_other_unreconciled() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let partial = TokenUsage {
+            uncached_input: 321,
+            ..TokenUsage::default()
+        };
+        let mut ids = Vec::new();
+        for stop in [true, false] {
+            let token = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            {
+                let guard = StreamGuard::new(&token);
+                guard.record_request_id(Some("req-1"));
+                guard.record_usage(&partial);
+                if stop {
+                    token.stop_on_purpose();
+                }
+            }
+            ids.push(token.id().clone());
+        }
+        let read = |i: usize| ledger.call(&ids[i]).expect("read").expect("present");
+        for (i, settlement) in [(0, Settlement::Cancelled), (1, Settlement::Unreconciled)] {
+            let row = read(i);
+            assert_eq!(row.settlement, settlement);
+            assert_eq!(row.usage.uncached_input, 321);
+            assert_eq!(row.request_id.as_deref(), Some("req-1"));
+        }
+    }
 
     #[test]
     fn an_event_split_across_chunk_boundaries_still_decodes() {

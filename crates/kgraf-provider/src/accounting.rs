@@ -202,7 +202,8 @@ pub enum Settlement {
     /// attempt that ran.
     Failed,
     /// The call was cancelled before completing. Whether it billed is unknown,
-    /// which is why it is not `Failed`.
+    /// which is why it is not `Failed`. One cancelled with no usage reported
+    /// has unknown spend ([`CallRecord::cancelled_without_usage`]).
     Cancelled,
     /// The call finished or died without delivering usage.
     ///
@@ -290,6 +291,16 @@ pub struct CallRecord {
     /// several different routes can share). `None` for a call made without
     /// going through either wrapper (most test fixtures).
     pub route: Option<String>,
+}
+
+impl CallRecord {
+    /// A call cancelled before the provider reported any usage. Its spend is
+    /// unknown, not zero: the vendor may have billed what it processed before
+    /// the cut. Charged like an unreconciled call, at a bound, never as `$0`.
+    /// A cancelled call with partial usage is charged at that usage.
+    pub fn cancelled_without_usage(&self) -> bool {
+        self.settlement == Settlement::Cancelled && self.usage.is_empty()
+    }
 }
 
 /// What a call was for and what it saw.
@@ -410,8 +421,9 @@ pub struct TaskUsage {
 pub struct SpendOf {
     /// The priced spend of the calls whose spend is known.
     pub total: Money,
-    /// Calls whose spend is not known: missing, in flight, unreconciled, or on
-    /// a model the table cannot price.
+    /// Calls whose spend is not known: missing, in flight, unreconciled,
+    /// cancelled before any usage was reported, or on a model the table cannot
+    /// price.
     pub unknown: Vec<CallId>,
 }
 
@@ -434,9 +446,46 @@ pub struct CallToken<'ledger> {
     /// every adapter, so it must be `Sync`.
     settled: AtomicBool,
     adapter: &'static str,
+    /// Set when the caller stops the call on purpose (a cancel, a steer, a
+    /// time limit), so an abandoned call settles `Cancelled`, not
+    /// `Unreconciled`. See [`Self::stop_on_purpose`].
+    stopped: AtomicBool,
+    /// A caller-supplied check for the same thing, read when the call is
+    /// abandoned. See [`Self::stop_when`].
+    stop_probe: std::sync::OnceLock<StopProbe>,
 }
 
+/// Reports whether a caller has stopped a call on purpose.
+type StopProbe = Box<dyn Fn() -> bool + Send + Sync>;
+
 impl<'ledger> CallToken<'ledger> {
+    /// Record that the caller is stopping this call on purpose, before it
+    /// drops the future that makes the call.
+    ///
+    /// Whatever then closes the abandoned row (an adapter's
+    /// [`crate::StreamGuard`], or this token's own `Drop`) settles it
+    /// [`Settlement::Cancelled`], with the partial usage it observed, rather
+    /// than [`Settlement::Unreconciled`]. A call that ends without usage for
+    /// a reason the caller did not choose (the stream broke, the provider
+    /// failed, a panic) is not marked and stays unreconciled. Has no effect
+    /// once the row is settled.
+    pub fn stop_on_purpose(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Like [`Self::stop_on_purpose`], for a caller that cannot reach the
+    /// token when it stops the call: `probe` is read when the call is
+    /// abandoned, and a `true` means the caller stopped it. Only the first
+    /// probe set is kept; a later one is ignored.
+    pub fn stop_when(&self, probe: impl Fn() -> bool + Send + Sync + 'static) {
+        let _first_only = self.stop_probe.set(Box::new(probe));
+    }
+
+    /// Whether the caller has stopped this call on purpose.
+    pub fn stopped_on_purpose(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst) || self.stop_probe.get().is_some_and(|probe| probe())
+    }
+
     /// The ledger id of this call.
     pub fn id(&self) -> &CallId {
         &self.id
@@ -565,7 +614,17 @@ impl<'ledger> CallToken<'ledger> {
 
     /// [`Self::cancel`] for an async caller.
     pub fn cancel_async(&self, partial: Option<&TokenUsage>) -> LedgerAck<()> {
-        self.finish(Settlement::Cancelled, partial, None)
+        self.cancel_with_async(partial, None)
+    }
+
+    /// [`Self::cancel_async`], keeping the provider's request id when the
+    /// stream had already sent one.
+    pub fn cancel_with_async(
+        &self,
+        partial: Option<&TokenUsage>,
+        request_id: Option<&str>,
+    ) -> LedgerAck<()> {
+        self.finish(Settlement::Cancelled, partial, request_id)
     }
 
     /// Record that the call ended without usage, with whatever handle exists for
@@ -667,9 +726,17 @@ impl Drop for CallToken<'_> {
         // write is still ordered before any later read through this ledger (see
         // `Ledger::read_barrier`), and a write that fails leaves the row in flight,
         // which `unreconciled` reports.
+        //
+        // A call its caller stopped on purpose is cancelled, with no usage
+        // known here; any other abandoned call is unreconciled.
+        let settlement = if self.stopped_on_purpose() {
+            Settlement::Cancelled
+        } else {
+            Settlement::Unreconciled
+        };
         self.ledger.submit_detached(Op::Settle {
             id: self.id.clone(),
-            settlement: Settlement::Unreconciled,
+            settlement,
             usage: None,
             request_id: None,
         });
@@ -1732,6 +1799,8 @@ impl Ledger {
             id,
             settled: AtomicBool::new(false),
             adapter,
+            stopped: AtomicBool::new(false),
+            stop_probe: std::sync::OnceLock::new(),
         }
     }
 
@@ -2211,11 +2280,12 @@ impl Ledger {
         })
     }
 
-    /// Spend of many calls in one query. A counted or cancelled call is priced;
-    /// a failed call is zero; a call that is missing, still in flight,
-    /// unreconciled, or on a model the table cannot price has spend that is
-    /// **unknown**, and is named in `unknown` rather than counted as zero. An id
-    /// given twice is counted twice, as the caller listed it.
+    /// Spend of many calls in one query. A counted call, or a cancelled one with
+    /// usage, is priced; a failed call is zero; a call that is missing, still in
+    /// flight, unreconciled, cancelled before any usage was reported, or on a
+    /// model the table cannot price has spend that is **unknown**, and is named
+    /// in `unknown` rather than counted as zero. An id given twice is counted
+    /// twice, as the caller listed it.
     pub fn spend_of(&self, ids: &[CallId], prices: &PriceTable) -> Result<SpendOf, LedgerError> {
         let wanted = serde_json::to_string(&ids.iter().map(CallId::as_str).collect::<Vec<_>>())
             .map_err(|_| LedgerError::Internal("cannot encode the call ids"))?;
@@ -2248,7 +2318,8 @@ impl Ledger {
         for id in ids {
             match rows.get(id.as_str()) {
                 Some((settlement, model, route, usage))
-                    if settlement == "counted" || settlement == "cancelled" =>
+                    if settlement == "counted"
+                        || (settlement == "cancelled" && !usage.is_empty()) =>
                 {
                     match prices.cost_exact_on(route.as_deref(), model, usage) {
                         Ok(cost) => exact += cost,
@@ -4363,6 +4434,41 @@ mod tests {
         assert_eq!(ledger.unreconciled().expect("query").len(), 1);
     }
 
+    /// A token its caller stopped on purpose, then dropped unsettled, is
+    /// cancelled; one dropped without the mark stays unreconciled.
+    #[test]
+    fn a_dropped_token_is_cancelled_only_when_its_caller_stopped_it() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let stopped = {
+            let token = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            token.stop_on_purpose();
+            token.id().clone()
+        };
+        let probed = {
+            let token = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            token.stop_when(|| true);
+            token.id().clone()
+        };
+        let dropped = {
+            let token = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("begin");
+            token.stop_when(|| false);
+            token.id().clone()
+        };
+        let read = |id: &CallId| ledger.call(id).expect("read").expect("present");
+        assert_eq!(read(&stopped).settlement, Settlement::Cancelled);
+        assert_eq!(read(&stopped).usage, TokenUsage::default());
+        assert_eq!(read(&probed).settlement, Settlement::Cancelled);
+        assert_eq!(read(&dropped).settlement, Settlement::Unreconciled);
+        assert_eq!(ledger.unreconciled().expect("query").len(), 1);
+        assert!(ledger.verify().expect("verify").ok);
+    }
+
     #[test]
     fn a_cancelled_call_keeps_the_usage_it_had_already_incurred() {
         let ledger = Ledger::open_in_memory().expect("ledger");
@@ -5967,6 +6073,32 @@ mod tests {
                 unknown: vec![]
             }
         );
+    }
+
+    /// A call cancelled before any usage was reported has unknown spend, not
+    /// `$0`; one cancelled with partial usage is priced at that usage.
+    #[test]
+    fn a_call_cancelled_without_usage_has_unknown_spend() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let prices = price_m();
+        let cancel = |partial: Option<&TokenUsage>| {
+            let t = ledger
+                .begin("test", Protocol::Additive, "m", "a", "t")
+                .expect("b");
+            t.cancel(partial).expect("cancel");
+            t.id().clone()
+        };
+        let cut = cancel(None);
+        let with_usage = cancel(Some(&usage()));
+        let spend = ledger
+            .spend_of(&[cut.clone(), with_usage.clone()], &prices)
+            .expect("spend");
+        assert_eq!(spend.unknown, vec![cut.clone()]);
+        let one = prices.cost_exact_on(None, "m", &usage()).expect("price");
+        assert_eq!(spend.total, one.to_money());
+        let read = |id: &CallId| ledger.call(id).expect("read").expect("present");
+        assert!(read(&cut).cancelled_without_usage());
+        assert!(!read(&with_usage).cancelled_without_usage());
     }
 
     #[test]

@@ -66,6 +66,7 @@ impl ModelKindCalls {
                 agent: format!("orchestrator:{run}"),
                 task: run.to_owned(),
                 role: "orchestrator".to_owned(),
+                stop: None,
             },
             log,
             cancel: CancellationToken::new(),

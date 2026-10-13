@@ -401,7 +401,10 @@ contracts have not merged yet is deferred to the root gate (0018).
 
 Press Ctrl-C, or send SIGTERM, to stop `orchestrate` or `schedule run-now`. Nothing new
 starts, every worker and model call in flight is cancelled, and the ledger settles each call.
-A call that may have billed appears in `kgraf unreconciled`. The report prints with status
+A worker's call stopped this way settles as cancelled, with the usage its stream reported
+before the stop. One stopped before any usage arrived is charged at its worst case, since the
+provider may have billed it. A call that ended for another reason and may have billed appears in
+`kgraf unreconciled`. The report prints with status
 `Stopped`. Each worktree the run left is named with how to continue or remove it. The exit
 code is 128 plus the signal number (130 for Ctrl-C, 143 for SIGTERM). Stopping can take up to
 30 seconds. A second interrupt exits at once.

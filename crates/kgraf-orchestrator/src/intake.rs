@@ -134,8 +134,8 @@ impl Drop for HeldCall<'_> {
     }
 }
 
-/// A call's ledger cost; an unsettled or unpriced one is charged the hold, a failed
-/// one nothing.
+/// A call's ledger cost; an unsettled or unpriced one, or one cancelled before
+/// any usage was reported, is charged the hold, a failed one nothing.
 fn cost_of(
     ledger: &Ledger,
     prices: &PriceTable,
@@ -144,6 +144,7 @@ fn cost_of(
 ) -> Result<Money, OrchestratorError> {
     let row = blocking(|| ledger.call(call))?;
     Ok(match row {
+        Some(r) if r.cancelled_without_usage() => held,
         Some(r) if matches!(r.settlement, Settlement::Counted | Settlement::Cancelled) => prices
             .cost_on(r.route.as_deref(), &r.model, &r.usage)
             .unwrap_or(held),

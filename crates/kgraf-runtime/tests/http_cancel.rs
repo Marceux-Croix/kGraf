@@ -162,3 +162,104 @@ async fn cancelled_requests_leave_no_client_port_in_time_wait() {
         });
     }
 }
+
+/// Serves one streaming reply that sends its headers and one text chunk, no
+/// usage, then holds the connection open: a local server that reports usage
+/// only in its last chunk, cut before that chunk.
+async fn one_chunk_then_silence() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // The headers and the JSON body, read until the body is whole.
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let event = format!(
+            "data: {{\"id\":\"chatcmpl-cut\",\"object\":\"chat.completion.chunk\",\
+             \"model\":\"{MODEL}\",\"choices\":[{{\"index\":0,\
+             \"delta\":{{\"role\":\"assistant\",\"content\":\"partial\"}}}}]}}\n\n"
+        );
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{event}"
+        );
+        if socket.write_all(reply.as_bytes()).await.is_err() {
+            return;
+        }
+        // Hold the stream open until the client goes away.
+        while matches!(socket.read(&mut chunk).await, Ok(n) if n > 0) {}
+    });
+    format!("http://{address}")
+}
+
+/// The real Chat Completions adapter, streaming, cut by the worker's deadline
+/// after a chunk with no usage: kGraf stopped the call, so its row is
+/// cancelled at zero by the adapter's own stream guard, with the request id
+/// the chunk carried, not left unreconciled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streaming_call_cut_by_the_deadline_settles_cancelled() {
+    let url = one_chunk_then_silence().await;
+    let mut env = Arc::into_inner(env(url)).expect("one owner");
+    env.settings.call_mode = CallMode::Stream;
+    let env = Arc::new(env);
+    let brief = WorkerBrief {
+        task: "cut-task".into(),
+        worker: "cut-worker".into(),
+        instruction: "Do the thing.".into(),
+        workspace_root: std::env::temp_dir(),
+        model: MODEL.into(),
+        slices: vec![],
+        skills: vec![],
+        step_budget: 4,
+        context: ContextConfig::for_model(1_000_000).expect("config"),
+        write_scope: None,
+    };
+    let options = SpawnOptions {
+        deadline: Some(kgraf_runtime::WorkerDeadline {
+            at: tokio::time::Instant::now() + Duration::from_millis(500),
+            expected_round: None,
+        }),
+        ..SpawnOptions::default()
+    };
+    let mut handle = spawn_worker(env.clone(), brief, options)
+        .await
+        .expect("spawn");
+    timeout(LIMIT, async {
+        while handle.next_event().await.is_some() {}
+    })
+    .await
+    .expect("the worker ended");
+    let result = handle.result().await.expect("result");
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted, "{result:?}");
+    assert!(
+        result.out_of_time.is_some_and(|stop| stop.cut),
+        "{result:?}"
+    );
+    let rows = env.ledger.calls().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].settlement, kgraf_provider::Settlement::Cancelled);
+    assert_eq!(rows[0].usage, kgraf_core::TokenUsage::default());
+    assert_eq!(rows[0].request_id.as_deref(), Some("chatcmpl-cut"));
+    assert!(env.ledger.unreconciled().expect("query").is_empty());
+}

@@ -2885,8 +2885,10 @@ impl Worker {
     /// Settle a call whose request never left the process as a known zero. A
     /// ledger error is recorded on the result, not dropped.
     async fn settle_unsent(&mut self, call: &CallId, token: &kgraf_provider::CallToken<'_>) {
-        let zero = TokenUsage::default();
-        match token.cancel_async(Some(&zero)).await {
+        // `Failed`, the settlement for a call that provably billed nothing:
+        // the request never left the process. Not `Cancelled`, whose zero
+        // usage means a cut before any usage arrived, spend unknown.
+        match token.fail_async().await {
             Ok(()) | Err(kgraf_provider::LedgerError::AlreadySettled { .. }) => {}
             Err(e) => self
                 .trace_failures
@@ -3292,9 +3294,14 @@ impl Worker {
                 partial: None,
             });
         }
+        // The cancel arm marks the token before the select drops the call, so
+        // an adapter guard that settles the abandoned row settles it cancelled.
         let outcome = tokio::select! {
             biased;
-            () = ep.cancelled() => None,
+            () = async {
+                ep.cancelled().await;
+                token.stop_on_purpose();
+            } => None,
             r = provider.complete(request, &token) => Some(r),
         };
         self.phase = CancelPhase::BetweenRounds;
@@ -3412,12 +3419,12 @@ impl Worker {
 
         // Decision 0067: an interrupt that arrived after the drain and before
         // this point (the ledger write above is an await) finds a request that
-        // has not left the process. Settled cancelled at zero, a known spend,
+        // has not left the process. Settled failed (billed nothing), a known spend,
         // rather than raced below, where the biased select would abandon the
         // never-polled call and leave its row unreconciled as unknown spend.
         // An arm that lands between this check and the select's first poll
         // still takes the conservative path below. The zero is returned as
-        // the partial usage, so the ledger settles it as known.
+        // the partial usage: the call billed nothing.
         //
         // Never in the final round. Abandoning it would spend the
         // last round, end the run `BudgetExhausted` with no answer, and still
@@ -3466,15 +3473,25 @@ impl Worker {
         tokio::pin!(interrupt);
         let response = match self.env.settings.call_mode {
             CallMode::Complete => {
+                // The cancel and interrupt arms mark the token before the
+                // select drops the call: a select drops its other futures
+                // before a handler runs, so marking in the handler would be
+                // too late for an adapter guard settling the abandoned row.
                 let outcome = tokio::select! {
                     biased;
-                    () = ep.cancelled() => Err(Interruption::Cancel),
-                    () = &mut interrupt => Err(Interruption::Steer),
+                    () = async {
+                        ep.cancelled().await;
+                        token.stop_on_purpose();
+                    } => Err(Interruption::Cancel),
+                    () = async {
+                        (&mut interrupt).await;
+                        token.stop_on_purpose();
+                    } => Err(Interruption::Steer),
                     r = provider.complete(request, &token) => Ok(r),
                 };
                 match outcome {
                     Err(why) => {
-                        // No usage was received, so the spend is unknown, not zero.
+                        // No usage was received: cancelled at zero usage, spend unknown.
                         if let Some(failure) =
                             settle_cancelled(&call, &token, &StreamSeen::default()).await
                         {
@@ -3562,7 +3579,7 @@ impl Worker {
                     };
                     let stream = streaming.stream(request, &token, &mut push);
                     tokio::pin!(stream);
-                    loop {
+                    let end = loop {
                         tokio::select! {
                             biased;
                             () = ep.cancelled() => break End::Cancelled,
@@ -3582,7 +3599,15 @@ impl Worker {
                                 Err(e) => overflow = Some(e),
                             },
                         }
+                    };
+                    // kGraf stopped the call itself (cancel, steer, deadline,
+                    // or its own halt): mark the token before the stream drops,
+                    // so the adapter's guard settles the row cancelled with the
+                    // usage it saw, not unreconciled.
+                    if !matches!(end, End::Finished(_)) {
+                        token.stop_on_purpose();
                     }
+                    end
                     // The stream future, the closure and the sink drop here, which
                     // closes the bridge so the pump drains to its end below.
                 };
@@ -4733,13 +4758,17 @@ fn last_round_tools(events: &[WorkerEvent]) -> Vec<String> {
     tools
 }
 
-/// Settle a call the loop cancelled (every token is attributed).
+/// Settle a call the loop stopped on purpose (every token is attributed).
 ///
-/// With usage received, the call is `Cancelled` with that partial usage. With
-/// none, the spend is unknown rather than zero, so the row is left unreconciled
-/// with the request id, where `Ledger::unreconciled` reports it until the
-/// provider's own record resolves it. `AlreadySettled` means the adapter finished
-/// the call as the cancel landed, and its settlement stands.
+/// The call is `Cancelled`, with the partial usage the stream reported, or
+/// zero usage when it reported none, and the request id when one arrived. A
+/// cancelled row with zero usage reads as unknown spend
+/// (`CallRecord::cancelled_without_usage`), never as `$0`. `Unreconciled` is kept for a call that ended without usage for a reason
+/// kGraf did not choose (a broken stream, a provider error), which the
+/// adapter settles itself. `AlreadySettled` means the adapter settled the
+/// call first: its guard, which settles cancelled because the token was
+/// marked before the call was dropped, or its own ending as the cancel
+/// landed. That settlement stands.
 ///
 /// A settle that the ledger refuses leaves the row in flight. It is returned as a
 /// failure line for the run's `trace_failures`, never dropped.
@@ -4748,10 +4777,8 @@ async fn settle_cancelled(
     token: &kgraf_provider::CallToken<'_>,
     seen: &StreamSeen,
 ) -> Option<String> {
-    let ack = match &seen.usage {
-        Some(usage) => token.cancel_async(Some(usage)),
-        None => token.leave_unreconciled_async(seen.request_id.as_deref()),
-    };
+    token.stop_on_purpose();
+    let ack = token.cancel_with_async(seen.usage.as_ref(), seen.request_id.as_deref());
     match ack.await {
         Ok(()) => None,
         // The adapter finished the call as the cancel landed; that stands.

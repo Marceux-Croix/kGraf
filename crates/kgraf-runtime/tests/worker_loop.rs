@@ -8,7 +8,7 @@ use kgraf_provider::capability::{Capabilities, StreamEvent, Streaming};
 use kgraf_provider::message::ToolDefinition;
 use kgraf_provider::{
     CallToken, Content, Ledger, Message, Provider, ProviderError, Request, Response, Role,
-    Settlement, StopReason,
+    Settlement, StopReason, StreamGuard,
 };
 use kgraf_runtime::{
     CallMode, CancelPhase, ContextConfig, INTERRUPTED_RESULT, NeutralPrefixEncoder, NoticeKind,
@@ -40,6 +40,9 @@ struct Round {
     hang_after: Option<usize>,
     /// Stream: wait forever right after `Started`, before any usage.
     hang_before_usage: bool,
+    /// Stream: fail on its own right after the first usage event, as a
+    /// connection the provider drops mid-stream does.
+    break_after_usage: bool,
     /// Fail after the request may have billed, closing the call as an adapter does.
     fail: bool,
     /// Stream: settle the call before any output, so a trace write after it
@@ -283,6 +286,10 @@ impl Streaming for Fake {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response, ProviderError> {
         let round = self.round(request);
+        // As every real streaming adapter does: the guard settles the row when
+        // this future ends any way but its own success.
+        let guard = StreamGuard::new(token);
+        guard.record_request_id(Some("req-fake-1"));
         sink(StreamEvent::Started {
             model: request.model.clone(),
             request_id: Some("req-fake-1".into()),
@@ -291,14 +298,21 @@ impl Streaming for Fake {
             std::future::pending::<()>().await;
         }
         // The input side first, as Anthropic's message_start does.
-        sink(StreamEvent::Usage {
-            usage: TokenUsage {
-                text_output: 0,
-                reasoning_output: 0,
-                ..round.usage.clone()
-            },
-        });
+        let input_side = TokenUsage {
+            text_output: 0,
+            reasoning_output: 0,
+            ..round.usage.clone()
+        };
+        guard.record_usage(&input_side);
+        sink(StreamEvent::Usage { usage: input_side });
+        if round.break_after_usage {
+            return Err(ProviderError::Transport {
+                adapter: "fake",
+                reason: "connection reset mid-stream".into(),
+            });
+        }
         if round.settle_early {
+            guard.disarm();
             token.settle(&round.usage, None)?;
         }
         let pieces = round.deltas.max(1);
@@ -320,6 +334,7 @@ impl Streaming for Fake {
         if round.hang_after.is_some() {
             std::future::pending::<()>().await;
         }
+        guard.record_usage(&round.usage);
         sink(StreamEvent::Usage {
             usage: round.usage.clone(),
         });
@@ -327,6 +342,7 @@ impl Streaming for Fake {
             stop_reason: round.stop.unwrap_or(StopReason::EndTurn),
         });
         if !round.settle_early {
+            guard.disarm();
             token.settle(&round.usage, None)?;
         }
         Ok(response(request, &round))
@@ -2437,7 +2453,7 @@ async fn a_finished_tool_call_records_the_measured_execution_time() {
 }
 
 #[tokio::test]
-async fn a_cancel_before_any_usage_leaves_the_call_unreconciled_in_both_modes() {
+async fn a_cancel_before_any_usage_settles_the_call_cancelled_at_zero_in_both_modes() {
     for (mode, streams) in [(CallMode::Stream, true), (CallMode::Complete, false)] {
         let dir = tempfile::tempdir().expect("dir");
         let provider = Fake::new(streams, |_| Round {
@@ -2474,10 +2490,11 @@ async fn a_cancel_before_any_usage_leaves_the_call_unreconciled_in_both_modes() 
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].settlement,
-            Settlement::Unreconciled,
-            "{mode:?}: an unknown spend is not a zero spend"
+            Settlement::Cancelled,
+            "{mode:?}: kGraf stopped the call, so it is cancelled, not unreconciled"
         );
-        assert_eq!(env.ledger.unreconciled().expect("query").len(), 1);
+        assert_eq!(rows[0].usage, TokenUsage::default(), "{mode:?}");
+        assert!(env.ledger.unreconciled().expect("query").is_empty());
         if mode == CallMode::Stream {
             assert_eq!(rows[0].request_id.as_deref(), Some("req-fake-1"));
         }
@@ -5825,6 +5842,73 @@ async fn a_round_in_flight_at_the_deadline_is_cut_and_settled_cancelled() {
     assert_eq!(rows[0].settlement, Settlement::Cancelled);
     assert_eq!(rows[0].usage.uncached_input, 1_234);
     assert!(env.ledger.unreconciled().expect("query").is_empty());
+}
+
+/// A round cut at the deadline before its stream reported any usage (a local
+/// server that sends usage only in its last chunk) is cancelled at zero with
+/// its request id, through the adapter's own stream guard, not left
+/// unreconciled: kGraf chose to stop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_cut_before_any_usage_settles_the_call_cancelled_at_zero() {
+    let dir = tempfile::tempdir().expect("dir");
+    let hang = Fake::new(true, |_| Round {
+        hang_before_usage: true,
+        ..Round::answer("never")
+    });
+    let env = Arc::new(env_with(hang, vec![], CallMode::Stream));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "answer", dir.path(), 5),
+        deadline_in(Duration::from_millis(300), None),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(result.outcome, WorkerOutcome::BudgetExhausted);
+    assert!(
+        result.out_of_time.is_some_and(|stop| stop.cut),
+        "{result:?}"
+    );
+    let rows = env.ledger.calls().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].settlement, Settlement::Cancelled);
+    assert_eq!(rows[0].usage, TokenUsage::default());
+    assert_eq!(rows[0].request_id.as_deref(), Some("req-fake-1"));
+    assert!(env.ledger.unreconciled().expect("query").is_empty());
+}
+
+/// A stream that breaks on its own, after reporting its input side, is an
+/// end kGraf did not choose: the row stays unreconciled, with the partial
+/// usage and the request id, for reconciliation.
+#[tokio::test]
+async fn a_stream_that_breaks_on_its_own_stays_unreconciled() {
+    let dir = tempfile::tempdir().expect("dir");
+    let broken = Fake::new(true, |_| {
+        let mut round = Round::answer("cut short");
+        round.usage = usage(777, 5);
+        round.break_after_usage = true;
+        round
+    });
+    let env = Arc::new(env_with(broken, vec![], CallMode::Stream));
+    let handle = spawn_worker(
+        env.clone(),
+        brief("w1", "answer", dir.path(), 3),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (_, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(
+        matches!(result.outcome, WorkerOutcome::Failed { .. }),
+        "{result:?}"
+    );
+    let rows = env.ledger.calls().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].settlement, Settlement::Unreconciled);
+    assert_eq!(rows[0].usage.uncached_input, 777);
+    assert_eq!(rows[0].usage.text_output, 0);
+    assert_eq!(rows[0].request_id.as_deref(), Some("req-fake-1"));
+    assert_eq!(env.ledger.unreconciled().expect("query").len(), 1);
 }
 
 /// A worker seeded with a round longer than the time it has does not start

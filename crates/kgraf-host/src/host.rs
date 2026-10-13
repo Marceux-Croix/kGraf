@@ -473,6 +473,16 @@ impl Host {
         } else {
             crate::config::production_rate_limit_store_path()
         };
+        // This crate's unit tests run as threads in one process, so the
+        // process-wide gate would let parallel tests take each other's agent
+        // slots and hold a contract for capacity at random. Each test host
+        // gets its own gate, sized as the first host would seed the shared one.
+        #[cfg(test)]
+        {
+            let gate = MachineGate::new(default_machine_limits(&config));
+            Self::open_impl(config, store_path.as_deref(), gate)
+        }
+        #[cfg(not(test))]
         Self::open_with_rate_limit_store(config, store_path.as_deref())
     }
 

@@ -126,6 +126,10 @@ pub struct Attribution {
     /// The ledger trace role: `tool` for a worker's call, `orchestrator` for
     /// the orchestrator's own.
     pub role: String,
+    /// The signal that stops the call on purpose (a tool call's cancel). An
+    /// abandoned row whose signal has fired settles cancelled; otherwise it
+    /// stays unreconciled, its spend unknown.
+    pub stop: Option<crate::CancellationToken>,
 }
 
 /// A result, the route that produced it, and the ledger rows it took (one
@@ -235,6 +239,10 @@ impl ModelCalls {
                 },
             )
             .await?;
+        if let Some(stop) = &who.stop {
+            let stop = stop.clone();
+            token.stop_when(move || stop.is_cancelled());
+        }
         if let Some(log) = &self.log {
             log.push(token.id().clone());
         }
@@ -472,11 +480,15 @@ pub async fn run_model_tool(
 }
 
 fn who(calls: &ModelCalls, ctx: &ToolContext) -> Attribution {
-    calls.attribution.clone().unwrap_or_else(|| Attribution {
+    let mut who = calls.attribution.clone().unwrap_or_else(|| Attribution {
         agent: ctx.worker.as_str().to_owned(),
         task: ctx.task.as_str().to_owned(),
         role: "tool".to_owned(),
-    })
+        stop: None,
+    });
+    // The tool call's cancel is what stops its model call on purpose.
+    who.stop = Some(ctx.cancel.clone());
+    who
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(
@@ -549,8 +561,9 @@ fn error_output(error: ModelCallError) -> ToolOutput {
 }
 
 /// Run a model call unless `ctx.cancel` fires first. A cancel drops the call:
-/// a request already sent leaves its ledger row unreconciled (it may have
-/// billed), and one not yet sent closes as never sent.
+/// a request already sent settles its ledger row cancelled (the row's stop
+/// signal is `ctx.cancel`, see [`Attribution::stop`]), and one not yet sent
+/// closes as never sent.
 async fn unless_cancelled<T>(
     tool: &str,
     ctx: &ToolContext,
@@ -1650,6 +1663,57 @@ mod tests {
         }
     }
 
+    /// An embedder whose request is sent and never answered; it signals once
+    /// the call is in flight.
+    struct Hanging(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl Embedder for Hanging {
+        fn adapter(&self) -> &'static str {
+            "hanging"
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::Inclusive
+        }
+        async fn embed(
+            &self,
+            _model: &str,
+            _texts: &[String],
+            _token: &CallToken,
+        ) -> Result<Embeddings, ProviderError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// A tool call cancelled while its model call is in flight stops that call
+    /// on purpose: the row is cancelled, not left unreconciled.
+    #[tokio::test]
+    async fn a_tool_call_cancelled_in_flight_settles_its_call_cancelled() {
+        let ledger = Arc::new(Ledger::open_in_memory().expect("ledger"));
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let calls = one_embedder(ledger.clone(), Arc::new(Hanging(sent.clone())));
+        let context = ctx();
+        let cancel = context.cancel.clone();
+        let tool = tool(&calls, EMBED_TOOL);
+        let permit = CallPermit::new();
+        let call = tool.call(serde_json::json!({"texts": ["a"]}), &context, &permit);
+        let stop = async {
+            sent.notified().await;
+            cancel.cancel();
+        };
+        let (out, ()) = tokio::join!(call, stop);
+        assert!(
+            matches!(out, Err(ToolError::Cancelled { .. })),
+            "{:?}",
+            out.err()
+        );
+        let rows = ledger.calls().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].settlement, Settlement::Cancelled);
+        assert!(ledger.unreconciled().expect("query").is_empty());
+    }
+
     fn one_embedder(ledger: Arc<Ledger>, embedder: Arc<dyn Embedder>) -> ModelCalls {
         ModelCalls::new(
             ledger,
@@ -1677,6 +1741,7 @@ mod tests {
             agent: "w1".into(),
             task: "c1".into(),
             role: "tool".into(),
+            stop: None,
         };
         let called = calls.embed(None, &texts, &who).await.expect("embed");
         assert_eq!(recording.requests.lock().expect("lock").len(), 3);
@@ -1783,6 +1848,7 @@ mod tests {
             agent: "w1".into(),
             task: "c1".into(),
             role: "tool".into(),
+            stop: None,
         };
         let texts = vec!["a".to_owned()];
         calls
@@ -1853,6 +1919,7 @@ mod tests {
             agent: "orchestrator:r1".into(),
             task: "r1".into(),
             role: "orchestrator".into(),
+            stop: None,
         };
         let out = run_model_tool(
             &calls,

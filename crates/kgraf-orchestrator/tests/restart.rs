@@ -332,6 +332,92 @@ fn a_worker_that_finished_before_the_kill_is_not_run_again() {
     assert_eq!(report.spent, expected, "{report:?}");
 }
 
+/// A call cancelled before the provider reported any usage may still have
+/// billed what was processed before the cut: the run charges it at its worst
+/// case, as an unreconciled call, never as `$0`. A call cancelled with partial
+/// usage is charged at that usage, and nothing more.
+#[test]
+fn a_call_cut_before_usage_is_charged_at_worst_case_and_one_with_usage_at_its_usage() {
+    let dir = tempfile::tempdir().expect("dir");
+    run_and_kill(dir.path());
+    let second = runtime();
+    let p2 = Parts::open_with(
+        dir.path(),
+        |_| panic!("no second decomposition"),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+        true,
+    );
+    // Two calls of this run, on its priced route, cut by kGraf: one before any
+    // usage arrived, one after its input side was reported.
+    let model = p2
+        .ledger
+        .calls()
+        .expect("calls")
+        .iter()
+        .find(|c| c.task_id == "r1/b")
+        .map(|c| c.model.clone())
+        .expect("a call of b");
+    let partial = TokenUsage {
+        uncached_input: 1_000,
+        text_output: 50,
+        ..TokenUsage::default()
+    };
+    let (cut, cut_with_usage) = {
+        let open = || {
+            p2.ledger
+                .begin("fake", kgraf_core::Protocol::Additive, &model, "w", "r1/b")
+                .expect("begin")
+        };
+        let cut = open();
+        cut.cancel(None).expect("cancel");
+        let with_usage = open();
+        with_usage.cancel(Some(&partial)).expect("cancel");
+        (cut.id().clone(), with_usage.id().clone())
+    };
+    let report = second
+        .block_on(async {
+            Orchestrator::new(cfg(), p2.services(WINDOW))
+                .expect("orchestrator")
+                .resume(RunId::new("r1"))
+                .await
+        })
+        .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let prices = prices();
+    let worst = prices
+        .cost(
+            &model,
+            &TokenUsage {
+                // The stop point at the dearer input rate (cache writes, here).
+                cache_write: 80_000,
+                text_output: 4_096,
+                ..TokenUsage::default()
+            },
+        )
+        .expect("priced");
+    let after = p2.ledger.calls().expect("calls");
+    let row = |id: &kgraf_core::CallId| after.iter().find(|c| &c.id == id).expect("row");
+    assert!(row(&cut).cancelled_without_usage());
+    assert!(!row(&cut_with_usage).cancelled_without_usage());
+    let mut expected = Money::ZERO;
+    for c in after
+        .iter()
+        .filter(|c| c.task_id.starts_with("r1/") || c.agent_id == "orchestrator:r1")
+    {
+        expected += match c.settlement {
+            _ if c.cancelled_without_usage() => worst,
+            Settlement::Unreconciled => worst,
+            Settlement::Counted | Settlement::Cancelled => {
+                prices.cost(&c.model, &c.usage).expect("priced")
+            }
+            _ => Money::ZERO,
+        };
+    }
+    assert!(worst > prices.cost(&model, &partial).expect("priced"));
+    assert_eq!(report.spent, expected, "{report:?}");
+}
+
 #[test]
 fn a_kill_mid_decomposition_does_not_repeat_the_calls_that_answered() {
     let dir = tempfile::tempdir().expect("dir");

@@ -21,7 +21,7 @@ use kgraf_provider::capability::{Capabilities, StreamEvent, Streaming};
 use kgraf_provider::message::ToolDefinition;
 use kgraf_provider::{
     CallToken, Content, Ledger, Message, Provider, ProviderError, Request, Response, Role,
-    Settlement, StopReason,
+    Settlement, StopReason, StreamGuard,
 };
 use kgraf_runtime::{
     CallMode, CancelPhase, ContextConfig, InjectError, Injection, NeutralPrefixEncoder, NoMasking,
@@ -173,17 +173,21 @@ impl Streaming for Scripted {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response, ProviderError> {
         let round = self.round(request);
+        // As every real streaming adapter does: the guard settles the row when
+        // this future ends any way but its own success.
+        let guard = StreamGuard::new(token);
+        guard.record_request_id(Some("req-scripted"));
         sink(StreamEvent::Started {
             model: request.model.clone(),
             request_id: Some("req-scripted".into()),
         });
         // The input side first, as Anthropic's message_start does.
-        sink(StreamEvent::Usage {
-            usage: TokenUsage {
-                text_output: 0,
-                ..round.usage.clone()
-            },
-        });
+        let input_side = TokenUsage {
+            text_output: 0,
+            ..round.usage.clone()
+        };
+        guard.record_usage(&input_side);
+        sink(StreamEvent::Usage { usage: input_side });
         let pieces = round.deltas.max(1);
         let chars: Vec<char> = round.text.chars().collect();
         let size = chars.len().div_ceil(pieces).max(1);
@@ -204,12 +208,14 @@ impl Streaming for Scripted {
         if round.hang_after.is_some() {
             std::future::pending::<()>().await;
         }
+        guard.record_usage(&round.usage);
         sink(StreamEvent::Usage {
             usage: round.usage.clone(),
         });
         sink(StreamEvent::Finished {
             stop_reason: round.stop.unwrap_or(StopReason::EndTurn),
         });
+        guard.disarm();
         token.settle(&round.usage, None)?;
         Ok(response(request, &round))
     }
@@ -703,7 +709,7 @@ async fn an_interrupt_mid_stream_settles_the_partial_call_and_the_next_request_i
 }
 
 #[tokio::test]
-async fn an_interrupt_during_a_complete_call_abandons_it_and_leaves_the_spend_unreconciled() {
+async fn an_interrupt_during_a_complete_call_abandons_it_and_settles_it_cancelled() {
     let dir = tempfile::tempdir().expect("dir");
     let provider = Scripted::new(|_, n| match n {
         0 => Round {
@@ -729,9 +735,13 @@ async fn an_interrupt_during_a_complete_call_abandons_it_and_leaves_the_spend_un
         .expect("queued");
     let (_, result) = finish(handle, events).await;
     assert_eq!(result.outcome, WorkerOutcome::Completed);
-    // No usage arrived, so the spend is unknown, not zero (every token is attributed).
-    let unreconciled = env.ledger.unreconciled().expect("query");
-    assert_eq!(unreconciled.len(), 1);
+    // kGraf stopped the call itself: it is cancelled, at zero since no usage
+    // arrived, not left unreconciled as an end kGraf did not choose.
+    let rows = env.ledger.calls().expect("rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].settlement, Settlement::Cancelled);
+    assert_eq!(rows[0].usage, TokenUsage::default());
+    assert!(env.ledger.unreconciled().expect("query").is_empty());
     // The first call was sent with the opening message alone, so the note is
     // a turn of its own after it: the opening instruction is not extended.
     let requests = provider.requests();
@@ -1601,12 +1611,12 @@ mod review {
     }
 
     /// Decision 0080 removed the worker spend ceiling: a call abandoned with
-    /// unknown usage no longer counts toward anything that stops the worker.
-    /// It still stays unknown in the ledger (every token is attributed: nothing here silently
-    /// invents a cost), and the worker runs until its step budget, not a
-    /// money ceiling, stops it.
+    /// no usage counts toward nothing that stops the worker, which runs until
+    /// its step budget, not a money ceiling, stops it. Each call it abandons,
+    /// by interrupt or by the final cancel, is settled cancelled in the
+    /// ledger (every token is attributed), not left unreconciled.
     #[tokio::test]
-    async fn calls_abandoned_with_unknown_usage_stay_unreconciled_in_the_ledger() {
+    async fn calls_abandoned_without_usage_settle_cancelled_in_the_ledger() {
         let dir = tempfile::tempdir().expect("dir");
         // Every call hangs and reports nothing: only an interrupt ends it.
         let provider = Scripted::new(|_, _| Round {
@@ -1637,12 +1647,23 @@ mod review {
         handle.cancel();
         let (_events, result) = finish(handle, events).await;
         assert_eq!(result.outcome, WorkerOutcome::Cancelled);
-        let unreconciled = env.ledger.unreconciled().expect("query");
-        assert_eq!(
-            unreconciled.len(),
-            n,
-            "each abandoned call stays unknown in the ledger"
+        let rows = env.ledger.calls().expect("rows");
+        // The cancel may land before the fourth call's row opens, or before
+        // its request leaves (then it billed nothing and is `Failed`).
+        assert!(rows.len() >= n, "the three interrupted calls: {rows:?}");
+        assert!(
+            rows[..n]
+                .iter()
+                .all(|r| r.settlement == Settlement::Cancelled && r.usage == TokenUsage::default()),
+            "each interrupted call is cancelled at zero: {rows:?}"
         );
+        assert!(
+            rows[n..]
+                .iter()
+                .all(|r| matches!(r.settlement, Settlement::Cancelled | Settlement::Failed)),
+            "{rows:?}"
+        );
+        assert!(env.ledger.unreconciled().expect("query").is_empty());
     }
 
     #[tokio::test]
@@ -1833,7 +1854,9 @@ mod review {
         assert_eq!(result.outcome, WorkerOutcome::Completed);
         let rows = env.ledger.calls().expect("rows");
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].settlement, Settlement::Cancelled);
+        // Failed: provably billed nothing. A zero-usage `Cancelled` would read
+        // as unknown spend.
+        assert_eq!(rows[1].settlement, Settlement::Failed);
         assert_eq!(rows[1].usage, TokenUsage::default(), "a known zero");
         assert!(
             env.ledger.unreconciled().expect("query").is_empty(),

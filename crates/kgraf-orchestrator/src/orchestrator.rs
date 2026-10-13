@@ -2969,7 +2969,8 @@ impl RunLoop {
     }
 
     /// Charge this run's calls already in the ledger: counted calls at their cost,
-    /// unreconciled and in-flight ones (a kill leaves these) at their worst case,
+    /// unreconciled and in-flight ones (a kill leaves these), and cancelled ones
+    /// with no usage reported, at their worst case,
     /// projected context plus a full output, until someone reconciles them.
     fn seed_spend(
         &mut self,
@@ -3042,9 +3043,16 @@ impl RunLoop {
 
     /// What one ledger row charges the run, exactly, by the rule a resume
     /// seeds with: a settled call at its price, a failed one at zero, an
-    /// unreconciled one at its worst case. `None` when its cost is unknown (an
-    /// unpriced model): never charged as $0.
+    /// unreconciled one, or one cancelled before any usage was reported, at
+    /// its worst case. `None` when its cost is unknown (an unpriced model):
+    /// never charged as $0.
     fn ledger_cost(&self, c: &kgraf_provider::CallRecord) -> Option<kgraf_core::cost::ExactMoney> {
+        if c.cancelled_without_usage() {
+            // The vendor may have billed what it processed before the cut.
+            return self
+                .worst_case(c.route.as_deref(), &c.model)
+                .map(kgraf_core::cost::ExactMoney::from_money);
+        }
         match c.settlement {
             Settlement::Counted | Settlement::Cancelled => self
                 .s
@@ -4235,7 +4243,8 @@ impl RunLoop {
     }
 
     /// Spend of ledger calls not already charged at open. An unreconciled call's
-    /// spend is unknown, not zero: it is charged `unknown_as` (the hold) instead.
+    /// spend is unknown, not zero, as is a cancelled call's with no usage
+    /// reported: either is charged `unknown_as` (the hold) instead.
     ///
     /// One ledger query for all of `calls`, not one per id.
     ///

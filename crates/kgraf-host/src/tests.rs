@@ -5627,6 +5627,19 @@ fn sessions_off_builds_no_session_line() {
     assert!(host.session_line().is_none());
 }
 
+/// Each host this crate's tests open with `Host::open` has its own
+/// `MachineGate`. Shared, the process-wide gate let tests running in
+/// parallel take each other's agent slots, and a contract was held for
+/// capacity at random.
+#[test]
+fn test_hosts_opened_plainly_never_share_a_machine_gate() {
+    let (_dir_a, config_a) = project();
+    let (_dir_b, config_b) = project();
+    let a = Host::open(config_a).expect("open project a");
+    let b = Host::open(config_b).expect("open project b");
+    assert!(!Arc::ptr_eq(a.machine_gate(), b.machine_gate()));
+}
+
 /// Decision 0067 two `Host`s, as two
 /// open projects in one shell process, sharing one `MachineGate` cannot
 /// together run more live agents than the gate's own limit, and the next
