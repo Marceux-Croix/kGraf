@@ -149,7 +149,35 @@ pub struct CompactionSummary {
     /// Quoted constraints dropped because the instruction does not hold them.
     #[serde(default)]
     pub constraints_dropped: u32,
+    /// Files the worker read in its pre-compaction history, from the tool
+    /// calls that succeeded and the paths their tools declare they read
+    /// ([`list_reads`]). Never taken from the model's reply. The most recent
+    /// [`MAX_LISTED_READS`] are listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_read: Vec<FileRead>,
+    /// Further files read that `files_read` does not list.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_read_unlisted: u32,
 }
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One file the worker read before a compaction, and where its last read's
+/// result sits in the recall archive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRead {
+    pub path: String,
+    /// The [`HistoryArchive`] entry that holds the last successful read's
+    /// result: `recall_history {"from": entry}` returns it.
+    pub entry: u64,
+}
+
+/// The most already-read files one summary lists. A worker that read more
+/// gets the most recent ones and a count of the rest; a list this long costs
+/// a few hundred tokens, far less than one re-read file.
+pub const MAX_LISTED_READS: usize = 40;
 
 /// The structured notice the runtime emits when it compacts a worker. Built by
 /// the loop alone; no model output becomes one.
@@ -356,7 +384,16 @@ pub fn parse_summary(reply: &str, instruction: &str) -> Result<CompactionSummary
         .rfind('}')
         .filter(|end| *end > start)
         .ok_or_else(|| "the reply holds no complete JSON object".to_owned())?;
-    let mut summary: CompactionSummary = serde_json::from_str(&reply[start..=end])
+    let mut value: serde_json::Value = serde_json::from_str(&reply[start..=end])
+        .map_err(|e| format!("the reply is not in the summary schema: {e}"))?;
+    // Fields the runtime fills from its own record are not the model's to
+    // set; one the model sent in another shape must not fail the parse.
+    if let Some(object) = value.as_object_mut() {
+        for key in ["files_read", "files_read_unlisted", "constraints_dropped"] {
+            object.remove(key);
+        }
+    }
+    let mut summary: CompactionSummary = serde_json::from_value(value)
         .map_err(|e| format!("the reply is not in the summary schema: {e}"))?;
     if summary.goal.trim().is_empty()
         && summary.decisions.is_empty()
@@ -431,6 +468,62 @@ pub fn complete_from_state(
     }
 }
 
+/// Fill `files_read` from the pre-compaction history `events` (the events the
+/// recall archive is built from, in order): each path that `reads_of` says a
+/// tool call read, for calls whose result was not an error, with the archive
+/// entry of its last such result. Listed in the order of that entry; when more
+/// than [`MAX_LISTED_READS`] were read, the most recent are listed and the rest
+/// counted. Applied to every summary, the model's and the runtime's, so a
+/// compacted worker knows what it already read and where to recall it,
+/// instead of reading every file again and refilling the context.
+pub fn list_reads<'a>(
+    summary: &mut CompactionSummary,
+    events: impl IntoIterator<Item = &'a WorkerEvent>,
+    reads_of: impl Fn(&str, &serde_json::Value) -> Vec<String>,
+) {
+    let mut started: std::collections::HashMap<&str, (&str, &serde_json::Value)> =
+        std::collections::HashMap::new();
+    // Path to the archive entry of its last successful read.
+    let mut last: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut entry: u64 = 0;
+    for event in events {
+        let is_entry = archive_entry(event).is_some();
+        match event {
+            WorkerEvent::ToolCallStarted {
+                call_id,
+                tool,
+                input,
+                ..
+            } => {
+                started.insert(call_id, (tool, input));
+            }
+            WorkerEvent::ToolCallFinished {
+                call_id,
+                is_error: false,
+                ..
+            } => {
+                if let Some((tool, input)) = started.get(call_id.as_str()) {
+                    for path in reads_of(tool, input) {
+                        last.insert(path, entry);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if is_entry {
+            entry += 1;
+        }
+    }
+    let mut reads: Vec<FileRead> = last
+        .into_iter()
+        .map(|(path, entry)| FileRead { path, entry })
+        .collect();
+    reads.sort_by_key(|read| read.entry);
+    let unlisted = reads.len().saturating_sub(MAX_LISTED_READS);
+    summary.files_read = reads.split_off(unlisted);
+    summary.files_read_unlisted = u32::try_from(unlisted).unwrap_or(u32::MAX);
+}
+
 /// The first non-blank line of the original instruction, cut at
 /// [`RUNTIME_GOAL_CHARS`].
 fn runtime_goal(instruction: &str) -> String {
@@ -465,8 +558,9 @@ pub fn render_notice(notice: &CompactionNotice, summary: &CompactionSummary) -> 
     };
     out.push_str(&format!(
         "The kGraf runtime compacted your context because {why}: {} tokens in use, stop point \
-         {} of a {}-token window. The instruction above is unchanged and complete. Below is a \
-         summary of your earlier work; it can miss details. ",
+         {} of a {}-token window. The instruction above is unchanged and complete; the contents \
+         of the files you read are not in your context any more (see \"Files already read\" \
+         below). Below is a summary of your earlier work; it can miss details. ",
         notice.at_tokens, notice.stop_tokens, notice.window_tokens,
     ));
     if notice.recall {
@@ -521,6 +615,24 @@ pub fn render_notice(notice: &CompactionNotice, summary: &CompactionSummary) -> 
     };
     section("Decisions", &summary.decisions);
     section("Files touched", &summary.files_touched);
+    let mut reads: Vec<String> = summary
+        .files_read
+        .iter()
+        .map(|read| {
+            if notice.recall {
+                format!("{} (recall entry {})", read.path, read.entry)
+            } else {
+                read.path.clone()
+            }
+        })
+        .collect();
+    if summary.files_read_unlisted > 0 {
+        reads.push(format!(
+            "and {} more file(s) read earlier, not listed",
+            summary.files_read_unlisted
+        ));
+    }
+    section(&files_read_title(notice.recall), &reads);
     section("Open items", &summary.open_items);
     section(
         "Constraints quoted from the instruction",
@@ -534,6 +646,22 @@ pub fn render_notice(notice: &CompactionNotice, summary: &CompactionSummary) -> 
         ));
     }
     out
+}
+
+/// The heading of the already-read list: with recall, how to get a file's
+/// content back without reading it again; without, that it is gone.
+fn files_read_title(recall: bool) -> String {
+    if recall {
+        format!(
+            "Files already read (their content is in your earlier history: call {RECALL_TOOL} \
+             with {{\"from\": N}}, N the recall entry shown, instead of reading the file again; \
+             read a file again only if it changed since)"
+        )
+    } else {
+        "Files already read (their content is no longer in your context; read one again only \
+         when you need it)"
+            .to_owned()
+    }
 }
 
 /// Whether `event` is a kind the recall archive keeps.
@@ -576,6 +704,35 @@ pub fn original_instruction(mut text: &str) -> &str {
     text
 }
 
+/// The recall entry `event` becomes, if any. One function for the archive and
+/// for [`list_reads`], so the entry numbers a summary names are the ones
+/// `recall_history` reads.
+fn archive_entry(event: &WorkerEvent) -> Option<String> {
+    Some(match event {
+        WorkerEvent::AssistantMessage { text, .. } if !text.trim().is_empty() => {
+            format!("assistant: {text}")
+        }
+        WorkerEvent::ToolCallStarted {
+            call_id,
+            tool,
+            input,
+            ..
+        } => format!("call {call_id} {tool}: {input}"),
+        WorkerEvent::ToolCallFinished {
+            call_id,
+            output,
+            is_error,
+            ..
+        } => {
+            let kind = if *is_error { "error result" } else { "result" };
+            format!("{kind} {call_id}: {output}")
+        }
+        WorkerEvent::Notice { text, .. } => format!("notice: {text}"),
+        WorkerEvent::Injected { kind, text, .. } => format!("message ({kind:?}): {text}"),
+        _ => return None,
+    })
+}
+
 /// The pre-compaction history of one worker, as recall entries: one per
 /// assistant message, tool call, tool result, notice and delivered message, in
 /// transcript order. Built from the persisted (persist-scrubbed) events.
@@ -587,34 +744,9 @@ pub struct HistoryArchive {
 impl HistoryArchive {
     /// The archive of `events`, in order.
     pub fn from_events<'a>(events: impl IntoIterator<Item = &'a WorkerEvent>) -> Self {
-        let mut entries = Vec::new();
-        for event in events {
-            let entry = match event {
-                WorkerEvent::AssistantMessage { text, .. } if !text.trim().is_empty() => {
-                    format!("assistant: {text}")
-                }
-                WorkerEvent::ToolCallStarted {
-                    call_id,
-                    tool,
-                    input,
-                    ..
-                } => format!("call {call_id} {tool}: {input}"),
-                WorkerEvent::ToolCallFinished {
-                    call_id,
-                    output,
-                    is_error,
-                    ..
-                } => {
-                    let kind = if *is_error { "error result" } else { "result" };
-                    format!("{kind} {call_id}: {output}")
-                }
-                WorkerEvent::Notice { text, .. } => format!("notice: {text}"),
-                WorkerEvent::Injected { kind, text, .. } => format!("message ({kind:?}): {text}"),
-                _ => continue,
-            };
-            entries.push(entry);
+        Self {
+            entries: events.into_iter().filter_map(archive_entry).collect(),
         }
-        Self { entries }
     }
 
     /// Entries in the archive.

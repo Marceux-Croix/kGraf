@@ -237,6 +237,11 @@ pub struct OpenContract {
     /// Scrubbed for storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside_error_note: Option<String>,
+    /// The paths the last attempt that failed for writing outside its scope
+    /// changed there, sorted and joined: an attempt that fails again on the
+    /// same paths holds the contract at once, since a retry repeats it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_violation: Option<String>,
     /// Commands an attempt must pass besides the run's own check: a gate
     /// remediation carries the commands of the gate it remediates, so a fix
     /// that the run's check already passed without is not accepted until the
@@ -394,6 +399,7 @@ impl OpenContract {
             last_refusal: None,
             last_stop: None,
             outside_error_note: None,
+            scope_violation: None,
             gate_commands: Vec::new(),
             granted_programs: Vec::new(),
             grants: Vec::new(),

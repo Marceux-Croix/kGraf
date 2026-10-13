@@ -287,6 +287,11 @@ pub enum NoticeKind {
     /// What the orchestrator answered to the report kGraf filed. Counted
     /// apart from [`NoticeKind::KgrafShortfall`] so one filing is one count.
     KgrafShortfallAnswer,
+    /// The context estimate reached the stop point before any usage report
+    /// measured it, and the round ran anyway (the estimate overcounts by
+    /// design); the text carries both numbers. Loop-only: never model input
+    /// (the transcript builder skips it).
+    EstimateOverStopPoint,
 }
 
 impl WorkerEvent {
@@ -442,6 +447,15 @@ impl WorkerEvent {
                 let files_touched = list(summary.files_touched, counts);
                 let open_items = list(summary.open_items, counts);
                 let constraints = list(summary.constraints, counts);
+                // Paths from tool inputs, which a model wrote.
+                let files_read = summary
+                    .files_read
+                    .into_iter()
+                    .map(|read| crate::compaction::FileRead {
+                        path: scrub(read.path, counts),
+                        entry: read.entry,
+                    })
+                    .collect();
                 WorkerEvent::Compacted {
                     notice,
                     summary: Box::new(crate::compaction::CompactionSummary {
@@ -451,6 +465,8 @@ impl WorkerEvent {
                         open_items,
                         constraints,
                         constraints_dropped: summary.constraints_dropped,
+                        files_read,
+                        files_read_unlisted: summary.files_read_unlisted,
                     }),
                     baseline,
                 }

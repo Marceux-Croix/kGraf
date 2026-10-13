@@ -137,6 +137,7 @@
 //! contract with the program named.
 
 mod assembler;
+mod attempt_processes;
 pub mod config;
 pub mod deps;
 mod earlier_delivery;

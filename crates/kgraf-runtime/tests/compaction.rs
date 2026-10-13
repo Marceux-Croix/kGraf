@@ -982,14 +982,10 @@ async fn failed_writes_before_a_write_that_works_do_not_stop_a_recompaction() {
     );
 }
 
-/// The opening message and the summary alone reach the stop point after the
-/// compaction: no compaction can make room, so the worker hands back at once,
-/// before another round, and says so with the numbers.
-#[tokio::test]
-async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once() {
-    let dir = tempfile::tempdir().expect("dir");
-    // About 60,000 tokens of instruction (3 bytes a token) under a stop point
-    // of 80,000, and a summary of about 25,000 more.
+/// About 60,000 tokens of instruction (3 bytes a token) under a stop point of
+/// 80,000, and a summary of about 25,000 more: the estimate right after the
+/// compaction is over the stop point and under the 100,000-token window.
+fn big_instruction_and_summary() -> (String, &'static str) {
     let filler = "keep the files short. ".repeat(8_200);
     let big_summary: &'static str = format!(
         "{{\"goal\": \"write the server files\", \"decisions\": [\"{}\"], \"files_touched\": [], \
@@ -997,12 +993,30 @@ async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once() 
         "one file per round, ".repeat(3_700)
     )
     .leak();
+    (format!("{INSTRUCTION}\n{filler}"), big_summary)
+}
+
+/// The opening message and the summary alone reach the stop point after the
+/// compaction, measured by the provider on the first round after it: no
+/// compaction can make room, so at the next stop point the worker hands back
+/// and says so with the measured numbers. One round runs after the
+/// compaction, because the estimate alone (which overcounts) decides nothing.
+#[tokio::test]
+async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_after_one_measured_round() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (instruction, big_summary) = big_instruction_and_summary();
     let provider = Fake::new(move |request| {
         if is_summary(request) {
             return answer(big_summary);
         }
         if compacted(request) {
-            return answer("a round after a compaction that left no room");
+            // The provider measures the floor at 85,000, over the stop point.
+            return tool(
+                "t2",
+                "write_file",
+                json!({"path": "f2.txt", "content": "y"}),
+                85_000,
+            );
         }
         tool(
             "t1",
@@ -1013,12 +1027,22 @@ async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once() 
     });
     let env = env_with(provider.clone(), true);
     let mut b = brief(dir.path());
-    b.instruction = format!("{INSTRUCTION}\n{filler}");
+    b.instruction = instruction;
     let handle = spawn_worker(env, b, compact_options())
         .await
         .expect("spawn");
     let (events, result) = drain(handle).await;
     assert_eq!(compactions(&events).len(), 1);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkerEvent::Notice {
+                kind: kgraf_runtime::NoticeKind::EstimateOverStopPoint,
+                ..
+            }
+        )),
+        "the round on the estimate alone is recorded"
+    );
     let WorkerOutcome::HandedBack { handoff } = &result.outcome else {
         panic!("expected a hand-back, got {:?}", result.outcome);
     };
@@ -1031,16 +1055,67 @@ async fn a_compaction_that_cannot_get_under_the_stop_point_hands_back_at_once() 
         panic!("expected no room, got {:?}", handoff.compaction_stop);
     };
     assert_eq!((*compactions, *stop_tokens), (1, 80_000));
-    assert!(*floor_tokens >= 80_000, "{floor_tokens}");
-    assert!(
-        !provider
+    assert_eq!(
+        *floor_tokens, 85_000,
+        "the measured floor, not the estimate"
+    );
+    assert_eq!(
+        provider
             .requests()
             .iter()
-            .any(|r| compacted(r) && !is_summary(r)),
-        "no round ran after the compaction"
+            .filter(|r| compacted(r) && !is_summary(r))
+            .count(),
+        1,
+        "one round ran after the compaction to measure it"
     );
     let said = handoff.compaction_stop.as_ref().expect("stop").describe();
     assert!(said.contains("compaction cannot make room"), "{said}");
+}
+
+/// The same estimate over the stop point after the compaction, but the
+/// provider measures the floor well under it: the worker goes on and finishes
+/// instead of handing back on an overcount.
+#[tokio::test]
+async fn an_estimate_over_the_stop_point_after_a_compaction_runs_and_the_measure_decides() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (instruction, big_summary) = big_instruction_and_summary();
+    let provider = Fake::new(move |request| {
+        if is_summary(request) {
+            return answer(big_summary);
+        }
+        if compacted(request) {
+            if rounds(request) == 0 {
+                return tool(
+                    "t2",
+                    "write_file",
+                    json!({"path": "f2.txt", "content": "y"}),
+                    40_000,
+                );
+            }
+            return answer("done");
+        }
+        tool(
+            "t1",
+            "write_file",
+            json!({"path": "f1.txt", "content": "x"}),
+            85_000,
+        )
+    });
+    let env = env_with(provider.clone(), true);
+    let mut b = brief(dir.path());
+    b.instruction = instruction;
+    let handle = spawn_worker(env, b, compact_options())
+        .await
+        .expect("spawn");
+    let (events, result) = drain(handle).await;
+    assert_eq!(compactions(&events).len(), 1);
+    assert_eq!(
+        result.outcome,
+        WorkerOutcome::Completed,
+        "{:?}",
+        result.outcome
+    );
+    assert!(dir.path().join("f2.txt").exists());
 }
 
 /// A resume right after a compaction measures the progress since it from the
@@ -1861,6 +1936,162 @@ async fn a_resume_after_a_compaction_counts_repeats_from_the_compaction() {
     .expect("resume");
     let (_, result) = drain(handle).await;
     assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+}
+
+/// Reads two files, fails to read a third, then writes past the stop point,
+/// so the worker compacts; after the compaction it answers. `summary_fails`
+/// makes the summary call fail, so the runtime builds the summary.
+async fn reads_then_compacts(
+    summary_fails: bool,
+) -> (tempfile::TempDir, Vec<WorkerEvent>, WorkerResult, Arc<Fake>) {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir(dir.path().join("src")).expect("src");
+    std::fs::write(dir.path().join("src/a.rs"), "fn alpha_marker() {}\n").expect("a");
+    std::fs::write(dir.path().join("src/b.rs"), "fn beta_marker() {}\n").expect("b");
+    let provider = Fake::new(move |request| {
+        if is_summary(request) {
+            let mut round = answer(SUMMARY);
+            round.fail = summary_fails;
+            return round;
+        }
+        if compacted(request) {
+            return answer("done");
+        }
+        match rounds(request) {
+            0 => tool("r1", "read_file", json!({"path": "src/a.rs"}), 20_000),
+            1 => tool("r2", "read_file", json!({"path": "src/b.rs"}), 40_000),
+            2 => tool("r3", "read_file", json!({"path": "missing.rs"}), 50_000),
+            3 => tool("r4", "read_file", json!({"path": "src"}), 55_000),
+            _ => tool(
+                "w1",
+                "write_file",
+                json!({"path": "f1.txt", "content": "x"}),
+                85_000,
+            ),
+        }
+    });
+    let mut registry = ToolRegistry::new();
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(WriteFile),
+        Arc::new(kgraf_tools::ReadFileTool::default()),
+        Arc::new(RecallHistoryTool),
+    ];
+    for tool in tools {
+        registry
+            .register_builtin(tool, Exposure::Prefix)
+            .expect("register");
+    }
+    let prefix = PrefixSnapshot::new(
+        SharedPrefix {
+            vendor: "fake-vendor".into(),
+            model: MODEL.into(),
+            system: vec![Content::text("You are a kGraf worker.")],
+            tools: registry.prefix_definitions(),
+            skill_catalog: vec![],
+            slice_pool: vec![],
+            mcp_instructions: vec![],
+        },
+        &NeutralPrefixEncoder,
+    )
+    .expect("snapshot");
+    let ledger = Arc::new(Ledger::open_in_memory().expect("ledger"));
+    let mut env = WorkerEnv::new(ledger, provider.clone(), Arc::new(registry), prefix);
+    env.prefixes = Arc::new(PrefixRegistry::new());
+    env.settings.call_mode = CallMode::Complete;
+    let handle = spawn_worker(Arc::new(env), brief(dir.path()), compact_options())
+        .await
+        .expect("spawn");
+    let (events, result) = drain(handle).await;
+    (dir, events, result, provider)
+}
+
+/// Every summary, the runtime's fallback and the model's, lists the files the
+/// worker already read (successful reads only, no directory) with the recall
+/// entry that holds each result, and the remainder the worker continues from
+/// carries that list and tells it to recall instead of reading again.
+#[tokio::test]
+async fn every_summary_lists_the_files_already_read_and_where_to_recall_them() {
+    for summary_fails in [true, false] {
+        let (_dir, events, result, provider) = reads_then_compacts(summary_fails).await;
+        assert_eq!(result.outcome, WorkerOutcome::Completed, "{result:?}");
+        let at = compactions(&events)[0];
+        let WorkerEvent::Compacted {
+            notice, summary, ..
+        } = &events[at]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            matches!(notice.summary_source, SummarySource::Runtime { .. }),
+            summary_fails,
+            "{notice:?}"
+        );
+        let paths: Vec<&str> = summary.files_read.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs"], "{summary:?}");
+        assert_eq!(summary.files_read_unlisted, 0);
+        // The entry named is the one recall reads back: the read's result.
+        let archive = kgraf_runtime::HistoryArchive::from_events(&events[..at]);
+        for (read, marker) in summary
+            .files_read
+            .iter()
+            .zip(["alpha_marker", "beta_marker"])
+        {
+            let back = archive
+                .recall(&json!({"from": read.entry, "count": 1}))
+                .expect("recall");
+            assert!(back.contains(marker), "{back}");
+        }
+        // The worker's transcript after the compaction carries the list.
+        let after = provider
+            .requests()
+            .into_iter()
+            .find(|r| compacted(r) && !is_summary(r))
+            .expect("a round after the compaction");
+        let text = text_of(&after);
+        assert!(text.contains("Files already read"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "src/a.rs (recall entry {})",
+                summary.files_read[0].entry
+            )),
+            "{text}"
+        );
+        assert!(text.contains("instead of reading the file again"), "{text}");
+        assert!(!text.contains("missing.rs ("), "{text}");
+    }
+}
+
+/// More reads than the list holds: the most recent are listed, the rest are
+/// counted, and the notice says how many more.
+#[test]
+fn the_read_list_is_capped_and_counts_the_rest() {
+    let mut events = Vec::new();
+    let total = kgraf_runtime::MAX_LISTED_READS + 3;
+    for i in 0..total {
+        events.push(WorkerEvent::ToolCallStarted {
+            call_id: format!("c{i}"),
+            tool: "read_file".into(),
+            input: json!({"path": format!("f{i}.rs")}),
+            signature: None,
+        });
+        events.push(WorkerEvent::ToolCallFinished {
+            call_id: format!("c{i}"),
+            output: "x".into(),
+            is_error: false,
+            duration_ms: None,
+        });
+    }
+    let mut summary = kgraf_runtime::CompactionSummary::default();
+    kgraf_runtime::list_reads(&mut summary, &events, |_, input| {
+        vec![input["path"].as_str().unwrap_or_default().to_owned()]
+    });
+    assert_eq!(summary.files_read.len(), kgraf_runtime::MAX_LISTED_READS);
+    assert_eq!(summary.files_read_unlisted, 3);
+    assert_eq!(summary.files_read[0].path, "f3.rs");
+    assert_eq!(
+        summary.files_read[0].entry, 7,
+        "the result of the fourth call"
+    );
 }
 
 /// A summary reply out of schema still carries the goal and the unwritten

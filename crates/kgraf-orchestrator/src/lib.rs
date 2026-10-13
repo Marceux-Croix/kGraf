@@ -188,11 +188,11 @@ pub use orchestrator::sessions::{
     QuestionAnswerer, SessionNoticeSink,
 };
 pub use orchestrator::{
-    AttemptEnv, AttemptEnvs, CloseEnv, CompactError, DEFAULT_MAX_CONTRACTS_PER_PLAN,
-    DEFAULT_MAX_SPLITS, DirWorkspaces, Orchestrator, OrchestratorConfig, OrchestratorError,
-    OrchestratorHandle, OrderError, PrepareFailure, Route, RunReport, Services, SessionError,
-    StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces, plan_review_refusal,
-    run_lease_holder_is_live,
+    AttemptEnv, AttemptEnvs, AttemptProcesses, CloseEnv, CompactError,
+    DEFAULT_MAX_CONTRACTS_PER_PLAN, DEFAULT_MAX_SPLITS, DirWorkspaces, Orchestrator,
+    OrchestratorConfig, OrchestratorError, OrchestratorHandle, OrderError, PrepareFailure, Route,
+    RunReport, Services, SessionError, StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces,
+    plan_review_refusal, run_lease_holder_is_live,
 };
 pub use partition::{
     CONFIDENT, CauseScore, GraphPredictor, MissCause, PairScore, PartitionReport,

@@ -411,15 +411,18 @@ pub enum WorkerError {
     /// An item of `SpawnOptions::injections` could not be queued.
     #[error("cannot queue a spawn injection: {0}")]
     Injection(InjectError),
-    /// The prefix and the opening messages alone reach the context stop point.
-    /// The worker would hand back before its first round with nothing done, and
-    /// the same brief split again would do so forever.
+    /// The prefix and the opening messages alone are estimated at or over the
+    /// route's effective window, past its stop point: a request that size
+    /// could not be sent, and the same brief split again would fail the same
+    /// way. An estimate between the stop point and the window does not refuse:
+    /// the estimate overcounts by design, so the first round runs and the
+    /// provider's reported usage decides (see the context section above).
     #[error(
         "the worker's pinned context of {floor} tokens (prefix, slices, instruction) reaches its \
-         stop point of {stop}; it cannot run a round. Raise the context ceiling or shrink the \
-         slices and the instruction"
+         {window}-token context window, past its stop point of {stop}; it cannot run a round. \
+         Raise the context ceiling or shrink the slices and the instruction"
     )]
-    PinnedContextTooLarge { floor: u64, stop: u64 },
+    PinnedContextTooLarge { floor: u64, window: u64, stop: u64 },
 }
 
 /// Options for one spawn.
@@ -601,11 +604,17 @@ async fn prepare(
         .into_iter()
         .filter(crate::compaction::archived_kind)
         .collect();
-    // A fresh worker that starts at the stop point can only hand back at once with the
-    // same remainder: refuse it, rather than let the caller split it forever.
-    if fresh && brief.context.reached_point(builder.context_tokens()) {
+    // A fresh worker whose opening is estimated at or over the whole window
+    // could not send a request: refuse it, rather than let the caller split it
+    // forever. Only the window refuses here. `estimate_tokens` overcounts on
+    // purpose (about 1.45x the provider's count on measured runs), so an
+    // estimate over the stop point but under the window is not evidence that
+    // the worker cannot run; its first round runs and the provider's reported
+    // prompt usage decides (`Worker::drive`).
+    if fresh && builder.context_tokens() >= brief.context.effective_window() {
         return Err(WorkerError::PinnedContextTooLarge {
             floor: builder.context_tokens(),
+            window: brief.context.effective_window(),
             stop: brief.context.worker_stop_tokens(),
         });
     }
@@ -830,6 +839,7 @@ async fn prepare(
         seq: EventSequence::new(),
         builder,
         peak_context: 0,
+        unmeasured_round_run: false,
         stall,
         notified_round: None,
         output_limit_retried: false,
@@ -1197,6 +1207,18 @@ pub fn lost_output_notice(counted: u64, missing: u64) -> String {
     )
 }
 
+/// The record of a round that ran although the context estimate reached the
+/// stop point. Loop-only: the transcript builder keeps it out of the model's
+/// context, so it is for the transcript file, the live view and the trace.
+pub fn estimate_over_stop_text(estimated: u64, stop: u64, window: u64) -> String {
+    format!(
+        "The context was estimated at {estimated} tokens, at or over the stop point of {stop} \
+         (window {window}), before any usage report measured it. The estimate overcounts by \
+         design, so the round runs anyway; the provider's reported prompt usage decides whether \
+         the worker stops."
+    )
+}
+
 /// How many notices one attempt gets for ending as done with no tool call
 /// and no change although its contract writes files; the next such end fails
 /// the attempt. Each notice is a counted round.
@@ -1254,6 +1276,12 @@ struct Worker {
     /// The largest context measure any stop check of this segment read: the
     /// value `reached_point` was given, so the trace reports what decided.
     peak_context: u64,
+    /// Whether a round has run on an estimate alone since the context was last
+    /// rebuilt (the start, or a compaction). One such round runs even when the
+    /// estimate reaches the stop point, so the provider can measure the
+    /// context; after it, the estimate rules again, so a route that reports no
+    /// usage still stops.
+    unmeasured_round_run: bool,
     budget: StepBudget,
     stall: StallDetector,
     /// The round number a step notice was last emitted for. A round refunded
@@ -1808,7 +1836,30 @@ impl Worker {
                     .await?;
                 continue;
             }
-            if self.brief.context.reached_point(context_tokens) {
+            // The context has no usage report yet (the first round, or the
+            // first after a compaction): the figure is the estimate alone,
+            // which overcounts by design. Run one round to measure it unless
+            // the estimate reaches the whole window; say so, with both numbers.
+            if !self.builder.is_measured()
+                && !self.unmeasured_round_run
+                && self.brief.context.reached_point(context_tokens)
+                && context_tokens < self.brief.context.effective_window()
+            {
+                self.unmeasured_round_run = true;
+                let text = estimate_over_stop_text(
+                    context_tokens,
+                    self.brief.context.worker_stop_tokens(),
+                    self.brief.context.effective_window(),
+                );
+                self.emit(
+                    ep,
+                    WorkerEvent::Notice {
+                        kind: crate::event::NoticeKind::EstimateOverStopPoint,
+                        text,
+                    },
+                )
+                .await?;
+            } else if self.brief.context.reached_point(context_tokens) {
                 // Compaction only where the caller cannot split the
                 // remainder. A later overflow compacts again only on measured
                 // progress (below); otherwise it hands back with everything
@@ -1914,6 +1965,11 @@ impl Worker {
                     partial,
                     sent,
                 }) => {
+                    // An abandoned round that left no usage report measured
+                    // nothing: the next round may still run on the estimate.
+                    if !self.builder.is_measured() {
+                        self.unmeasured_round_run = false;
+                    }
                     if !sent {
                         // The round `next_round` counted above never reached the
                         // provider, so it bought no model turn. Refund it before
@@ -2897,6 +2953,9 @@ impl Worker {
     /// the malformed-output bound (it counts server faults, not context).
     fn reset_context_state(&mut self) {
         self.stall.reset();
+        // The rebuilt remainder has no usage report: its first round may run
+        // on the estimate, as the worker's first round may.
+        self.unmeasured_round_run = false;
         self.empty_turn_retried = false;
         self.output_limit_retried = false;
     }
@@ -2972,6 +3031,29 @@ impl Worker {
             &self.done,
             &changes,
         );
+        // What the worker already read, from its own successful calls and the
+        // paths their tools declare they read, never from the model's reply.
+        // A directory (a listing or a search root) is not a file read.
+        let root = self.brief.workspace_root.clone();
+        let tools = &self.env.tools;
+        crate::compaction::list_reads(&mut summary, &self.history, |tool, input| {
+            tools
+                .get(tool)
+                .and_then(|registered| registered.tool().access(input).ok())
+                .map(|access| {
+                    access
+                        .reads_paths()
+                        .iter()
+                        .filter(|path| {
+                            !path.as_os_str().is_empty()
+                                && path.as_os_str() != "."
+                                && !root.join(path).is_dir()
+                        })
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
         let archive = HistoryArchive::from_events(&self.history);
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -164,13 +164,25 @@ pub fn status_of(result: &WorkerResult) -> AttemptStatus {
 /// budget ends between rounds or refuses the final round's calls), so the
 /// tree is final. `Failed` is left out: it can end inside a round whose calls
 /// ran only in part, and it is mostly a provider or environment fault whose
-/// retry is already handled apart. `HandedBack` continues in a fresh worker,
-/// and `Cancelled` was asked for. A tree with no change has nothing to judge.
+/// retry is already handled apart. `HandedBack` usually continues in a fresh
+/// worker; when it will not, [`verifies_handed_back`] covers it. `Cancelled`
+/// was asked for. A tree with no change has nothing to judge.
 pub fn verifies_unfinished(result: &WorkerResult) -> bool {
     matches!(
         result.outcome,
         WorkerOutcome::Stalled { .. } | WorkerOutcome::BudgetExhausted
     ) && !result.changed_paths.is_empty()
+}
+
+/// Whether a worker that handed its work back left a tree the verifier
+/// should judge, given that no continuation will run for it (the caller
+/// checks that: its re-split would be refused, or another attempt is the one
+/// continued). A hand-back ends at a round boundary, so the tree is final,
+/// and a worker can hand back a remainder after it already delivered the
+/// whole contract; without this, that tree was held unjudged. A tree with no
+/// change has nothing to judge.
+pub fn verifies_handed_back(result: &WorkerResult) -> bool {
+    matches!(result.outcome, WorkerOutcome::HandedBack { .. }) && !result.changed_paths.is_empty()
 }
 
 /// One attempt at a contract.

@@ -3,6 +3,7 @@
 //! addition is [`ResolverOverride`], which a host with its own ask surface (the
 //! desktop shell's box) puts around the assembler.
 
+use crate::attempt_processes::{MarkedExecutor, SandboxProcesses};
 use crate::error::{Error, Result, ResultExt};
 use crate::host::Notice;
 use crate::worker::ask::Attendance;
@@ -11,7 +12,8 @@ use crate::worker::config::WorkerConfig;
 use crate::workspaces::{GitWorkspaces, now_nanos};
 use kgraf_graph::GraphStore;
 use kgraf_orchestrator::{
-    AttemptEnv, AttemptEnvs, CloseEnv, FnProbe, MachineGate, ReadinessFailure, Route, SessionLine,
+    AttemptEnv, AttemptEnvs, AttemptProcesses, CloseEnv, FnProbe, MachineGate, ReadinessFailure,
+    Route, SessionLine,
 };
 use kgraf_provider::{Ledger, Provider};
 use kgraf_runtime::{AskResolver, CallMode, ContextConfig};
@@ -220,14 +222,27 @@ impl AttemptAssembler {
         worker: &kgraf_core::AgentId,
         task: &kgraf_core::TaskId,
         granted: &[String],
-    ) -> std::result::Result<(Assembled, Option<String>), String> {
+    ) -> std::result::Result<(Assembled, Option<String>, Arc<dyn AttemptProcesses>), String> {
         let ws = self
             .workspaces
             .get(workspace)
             .ok_or_else(|| format!("{} is not a live worktree of this run", workspace.display()))?;
+        let hold = ws.hold_file().to_path_buf();
         let mut assembly = self
             .assembly(&route.name, ws, worker.as_str(), task.as_str())
             .map_err(|e| format!("{e:#}"))?;
+        // What this attempt's commands leave running is ended when the
+        // orchestrator is done with it (`attempt_processes`): found by the
+        // sandbox's session log, or, for commands routed to a task container,
+        // by the mark every such command now carries.
+        let processes: Arc<dyn AttemptProcesses> = match assembly.external_executor.take() {
+            Some(executor) => {
+                let marked = Arc::new(MarkedExecutor::new(executor, worker.as_str()));
+                assembly.external_executor = Some(marked.clone());
+                marked
+            }
+            None => Arc::new(SandboxProcesses { hold }),
+        };
         assembly.config = assembly
             .config
             .with_granted_programs(granted.iter().cloned());
@@ -248,7 +263,7 @@ impl AttemptAssembler {
             .prefixes
             .replace(&assembled.env.prefix)
             .map(|change| prefix_replaced_notice(&change, graph_open));
-        Ok((assembled, notice))
+        Ok((assembled, notice, processes))
     }
 }
 
@@ -289,13 +304,21 @@ pub(crate) fn settings_check(root: PathBuf) -> kgraf_tools::protected::SettingsC
     })
 }
 
-/// Closes an attempt's MCP connections after its worker ends.
-struct AssembledCloser(Assembled);
+/// Closes an attempt's MCP connections after its worker ends, and hands the
+/// orchestrator what ends the processes its commands left running.
+struct AssembledCloser {
+    assembled: Assembled,
+    processes: Arc<dyn AttemptProcesses>,
+}
 
 #[async_trait::async_trait]
 impl CloseEnv for AssembledCloser {
     async fn close(self: Box<Self>) {
-        self.0.close().await
+        self.assembled.close().await
+    }
+
+    fn processes(&self) -> Option<Arc<dyn AttemptProcesses>> {
+        Some(self.processes.clone())
     }
 }
 
@@ -320,12 +343,15 @@ impl AttemptEnvs for AttemptAssembler {
         task: &kgraf_core::TaskId,
         granted: &[String],
     ) -> std::result::Result<AttemptEnv, String> {
-        let (assembled, notice) = self
+        let (assembled, notice, processes) = self
             .assembled(route, workspace, worker, task, granted)
             .await?;
         Ok(AttemptEnv {
             env: assembled.env.clone(),
-            closer: Some(Box::new(AssembledCloser(assembled))),
+            closer: Some(Box::new(AssembledCloser {
+                assembled,
+                processes,
+            })),
             notice,
         })
     }
@@ -362,7 +388,7 @@ impl AttemptEnvs for ResolverOverride {
         task: &kgraf_core::TaskId,
         granted: &[String],
     ) -> std::result::Result<AttemptEnv, String> {
-        let (mut assembled, notice) = self
+        let (mut assembled, notice, processes) = self
             .inner
             .assembled(route, workspace, worker, task, granted)
             .await?;
@@ -376,7 +402,10 @@ impl AttemptEnvs for ResolverOverride {
         env.asks = Some(self.asks.clone());
         Ok(AttemptEnv {
             env: assembled.env.clone(),
-            closer: Some(Box::new(AssembledCloser(assembled))),
+            closer: Some(Box::new(AssembledCloser {
+                assembled,
+                processes,
+            })),
             notice,
         })
     }

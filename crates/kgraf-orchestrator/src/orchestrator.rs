@@ -125,6 +125,11 @@ mod permission_hooks;
 /// (decision 0094).
 mod plan_review;
 pub use plan_review::plan_review_refusal;
+/// Ending what an attempt's commands left running.
+mod attempt_processes;
+/// Files an attempt's shell commands wrote outside its declared writes: put
+/// to the permission mode as a write tool's would be (decision 0094).
+mod shell_writes;
 /// A worker's shortfall report, and the grant, amendment or hold that
 /// answers it (decision 0093).
 mod shortfall_hooks;
@@ -515,6 +520,34 @@ pub struct AttemptEnv {
 #[async_trait::async_trait]
 pub trait CloseEnv: Send {
     async fn close(self: Box<Self>);
+
+    /// The processes this attempt's commands start, when the environment
+    /// can find and end them ([`AttemptProcesses`]). `None`: it starts none
+    /// that outlive a command, or cannot tell.
+    fn processes(&self) -> Option<Arc<dyn AttemptProcesses>> {
+        None
+    }
+}
+
+/// The processes one attempt's commands started, ended when the attempt is
+/// done with them, so that none outlives it: a server started in the
+/// background would otherwise hold its port against the next attempt, keep
+/// writing the tree, or answer a later attempt's requests with the earlier
+/// attempt's files.
+#[async_trait::async_trait]
+pub trait AttemptProcesses: Send + Sync {
+    /// Whether the processes are part of what the attempt delivers: its
+    /// commands run in a task's own environment (a container whose state is
+    /// judged, not only the tree), so the accepted attempt's processes stay,
+    /// and only the attempts that are not accepted are ended. `false`: the
+    /// tree is the whole delivery, and every attempt's processes end as soon
+    /// as its worker finishes, before its tree is verified.
+    fn delivered(&self) -> bool;
+
+    /// End every process the attempt's commands started that still runs.
+    /// `Ok`: a line per thing ended (empty when nothing ran). `Err`: they
+    /// could not be ended, and why.
+    async fn end(&self) -> Result<Vec<String>, String>;
 }
 
 /// Tunables. Every default is a starting point, not a researched number. The
@@ -1566,6 +1599,18 @@ struct InFlight {
     /// stopped it: a pass accepts the tree with a notice, a failure fails the
     /// attempt as the stop alone did.
     unfinished_verify: BTreeMap<AgentId, String>,
+    /// Workers whose attempt handed its work back with changes in its tree
+    /// while no continuation will run for it (its re-split would be refused,
+    /// or another attempt is the one continued): verified as it stands, as
+    /// in `unfinished_verify`, so finished work is never discarded unjudged.
+    handback_verify: BTreeSet<AgentId>,
+    /// A `handback_verify` attempt that failed its check: the reason, added
+    /// to the hold its refused re-split makes.
+    handback_failed: Option<String>,
+    /// An attempt failed the scope check on the same paths as the
+    /// contract's last such failure: the contract is held with this reason
+    /// when the round ends, not retried.
+    repeated_scope: Option<String>,
     /// A worktree could not be provided: the retry gets fresh workers.
     renew_workers: bool,
     /// With `renew_workers`: the renewed attempts' worktrees are removed too,
@@ -1599,6 +1644,10 @@ struct InFlight {
     /// note in the attempt's fresh brief is delivered from that moment, never
     /// from the moment the brief was built (`coord.rs`, `CopyState::InBrief`).
     first_calls: BTreeMap<AgentId, Arc<OnceLock<i64>>>,
+    /// Per attempt, its processes once its environment is built
+    /// ([`CloseEnv::processes`]): ended when its worker finishes, or, when
+    /// they are part of the delivery, when the attempt is not accepted.
+    processes: BTreeMap<AgentId, Arc<OnceLock<Arc<dyn AttemptProcesses>>>>,
     run: String,
     task: String,
     clock: Arc<dyn Clock>,
@@ -5918,6 +5967,9 @@ impl RunLoop {
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
             unfinished_verify: BTreeMap::new(),
+            handback_verify: BTreeSet::new(),
+            handback_failed: None,
+            repeated_scope: None,
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),
@@ -5926,6 +5978,7 @@ impl RunLoop {
             ended: BTreeMap::new(),
             brief_digests: BTreeMap::new(),
             first_calls: BTreeMap::new(),
+            processes: BTreeMap::new(),
             run: self.run_id().to_string(),
             task: contract.task.as_str().to_owned(),
             clock: self.s.clock.clone(),
@@ -6515,6 +6568,10 @@ impl RunLoop {
         let notice_tx = self.tx.clone();
         let notice_contract = contract.contract.clone();
         let notice_worker = worker.clone();
+        let processes_slot: Arc<OnceLock<Arc<dyn AttemptProcesses>>> = Arc::new(OnceLock::new());
+        flight
+            .processes
+            .insert(worker.clone(), processes_slot.clone());
         let task = tokio::spawn(async move {
             let built = match attempt_env {
                 None => Ok(AttemptEnv {
@@ -6540,6 +6597,9 @@ impl RunLoop {
                     closer,
                     notice,
                 }) => {
+                    if let Some(processes) = closer.as_ref().and_then(|c| c.processes()) {
+                        let _ = processes_slot.set(processes);
+                    }
                     if let Some(detail) = notice {
                         let _ = notice_tx
                             .send(LoopMsg::AttemptNotice {
@@ -6686,6 +6746,9 @@ impl RunLoop {
         let idx = flight.attempts.iter().position(|a| a.worker == f.worker);
         let reservation = flight.reservations.remove(&f.worker);
         flight.ended.remove(&f.worker);
+        // What its commands left running ends now, before its tree is
+        // verified, unless it is part of the delivery (`attempt_processes`).
+        on_heap(|| self.on_attempt_processes_finished(&f.contract, &f.worker, &mut flight)).await?;
         let held_amount = reservation
             .as_ref()
             .map(Reservation::amount)
@@ -6987,10 +7050,57 @@ impl RunLoop {
                 .unwrap_or_else(|| outcome_name(&f.result.outcome).to_owned());
             flight.unfinished_verify.insert(f.worker.clone(), stop);
         }
+        // A worker that handed its work back is continued by a re-split of
+        // its remainder. When no continuation will run (the re-split would be
+        // refused, or another attempt of the contract is the one continued)
+        // and it changed files, its tree is verified as it stands, as a
+        // stopped worker's is: a pass merges it, a failure leaves the hold
+        // the refused re-split makes, with the check's reason.
+        let handback_refusal = match &f.result.outcome {
+            WorkerOutcome::HandedBack { handoff }
+                if !verify_held
+                    && crate::verify::verifies_handed_back(&f.result)
+                    && f.merged.is_none() =>
+            {
+                if flight.handed_back.is_some() || contract.attempts != 1 {
+                    Some("another attempt of the contract is the one continued".to_owned())
+                } else {
+                    self.resplit_refusal(&contract, handoff)
+                }
+            }
+            _ => None,
+        };
+        let verify_handback = handback_refusal.is_some();
+        if let (Some(refusal), WorkerOutcome::HandedBack { handoff }) =
+            (&handback_refusal, &f.result.outcome)
+        {
+            self.note_handback(
+                &contract,
+                &f.worker,
+                handoff,
+                &mut flight,
+                workspace.clone(),
+                compacted_at_stop,
+                now,
+            )
+            .await?;
+            if let Some(i) = idx {
+                flight.attempts[i].status = AttemptStatus::Success;
+            }
+            flight.handback_verify.insert(f.worker.clone());
+            flight.unfinished_verify.insert(
+                f.worker.clone(),
+                format!(
+                    "handed its work back, and no continuation will run ({})",
+                    refusal.lines().next().unwrap_or(refusal)
+                ),
+            );
+        }
         match &f.result.outcome {
             outcome
                 if verify_held
                     || verify_unfinished
+                    || verify_handback
                     || matches!(outcome, WorkerOutcome::Completed) =>
             {
                 // Merge-back scope: a write outside the contract's set fails
@@ -7001,14 +7111,37 @@ impl RunLoop {
                     &workspace,
                     self.bypass_git_files(),
                 );
-                if flight.lease_lost || !outside.is_empty() {
-                    let reason = if flight.lease_lost {
-                        "the attempt was withdrawn: a lease was lost, or its interface contract was superseded".to_owned()
-                    } else {
-                        format!("wrote outside the declared scope: {outside:?}")
+                // The write tools never leave a file outside the scope (they
+                // are refused per path while the worker runs), so a path here
+                // was written by a shell command. It is put to the user's
+                // permission mode as a write tool's would be
+                // (`shell_writes.rs`): granted, it joins the contract's writes
+                // and the attempt goes on; refused, the reason says why.
+                let mut scope_refusal = None;
+                if !flight.lease_lost && !outside.is_empty() {
+                    let decided =
+                        on_heap(|| self.grant_shell_writes(&f.contract, &f.worker, &outside))
+                            .await?;
+                    if let Err(reason) = decided {
+                        scope_refusal = Some(reason);
+                    }
+                }
+                if flight.lease_lost || scope_refusal.is_some() {
+                    let reason = match scope_refusal {
+                        Some(reason) if !flight.lease_lost => reason,
+                        _ => "the attempt was withdrawn: a lease was lost, or its interface contract was superseded".to_owned(),
                     };
+                    // The same paths as the contract's last scope failure:
+                    // held when the round ends, since a retry repeats it.
+                    if !flight.lease_lost
+                        && let Some(held) = self
+                            .repeated_scope_hold(&f.contract, &f.worker, &outside, &reason)
+                            .await?
+                    {
+                        flight.repeated_scope = Some(held);
+                    }
                     // A withdrawal is the environment's doing, an out-of-scope
-                    // write the model's: only the second is a tally.
+                    // write the attempt's: only the second is a tally.
                     let withdrawn = flight.lease_lost;
                     self.in_flight.insert(f.contract.clone(), flight);
                     return on_heap(|| {
@@ -7275,32 +7408,16 @@ impl RunLoop {
                 return Ok(());
             }
             WorkerOutcome::HandedBack { handoff } => {
-                // One miss per worker: a compaction at the stop point counted
-                // it already.
-                if !compacted_at_stop {
-                    self.record.counters.sizing_misses += 1;
-                }
-                self.trace(TraceEvent::Compaction {
-                    at_ms: now,
-                    contract: f.contract.clone(),
-                    worker: f.worker.to_string(),
-                    trigger: "worker_stop_point".into(),
-                    context_tokens: handoff.context_tokens,
-                    done_items: handoff.done.len(),
-                    remaining_items: handoff.remaining.len(),
-                    cause: handoff.cause.as_str().to_owned(),
-                    compaction_stop: handoff.compaction_stop.clone(),
-                })
-                .await?;
-                self.submit_report(
+                self.note_handback(
                     &contract,
-                    Some(&f.worker),
-                    ReportKind::Informational,
-                    &format!("handed back {} remaining items", handoff.remaining.len()),
-                );
-                if flight.handed_back.is_none() && contract.attempts == 1 {
-                    flight.handed_back = Some((f.worker.clone(), handoff.clone(), workspace));
-                }
+                    &f.worker,
+                    handoff,
+                    &mut flight,
+                    workspace,
+                    compacted_at_stop,
+                    now,
+                )
+                .await?;
             }
             WorkerOutcome::Cancelled => {}
             other => {
@@ -7554,6 +7671,17 @@ impl RunLoop {
             }
             None => verdict,
         };
+        // A hand-back verified because no continuation will run: a failure
+        // is said in the hold its refused re-split makes at finalize.
+        if flight.handback_verify.remove(&worker)
+            && let Verdict::Fail { reason } = &verdict
+        {
+            let mut note: String = reason.chars().take(400).collect();
+            if note.len() < reason.len() {
+                note.push_str("...");
+            }
+            flight.handback_failed = Some(kgraf_secrets::scrub_persist_owned(note));
+        }
         // A stopped worker's tree the verifier could not judge fails on the
         // stop alone, as it did before its tree was verified: counted against
         // the attempt, not retried as a verifier outage.
@@ -7804,6 +7932,21 @@ impl RunLoop {
                 .await?;
             }
         }
+        // Processes that are part of the delivery (`attempt_processes`) stay
+        // for the attempt about to be accepted and for a hand-back whose work
+        // continues; every other attempt's end now. A lost lease keeps all:
+        // its workers are continued.
+        if !flight.lease_lost {
+            let mut keep: Vec<AgentId> = Vec::new();
+            if let Some(winner) = select(&flight.attempts, &flight.premerged) {
+                keep.push(flight.attempts[winner].worker.clone());
+            }
+            if let Some((worker, _, _)) = &flight.handed_back {
+                keep.push(worker.clone());
+            }
+            self.end_unaccepted_processes(&id, &mut flight, &keep)
+                .await?;
+        }
         // Continuous merge-back (0018): the selected attempt is merged into the
         // run's integration branch before it counts as verified. A conflict
         // gets a resolver worker first (decision 0073); any
@@ -7876,6 +8019,8 @@ impl RunLoop {
                 }
                 IntegrateOutcome::Refused => {
                     integrated = false;
+                    // Not accepted after all: its processes end too.
+                    self.end_unaccepted_processes(&id, &mut flight, &[]).await?;
                 }
             }
         }
@@ -7984,7 +8129,10 @@ impl RunLoop {
                      {worker}: {e}"
                 );
             }
-            return self.resplit(&contract, &worker, &handoff, workspace).await;
+            let verified_note = flight.handback_failed.take();
+            return self
+                .resplit(&contract, &worker, &handoff, workspace, verified_note)
+                .await;
         }
 
         // A lost lease is not the attempt's failure: it goes back to Planned with
@@ -8059,6 +8207,7 @@ impl RunLoop {
             max_retries,
         );
         let mut pinned_too_large = pinned_too_large_hold(&flight.attempts);
+        let mut repeated_scope = flight.repeated_scope.take();
         let backoff = (self.config.tick.as_millis() as i64).max(1);
         let retry_now = self.now();
         if let Some(c) = self.record.contract_mut(&id) {
@@ -8116,6 +8265,12 @@ impl RunLoop {
             {
                 // The same brief on the same routes fails the same way, so a
                 // retry only repeats it: held now, with the remedy.
+                ContractStatus::Held { reason }
+            } else if let Some(reason) = repeated_scope.take()
+                && !not_a_failure
+            {
+                // An attempt wrote outside the scope on the same paths as the
+                // last one that did: the same scope fails the same way.
                 ContractStatus::Held { reason }
             } else if failures > max_retries && !not_a_failure && !refusal_unseen {
                 ContractStatus::Held {
@@ -8180,18 +8335,21 @@ impl RunLoop {
         self.save()
     }
 
-    /// A handoff's remaining items become child contracts in the parent's
-    /// worktree, in order, through the delegation guards.
-    async fn resplit(
-        &mut self,
+    /// The children a handoff's remaining items would become, each with the
+    /// room its brief leaves under the plan target, or why the re-split is
+    /// refused. Pure: [`Self::resplit`] makes the split from it, and
+    /// `on_finished` asks it first whether a hand-back will be continued at
+    /// all (an attempt whose re-split would be refused is verified as it
+    /// stands, so its work is judged before the contract is held). An empty
+    /// list: the handoff listed nothing remaining.
+    fn plan_children(
+        &self,
         parent: &OpenContract,
-        worker: &AgentId,
         handoff: &kgraf_runtime::Handoff,
-        workspace: PathBuf,
-    ) -> Result<(), OrchestratorError> {
+    ) -> Result<Vec<(OpenContract, crate::handback_fit::ChildFit)>, SplitRefusal> {
         let roster = self.roster();
         let source_route = parent.route.clone().unwrap_or_else(|| roster[0].clone());
-        let mut children: Vec<OpenContract> = Vec::new();
+        let mut children = Vec::new();
         let mut prev: Option<String> = None;
         let taken: BTreeSet<String> = self
             .record
@@ -8202,21 +8360,6 @@ impl RunLoop {
             .chain(self.record.split_contracts.iter().cloned())
             .collect();
         let policy = self.delegation_policy();
-        // The worktree the children continue in, recorded in each under its
-        // own name ([`inherited_key`]), so a child's retry, or a resume in a
-        // later process, reopens it with the parent's work
-        // ([`Workspaces::adopt`]). The live handle, else the one the parent
-        // recorded (its own worker's, or the one it inherited).
-        let inherited_name = workspace
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned);
-        let inherited_handle = match self.s.workspaces.handle(&workspace).await {
-            Some(h) => Some(h),
-            None => inherited_name
-                .as_ref()
-                .and_then(|n| parent.worktrees.get(n).cloned()),
-        };
         // What the child's brief may take, from the route it runs on.
         let (prefix_tokens, target_tokens) = self.route(&source_route).map_or((0, u64::MAX), |r| {
             (
@@ -8244,33 +8387,18 @@ impl RunLoop {
             let cid = format!("{}.h{}", parent.contract, i + 1);
             let delegation = match checked {
                 Ok(d) if !taken.contains(&cid) => d,
-                other => {
-                    let reason = match other {
-                        Err(refusal) => {
-                            if matches!(refusal, guards::GuardRefusal::Cycle { .. }) {
-                                let at = self.now();
-                                self.trace(TraceEvent::LoopPattern {
-                                    at_ms: at,
-                                    contract: parent.contract.clone(),
-                                    kind: LoopKind::Alternating,
-                                    detail: refusal.to_string(),
-                                })
-                                .await?;
-                            }
-                            format!("re-split refused: {refusal}")
-                        }
-                        Ok(_) => format!("re-split refused: child id `{cid}` is taken"),
-                    };
-                    return self
-                        .hold_unsplit(
-                            parent,
-                            worker,
-                            reason,
-                            handoff.compaction_stop.as_ref(),
-                            &workspace,
-                            inherited_name.as_deref().zip(inherited_handle.as_deref()),
-                        )
-                        .await;
+                Ok(_) => {
+                    return Err(SplitRefusal {
+                        reason: format!("re-split refused: child id `{cid}` is taken"),
+                        cycle: None,
+                    });
+                }
+                Err(refusal) => {
+                    return Err(SplitRefusal {
+                        reason: format!("re-split refused: {refusal}"),
+                        cycle: matches!(refusal, guards::GuardRefusal::Cycle { .. })
+                            .then(|| refusal.to_string()),
+                    });
                 }
             };
             let spec = ContractSpec {
@@ -8293,7 +8421,7 @@ impl RunLoop {
             if let Some(p) = &prev {
                 deps.push(p.clone());
             }
-            let mut child = contract_from_spec(
+            let child = contract_from_spec(
                 &spec,
                 cid.clone(),
                 self.record.run.as_str(),
@@ -8301,29 +8429,100 @@ impl RunLoop {
                 parent.lineage_tasks.clone(),
                 deps,
             );
-            // The child starts under the plan target (`handback_fit`): the
-            // parent's pinned slices are kept up to what the fixed part of the
-            // brief leaves, or the split is refused now, at the first
-            // hand-back, when nothing can fit.
-            let fit = match crate::handback_fit::child_fit(
-                prefix_tokens,
-                &brief_text(&child),
-                target_tokens,
-            ) {
-                Ok(f) => f,
-                Err(unfit) => {
-                    return self
-                        .hold_unsplit(
-                            parent,
-                            worker,
-                            format!("re-split refused: {unfit}"),
-                            handoff.compaction_stop.as_ref(),
-                            &workspace,
-                            inherited_name.as_deref().zip(inherited_handle.as_deref()),
-                        )
-                        .await;
+            // The child starts under the plan target (`handback_fit`), or the
+            // split is refused now, at the first hand-back, when nothing can
+            // fit.
+            let fit =
+                crate::handback_fit::child_fit(prefix_tokens, &brief_text(&child), target_tokens)
+                    .map_err(|unfit| SplitRefusal {
+                    reason: format!("re-split refused: {unfit}"),
+                    cycle: None,
+                })?;
+            prev = Some(cid);
+            children.push((child, fit));
+        }
+        Ok(children)
+    }
+
+    /// Why a hand-back of `parent` will not be continued in a re-split, or
+    /// `None` when it will ([`Self::plan_children`]).
+    fn resplit_refusal(
+        &self,
+        parent: &OpenContract,
+        handoff: &kgraf_runtime::Handoff,
+    ) -> Option<String> {
+        match self.plan_children(parent, handoff) {
+            Ok(children) if children.is_empty() => {
+                Some("the handoff listed nothing remaining".to_owned())
+            }
+            Ok(_) => None,
+            Err(refusal) => Some(refusal.reason),
+        }
+    }
+
+    /// A handoff's remaining items become child contracts in the parent's
+    /// worktree, in order, through the delegation guards. `verified_note`:
+    /// the attempt's tree was verified as it stood (no continuation was going
+    /// to run) and failed for this reason, said with any hold.
+    async fn resplit(
+        &mut self,
+        parent: &OpenContract,
+        worker: &AgentId,
+        handoff: &kgraf_runtime::Handoff,
+        workspace: PathBuf,
+        verified_note: Option<String>,
+    ) -> Result<(), OrchestratorError> {
+        let roster = self.roster();
+        let source_route = parent.route.clone().unwrap_or_else(|| roster[0].clone());
+        // The worktree the children continue in, recorded in each under its
+        // own name ([`inherited_key`]), so a child's retry, or a resume in a
+        // later process, reopens it with the parent's work
+        // ([`Workspaces::adopt`]). The live handle, else the one the parent
+        // recorded (its own worker's, or the one it inherited).
+        let inherited_name = workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned);
+        let inherited_handle = match self.s.workspaces.handle(&workspace).await {
+            Some(h) => Some(h),
+            None => inherited_name
+                .as_ref()
+                .and_then(|n| parent.worktrees.get(n).cloned()),
+        };
+        let target_tokens = self
+            .route(&source_route)
+            .map_or(u64::MAX, |r| r.context.worker_plan_target_tokens());
+        let verified_suffix = verified_note
+            .map(|n| format!("; its tree was verified as it stood and failed: {n}"))
+            .unwrap_or_default();
+        let planned = match self.plan_children(parent, handoff) {
+            Ok(planned) => planned,
+            Err(refusal) => {
+                if let Some(detail) = refusal.cycle {
+                    let at = self.now();
+                    self.trace(TraceEvent::LoopPattern {
+                        at_ms: at,
+                        contract: parent.contract.clone(),
+                        kind: LoopKind::Alternating,
+                        detail,
+                    })
+                    .await?;
                 }
-            };
+                return self
+                    .hold_unsplit(
+                        parent,
+                        worker,
+                        refusal.reason + &verified_suffix,
+                        handoff.compaction_stop.as_ref(),
+                        &workspace,
+                        inherited_name.as_deref().zip(inherited_handle.as_deref()),
+                    )
+                    .await;
+            }
+        };
+        let mut children: Vec<OpenContract> = Vec::new();
+        let mut prev: Option<String> = None;
+        for (mut child, fit) in planned {
             let sized = self.rendered_slice_sizes(Some(&source_route), &parent.slices)?;
             let kept = crate::handback_fit::fit_slices(&sized, fit.slice_cap_tokens);
             if kept.len() < parent.slices.len() {
@@ -8362,13 +8561,13 @@ impl RunLoop {
             if let (Some(name), Some(handle)) = (&inherited_name, &inherited_handle) {
                 child.worktrees.insert(name.clone(), handle.clone());
             }
-            prev = Some(cid);
+            prev = Some(child.contract.clone());
             children.push(child);
         }
         let Some(last) = prev else {
             self.hold(
                 &parent.contract,
-                "the handoff listed nothing remaining".into(),
+                format!("the handoff listed nothing remaining{verified_suffix}"),
             );
             if let Some(c) = self.record.contract_mut(&parent.contract) {
                 c.workspace = Some(workspace.clone());
@@ -8414,6 +8613,49 @@ impl RunLoop {
         let tasks = blocking(|| ledger.usage_by_task(Some(ORCHESTRATOR_AGENT_PREFIX)))?;
         self.sizer = Sizer::from_task_usage(&tasks);
         self.save()
+    }
+
+    /// Record a worker's hand-back: the sizing miss, the compaction event and
+    /// the report, and, for the contract's only attempt, the handoff its
+    /// re-split continues from at finalize.
+    #[allow(clippy::too_many_arguments)]
+    async fn note_handback(
+        &mut self,
+        contract: &OpenContract,
+        worker: &AgentId,
+        handoff: &kgraf_runtime::Handoff,
+        flight: &mut InFlight,
+        workspace: PathBuf,
+        compacted_at_stop: bool,
+        now: i64,
+    ) -> Result<(), OrchestratorError> {
+        // One miss per worker: a compaction at the stop point counted it
+        // already.
+        if !compacted_at_stop {
+            self.record.counters.sizing_misses += 1;
+        }
+        self.trace(TraceEvent::Compaction {
+            at_ms: now,
+            contract: contract.contract.clone(),
+            worker: worker.to_string(),
+            trigger: "worker_stop_point".into(),
+            context_tokens: handoff.context_tokens,
+            done_items: handoff.done.len(),
+            remaining_items: handoff.remaining.len(),
+            cause: handoff.cause.as_str().to_owned(),
+            compaction_stop: handoff.compaction_stop.clone(),
+        })
+        .await?;
+        self.submit_report(
+            contract,
+            Some(worker),
+            ReportKind::Informational,
+            &format!("handed back {} remaining items", handoff.remaining.len()),
+        );
+        if flight.handed_back.is_none() && contract.attempts == 1 {
+            flight.handed_back = Some((worker.clone(), handoff.clone(), workspace));
+        }
+        Ok(())
     }
 
     /// A hand-back that cannot be split: the parent is held with `reason`, and
@@ -9098,6 +9340,14 @@ fn refusal_never_shown(
     max_retries: u32,
 ) -> bool {
     max_retries > 0 && refused_now && !refusal_carried && failures == max_retries + 1
+}
+
+/// Why a hand-back cannot be re-split ([`RunLoop::plan_children`]).
+struct SplitRefusal {
+    /// The held reason, starting `re-split refused: `.
+    reason: String,
+    /// The delegation cycle the guards rejected, for the trace's loop shape.
+    cycle: Option<String>,
 }
 
 /// Starts the failure text of an attempt that could not run a single round
@@ -9995,6 +10245,9 @@ mod tests {
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
             unfinished_verify: BTreeMap::new(),
+            handback_verify: BTreeSet::new(),
+            handback_failed: None,
+            repeated_scope: None,
             renew_workers: false,
             discard_renewed: false,
             injectors: BTreeMap::new(),
@@ -10003,6 +10256,7 @@ mod tests {
             ended: BTreeMap::new(),
             brief_digests: BTreeMap::new(),
             first_calls: BTreeMap::new(),
+            processes: BTreeMap::new(),
             run: "r".into(),
             task: "r/a".into(),
             clock: Arc::new(crate::clock::SystemClock),

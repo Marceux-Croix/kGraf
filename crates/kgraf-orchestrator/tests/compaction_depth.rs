@@ -6,8 +6,9 @@
 //! re-split is refused and the contract was held. Now the worker at the cap is
 //! spawned to compact instead, and goes on. At a later stop point it compacts
 //! again while it makes measured progress (amendment of 2026-10-06); one that
-//! overflows again with no progress is held with the reason, its work and its
-//! full transcript named.
+//! overflows again with no progress has its tree verified as it stands: a
+//! pass merges it, a failure holds it with the reason, its work and its full
+//! transcript named.
 
 mod support;
 
@@ -107,6 +108,51 @@ async fn a_chain_at_the_depth_cap_compacts_and_finishes_instead_of_holding() {
     )));
 }
 
+/// A compacted worker that overflows again with no progress hands its work
+/// back, and its re-split is refused. Its tree already holds the contract's
+/// file: it is verified as it stands instead of held unjudged, passes, and
+/// merges, with a notice naming why it was verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compacted_worker_that_overflows_again_is_verified_and_merges_when_its_tree_passes() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan("ALWAYSBIG STUBBORN part WRITE src/big.rs");
+    let p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(5),
+    );
+    let mut cfg = config();
+    cfg.max_split_depth = 0;
+    let o = Orchestrator::new(cfg, p.services(WINDOW)).expect("orchestrator");
+    let report = o
+        .start(RunId::new("r1"), "a big part".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let record = RunStore::new(p.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    assert_eq!(record.compactions.len(), 1, "compacted once, never twice");
+    let entry = &record.compactions[0];
+    assert_eq!(report.verified, vec![entry.contract.clone()]);
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains("handed its work back, and no continuation will run"))
+        .unwrap_or_else(|| panic!("{:?}", report.notices));
+    assert!(notice.contains("re-split refused"), "{notice}");
+    assert!(notice.contains("accepted as verified"), "{notice}");
+    assert!(trace(&p).await.iter().any(|e| matches!(
+        e,
+        TraceEvent::Verdict { contract, passed: true, .. } if *contract == entry.contract
+    )));
+}
+
+/// As above, but the tree fails its check: the contract is held as before,
+/// with its work and transcript named, and the hold says the tree was
+/// verified and failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compacted_worker_that_overflows_again_is_held_with_its_work_and_transcript_named() {
     let dir = tempfile::tempdir().expect("dir");
@@ -117,6 +163,7 @@ async fn a_compacted_worker_that_overflows_again_is_held_with_its_work_and_trans
         |_| SERVES.into(),
         Duration::from_millis(5),
     );
+    *p.verifier.require.lock().expect("lock") = Some("NEVER-WRITTEN".into());
     let mut cfg = config();
     cfg.max_split_depth = 0;
     let o = Orchestrator::new(cfg, p.services(WINDOW)).expect("orchestrator");
@@ -139,6 +186,11 @@ async fn a_compacted_worker_that_overflows_again_is_held_with_its_work_and_trans
         panic!("expected a hold, got {:?}", held.status);
     };
     assert!(reason.contains("re-split refused"), "{reason}");
+    assert!(
+        reason
+            .contains("its tree was verified as it stood and failed: src/big.rs missing or wrong"),
+        "{reason}"
+    );
     assert!(reason.contains("already compacted once"), "{reason}");
     // It wrote the same content again after its compaction: no net change,
     // so it was not compacted again, and the reason says so.

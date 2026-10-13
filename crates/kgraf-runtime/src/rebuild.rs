@@ -172,6 +172,9 @@ pub struct TranscriptBuilder {
     /// The context estimate right after the last compaction: the floor no
     /// compaction can get under (the opening message, notice and summary).
     compaction_floor: Option<u64>,
+    /// Whether a usage report has replaced `compaction_floor`'s estimate with
+    /// the provider's count of the first prompt after the compaction.
+    floor_measured: bool,
     /// The tree and check scores at the last compaction, when its event
     /// stored them: the baseline of the progress since it.
     compaction_baseline: Option<crate::progress::CheckpointBaseline>,
@@ -190,6 +193,7 @@ impl TranscriptBuilder {
             compactions: Vec::new(),
             last_summary: None,
             compaction_floor: None,
+            floor_measured: false,
             compaction_baseline: None,
             replay_compacted_at: None,
             messages: opening,
@@ -247,7 +251,16 @@ impl TranscriptBuilder {
         self.last_summary.as_ref()
     }
 
-    /// The context estimate right after the last compaction, if any.
+    /// Whether a usage report has measured the context since it was last
+    /// built (the start, or a compaction). Until then every context figure is
+    /// the estimate alone, which overcounts by design.
+    pub fn is_measured(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    /// The context right after the last compaction, if any: the provider's
+    /// count of the first prompt after it once a usage report measured that
+    /// prompt, and the estimate until then.
     pub fn compaction_floor(&self) -> Option<u64> {
         self.compaction_floor
     }
@@ -317,6 +330,14 @@ impl TranscriptBuilder {
                     self.tokens_since_usage = 0;
                     self.since_usage_reasoning = 0;
                     self.round_anchored = true;
+                    // The first prompt after a compaction is the floor
+                    // (opening, notice, summary): its measured size replaces
+                    // the estimate, so "no room" is never decided on an
+                    // overcount alone.
+                    if self.compaction_floor.is_some() && !self.floor_measured {
+                        self.compaction_floor = Some(usage.total_input());
+                        self.floor_measured = true;
+                    }
                 }
             }
             WorkerEvent::Stop { reason, .. } => {
@@ -451,6 +472,12 @@ impl TranscriptBuilder {
                     .results
                     .insert(call_id.clone(), (output, *is_error));
             }
+            // A record for the transcript file and the live view, not text
+            // the loop added to the user turn.
+            WorkerEvent::Notice {
+                kind: crate::event::NoticeKind::EstimateOverStopPoint,
+                ..
+            } => {}
             WorkerEvent::Notice { text, .. } => {
                 // The same append-only rule as `Injected`. After an
                 // abandoned (or, on resume, cancelled) round, the last user
@@ -591,6 +618,7 @@ impl TranscriptBuilder {
                 self.compactions.push((**notice).clone());
                 self.last_summary = Some((**summary).clone());
                 self.compaction_floor = Some(self.tokens_since_usage);
+                self.floor_measured = false;
                 self.compaction_baseline = baseline.as_deref().cloned();
                 self.replay_compacted_at = Some(self.replay.len());
             }

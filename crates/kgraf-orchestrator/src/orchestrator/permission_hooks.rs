@@ -234,6 +234,21 @@ impl RunLoop {
         why: &str,
         at_ms: i64,
     ) {
+        Self::record_grant(c, grant, by, worker, why, at_ms);
+        c.shortfall_redispatches += 1;
+    }
+
+    /// [`Self::apply_grant`] without counting a re-dispatch: a path granted
+    /// to the attempt that already wrote it, which goes on to verification
+    /// rather than to a fresh attempt.
+    pub(super) fn record_grant(
+        c: &mut OpenContract,
+        grant: &Grant,
+        by: &str,
+        worker: &str,
+        why: &str,
+        at_ms: i64,
+    ) {
         match grant {
             Grant::Program(_) | Grant::Programs(_) => {
                 for p in grant.programs() {
@@ -266,7 +281,6 @@ impl RunLoop {
                 by: by.to_owned(),
             });
         }
-        c.shortfall_redispatches += 1;
     }
 
     /// A program grant takes effect only through a per-attempt environment

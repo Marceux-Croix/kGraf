@@ -2280,6 +2280,128 @@ fn host_probe() -> HostId {
     HostId::default()
 }
 
+/// What [`end_worktree_processes`] ended.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EndedProcesses {
+    /// The logged sessions that still had a live process.
+    pub sessions: Vec<u32>,
+    /// The processes signalled, each a member of one of those sessions or
+    /// (macOS) a process that left them but still held the hold file.
+    pub processes: Vec<u32>,
+    /// Sessions still live after [`crate::lifecycle::GROUP_EXIT_GRACE`]: a
+    /// process that survived `SIGKILL` or moved out of reach meanwhile.
+    pub survivors: Vec<u32>,
+    /// Sessions logged in another PID namespace: not reachable from here.
+    pub foreign: usize,
+}
+
+impl EndedProcesses {
+    /// Whether nothing was found running.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty() && self.processes.is_empty() && self.foreign == 0
+    }
+}
+
+/// End every process the sandboxed commands of one worktree started that
+/// still runs, given the worktree's hold file ([`Workspace::hold_file`]):
+/// what an attempt left behind when it ended (a server started in the
+/// background, a watcher), which would otherwise outlive it, hold a port the
+/// next attempt needs, or keep writing the tree.
+///
+/// Unix: every command calls `setsid` and logs its session beside the hold,
+/// so each logged session that still has a live member is signalled
+/// (`SIGKILL`, every member, which reaches a process its shell put in the
+/// background or in another process group). On macOS a process that left the
+/// session but kept the inherited hold descriptor is found by the hold
+/// (`lifecycle::holders`) and signalled too. Repeated until nothing logged is
+/// live or [`crate::lifecycle::GROUP_EXIT_GRACE`] runs out. A process that
+/// closed its descriptors **and** left the session is out of reach here (the
+/// gap the session log documents); on Linux with PID namespaces the kernel
+/// already ended it with its command.
+///
+/// Windows: each command runs in a job that ends its processes when the
+/// command's job handle closes and allows no breakaway, so nothing outlives
+/// the command; this finds nothing there.
+///
+/// The caller must call this only once no command of the worktree runs (the
+/// attempt ended): a running command is one of these sessions.
+pub fn end_worktree_processes(hold: &Path) -> Result<EndedProcesses, WorkspaceError> {
+    #[cfg(unix)]
+    {
+        end_unix(hold)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = hold;
+        Ok(EndedProcesses::default())
+    }
+}
+
+#[cfg(unix)]
+fn end_unix(hold: &Path) -> Result<EndedProcesses, WorkspaceError> {
+    let mut ended = EndedProcesses::default();
+    {
+        let me = std::process::id();
+        let deadline = std::time::Instant::now() + crate::lifecycle::GROUP_EXIT_GRACE;
+        loop {
+            let sessions = WorkspaceManager::live_sessions(hold)?;
+            ended.foreign = sessions.foreign;
+            // Extended on macOS only, by the holders of the hold.
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut targets: Vec<u32> = if sessions.live.is_empty() {
+                Vec::new()
+            } else {
+                all_pids()
+                    .into_iter()
+                    .filter(|pid| *pid != me)
+                    .filter(|pid| session_of(*pid).is_some_and(|sid| sessions.live.contains(&sid)))
+                    .filter(|pid| !is_zombie(*pid))
+                    .collect()
+            };
+            #[cfg(target_os = "macos")]
+            if let Ok(holders) = crate::lifecycle::holders(hold) {
+                targets.extend(
+                    holders
+                        .into_iter()
+                        .filter_map(|p| u32::try_from(p).ok())
+                        .filter(|p| *p != me),
+                );
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            if targets.is_empty() {
+                ended.survivors = sessions.live;
+                break;
+            }
+            for sid in &sessions.live {
+                if !ended.sessions.contains(sid) {
+                    ended.sessions.push(*sid);
+                }
+            }
+            for pid in &targets {
+                if let Ok(p) = libc::pid_t::try_from(*pid) {
+                    // SAFETY: kill only sends a signal; each target is a
+                    // member of a session this worktree's commands logged
+                    // (checked against the leader's start time when the log
+                    // was read), or holds this worktree's hold file.
+                    unsafe {
+                        libc::kill(p, libc::SIGKILL);
+                    }
+                }
+                if !ended.processes.contains(pid) {
+                    ended.processes.push(*pid);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                ended.survivors = WorkspaceManager::live_sessions(hold)?.live;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Ok(ended)
+}
+
 /// What a worktree's session log says, read from here.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Sessions {
@@ -3117,6 +3239,59 @@ mod tests {
         std::fs::write(session_log(&hold), format!("{unreadable}\n")).unwrap();
         let sessions = WorkspaceManager::live_sessions(&hold).unwrap();
         assert_eq!(sessions.foreign, usize::from(PID_NAMESPACES_EXIST));
+    }
+
+    /// A command that started a server in the background and returned (the
+    /// shape `sh -c "server > log 2>&1 &"`) leaves the server running in the
+    /// command's session after the command itself exited. Ending the
+    /// worktree's processes finds it through the session log and kills it,
+    /// and says which session and process it ended; a second call finds
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_a_finished_command_left_is_ended() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 300 > /dev/null 2>&1 & echo $!"])
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: setsid is async-signal-safe and touches no parent state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut leader = cmd.spawn().unwrap();
+        let sid = leader.id();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let server: u32 = line.trim().parse().unwrap();
+        // The command itself has finished, as an attempt's command has.
+        leader.wait().unwrap();
+        assert!(
+            pid_alive(server) && !is_zombie(server),
+            "the server runs on"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let hold = dir.path().join("hold");
+        let here = HostId::current();
+        let boot = here.boot.clone().unwrap();
+        std::fs::write(session_log(&hold), format!("{sid} - {boot}\n")).unwrap();
+        let ended = end_worktree_processes(&hold).unwrap();
+        assert_eq!(ended.sessions, vec![sid], "{ended:?}");
+        assert!(ended.processes.contains(&server), "{ended:?}");
+        assert!(ended.survivors.is_empty(), "{ended:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pid_alive(server) && !is_zombie(server) {
+            assert!(std::time::Instant::now() < deadline, "the server survived");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(end_worktree_processes(&hold).unwrap().is_empty());
     }
 
     /// A process that has exited but is not reaped (what a sandboxed command

@@ -7473,6 +7473,9 @@ mod speculation;
 #[path = "build_allowlist_tests.rs"]
 mod build_allowlist;
 
+#[path = "scope_shell_tests.rs"]
+mod scope_shell;
+
 #[path = "shortfall_tests.rs"]
 mod shortfall;
 

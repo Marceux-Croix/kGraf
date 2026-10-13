@@ -70,10 +70,11 @@ pub use brief::{
 };
 pub use compaction::{
     COMPACTION_CALL_KIND, COMPACTION_NOTICE_HEADER, CompactionNotice, CompactionStop,
-    CompactionSummary, CompactionTrigger, DEFAULT_READ_COUNT, HistoryArchive, MAX_READ_COUNT,
-    MAX_RECALL_CHARS, MAX_RECALL_HITS, NOTHING_TO_RECALL, RECALL_TOOL, REMAINDER_HEAD,
-    RecallHistoryTool, SUMMARY_REQUEST, StopPointPolicy, SummarySource, carry_forward,
-    handback_remainder, original_instruction, parse_summary, recompaction, render_notice,
+    CompactionSummary, CompactionTrigger, DEFAULT_READ_COUNT, FileRead, HistoryArchive,
+    MAX_LISTED_READS, MAX_READ_COUNT, MAX_RECALL_CHARS, MAX_RECALL_HITS, NOTHING_TO_RECALL,
+    RECALL_TOOL, REMAINDER_HEAD, RecallHistoryTool, SUMMARY_REQUEST, StopPointPolicy,
+    SummarySource, carry_forward, handback_remainder, list_reads, original_instruction,
+    parse_summary, recompaction, render_notice,
 };
 pub use context::{
     GraphSlices, NeutralPrefixEncoder, NoSlices, PrefixCheckError, PrefixInvalidation,

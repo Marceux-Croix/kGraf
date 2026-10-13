@@ -550,7 +550,12 @@ pub fn ground(scope: RequestScope, need: &str, record: &RefusalRecord) -> Ground
                     quoted_error(e)
                 ));
             }
-            answer.push_str(" Continue your work; fix a malformed call and retry it.");
+            // Retry advice only fits a call that failed on its input.
+            if record.last_input_error.is_some() {
+                answer.push_str(" Continue your work; fix a malformed call and retry it.");
+            } else {
+                answer.push_str(" Continue your work.");
+            }
             Grounding::NothingRefused { answer }
         }
         several => Grounding::Ambiguous {
@@ -1214,6 +1219,9 @@ pub fn ground_report(
         skills.refusal_for(worker, &name, None)
     });
     match (refused, live) {
+        (None, Some(refusal)) if matches!(grounding, Grounding::NothingRefused { .. }) => {
+            (restriction_answer(&tool, &refusal, record), None)
+        }
         (Some(c), Some(refusal)) => (
             Grounding::Refused {
                 subject: tool,
@@ -1224,6 +1232,29 @@ pub fn ground_report(
         ),
         _ => (grounding, None),
     }
+}
+
+/// The answer to a report of scope tool that names a tool no call of which was
+/// refused this attempt, while the worker's live skills would refuse it. No
+/// grant or hold follows (a grant is grounded only in a recorded refusal); the
+/// words say what restricts the tool, and drop retry advice when no call failed.
+fn restriction_answer(tool: &str, refusal: &str, record: &RefusalRecord) -> Grounding {
+    let mut answer = format!(
+        "Nothing was granted or held: no call of `{tool}` was refused in this attempt, but an \
+         active restriction would refuse one: {}. A permission grant cannot lift a skill's \
+         allowed-tools. If your instruction cannot be done without `{tool}`, make the call: a \
+         refusal is recorded and can then be reported. Otherwise continue with the tools the \
+         skill allows.",
+        refusal.trim().trim_end_matches('.')
+    );
+    if let Some(e) = &record.last_input_error {
+        answer.push_str(&format!(
+            " Your last failed call was refused for its input, which is not a permission \
+             refusal: {}",
+            quoted_error(e)
+        ));
+    }
+    Grounding::NothingRefused { answer }
 }
 
 /// The held reason for a permission report grounded in a refused package
@@ -2853,5 +2884,58 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// Soak 3: the worker read the skill's reply and reported the shell before
+    /// any call. Nothing was refused, so nothing is granted or held, but the
+    /// answer names the restriction that would refuse the call and gives no
+    /// advice about a malformed call, since none failed.
+    #[tokio::test]
+    async fn a_report_of_a_tool_the_active_skill_would_refuse_names_the_skill() {
+        let (_session, skills, _w) = restricted();
+        let input = serde_json::json!({
+            "kind": "permission", "scope": "tool", "need": "shell",
+            "why": "the instruction asks for a grep"
+        });
+        let (control, out) = drive(record(vec![]), Some(skills.clone()), input, loop_like).await;
+        let Some(Grounding::NothingRefused { answer }) = grounding_of(&control) else {
+            panic!("{control:?}");
+        };
+        assert!(answer.contains("Nothing was granted or held"), "{answer}");
+        assert!(answer.contains("read-only-audit"), "{answer}");
+        assert!(answer.contains("`shell`"), "{answer}");
+        assert!(answer.contains("cannot lift"), "{answer}");
+        assert!(!answer.contains("malformed"), "no call failed: {answer}");
+        // No refusal is carried, so no hold can follow from it.
+        let ContractControl::Shortfall { skill_refusal, .. } = &control else {
+            panic!("{control:?}");
+        };
+        assert!(skill_refusal.is_none(), "{control:?}");
+        let out = out.expect("answered");
+        assert!(!out.is_error);
+        // A failed input is still named, with the retry advice, beside the restriction.
+        let mut r = record(vec![]);
+        r.last_input_error = Some("ERROR: invalid call: bad patch".into());
+        let input = serde_json::json!({
+            "kind": "permission", "scope": "tool", "need": "shell", "why": "x"
+        });
+        let (control, _) = drive(r, Some(skills), input, loop_like).await;
+        let Some(Grounding::NothingRefused { answer }) = grounding_of(&control) else {
+            panic!("{control:?}");
+        };
+        assert!(answer.contains("bad patch"), "{answer}");
+    }
+
+    /// With no skill involved and no failed call, the answer to a report that
+    /// names nothing refused does not tell the worker to fix a malformed call.
+    #[test]
+    fn nothing_refused_and_no_failed_call_gives_no_retry_advice() {
+        let Grounding::NothingRefused { answer } =
+            ground(RequestScope::Command, "curl", &record(vec![]))
+        else {
+            panic!("nothing was refused");
+        };
+        assert!(answer.ends_with(" Continue your work."), "{answer}");
+        assert!(!answer.contains("malformed"), "{answer}");
     }
 }

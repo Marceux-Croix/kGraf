@@ -4469,10 +4469,131 @@ async fn a_resume_does_not_trust_a_git_entry_planted_below_the_top() {
     );
 }
 
-/// A worker whose prefix and opening alone reach its stop point can only hand
-/// back at once with the same remainder. It is refused at spawn.
+/// A brief of about 9,000 estimated tokens (3 bytes a token) against a
+/// 10,000-token window with its stop point at 8,000: the estimate is over the
+/// stop point and under the window.
+fn over_stop_brief(root: &Path) -> WorkerBrief {
+    let padding = "the quick brown fox jumps over the lazy dog ".repeat(610);
+    let mut b = brief("w1", &format!("write a.txt. {padding}"), root, 4);
+    b.context = ContextConfig::for_model(10_000).expect("config");
+    assert_eq!(b.context.worker_stop_tokens(), 8_000);
+    assert_eq!(b.context.effective_window(), 10_000);
+    b
+}
+
+fn estimate_notices(events: &[WorkerEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::Notice {
+                kind: NoticeKind::EstimateOverStopPoint,
+                text,
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The estimate overcounts by design (measured near 1.45x a provider's count),
+/// so an opening estimated over the stop point but under the window is not
+/// refused: the first round runs, the provider's usage report measures the
+/// context under the stop point, and the worker finishes. A notice records the
+/// round with both numbers and never reaches the model.
 #[tokio::test]
-async fn a_worker_that_starts_at_its_stop_point_is_refused_not_handed_back() {
+async fn an_estimate_over_the_stop_point_runs_the_first_round_and_the_measure_decides() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |request| {
+        if request.messages.len() == 1 {
+            let mut round = Round::tool(vec![(
+                "c1",
+                "write_file",
+                json!({"path": "a.txt", "content": "a"}),
+            )]);
+            // What the provider counted: well under the stop point.
+            round.usage = usage(6_000, 10);
+            round
+        } else {
+            let mut round = Round::answer("done");
+            round.usage = usage(6_100, 10);
+            round
+        }
+    });
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(env, over_stop_brief(dir.path()), SpawnOptions::default())
+        .await
+        .expect("an estimate under the window is not refused");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert_eq!(
+        result.outcome,
+        WorkerOutcome::Completed,
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(provider.requests().len(), 2);
+    let notices = estimate_notices(&events);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let estimated: u64 = notices[0]
+        .split("estimated at ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("the estimate is named");
+    assert!((8_000..10_000).contains(&estimated), "{}", notices[0]);
+    assert!(notices[0].contains("stop point of 8000"), "{}", notices[0]);
+    for request in provider.requests() {
+        let text = format!("{:?}", request.messages);
+        assert!(
+            !text.contains("estimated at"),
+            "loop-only notice sent: {text}"
+        );
+    }
+}
+
+/// The same opening, but the provider measures it over the stop point: the
+/// worker stops at the next boundary the way a measured context always does
+/// (here, having written, it hands back).
+#[tokio::test]
+async fn an_estimate_over_the_stop_point_confirmed_by_the_measure_hands_back() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(false, |_| {
+        let mut round = Round::tool(vec![(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]);
+        round.usage = usage(8_500, 10);
+        round
+    });
+    let env = Arc::new(env_with(
+        provider.clone(),
+        vec![Arc::new(WriteFile)],
+        CallMode::Complete,
+    ));
+    let handle = spawn_worker(env, over_stop_brief(dir.path()), SpawnOptions::default())
+        .await
+        .expect("spawn");
+    let (events, result) = with_timeout(drain(handle)).await.expect("in time");
+    assert!(
+        matches!(result.outcome, WorkerOutcome::HandedBack { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "one measured round, then stop"
+    );
+    assert_eq!(estimate_notices(&events).len(), 1);
+}
+
+/// A worker whose prefix and opening alone are estimated at or over the
+/// whole window could not send a request. It is refused at spawn.
+#[tokio::test]
+async fn a_worker_that_starts_at_its_window_is_refused_not_handed_back() {
     let dir = tempfile::tempdir().expect("dir");
     let provider = Fake::new(false, |_| Round::answer("never"));
     let env = Arc::new(env_with(provider.clone(), vec![], CallMode::Complete));

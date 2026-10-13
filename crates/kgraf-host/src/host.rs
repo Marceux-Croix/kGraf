@@ -1024,6 +1024,14 @@ impl Host {
         self
     }
 
+    /// Retries a contract gets after its first failed attempt, for a test
+    /// that needs more than the default one.
+    #[cfg(test)]
+    pub(crate) fn with_max_retries(mut self, retries: u32) -> Self {
+        self.orchestrator_config.max_retries = retries;
+        self
+    }
+
     /// The live permission control runs of this host use.
     pub fn permissions(&self) -> &Arc<kgraf_tools::PermissionControl> {
         &self.permissions

@@ -551,6 +551,19 @@ root, unless it was started in a container that says so.
 **Rules that hold in every mode.** A deny rule blocks matching calls, Bypass included. An ask
 rule asks. Deleting a system path is refused. A run nobody attends denies what would ask.
 
+**Files a command writes outside the contract's files.** A worker's file tools are refused a
+path its contract does not list, and the mode decides whether to add it. A shell command is not
+stopped per path, so a file it writes outside the list is decided when the worker finishes, the
+same way: a mode that would grant the path (Bypass, Orchestrator decides, Accept edits, or Auto
+with the path in `--allow-path`) adds it to the contract, records the grant and says so in a
+notice. A path another contract lists is never added, in any mode. Otherwise the attempt fails
+and its reason says why. If the next attempt fails on the same paths, the contract is held at
+once instead of retried.
+
+**Processes a worker leaves running** end when its attempt ends, with a notice. In a task
+container (the Terminal-Bench bridge) the accepted attempt's processes stay, since the task
+judges the container, and the other attempts' processes end.
+
 **Where to set them.**
 
 | Setting | Flag | `permissions.toml` key |
@@ -626,7 +639,10 @@ keys. Unknown keys are refused. `worktrees` is refused too: the Settings switch 
 
 The **compaction point** is the share of the window at which a worker hands back. The slider
 runs from 5 to 95 percent and defaults to 80. A `point` key in `run.json` outranks it. The
-command line takes `--point`.
+command line takes `--point`. The point is judged on the token counts the provider reports.
+Before the first report, kGraf only estimates, and the estimate runs high. So a worker whose
+brief is estimated past the point still runs its first round, and its transcript records both
+numbers. kGraf refuses a brief only when the estimate reaches the whole window.
 
 **Updates.** Off by default. Settings > General > "Check for updates on start" lets the app
 read the GitHub Releases of `Marceux-Croix/kGraf` at start. "Check now" always checks. A

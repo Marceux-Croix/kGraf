@@ -81,7 +81,7 @@ pub use sandbox::{HoldGate, SetupProbe, SpawnHold};
 pub use sandbox::{LinuxConfinement, linux_confinement};
 pub use win_command_line::windows_command_line;
 pub use workspace::{
-    CheckFolder, HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause, OrphanRemoval,
-    ProcessIdentity, QuietGuard, ReopenSpec, Workspace, WorkspaceManager, WorkspaceSpec,
-    lock_owner_may_be_running, pid_is_gone,
+    CheckFolder, EndedProcesses, HostId, LEGACY_LOCK_TAG, LOCK_TAG, Liveness, OrphanCause,
+    OrphanRemoval, ProcessIdentity, QuietGuard, ReopenSpec, Workspace, WorkspaceManager,
+    WorkspaceSpec, end_worktree_processes, lock_owner_may_be_running, pid_is_gone,
 };

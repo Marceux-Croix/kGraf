@@ -351,23 +351,36 @@ impl Provider for WorkerFake {
         // the instruction), so a chain reaches the delegation depth cap; it
         // stops being big once the runtime compacted the worker (decision
         // 0095), unless the instruction also says `STUBBORN`.
+        //
+        // Right after a compaction the prompt is the summary and the pinned
+        // brief, which is small, and it grows back only with new work. So a
+        // compacted worker reports a small prompt at its first round and a
+        // big one at its second (which writes again), and the overflow shows
+        // at the boundary after that. `STUBBORN` writes the same content
+        // (no measured progress); `PERSISTENT` writes new content and is big
+        // again only after its first compaction, so the runtime compacts it a
+        // second time and it then finishes small (decision 0095, amendment
+        // of 2026-10-06).
         let compacted = request.messages.first().is_some_and(|m| {
             m.content.iter().any(|c| {
                 c.as_text()
                     .is_some_and(|t| t.contains(kgraf_runtime::COMPACTION_NOTICE_HEADER))
             })
         });
-        // `PERSISTENT` stays big at the first round after its first compaction
-        // and writes new content each time, so the runtime measures progress
-        // and compacts it again; after the second compaction it is small and
-        // finishes (decision 0095, amendment of 2026-10-06).
-        let persistent = instruction.contains("PERSISTENT")
+        let persistent_compactions = if instruction.contains("PERSISTENT") && compacted {
+            persistent_round(&instruction, round == 0)
+        } else {
+            0
+        };
+        let regrows = instruction.contains("ALWAYSBIG")
             && compacted
-            && round == 0
-            && persistent_round(&instruction) <= 1;
-        let always = instruction.contains("ALWAYSBIG")
-            && (!compacted || instruction.contains("STUBBORN") || persistent);
-        let big = (instruction.starts_with("BIG") || always) && round == 0;
+            && round == 1
+            && (instruction.contains("STUBBORN")
+                || (instruction.contains("PERSISTENT") && persistent_compactions <= 1));
+        let big = ((instruction.starts_with("BIG")
+            || (instruction.contains("ALWAYSBIG") && !compacted))
+            && round == 0)
+            || regrows;
         // Far more than any estimate of a small brief, under the stop point.
         let costly = instruction.contains("COSTLY") && round == 0;
         let usage = TokenUsage {
@@ -423,7 +436,7 @@ impl Provider for WorkerFake {
                 }
                 (content, StopReason::ToolUse)
             }
-            (0, Some(path)) => {
+            (r, Some(path)) if r == 0 || regrows => {
                 let written = self
                     .content
                     .lock()
@@ -442,7 +455,7 @@ impl Provider for WorkerFake {
                 let mut content = vec![
                     Content::text("writing"),
                     Content::ToolUse {
-                        id: "t1".into(),
+                        id: format!("t1-{r}"),
                         name: "write_file".into(),
                         input: json!({"path": path, "content": written}),
                         signature: None,
@@ -502,14 +515,17 @@ impl Provider for WorkerFake {
 /// A distinct suffix for every `PERSISTENT` write.
 static PERSISTENT_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How many compacted first rounds a `PERSISTENT` instruction has had before
-/// this one, counted per instruction.
-fn persistent_round(instruction: &str) -> u32 {
+/// How many compacted first rounds a `PERSISTENT` instruction has had,
+/// counted per instruction. `count` adds the current round-0 call; a later
+/// round of the same compacted segment only reads the figure.
+fn persistent_round(instruction: &str, count: bool) -> u32 {
     static SEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
         std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
     let mut seen = SEEN.lock().expect("lock");
     let n = seen.entry(instruction.to_owned()).or_insert(0);
-    *n += 1;
+    if count {
+        *n += 1;
+    }
     *n
 }
 
