@@ -2414,25 +2414,42 @@ fn kind_label_satisfied(claim: &str, text: &str, theirs: &BTreeSet<String>) -> b
         || theirs.iter().any(|c| words.contains(&c.as_str()))
 }
 
-/// The anchors a sentence writes right after the word "type" or "kind"
-/// ("as type `Code`", "of kind `Config`"): the kind the sentence gives
-/// what it is about.
-fn kind_anchors(text: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut after_kind_word = false;
+/// The prose that joins a file to its kind, spaces removed and lower-cased:
+/// "`F` as type `K`", "`F` of type `K`", "`F` (type `K`)", and the same with
+/// "kind".
+const FILE_KIND_JOINS: &[&str] = &["astype", "oftype", "(type", "askind", "ofkind", "(kind"];
+
+/// The kinds a sentence gives surface files: (file symbol, kind) for each
+/// anchor that directly follows a file anchor across one of
+/// [`FILE_KIND_JOINS`]. A kind word elsewhere in the sentence ("`a.py`
+/// exports `rate` of type `f64`") is about another anchor, not the file.
+fn file_kinds<'s>(
+    text: &str,
+    surface: &BTreeSet<&'s str>,
+    set_aside: &BTreeSet<&str>,
+) -> Vec<(&'s str, String)> {
+    let mut out = Vec::new();
+    let mut file: Option<&'s str> = None;
+    let mut between = String::new();
     for piece in pieces(text) {
         match piece {
-            Piece::Prose(chunk) => {
-                after_kind_word = chunk
-                    .split_whitespace()
-                    .next_back()
-                    .is_some_and(|w| matches!(w.to_lowercase().as_str(), "type" | "kind"));
-            }
+            Piece::Prose(chunk) => between.push_str(chunk),
             Piece::Code(code) => {
-                if after_kind_word {
-                    out.insert(code.split_whitespace().collect::<Vec<_>>().join(" "));
+                let code = code.split_whitespace().collect::<Vec<_>>().join(" ");
+                let join = between
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+                    .to_lowercase();
+                if let Some(f) = file.filter(|_| FILE_KIND_JOINS.contains(&join.as_str())) {
+                    out.push((f, code.clone()));
                 }
-                after_kind_word = false;
+                file = if is_path(&code) && !set_aside.contains(code.as_str()) {
+                    resolve_path(&code, surface)
+                } else {
+                    None
+                };
+                between.clear();
             }
         }
     }
@@ -2440,16 +2457,25 @@ fn kind_anchors(text: &str) -> BTreeSet<String> {
 }
 
 /// Whether `claim` only gives a file symbol its kind ("I assume you provide
-/// `pkg/__init__.py` as type `Code`"), and the provision does not give the
-/// file another kind. A file has no type in a programming language, so a
-/// word written as its type names a category the provider need not repeat.
-/// On a symbol that is not a file the same words are a type claim
-/// ("`rate` of type `f64`") and are compared as any other claim.
-fn file_kind_satisfied(symbol: &str, claim: &str, expects: &str, provides: &str) -> bool {
-    if !is_path(symbol) || !kind_anchors(expects).contains(claim) {
-        return false;
-    }
-    kind_anchors(provides).iter().all(|k| k == claim)
+/// `pkg/__init__.py` as type `Code`"), and no provision of the providing
+/// party gives that file another kind. A file has no type in a programming
+/// language, so a word written as its type names a category the provider
+/// need not repeat. The kind must directly follow the file ([`file_kinds`]):
+/// elsewhere the same words are a type claim ("`a.py` exports `rate` of type
+/// `f64`") and are compared as any other claim.
+fn file_kind_satisfied(
+    claim: &str,
+    expects: &[(&str, String)],
+    provides: &[(&str, String)],
+) -> bool {
+    let mut files = expects.iter().filter(|(_, k)| k == claim).peekable();
+    files.peek().is_some()
+        && files.all(|(f, _)| {
+            provides
+                .iter()
+                .filter(|(g, _)| g == f)
+                .all(|(_, k)| k == claim)
+        })
 }
 
 /// One provision: (party, sentence, the sentence's claims).
@@ -2797,10 +2823,11 @@ pub fn compare_handshake(
 ///   states a signature for the symbol that the files do not give;
 /// - a surface symbol written as a bare file name is compared as the one stub
 ///   or reference path with that file name ([`resolve_file_symbols`]);
-/// - on a file symbol, an expectation's word after "type" or "kind" is the
-///   file's kind, met unless the provision gives the file another kind
-///   ([`file_kind_satisfied`]); another surface symbol the expectation lists
-///   is met when the same party provides it in any sentence;
+/// - an anchor that directly follows a surface file ("`F` as type `K`",
+///   "`F` of type `K`", "`F` (type `K`)") is the file's kind, met unless the
+///   providing party gives the file another kind ([`file_kind_satisfied`]);
+///   another surface file an expectation about a file lists is met when the
+///   same party provides it in any sentence;
 /// - a touch shared by two parties overlaps only when no dependency orders
 ///   them: parties in order never write at once;
 /// - [`HandshakeFinding::Unanchored`] and [`HandshakeFinding::OutsideSurface`]
@@ -2837,6 +2864,25 @@ pub fn compare_handshake_ordered(
     // The interface's id is set aside only when it is not also a surface
     // symbol's name (an interface `double` over the symbol `double`).
     let own_id = (!surface.contains(ic.id.as_str())).then_some(ic.id.as_str());
+    // A bare file name that two of the interface's files have (stub,
+    // reference or surface paths) names neither, even when only one of them
+    // is a surface symbol: binding it to that one would guess.
+    let mut by_name: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for p in ic
+        .stub
+        .iter()
+        .chain(&ic.reference)
+        .map(|f| f.path.as_str())
+        .chain(surface.iter().copied().filter(|s| is_path(s)))
+    {
+        let p = norm_path(p);
+        by_name.entry(file_name(p)).or_default().insert(p);
+    }
+    let ambiguous_names: Vec<&str> = by_name
+        .into_iter()
+        .filter(|(name, paths)| paths.len() > 1 && !surface.contains(name))
+        .map(|(name, _)| name)
+        .collect();
     let set_aside: BTreeSet<&str> = ic
         .parties
         .iter()
@@ -2844,6 +2890,7 @@ pub fn compare_handshake_ordered(
         .chain(statements.iter().map(|s| s.party.as_str()))
         .chain(own_id)
         .chain([label.as_str()])
+        .chain(ambiguous_names)
         .collect();
     let read = |text: &str| read_sentence(text, &surface, &set_aside);
     let mut findings = Vec::new();
@@ -2926,8 +2973,10 @@ pub fn compare_handshake_ordered(
                 subject,
                 first_other,
                 claims: mine,
+                also,
                 ..
             } = read(text);
+            let my_kinds = file_kinds(text, &surface, &set_aside);
             let sym = match (subject, first_other) {
                 (Some(sym), _) => sym,
                 // "I assume the other party does not provide any symbols": a
@@ -2974,21 +3023,35 @@ pub fn compare_handshake_ordered(
                 .iter()
                 .filter(|(p, t, theirs)| {
                     let silent_ok = artifact.provision_consistent(sym, theirs);
-                    // Another surface symbol the expectation lists with this
-                    // one ("`a` ... and `b`") is met when the same party
-                    // provides it, in this sentence or another; whether it
-                    // is provided at all is `SymbolUnprovided`'s question.
+                    // Another surface file the expectation lists with this
+                    // file ("`a.py` ... and `b.toml`") is met when the same
+                    // party provides it, in this sentence or another; whether
+                    // it is provided at all is `SymbolUnprovided`'s question.
+                    // Only a file listed with a file: a symbol that follows
+                    // another in a sentence ("`parse` returns `Config`") is a
+                    // claim about it, which the provision must state.
                     let co_provided = |c: &str| {
-                        surface.contains(c)
+                        is_path(sym)
+                            && is_path(c)
+                            && also.iter().any(|(a, _)| *a == c)
                             && provided
                                 .get(c)
                                 .is_some_and(|l| l.iter().any(|(q, _, _)| q == p))
                     };
+                    // The kinds the providing party gives files, in any of
+                    // its provisions: one that gives a file another kind
+                    // still disagrees.
+                    let their_kinds: Vec<(&str, String)> = statements
+                        .iter()
+                        .filter(|x| x.party == *p)
+                        .flat_map(|x| &x.provide)
+                        .flat_map(|t| file_kinds(t, &surface, &set_aside))
+                        .collect();
                     mine.iter().all(|c| {
                         theirs.contains(c)
                             || stated_in_prose(c, t)
                             || kind_label_satisfied(c, t, theirs)
-                            || file_kind_satisfied(sym, c, text, t)
+                            || file_kind_satisfied(c, &my_kinds, &their_kinds)
                             || co_provided(c)
                             || (silent_ok && artifact.states(sym, c))
                     })

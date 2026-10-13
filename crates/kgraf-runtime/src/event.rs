@@ -102,6 +102,12 @@ pub enum WorkerEvent {
         /// The result as the model sees it.
         output: String,
         is_error: bool,
+        /// Measured wall time of the tool's execution alone, in
+        /// milliseconds. Absent for a call that never ran (a refusal, a
+        /// denial, a synthetic result) and in a transcript written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     /// Usage for one accounted provider call, with its ledger id (every token is attributed).
     Usage { call: CallId, usage: TokenUsage },
@@ -372,10 +378,12 @@ impl WorkerEvent {
                 call_id,
                 output,
                 is_error,
+                duration_ms,
             } => WorkerEvent::ToolCallFinished {
                 call_id,
                 output: scrub(output, counts),
                 is_error,
+                duration_ms,
             },
             WorkerEvent::Notice { kind, text } => WorkerEvent::Notice {
                 kind,
@@ -774,6 +782,7 @@ mod tests {
             call_id: id.into(),
             output: "ok".into(),
             is_error: false,
+            duration_ms: None,
         }
     }
 

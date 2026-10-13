@@ -407,6 +407,7 @@ impl TranscriptBuilder {
                 call_id,
                 output,
                 is_error,
+                ..
             } => {
                 self.tokens_since_usage += estimate_tokens(output);
                 if let Some(call) = self.started.remove(call_id)
@@ -1098,6 +1099,7 @@ mod tests {
             call_id: id.into(),
             output: format!("contents of {id}"),
             is_error: false,
+            duration_ms: None,
         }
     }
 
@@ -1592,6 +1594,7 @@ mod tests {
             call_id: "c".into(),
             output: "ERROR: no".into(),
             is_error: true,
+            duration_ms: None,
         });
         assert_eq!(b.succeeded().len(), 2);
     }
@@ -1631,6 +1634,7 @@ mod tests {
             call_id: "a".into(),
             output: "y".repeat(3_000),
             is_error: false,
+            duration_ms: None,
         });
         assert!(b.context_tokens() > 2_000);
     }
@@ -1757,6 +1761,7 @@ mod tests {
                 call_id: "t1".into(),
                 output: format!("let key = \"{marker}\";"),
                 is_error: false,
+                duration_ms: None,
             },
             WorkerEvent::ToolCallStarted {
                 call_id: "t2".into(),
@@ -1768,6 +1773,7 @@ mod tests {
                 call_id: "t2".into(),
                 output: "patched".into(),
                 is_error: false,
+                duration_ms: None,
             },
             WorkerEvent::ToolCallStarted {
                 call_id: "t3".into(),
@@ -1779,6 +1785,7 @@ mod tests {
                 call_id: "t3".into(),
                 output: "plain".into(),
                 is_error: false,
+                duration_ms: None,
             },
         ];
         let result_text = |messages: &[Message], id: &str| -> String {
@@ -1851,6 +1858,7 @@ mod tests {
             call_id: "t2".into(),
             output: format!("{}hook: no", crate::worker::DENIED_PREFIX),
             is_error: true,
+            duration_ms: None,
         });
         let rounds = b.replay_rounds();
         assert_eq!(rounds.len(), 1);
@@ -1908,6 +1916,7 @@ mod tests {
             call_id: id.into(),
             output,
             is_error,
+            duration_ms: None,
         };
         // A successful result that starts like a denial is still a run call.
         b.apply(&result(

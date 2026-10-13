@@ -256,7 +256,8 @@ pub use subagent_tool::{
     SUBAGENT_REPORT_PREFIX, SpawnRefusal, SpawnRequest, Spawned, SubagentReport, spawned_text,
 };
 pub use trace::{
-    DeferReason, LoopDetector, LoopKind, PlannedContract, PlannedInterface, TraceEvent, TraceLog,
+    DeferReason, LoopDetector, LoopKind, PlannedContract, PlannedInterface, RateLimitWaitsSource,
+    RouteWaits, TraceEvent, TraceLog,
 };
 pub use verify::{Attempt, AttemptStatus, Verdict, Verifier, select, status_of};
 pub use waits::{WaitKind, WaitState, one_line};

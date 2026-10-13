@@ -732,6 +732,7 @@ impl BlockLog {
                 call_id,
                 output,
                 is_error,
+                ..
             } => {
                 let Some((tool, input)) = self.started.remove(call_id) else {
                     return;
@@ -1279,6 +1280,7 @@ mod tests {
                 call_id: id.into(),
                 output: out.into(),
                 is_error: err,
+                duration_ms: None,
             },
             &Facts,
         );
@@ -1877,6 +1879,7 @@ mod tests {
                 call_id: format!("r{n}"),
                 output: "same".into(),
                 is_error: false,
+                duration_ms: None,
             });
         }
         let mut resumed = ProgressGate::new(10, 10);

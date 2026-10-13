@@ -404,7 +404,8 @@ enum Command {
         /// time for the optional asks: the interface asks and the re-plans.
         /// An ask that would start past that budget, or is expected to end
         /// past it, is not made: the interface edges go unchecked, with a
-        /// notice, and a held plan is not planned again. The first plan is
+        /// notice, and a held plan is not planned again (its failing checks are
+        /// dropped with a notice and the contracts run). The first plan is
         /// never skipped. Without this flag nothing is held back.
         #[arg(long)]
         time_limit: Option<u64>,

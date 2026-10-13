@@ -1413,10 +1413,12 @@ async fn a_cancel_while_a_result_waits_for_a_bulk_slot_still_persists_the_result
     for id in ["a", "b"] {
         assert!(
             events.iter().any(|e| matches!(
-                e,
-                WorkerEvent::ToolCallFinished { call_id, output, is_error: false }
-                    if call_id == id && output.starts_with("out ")
-            )),
+                            e,
+                            WorkerEvent::ToolCallFinished { call_id, output, is_error: false,
+            ..
+            }
+                                if call_id == id && output.starts_with("out ")
+                        )),
             "the result of {id} is in the persisted transcript: {events:#?}"
         );
     }
@@ -2347,16 +2349,91 @@ async fn a_write_that_completes_during_the_cancel_grace_is_recorded_not_interrup
         vec![std::path::PathBuf::from("out.txt")]
     );
     assert!(events.iter().any(|e| matches!(
-        e,
-        WorkerEvent::ToolCallFinished { call_id, output, is_error: false }
-            if call_id == "w" && output == "written"
-    )));
+            e,
+            WorkerEvent::ToolCallFinished { call_id, output, is_error: false,
+    ..
+    }
+                if call_id == "w" && output == "written"
+        )));
     let state = kgraf_runtime::ResumeState::from_events(
         kgraf_runtime::opening_messages("write", &[]),
         &events,
     )
     .expect("resumable");
     assert!(state.interrupted.is_empty(), "{:?}", state.interrupted);
+}
+
+/// A tool that takes 60 ms records `duration_ms >= 60` on its finished event;
+/// a call refused before it ran records none. The serialized line carries the
+/// field under that name, and a transcript line from before the field existed
+/// still parses.
+#[tokio::test]
+async fn a_finished_tool_call_records_the_measured_execution_time() {
+    let dir = tempfile::tempdir().expect("dir");
+    let provider = Fake::new(true, |request| match round_of(request) {
+        0 => Round::tool(vec![
+            ("slow", "slow_write", json!({"path": "out.txt", "ms": 60})),
+            ("missing", "no_such_tool", json!({})),
+        ]),
+        _ => Round::answer("done"),
+    });
+    let env = Arc::new(env_with(
+        provider,
+        vec![Arc::new(SlowWriter)],
+        CallMode::Stream,
+    ));
+    let handle = spawn_worker(
+        env,
+        brief("w1", "write", dir.path(), 5),
+        SpawnOptions::default(),
+    )
+    .await
+    .expect("spawn");
+    let (events, _result) = with_timeout(drain(handle)).await.expect("in time");
+    let finished = |id: &str| {
+        events
+            .iter()
+            .find(|e| matches!(e, WorkerEvent::ToolCallFinished { call_id, .. } if call_id == id))
+            .cloned()
+            .expect("finished event")
+    };
+    let slow = finished("slow");
+    let WorkerEvent::ToolCallFinished { duration_ms, .. } = &slow else {
+        unreachable!()
+    };
+    assert!(duration_ms.is_some_and(|d| d >= 60), "{duration_ms:?}");
+    let line = serde_json::to_value(&slow).expect("serialize");
+    assert!(
+        line["duration_ms"].as_u64().is_some_and(|d| d >= 60),
+        "{line}"
+    );
+    assert_eq!(line["type"], "tool_call_finished");
+    let refused = finished("missing");
+    assert!(matches!(
+        refused,
+        WorkerEvent::ToolCallFinished {
+            duration_ms: None,
+            is_error: true,
+            ..
+        }
+    ));
+    assert!(
+        serde_json::to_value(&refused)
+            .expect("serialize")
+            .get("duration_ms")
+            .is_none()
+    );
+    let old: WorkerEvent = serde_json::from_str(
+        r#"{"type":"tool_call_finished","call_id":"t","output":"ok","is_error":false}"#,
+    )
+    .expect("a line from before the field");
+    assert!(matches!(
+        old,
+        WorkerEvent::ToolCallFinished {
+            duration_ms: None,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -3800,6 +3877,7 @@ async fn a_write_approved_before_its_path_was_fenced_is_refused_when_it_starts()
                     call_id,
                     output,
                     is_error,
+                    ..
                 } if call_id == id => Some((output.clone(), *is_error)),
                 _ => None,
             })
@@ -3871,10 +3949,12 @@ async fn a_cancel_during_a_bulk_emit_still_records_the_sibling_calls() {
     for id in ["a", "b", "c"] {
         assert!(
             events.iter().any(|e| matches!(
-                e,
-                WorkerEvent::ToolCallFinished { call_id, output, is_error: false }
-                    if call_id == id && output == "written"
-            )),
+                            e,
+                            WorkerEvent::ToolCallFinished { call_id, output, is_error: false,
+            ..
+            }
+                                if call_id == id && output == "written"
+                        )),
             "the result of {id} is recorded: {events:#?}"
         );
     }
@@ -4721,6 +4801,7 @@ fn finished_output(events: &[WorkerEvent], id: &str) -> (String, bool) {
                 call_id,
                 output,
                 is_error,
+                ..
             } if call_id == id => Some((output.clone(), *is_error)),
             _ => None,
         })

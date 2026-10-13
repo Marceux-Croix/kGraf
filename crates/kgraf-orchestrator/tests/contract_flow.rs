@@ -21,9 +21,10 @@ use kgraf_core::{AgentId, RunId};
 use kgraf_orchestrator::{
     Basis, Challenge, Challenger, CheckStage, ConsumerTestRequest, ConsumerTestWriter,
     ContractChecks, ContractControl, ContractEvent, ContractReply, CostBasis, Evidence,
-    FileOverlay, GitStubLander, HandshakeFinding, InterfaceContract, ManualClock, ModelCaller,
-    ModelHandshaker, ModelReviewer, Orchestrator, OrchestratorHandle, PlanError, Resolution,
-    Revision, RevisionClass, RunReport, RunStatus, StubLander, StubScope, TraceEvent, TraceLog,
+    FileOverlay, GateRequest, GateRunner, GateVerdict, GitStubLander, HandshakeFinding,
+    InterfaceContract, ManualClock, ModelCaller, ModelHandshaker, ModelReviewer, Orchestrator,
+    OrchestratorHandle, PlanError, ROOT_GATE, Resolution, Revision, RevisionClass, RunReport,
+    RunStatus, StubLander, StubScope, TraceEvent, TraceLog, UntrustedText,
 };
 use kgraf_sandbox::{Identity, MergeBack, WorkspaceManager};
 use std::path::Path;
@@ -2285,10 +2286,11 @@ async fn the_contracts_ask_is_never_skipped_by_the_budget() {
 }
 
 /// A re-plan is optional: with the budget spent, a plan the gate holds is not
-/// planned again, and the run ends on the hold as it does when no re-plan is
-/// left.
+/// planned again. The run does not end on the hold: as when the re-plan is
+/// spent, the failing check is dropped with a notice that names the budget,
+/// and the contracts dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replan_is_skipped_when_the_budget_is_spent() {
+async fn a_replan_the_budget_refuses_drops_the_failing_check_and_dispatches() {
     let dir = tempfile::tempdir().expect("dir");
     let clock = Arc::new(ManualClock::new(1_000_000));
     let rig = Rig::with_planner(
@@ -2310,10 +2312,10 @@ async fn a_replan_is_skipped_when_the_budget_is_spent() {
         Duration::from_millis(20),
     );
     let report = orchestrator_on(&rig, clock, Some(Duration::from_secs(9)))
+        .with_gate_runner(Arc::new(PassGate))
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
-    assert_ne!(report.status, RunStatus::Completed, "{report:?}");
     assert!(
         rig.parts
             .planner
@@ -2331,6 +2333,70 @@ async fn a_replan_is_skipped_when_the_budget_is_spent() {
         "{:?}",
         report.notices
     );
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "config",
+        "Optional[Config]",
+        "the planner time budget refused it",
+    )
+    .await;
+}
+
+/// A check that fails after work has started is not the planner's to
+/// correct: nothing is re-planned, the check is dropped with a notice that
+/// says work already started, and its parties dispatch. Here an unrelated
+/// contract no interface holds dispatches and verifies; the interface's
+/// handshake fails, and the run would end on its hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_failing_after_work_started_is_dropped_and_the_run_continues() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut all = vec![c("other", "unrelated work", "other.txt", &[])];
+    all.extend(parties_plan(false));
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&plan_json(&all)).expect("the plan is JSON");
+    plan["interfaces"] = serde_json::json!([serde_json::to_value(py_ic()).expect("json")]);
+    let rig = Rig::new(
+        dir.path(),
+        plan.to_string(),
+        |prompt| {
+            if prompt.contains("You are party `cons`") {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing(prompt)
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert!(
+        rig.parts
+            .planner
+            .prompts()
+            .iter()
+            .all(|p| !p.contains("before any work started")),
+        "no re-plan ask was made"
+    );
+    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
+    assert!(report.verified.iter().any(|v| v == "other"), "{report:?}");
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "config",
+        "Optional[Config]",
+        "work has already started",
+    )
+    .await;
 }
 
 /// A plan the gate holds before any work started (a handshake mismatch) is
@@ -2536,6 +2602,7 @@ async fn a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_d
     );
     let report = rig
         .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
@@ -2545,7 +2612,14 @@ async fn a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_d
         "one plan, one re-plan, each a contracts and an interface call"
     );
     assert_eq!(report.contracts.handshake_failures, 2, "{report:?}");
-    assert_checks_dropped(&rig, &report, "re1.config", "Optional[Config]").await;
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "re1.config",
+        "Optional[Config]",
+        "the re-plan is spent",
+    )
+    .await;
 }
 
 /// A re-planned interface whose handshake cannot run at all (a party's
@@ -2576,18 +2650,53 @@ async fn a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_disp
     );
     let report = rig
         .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
     assert_eq!(rig.parts.planner.prompts().len(), 4, "one re-plan");
     assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
-    assert_checks_dropped(&rig, &report, "re1.config", "could not run").await;
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "re1.config",
+        "could not run",
+        "the re-plan is spent",
+    )
+    .await;
 }
 
-/// The run went on past a check that still failed after the re-plan: workers
-/// ran, the interface's checks were dropped once with the finding named in a
-/// notice and a trace event, and its edge was counted as not run.
-async fn assert_checks_dropped(rig: &Rig, report: &RunReport, interface: &str, finding: &str) {
+/// A gate runner whose every gate passes: the run plans a root gate over the
+/// whole plan, so a test can see that gate judge the work.
+struct PassGate;
+
+#[async_trait::async_trait]
+impl GateRunner for PassGate {
+    fn commands(&self) -> Vec<String> {
+        vec!["python -m pytest".into()]
+    }
+
+    async fn run(&self, _: GateRequest) -> Result<GateVerdict, String> {
+        Ok(GateVerdict {
+            passed: true,
+            by: "python -m pytest".into(),
+            output: UntrustedText::new("ok"),
+        })
+    }
+}
+
+/// The run went on past a check that still failed with no re-plan left:
+/// workers ran, the interface's checks were dropped once with the finding and
+/// `no_replan` (why no re-plan happened) named in a notice and the finding in
+/// a trace event, its edge was counted as not run, and the root verify gate
+/// ran after the drop and judged the work.
+async fn assert_checks_dropped(
+    rig: &Rig,
+    report: &RunReport,
+    interface: &str,
+    finding: &str,
+    no_replan: &str,
+) {
     assert!(
         !matches!(report.status, RunStatus::Blocked { .. }),
         "the run is not blocked on the check: {report:?}"
@@ -2604,6 +2713,23 @@ async fn assert_checks_dropped(rig: &Rig, report: &RunReport, interface: &str, f
         .find(|n| n.contains(&format!("interface {interface}@v1")) && n.contains("dropped"))
         .unwrap_or_else(|| panic!("a notice names the interface: {:?}", report.notices));
     assert!(notice.contains(finding), "{notice}");
+    assert!(
+        notice.contains(&format!("no re-plan will happen ({no_replan}")),
+        "the notice says why no re-plan happened: {notice}"
+    );
+    let trace = rig.trace().await;
+    let dropped_at = trace
+        .iter()
+        .position(|e| matches!(e,
+            TraceEvent::Contract { record, .. }
+                if matches!(&**record, ContractEvent::ChecksDropped { interface: i, .. } if i == interface)))
+        .expect("the drop is traced");
+    assert!(
+        trace[dropped_at..].iter().any(|e| matches!(e,
+            TraceEvent::Gate { gate, state, .. } if gate == ROOT_GATE && state == "passed")),
+        "the root verify gate ran after the drop: {:#?}",
+        &trace[dropped_at..]
+    );
     let events = rig.contract_events().await;
     assert!(
         events.iter().any(|e| matches!(e,
@@ -2615,6 +2741,92 @@ async fn assert_checks_dropped(rig: &Rig, report: &RunReport, interface: &str, f
         events.iter().any(|e| matches!(e,
             ContractEvent::Unchecked { reason, .. } if reason.contains(interface))),
         "{events:?}"
+    );
+}
+
+/// `ChecksDropped` is traced before the record is saved, as every contract
+/// event is. A stop between the two leaves the trace with the checks dropped
+/// and the record with the parties held. Simulated here: a run ends on a
+/// handshake hold, then the drop is appended to its trace with the record left
+/// as saved. The resume releases the parties from the trace, with a notice,
+/// and dispatches them; the root verify gate judges the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_after_a_drop_traced_but_not_saved_releases_the_parties() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        |prompt| {
+            if prompt.contains("You are party `prod`") {
+                agreeing(prompt)
+            } else {
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let first = rig
+        .orchestrator(vec![py_ic()])
+        .with_gate_runner(Arc::new(PassGate))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert!(
+        matches!(first.status, RunStatus::Blocked { .. }),
+        "{first:?}"
+    );
+    assert_eq!(first.held.len(), 2, "{first:?}");
+    assert!(worker_requests(&rig.parts).is_empty());
+    {
+        let path = rig.parts.dir.join("runs").join("r1").join("trace.jsonl");
+        let mut log = TraceLog::open(&path).await.expect("trace");
+        log.record(TraceEvent::Contract {
+            at_ms: 0,
+            record: Box::new(ContractEvent::ChecksDropped {
+                interface: "config".into(),
+                version: 1,
+                stage: "handshake".into(),
+                reason: "1 mismatch: Optional[Config]".into(),
+                released: vec!["prod".into(), "cons".into()],
+            }),
+            counters: Default::default(),
+        })
+        .await
+        .expect("append");
+    }
+    let report = rig
+        .orchestrator(vec![py_ic()])
+        .with_gate_runner(Arc::new(PassGate))
+        .resume(RunId::new("r1"))
+        .await
+        .expect("resume");
+    assert!(
+        !matches!(report.status, RunStatus::Blocked { .. }),
+        "the resume is not blocked on the dropped check: {report:?}"
+    );
+    assert!(
+        !worker_requests(&rig.parts).is_empty(),
+        "the parties dispatched: {report:?}"
+    );
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("interface config@v1") && n.contains("released on resume")),
+        "{:?}",
+        report.notices
+    );
+    assert!(report.contracts.checks_not_run >= 1, "{report:?}");
+    let trace = rig.trace().await;
+    assert!(
+        trace.iter().any(|e| matches!(e,
+            TraceEvent::Gate { gate, state, .. } if gate == ROOT_GATE && state == "passed")),
+        "the root verify gate judged the work"
     );
 }
 

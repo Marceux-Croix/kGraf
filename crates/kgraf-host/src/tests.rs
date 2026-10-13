@@ -8889,6 +8889,7 @@ mod skill_enforcement {
                 call_id,
                 output,
                 is_error,
+                ..
             } = ev
             {
                 // Asked while the worker runs, as `report_shortfall` would be.
@@ -9385,4 +9386,38 @@ async fn finish_run_empties_every_per_run_table_of_the_host() {
             "a second finish is a no-op"
         );
     }
+}
+
+/// The run's rate-limit waits are the limiters' growth since the reader was
+/// made: a wait before it is not counted, a wait after it is, and a route
+/// that never waited reads zero (the orchestrator writes no record for it).
+#[tokio::test]
+async fn the_rate_limit_wait_reader_counts_only_waits_after_its_baseline() {
+    let paced = kgraf_provider::RouteLimiter::new(
+        "paced",
+        kgraf_provider::RateLimit::parse("600/1@5000").expect("limit"),
+    )
+    .expect("limiter");
+    let idle = kgraf_provider::RouteLimiter::new(
+        "idle",
+        kgraf_provider::RateLimit::parse("600/1@5000").expect("limit"),
+    )
+    .expect("limiter");
+    let mut limiters = Limiters::new();
+    limiters.insert("paced".into(), paced.clone());
+    limiters.insert("idle".into(), idle);
+    // The first call takes the burst slot; the second waits (before the
+    // baseline, so it is not the run's).
+    paced.acquire("test").await.expect("first");
+    paced.acquire("test").await.expect("second, waits");
+    assert_eq!(paced.stats().waited, 1);
+    let source = crate::host::rate_limit_waits_since_now(&limiters);
+    paced.acquire("test").await.expect("third, waits");
+    let read: BTreeMap<String, (u64, u64)> = source()
+        .into_iter()
+        .map(|w| (w.route, (w.waited_ms, w.waits)))
+        .collect();
+    assert_eq!(read["paced"].1, 1, "{read:?}");
+    assert!(read["paced"].0 >= 50, "{read:?}");
+    assert_eq!(read["idle"], (0, 0));
 }

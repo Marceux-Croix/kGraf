@@ -603,6 +603,7 @@ impl HistoryArchive {
                     call_id,
                     output,
                     is_error,
+                    ..
                 } => {
                     let kind = if *is_error { "error result" } else { "result" };
                     format!("{kind} {call_id}: {output}")
@@ -1025,6 +1026,7 @@ mod tests {
                 call_id: "t1".into(),
                 output: "fn load() { let port = 8443; }".into(),
                 is_error: false,
+                duration_ms: None,
             },
             WorkerEvent::TextDelta {
                 text: "ignored".into(),

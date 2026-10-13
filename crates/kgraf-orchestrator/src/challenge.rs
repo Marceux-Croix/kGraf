@@ -282,8 +282,8 @@ pub struct ContractCounters {
     /// program is not installed ([`ContractEvent::ChecksSkipped`]); their
     /// parties ran without contract checks.
     pub interface_checks_skipped: u64,
-    /// Interfaces whose pre-dispatch checks still failed after the one
-    /// re-plan and were dropped ([`ContractEvent::ChecksDropped`]); their
+    /// Interfaces whose checks still failed with no re-plan left (spent,
+    /// refused by the budget, or work already started) and were dropped ([`ContractEvent::ChecksDropped`]); their
     /// parties ran without contract checks, and their edges are counted in
     /// `checks_not_run` through [`ContractEvent::Unchecked`].
     pub interface_checks_dropped: u64,
@@ -387,8 +387,10 @@ pub enum ContractEvent {
         program: String,
         detail: String,
     },
-    /// The interface's checks failed again after the plan's one re-plan, and
-    /// the run would otherwise end on the hold with its contracts undone. The
+    /// The interface's checks still fail, no re-plan will happen (the one
+    /// re-plan is spent or was refused, the planner time budget refused it,
+    /// or work already started), and the run would otherwise end on the hold
+    /// with its contracts undone. The
     /// checks are dropped: the interface takes the path of a run with
     /// contract checks off, its held parties are released, and the run's
     /// verify gate still judges the work. `stage` is the failing stage
@@ -525,7 +527,7 @@ struct Entry {
     stub_landed: bool,
     /// Why the current version's checks are not run: the missing check
     /// program (`ContractEvent::ChecksSkipped`), or the failure that still
-    /// held after the re-plan (`ContractEvent::ChecksDropped`). While set, the interface
+    /// held with no re-plan left (`ContractEvent::ChecksDropped`). While set, the interface
     /// takes the path of a run with contract checks off: no stub landing, no
     /// consumer tests, no hold.
     checks_skipped: Option<String>,

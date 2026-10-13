@@ -530,6 +530,7 @@ fn outputs(events: &[WorkerEvent]) -> BTreeMap<String, (String, bool)> {
                 call_id,
                 output,
                 is_error,
+                ..
             } => Some((call_id.clone(), (output.clone(), *is_error))),
             _ => None,
         })

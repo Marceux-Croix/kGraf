@@ -2147,6 +2147,7 @@ impl RunLoop {
         let traced = self
             .trace(TraceEvent::Integration {
                 at_ms: now,
+                duration_ms: None,
                 contract: c.contract.clone(),
                 outcome: format!("subagent_{status}"),
                 detail: format!("{id} into {parent}"),

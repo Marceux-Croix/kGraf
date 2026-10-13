@@ -691,6 +691,7 @@ async fn recall_finds_a_detail_the_summary_dropped_and_only_after_compaction() {
                     call_id,
                     output,
                     is_error,
+                    ..
                 } if call_id == id => Some((output.clone(), *is_error)),
                 _ => None,
             })

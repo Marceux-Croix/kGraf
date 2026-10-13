@@ -994,6 +994,16 @@ fn answer_recovery_record(at_ms: i64, r: kgraf_provider::AnswerRecovery) -> (Tra
 /// re-ask as the first plan's, and its interfaces their own budget.
 pub(crate) const MAX_REPLANS: u32 = 1;
 
+/// What [`RunLoop::replan`] did when the run would end blocked.
+enum Replan {
+    /// A new plan replaced the held one, or a stop arrived while planning.
+    Planned,
+    /// No re-plan will happen, and why: the one re-plan is spent or was
+    /// refused, the planner time budget refused it, work already started, or
+    /// the holds are not the planner's to correct.
+    NotPlanned(String),
+}
+
 /// The held plan's failures, quoted as data for one re-planned contract's
 /// worker: only the failures that concern the files it writes or the
 /// contract it replaces (same id), so a worker is not given another
@@ -2050,6 +2060,9 @@ pub struct Orchestrator {
     tx: mpsc::Sender<LoopMsg>,
     rx: mpsc::Receiver<LoopMsg>,
     gate_runner: Option<Arc<dyn crate::gates::GateRunner>>,
+    /// Read once at the run's end; each route that waited gets a
+    /// `rate_limit_waits` trace record. `None`: no limiter to read.
+    rate_limit_waits: Option<crate::trace::RateLimitWaitsSource>,
     attempt_envs: Option<Arc<dyn AttemptEnvs>>,
     /// Decision 0079: a model on a cross-vendor consumer's route, asked once per
     /// producer verification when [`OrchestratorConfig::interface_review`] is on.
@@ -2126,6 +2139,7 @@ impl Orchestrator {
             tx,
             rx,
             gate_runner: None,
+            rate_limit_waits: None,
             attempt_envs: None,
             interface_reviewer: None,
             model_kinds: None,
@@ -2233,6 +2247,13 @@ impl Orchestrator {
     /// has no gates and its record says so.
     pub fn with_gate_runner(mut self, runner: Arc<dyn crate::gates::GateRunner>) -> Self {
         self.gate_runner = Some(runner);
+        self
+    }
+
+    /// Where the run's rate-limit waits are read at its end (one trace record
+    /// per route that waited).
+    pub fn with_rate_limit_waits(mut self, source: crate::trace::RateLimitWaitsSource) -> Self {
+        self.rate_limit_waits = Some(source);
         self
     }
 
@@ -2643,6 +2664,7 @@ impl RunLoop {
             tx,
             rx,
             gate_runner,
+            rate_limit_waits,
             attempt_envs,
             interface_reviewer,
             model_kinds,
@@ -2804,7 +2826,7 @@ impl RunLoop {
             rerouted_from: BTreeMap::new(),
             unpriced_cache: Mutex::new(None),
             wake_at: None,
-            coord: coord::CoordRuntime::new(gate_runner),
+            coord: coord::CoordRuntime::new(gate_runner, rate_limit_waits),
             frugal: frugality::FrugalRuntime::new(),
             notices: BTreeSet::new(),
             intake_notices: Vec::new(),
@@ -4333,6 +4355,7 @@ impl RunLoop {
         // whatever the status (decision 0067, amendment of 2026-10-06).
         self.report_undelivered_at_run_end();
         self.shutdown()?;
+        self.queue_rate_limit_waits();
         self.flush_coord().await?;
         self.save()?;
         if matches!(self.record.status, RunStatus::Completed) {
@@ -4398,6 +4421,7 @@ impl RunLoop {
     async fn report_undelivered_on_error(&mut self) {
         self.coord.run_failed = true;
         self.report_undelivered_at_run_end();
+        self.queue_rate_limit_waits();
         if let Err(e) = self.save() {
             eprintln!(
                 "kgraf-orchestrator: a failed run's undelivered reports could not be saved: {e}"
@@ -4435,15 +4459,26 @@ impl RunLoop {
                 if !self.contract_jobs_busy()
                     && let Some(status) = self.terminal_status()
                 {
-                    // A plan its interface checks held before any work
-                    // started goes back to the planner once. A check that
-                    // still holds after that re-plan is dropped, loudly, and
-                    // the contracts run: the run does not end on it.
-                    if matches!(status, RunStatus::Blocked { .. })
-                        && (on_heap(|| self.replan()).await?
-                            || on_heap(|| self.drop_failed_checks()).await?)
-                    {
-                        continue;
+                    // A hold whose checks the trace already dropped (a stop
+                    // between the event and the save) is released first. A
+                    // plan its interface checks held before any work started
+                    // goes back to the planner once. A check that still holds
+                    // when no re-plan will happen (spent, refused by the
+                    // budget, work started) is dropped, loudly, and the
+                    // contracts run: the run does not end on it.
+                    if matches!(status, RunStatus::Blocked { .. }) {
+                        if on_heap(|| self.release_dropped_holds()).await? {
+                            continue;
+                        }
+                        let released = match on_heap(|| self.replan()).await? {
+                            Replan::Planned => true,
+                            Replan::NotPlanned(why) => {
+                                on_heap(|| self.drop_failed_checks(&why)).await?
+                            }
+                        };
+                        if released {
+                            continue;
+                        }
                     }
                     self.record.status = status;
                     break;
@@ -4544,9 +4579,10 @@ impl RunLoop {
 
     /// Send a plan that its interfaces' pre-dispatch checks held before any
     /// work started back to the planner with the checks' failures, once
-    /// ([`MAX_REPLANS`]), instead of ending the run on the hold. `true`: a new
-    /// plan replaced the held one (or a stop arrived while planning), and the
-    /// loop goes on.
+    /// ([`MAX_REPLANS`]), instead of ending the run on the hold.
+    /// [`Replan::Planned`]: a new plan replaced the held one (or a stop
+    /// arrived while planning), and the loop goes on; otherwise why no re-plan
+    /// will happen.
     ///
     /// The failures are ones the planner's re-asks never saw: a handshake runs
     /// only at the gate, and the last ask's plan is taken without its
@@ -4554,23 +4590,34 @@ impl RunLoop {
     /// its own ([`renamed_for_replan`]); the gate checks it as it checks any
     /// plan. A re-plan the planner answers with a plan that is refused
     /// outright leaves the held plan, with the refusal noticed. Either way, a
-    /// check that still holds once the re-plan is spent is dropped
+    /// check that still holds when no re-plan will happen (the re-plan is
+    /// spent, refused by the budget, or not eligible) is dropped
     /// ([`RunLoop::drop_failed_checks`]) rather than ending the run.
-    async fn replan(&mut self) -> Result<bool, OrchestratorError> {
-        if self.record.replans >= MAX_REPLANS || self.record.source_plan.is_some() {
-            return Ok(false);
+    async fn replan(&mut self) -> Result<Replan, OrchestratorError> {
+        if self.record.source_plan.is_some() {
+            return Ok(Replan::NotPlanned("the plan was approved".to_owned()));
         }
-        let Some(parts) = self.replan_failures() else {
-            return Ok(false);
+        if self.record.replans >= MAX_REPLANS {
+            return Ok(Replan::NotPlanned(format!(
+                "the re-plan is spent ({} of {MAX_REPLANS})",
+                self.record.replans
+            )));
+        }
+        let parts = match self.replan_failures() {
+            Ok(parts) => parts,
+            Err(why) => return Ok(Replan::NotPlanned(why)),
         };
         // A re-plan is optional: with the planner time budget spent the held
-        // plan's outcome stands, as it does when no re-plan is left.
+        // plan is not planned again, as when no re-plan is left, and its
+        // failing checks are dropped instead.
         if let Some(why) = self.planner_budget_gate("replan").await? {
             self.notices
                 .insert(kgraf_secrets::scrub_persist_owned(format!(
                     "the plan was held before any work started and is not planned again: {why}"
                 )));
-            return Ok(false);
+            return Ok(Replan::NotPlanned(format!(
+                "the planner time budget refused it: {why}"
+            )));
         }
         let failures = parts
             .iter()
@@ -4625,7 +4672,7 @@ impl RunLoop {
                     self.stopping = true;
                 }
                 self.save()?;
-                Ok(true)
+                Ok(Replan::Planned)
             }
             Err(e) => {
                 let (open, gates, base) = held;
@@ -4642,7 +4689,7 @@ impl RunLoop {
                         "the re-plan was refused, so the held plan stands: {e}"
                     )));
                 self.save()?;
-                Ok(false)
+                Ok(Replan::NotPlanned(format!("the re-plan was refused: {e}")))
             }
         }
     }
@@ -4701,6 +4748,7 @@ impl RunLoop {
         let at = self.now();
         self.trace(TraceEvent::Integration {
             at_ms: at,
+            duration_ms: None,
             contract: contract.to_owned(),
             outcome: "not_landed".to_owned(),
             detail: format!("{detail} (commit {commit})"),

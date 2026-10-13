@@ -276,3 +276,24 @@ Tests: `contract_flow.rs`
 `a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_dispatches`; `challenge.rs`
 `dropped_checks_release_the_hold_and_replay_once`. Both flow tests failed on the code before this
 change: the run ended Blocked with no dispatch.
+
+### 2026-10-13, later: the drop applies when no re-plan will happen
+
+The "When" above is widened. The checks are dropped when the run would end on such a hold and no
+re-plan will happen, for any reason: the one re-plan is spent or was refused, the planner time
+budget refused it, or work has already started (a check that fails after a dispatch, a verified
+contract or a merge is not the planner's to correct). A re-plan that the budget refused returned
+without counting as spent, so the earlier condition still ended those runs Blocked with no worker.
+The notice now says why no re-plan happened. Kept as before: a run from an approved plan, an
+interface given before planning, and holds with other causes keep their holds.
+
+`ChecksDropped` is traced before the run record is saved, as every contract event is. A resume that
+finds parties still held under an interface that the trace shows with its checks dropped releases
+them, with a notice, and records any of its edges the trace lacks as not run.
+
+Tests: `contract_flow.rs` `a_replan_the_budget_refuses_drops_the_failing_check_and_dispatches`
+(formerly `a_replan_is_skipped_when_the_budget_is_spent`),
+`a_check_failing_after_work_started_is_dropped_and_the_run_continues`,
+`a_resume_after_a_drop_traced_but_not_saved_releases_the_parties`; each failed on the code before
+this change (the run ended Blocked). The flow tests also assert that the root verify gate passed
+after the drop.

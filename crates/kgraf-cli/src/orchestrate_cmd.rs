@@ -910,7 +910,7 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         }
         if c.interface_checks_dropped > 0 {
             out.push(format!(
-                "interface checks dropped  {} (still failing after the re-plan; those parties \
+                "interface checks dropped  {} (still failing with no re-plan left; those parties \
                  ran without contract checks, and their edges are counted as not run)",
                 c.interface_checks_dropped
             ));

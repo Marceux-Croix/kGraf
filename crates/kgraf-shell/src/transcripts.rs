@@ -161,7 +161,8 @@ fn event_turn(event: WorkerEvent, turns: &mut Vec<Turn>) {
             call_id,
             output,
             is_error,
-        } => turns.push(Turn::ToolResult {
+..
+} => turns.push(Turn::ToolResult {
             call_id,
             output,
             is_error,

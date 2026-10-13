@@ -276,3 +276,116 @@ fn an_ambiguous_bare_file_name_still_holds() {
         "{f:#?}"
     );
 }
+
+// ------------------------------------------------------------ narrow rules
+
+/// A surface symbol that follows another in a sentence is a claim about it,
+/// not a listed file: the provider's "`parse_config` returns `dict`"
+/// disagrees with "`parse_config` returns `Config`", however the same party
+/// describes `Config` elsewhere.
+#[test]
+fn a_symbol_claimed_about_another_is_not_met_by_its_provision_elsewhere() {
+    let i = ic(&["parse_config", "Config"], &["app/config.py"]);
+    let s = [
+        statement(
+            "p",
+            &[
+                "I will provide `parse_config` returns `dict`.",
+                "I will provide `Config` is a dataclass.",
+            ],
+            &[],
+        ),
+        statement("c", &[], &["I assume `parse_config` returns `Config`."]),
+    ];
+    let f = compare_handshake(&i, &s, &writes_of(&["app/config.py"]));
+    assert!(
+        f.iter().any(|x| matches!(x,
+            HandshakeFinding::Disagree { symbol, .. } if symbol == "parse_config")),
+        "{f:#?}"
+    );
+}
+
+/// A kind word that follows another anchor ("`rate` of type `f64`") is a
+/// type claim about that anchor, even in a sentence about a file.
+#[test]
+fn a_type_given_to_an_item_inside_a_file_sentence_is_still_a_claim() {
+    let i = ic(&["pkg/a.py"], &["pkg/a.py"]);
+    let s = [
+        statement(
+            "p",
+            &["I will provide `pkg/a.py` exports `rate` as `i64`."],
+            &[],
+        ),
+        statement(
+            "c",
+            &[],
+            &["I assume `pkg/a.py` exports `rate` of type `f64`."],
+        ),
+    ];
+    let f = compare_handshake(&i, &s, &writes_of(&["pkg/a.py"]));
+    assert!(
+        matches!(&holding(&f)[..],
+            [HandshakeFinding::Disagree { symbol, .. }] if symbol == "pkg/a.py"),
+        "{f:#?}"
+    );
+}
+
+/// The joins name a file's kind; a provider that gives the file another kind
+/// in a different sentence still disagrees.
+#[test]
+fn file_kind_joins_and_a_contrary_kind_in_another_sentence() {
+    let surface: BTreeSet<&str> = ["pkg/a.py", "b.toml"].into_iter().collect();
+    assert_eq!(
+        file_kinds(
+            "`pkg/a.py` as type `Code`, `b.toml` (kind `Config`) and `x` of type `f64`",
+            &surface,
+            &BTreeSet::new()
+        ),
+        vec![
+            ("pkg/a.py", "Code".to_owned()),
+            ("b.toml", "Config".to_owned())
+        ]
+    );
+    let i = ic(&["pkg/a.py", "b.toml"], &["pkg/a.py", "b.toml"]);
+    let s = [
+        statement(
+            "p",
+            &[
+                "I will provide `pkg/a.py` with the code.",
+                "I will provide `b.toml`; `pkg/a.py` of type `Config` is generated.",
+            ],
+            &[],
+        ),
+        statement(
+            "c",
+            &[],
+            &["I assume you provide `pkg/a.py` as type `Code`."],
+        ),
+    ];
+    let f = compare_handshake(&i, &s, &writes_of(&["pkg/a.py", "b.toml"]));
+    assert!(
+        f.iter().any(|x| matches!(x,
+            HandshakeFinding::Disagree { symbol, .. } if symbol == "pkg/a.py")),
+        "{f:#?}"
+    );
+}
+
+/// A bare file name two stub files have names neither, even when only one
+/// of them is on the surface: the provider's "`__init__.py`" does not
+/// provide `a/__init__.py`.
+#[test]
+fn a_bare_name_two_stub_files_share_binds_to_neither() {
+    let mut i = ic(&["a/__init__.py"], &["a/__init__.py", "b/__init__.py"]);
+    i.symbols = vec!["a/__init__.py".into()];
+    let s = [
+        statement("p", &["I will provide `__init__.py`."], &[]),
+        statement("c", &[], &["I assume you provide `a/__init__.py`."]),
+    ];
+    let f = compare_handshake(&i, &s, &writes_of(&["a/__init__.py", "b/__init__.py"]));
+    assert!(
+        f.contains(&HandshakeFinding::SymbolUnprovided {
+            symbol: "a/__init__.py".into()
+        }),
+        "{f:#?}"
+    );
+}

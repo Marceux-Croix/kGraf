@@ -46,6 +46,8 @@ struct ScriptGate {
     script: BTreeMap<String, Vec<bool>>,
     output: String,
     runs: Mutex<Vec<GateRequest>>,
+    /// How long each run takes, in milliseconds.
+    delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ScriptGate {
@@ -58,6 +60,7 @@ impl ScriptGate {
                 .collect(),
             output: output.into(),
             runs: Mutex::new(Vec::new()),
+            delay_ms: std::sync::atomic::AtomicU64::new(5),
         })
     }
 
@@ -86,7 +89,8 @@ impl GateRunner for ScriptGate {
             .unwrap_or(vec![true]);
         let passed = script[n.min(script.len() - 1)];
         self.runs.lock().expect("lock").push(request);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         Ok(GateVerdict {
             passed,
             by: "cargo test --workspace".into(),
@@ -130,6 +134,107 @@ fn split_parts(dir: &std::path::Path) -> Parts {
 
 fn index_of(trace: &[TraceEvent], f: impl Fn(&TraceEvent) -> bool) -> usize {
     trace.iter().position(f).expect("event in the trace")
+}
+
+/// The trace carries measured times: a gate command that takes 50 ms records
+/// `duration_ms >= 50` on the record that ends its run, a merge-back that takes
+/// 30 ms records at least 30, a planning record carries none, and a route that
+/// waited on its rate limiter gets one `rate_limit_waits` record at the run's
+/// end (a route that did not wait gets none).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_trace_records_gate_merge_back_and_rate_limit_wait_times() {
+    let dir = tempfile::tempdir().expect("dir");
+    let p = split_parts(dir.path());
+    let gate = ScriptGate::new(
+        &[("gate:h", &[false, true])],
+        "error[E0308]: mismatched types",
+    );
+    gate.delay_ms.store(50, std::sync::atomic::Ordering::SeqCst);
+    let integration = FakeIntegration::new(dir.path().join("worktrees"));
+    integration
+        .merge_delay_ms
+        .store(30, std::sync::atomic::Ordering::SeqCst);
+    let mut services = p.services(WINDOW);
+    services.workspaces = integration.clone();
+    let source: kgraf_orchestrator::RateLimitWaitsSource = Arc::new(|| {
+        vec![
+            kgraf_orchestrator::RouteWaits {
+                route: "slow".into(),
+                waited_ms: 1_234,
+                waits: 3,
+            },
+            kgraf_orchestrator::RouteWaits {
+                route: "idle".into(),
+                waited_ms: 0,
+                waits: 0,
+            },
+        ]
+    });
+    let o = Orchestrator::new(config(), services)
+        .expect("orchestrator")
+        .with_gate_runner(gate.clone())
+        .with_rate_limit_waits(source);
+    let report = o
+        .start(RunId::new("r1"), "one huge part and one small".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+
+    let trace = trace_of(&p).await;
+    // Every gate-run result (failed, then passed, then the root) has a time of
+    // at least the gate command's own.
+    let ended: Vec<(&String, &String, Option<u64>)> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::Gate {
+                gate,
+                state,
+                duration_ms,
+                ..
+            } if state == "passed" || state == "failed" => Some((gate, state, *duration_ms)),
+            _ => None,
+        })
+        .collect();
+    assert!(ended.len() >= 3, "{ended:?}");
+    for (g, s, d) in &ended {
+        assert!(d.is_some_and(|d| d >= 50), "{g} {s}: {d:?}");
+    }
+    // A planning record ran nothing.
+    assert!(trace.iter().any(|e| matches!(
+        e,
+        TraceEvent::Gate { state, duration_ms: None, .. } if state == "planned"
+    )));
+    // Each attempt's merge-back took at least the merge's own time.
+    let merges: Vec<Option<u64>> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::Integration {
+                outcome,
+                duration_ms,
+                ..
+            } if outcome == "merged" => Some(*duration_ms),
+            _ => None,
+        })
+        .collect();
+    assert!(!merges.is_empty());
+    assert!(
+        merges.iter().all(|d| d.is_some_and(|d| d >= 30)),
+        "{merges:?}"
+    );
+    // Rate-limit waits: only the route that waited, once.
+    let waits: Vec<(&String, u64, u64)> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::RateLimitWaits {
+                route,
+                waited_ms,
+                waits,
+                ..
+            } => Some((route, *waited_ms, *waits)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(waits, vec![(&"slow".to_owned(), 1_234, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

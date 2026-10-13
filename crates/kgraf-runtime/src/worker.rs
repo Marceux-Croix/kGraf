@@ -2740,6 +2740,7 @@ impl Worker {
                 call_id: id.clone(),
                 output: format!("ERROR: not run: {why}"),
                 is_error: true,
+                duration_ms: None,
             };
             self.emit(ep, finished).await?;
         }
@@ -3561,6 +3562,7 @@ impl Worker {
                                 call_id: call_id.clone(),
                                 output: format!("{REFUSED_PREFIX}{why}"),
                                 is_error: true,
+                                duration_ms: None,
                             };
                             self.note_refusal(&mut finished, path);
                             self.emit(ep, finished).await?;
@@ -3584,6 +3586,7 @@ impl Worker {
                             call_id: call_id.clone(),
                             output,
                             is_error: true,
+                            duration_ms: None,
                         };
                         self.note_refusal(&mut finished, None);
                         self.emit(ep, finished).await?;
@@ -3637,6 +3640,7 @@ impl Worker {
                 call_id: call.call_id().to_owned(),
                 output,
                 is_error,
+                duration_ms: None,
             };
             self.emit(ep, finished).await?;
         }
@@ -3744,7 +3748,7 @@ impl Worker {
                 }
                 next = running.next() => next,
             };
-            let Some((j, call_id, tool, result)) = next else {
+            let Some((j, call_id, tool, result, took_ms)) = next else {
                 return Ok(());
             };
             // A call's own `resumed()` report (if it made one) is sent,
@@ -3761,8 +3765,9 @@ impl Worker {
             // during it cannot lose the call's writes or mark a finished call
             // interrupted.
             done[j] = true;
-            let mut finished =
-                self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            let mut finished = self
+                .record_result(j, &accesses, call_id, &tool, &digests[j], result)
+                .timed(took_ms);
             self.note_refusal(&mut finished, None);
             // A sandboxed build declares no paths; ask git what it changed. Before
             // any emit: a cancel during an emit must not lose the paths.
@@ -3837,11 +3842,13 @@ impl Worker {
                 next = running.next() => next,
                 () = &mut grace => break,
             };
-            let Some((j, call_id, tool, result)) = next else {
+            let Some((j, call_id, tool, result, took_ms)) = next else {
                 break;
             };
             done[j] = true;
-            let finished = self.record_result(j, &accesses, call_id, &tool, &digests[j], result);
+            let finished = self
+                .record_result(j, &accesses, call_id, &tool, &digests[j], result)
+                .timed(took_ms);
             if accesses[j].is_sandboxed_build() {
                 self.record_tree_changes(&tool).await;
             }
@@ -3867,7 +3874,7 @@ impl Worker {
                     next = running.next() => next,
                     () = &mut reap => break,
                 };
-                let Some((j, _call_id, _tool, result)) = next else {
+                let Some((j, _call_id, _tool, result, _)) = next else {
                     break;
                 };
                 let own = match result {
@@ -3907,6 +3914,7 @@ impl Worker {
                         output: "ERROR: not run: the worker was cancelled before this call started"
                             .into(),
                         is_error: true,
+                        duration_ms: None,
                     };
                     self.emit_after_cancel(ep, finished)?;
                 }
@@ -3980,6 +3988,7 @@ impl Worker {
                         call_id,
                         output,
                         is_error: true,
+                        duration_ms: None,
                     };
                     self.emit_round_end(ep, finished).await?;
                 }
@@ -4063,6 +4072,7 @@ impl Worker {
             call_id,
             output,
             is_error,
+            duration_ms: None,
         }
     }
 
@@ -4087,6 +4097,7 @@ impl Worker {
             call_id,
             output,
             is_error,
+            ..
         } = event
         else {
             return;
@@ -4143,6 +4154,7 @@ impl Worker {
             call_id,
             output,
             is_error,
+            ..
         } = event
         else {
             return;
@@ -4274,7 +4286,33 @@ fn redacted_event(counts: kgraf_secrets::Redactions) -> Option<WorkerEvent> {
     })
 }
 
-type Running<'a> = BoxFuture<'a, (usize, String, String, Result<ToolOutput, ToolError>)>;
+trait Timed {
+    /// Set the measured execution time on a finished-call event.
+    fn timed(self, ms: Option<u64>) -> Self;
+}
+
+impl Timed for WorkerEvent {
+    fn timed(mut self, ms: Option<u64>) -> Self {
+        if let WorkerEvent::ToolCallFinished { duration_ms, .. } = &mut self {
+            *duration_ms = ms;
+        }
+        self
+    }
+}
+
+/// One finished call: its index in the round, id, tool, result, and the
+/// measured wall time of the execution alone (`None` for a call refused as it
+/// started, which ran nothing).
+type Running<'a> = BoxFuture<
+    'a,
+    (
+        usize,
+        String,
+        String,
+        Result<ToolOutput, ToolError>,
+        Option<u64>,
+    ),
+>;
 
 /// The two tool contexts of one round: writing calls get a token
 /// a steer does not cancel.
@@ -4355,7 +4393,7 @@ fn start_ready<'a>(
                 let tool = call.tool().to_owned();
                 let output = format!("{DENIED_PREFIX}{}: {}", refusal.by, refusal.reason);
                 running.push(Box::pin(async move {
-                    (j, id, tool, Ok(ToolOutput::error(output)))
+                    (j, id, tool, Ok(ToolOutput::error(output)), None)
                 }));
                 continue;
             }
@@ -4377,6 +4415,7 @@ fn start_ready<'a>(
                         id,
                         tool,
                         Ok(ToolOutput::error(format!("refused: {why}"))),
+                        None,
                     )
                 }));
                 continue;
@@ -4399,8 +4438,12 @@ fn start_ready<'a>(
                 let _ = tx.send((report_id.clone(), status.map(str::to_owned)));
             });
             running.push(Box::pin(async move {
+                // Only the tool's own execution is timed: approval, queueing
+                // behind a conflicting call and the transcript write are not.
+                let started = std::time::Instant::now();
                 let result = registry.execute(call, &call_ctx).await;
-                (j, id, tool, result)
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (j, id, tool, result, Some(ms))
             }));
         }
     }

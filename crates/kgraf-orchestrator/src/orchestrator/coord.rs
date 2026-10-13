@@ -23,12 +23,18 @@ pub(super) struct CoordRuntime {
     pub(super) pending: Vec<TraceEvent>,
     /// The run loop ended with an error: the run-end reports say so.
     pub(super) run_failed: bool,
+    /// Reads the routes' rate-limit waits at the run's end.
+    pub(super) rate_limit_waits: Option<crate::trace::RateLimitWaitsSource>,
 }
 
 impl CoordRuntime {
-    pub(super) fn new(gate_runner: Option<Arc<dyn GateRunner>>) -> Self {
+    pub(super) fn new(
+        gate_runner: Option<Arc<dyn GateRunner>>,
+        rate_limit_waits: Option<crate::trace::RateLimitWaitsSource>,
+    ) -> Self {
         Self {
             gate_runner,
+            rate_limit_waits,
             gate_flights: BTreeMap::new(),
             pending: Vec::new(),
             run_failed: false,
@@ -44,6 +50,16 @@ pub(super) struct GateDone {
     /// The same commands at the run's base commit, run after a failure of a
     /// gate below the root when the base was not checked yet: (commit, verdict).
     pub(super) base: Option<(String, Result<GateVerdict, String>)>,
+    /// Measured wall time of the gate's own command run, in milliseconds;
+    /// `None` when the run's task panicked or ended abnormally.
+    pub(super) duration_ms: Option<u64>,
+    /// Measured wall time of the base-commit probe, when one ran.
+    pub(super) base_duration_ms: Option<u64>,
+}
+
+/// Whole milliseconds since `started`, saturating.
+pub(super) fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What `integrate_winner` found, for the caller to act on: accepted (or
@@ -64,6 +80,25 @@ pub(super) enum IntegrateOutcome {
 impl RunLoop {
     pub(super) fn queue(&mut self, e: TraceEvent) {
         self.coord.pending.push(e);
+    }
+
+    /// Queue one `rate_limit_waits` record per route that waited, once, at the
+    /// run's end. A route with no waits writes nothing.
+    pub(super) fn queue_rate_limit_waits(&mut self) {
+        let Some(source) = self.coord.rate_limit_waits.take() else {
+            return;
+        };
+        let at = self.now();
+        for w in source() {
+            if w.waited_ms > 0 || w.waits > 0 {
+                self.queue(TraceEvent::RateLimitWaits {
+                    at_ms: at,
+                    route: w.route,
+                    waited_ms: w.waited_ms,
+                    waits: w.waits,
+                });
+            }
+        }
     }
 
     /// Write the queued trace records.
@@ -214,6 +249,7 @@ impl RunLoop {
         contract: &OpenContract,
         workspace: &Path,
     ) -> Result<IntegrateOutcome, OrchestratorError> {
+        let started = std::time::Instant::now();
         let outcome = match self.s.workspaces.integrate(contract, workspace).await {
             Ok(o) => o,
             // A merge that could not run is not a merge.
@@ -234,6 +270,7 @@ impl RunLoop {
         };
         self.queue(TraceEvent::Integration {
             at_ms: at,
+            duration_ms: Some(elapsed_ms(started)),
             contract: contract.contract.clone(),
             outcome: outcome.name().to_owned(),
             detail,
@@ -322,6 +359,7 @@ impl RunLoop {
                 }
                 self.queue(TraceEvent::Gate {
                     at_ms: at,
+                    duration_ms: None,
                     gate: gate.clone(),
                     state: "failed".into(),
                     detail: format!(
@@ -336,6 +374,7 @@ impl RunLoop {
                 if let GateStatus::Held { reason } = status {
                     self.queue(TraceEvent::Gate {
                         at_ms: at,
+                        duration_ms: None,
                         gate: gate.clone(),
                         state: "held".into(),
                         detail: reason,
@@ -738,6 +777,7 @@ impl RunLoop {
                 }
                 self.queue(TraceEvent::Integration {
                     at_ms: at,
+                    duration_ms: None,
                     contract: original.clone(),
                     outcome: "resolved".into(),
                     detail: format!("resolver {id} merged the conflict"),
@@ -769,6 +809,7 @@ impl RunLoop {
                 }
                 self.queue(TraceEvent::Integration {
                     at_ms: at,
+                    duration_ms: None,
                     contract: original.clone(),
                     outcome: "resolver_failed".into(),
                     detail: format!(
@@ -812,6 +853,7 @@ impl RunLoop {
             let at = self.now();
             self.queue(TraceEvent::Integration {
                 at_ms: at,
+                duration_ms: None,
                 contract: String::new(),
                 outcome: "check_base".into(),
                 detail: format!("contract checks now build from {commit}"),
@@ -840,6 +882,7 @@ impl RunLoop {
         )?;
         self.queue(TraceEvent::Gate {
             at_ms: at,
+            duration_ms: None,
             gate: gate.to_owned(),
             state: format!("{decision:?}").to_lowercase(),
             detail: format!("decided by the user: {}", envelope::label(note)),
@@ -870,6 +913,7 @@ impl RunLoop {
             self.record.coordination.gate_notice = Some(notice.clone());
             self.queue(TraceEvent::Gate {
                 at_ms: at,
+                duration_ms: None,
                 gate: String::new(),
                 state: "absent".into(),
                 detail: notice,
@@ -880,6 +924,7 @@ impl RunLoop {
         for g in &planned {
             self.queue(TraceEvent::Gate {
                 at_ms: at,
+                duration_ms: None,
                 gate: g.id.clone(),
                 state: "planned".into(),
                 detail: format!("covers {}", g.covers.join(", ")),
@@ -898,6 +943,7 @@ impl RunLoop {
         let at = self.now();
         self.queue(TraceEvent::Gate {
             at_ms: at,
+            duration_ms: None,
             gate: gates::gate_id(parent),
             state: "planned".into(),
             detail: format!(
@@ -1016,6 +1062,7 @@ impl RunLoop {
                 self.hold_gate(&id, reason.clone());
                 self.queue(TraceEvent::Gate {
                     at_ms: at,
+                    duration_ms: None,
                     gate: id.clone(),
                     state: "held".into(),
                     detail: reason,
@@ -1092,6 +1139,7 @@ impl RunLoop {
             self.note_wait(&id, WaitState::Running);
             self.queue(TraceEvent::Gate {
                 at_ms: at,
+                duration_ms: None,
                 gate: id.clone(),
                 state: "running".into(),
                 detail: match &pin {
@@ -1108,21 +1156,34 @@ impl RunLoop {
             // admission slot held for this gate and clearing its wait state,
             // or the gate (and any run waiting on it) hangs forever.
             let gate_task = tokio::spawn(async move {
+                let started = std::time::Instant::now();
                 let verdict = runner.run(request).await;
+                let duration_ms = Some(elapsed_ms(started));
+                let mut base_duration_ms = None;
                 let base = match (&verdict, probe) {
                     (Ok(v), Some(p)) if !v.passed => {
                         let at = p.pinned.as_ref().map(|c| c.sha.clone()).unwrap_or_default();
-                        Some((at, runner.run(p).await))
+                        let probe_started = std::time::Instant::now();
+                        let result = runner.run(p).await;
+                        base_duration_ms = Some(elapsed_ms(probe_started));
+                        Some((at, result))
                     }
                     _ => None,
                 };
-                (verdict, base)
+                (verdict, base, duration_ms, base_duration_ms)
             });
             tokio::spawn(async move {
-                let (verdict, base) = match gate_task.await {
+                let (verdict, base, duration_ms, base_duration_ms) = match gate_task.await {
                     Ok(v) => v,
-                    Err(e) if e.is_panic() => (Err(format!("the gate panicked: {e}")), None),
-                    Err(e) => (Err(format!("the gate's task ended abnormally: {e}")), None),
+                    Err(e) if e.is_panic() => {
+                        (Err(format!("the gate panicked: {e}")), None, None, None)
+                    }
+                    Err(e) => (
+                        Err(format!("the gate's task ended abnormally: {e}")),
+                        None,
+                        None,
+                        None,
+                    ),
                 };
                 let _ = tx
                     .send(LoopMsg::GateFinished(Box::new(GateDone {
@@ -1130,6 +1191,8 @@ impl RunLoop {
                         pinned: pin,
                         verdict,
                         base,
+                        duration_ms,
+                        base_duration_ms,
                     })))
                     .await;
             });
@@ -1148,6 +1211,8 @@ impl RunLoop {
             pinned,
             verdict,
             base,
+            duration_ms,
+            base_duration_ms,
         } = done;
         if let Some(a) = self.coord.gate_flights.remove(&gate) {
             self.s.admission.gate().release(a);
@@ -1164,6 +1229,7 @@ impl RunLoop {
                 Ok(v) => {
                     self.queue(TraceEvent::Gate {
                         at_ms: at,
+                        duration_ms: base_duration_ms,
                         gate: gates::BASE_GATE_PROBE.into(),
                         state: if v.passed { "passed" } else { "failed" }.into(),
                         detail: format!(
@@ -1182,6 +1248,7 @@ impl RunLoop {
                 // failure.
                 Err(e) => self.queue(TraceEvent::Gate {
                     at_ms: at,
+                    duration_ms: None,
                     gate: gates::BASE_GATE_PROBE.into(),
                     state: "not run".into(),
                     detail: kgraf_secrets::scrub_persist_owned(format!(
@@ -1223,6 +1290,7 @@ impl RunLoop {
                 .unwrap_or_default();
             self.queue(TraceEvent::Gate {
                 at_ms: at,
+                duration_ms,
                 gate: gate.clone(),
                 state: "inconclusive".into(),
                 detail: reason,
@@ -1258,6 +1326,7 @@ impl RunLoop {
         };
         self.queue(TraceEvent::Gate {
             at_ms: at,
+            duration_ms,
             gate: gate.clone(),
             state: state.into(),
             detail,

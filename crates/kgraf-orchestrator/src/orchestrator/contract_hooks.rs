@@ -1007,23 +1007,27 @@ impl RunLoop {
         self.save()
     }
 
-    /// Drop the checks of every interface whose pre-dispatch check still
-    /// holds parties after the plan's one re-plan ([`super::MAX_REPLANS`]),
-    /// instead of ending the run on the hold with its contracts undone. Each
-    /// such interface (state `Failed` at any stage, or `NotRun`) records
-    /// [`ContractEvent::ChecksDropped`] and one [`ContractEvent::Unchecked`]
-    /// per edge between its parties, a notice names it with its failure, and
-    /// its held parties go back to planned. The interface then takes the path
-    /// of a run with contract checks off; the run's verify gate still judges
-    /// the work. Holds with another cause (review, escalation, a withdrawn
-    /// build) are kept. `true`: some party was released, and the loop goes on.
+    /// Drop the checks of every interface whose check still holds parties
+    /// when the run would end blocked and no re-plan will happen
+    /// (`no_replan` says why: the one re-plan ([`super::MAX_REPLANS`]) is
+    /// spent or was refused, the planner time budget refused it, or work
+    /// already started), instead of ending the run on the hold with its
+    /// contracts undone. Each such interface (state `Failed` at any stage, or
+    /// `NotRun`) records [`ContractEvent::ChecksDropped`] and one
+    /// [`ContractEvent::Unchecked`] per edge between its parties, a notice
+    /// names it with its failure and why no re-plan happened, and its held
+    /// parties go back to planned. The interface then takes the path of a run
+    /// with contract checks off; the run's verify gate still judges the work.
+    /// Holds with another cause (review, escalation, a withdrawn build) are
+    /// kept. `true`: some party was released, and the loop goes on.
     ///
-    /// Before the re-plan is spent the failure goes back to the planner
-    /// first ([`RunLoop::replan`]); a run whose plan the user approved, or
-    /// whose interfaces were given before planning, is never re-planned, and
-    /// keeps its holds.
-    pub(super) async fn drop_failed_checks(&mut self) -> Result<bool, OrchestratorError> {
-        if self.record.replans < super::MAX_REPLANS || self.record.source_plan.is_some() {
+    /// A run whose plan the user approved, or an interface given before
+    /// planning, keeps its holds: the user chose that plan or interface.
+    pub(super) async fn drop_failed_checks(
+        &mut self,
+        no_replan: &str,
+    ) -> Result<bool, OrchestratorError> {
+        if self.record.source_plan.is_some() {
             return Ok(false);
         }
         let Some(desk) = self.contracts.as_ref() else {
@@ -1078,9 +1082,9 @@ impl RunLoop {
                 "",
                 "",
                 format!(
-                    "interface {label}: its checks still fail after the re-plan ({why}); kGraf \
-                     dropped them so the work can run: {} counted as not run, and the run's \
-                     verify gate still judges the work",
+                    "interface {label}: its checks still fail ({why}) and no re-plan will \
+                     happen ({no_replan}); kGraf dropped them so the work can run: {} counted \
+                     as not run, and the run's verify gate still judges the work",
                     if consumers.is_empty() {
                         "its parties are".to_owned()
                     } else {
@@ -1101,10 +1105,91 @@ impl RunLoop {
                     .iter()
                     .map(|p| {
                         format!(
-                            "{consumer} <- {p}: interface {label} checks dropped after the \
-                             re-plan: {why}"
+                            "{consumer} <- {p}: interface {label} checks dropped with no \
+                             re-plan ({no_replan}): {why}"
                         )
                     })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.contract_event(ContractEvent::Unchecked {
+                    consumer,
+                    producers,
+                    reason: kgraf_secrets::scrub_persist_owned(reason),
+                })
+                .await?;
+            }
+        }
+        if any {
+            self.save()?;
+        }
+        Ok(any)
+    }
+
+    /// Release parties the run record still holds under an interface whose
+    /// checks the trace already dropped or skipped (state `Active`, checks
+    /// skipped). As with every contract event, [`ContractEvent::ChecksDropped`]
+    /// is traced before the record is saved, and a resume replays the trace:
+    /// a stop between the two leaves the book with the checks dropped and the
+    /// record with the parties held, which no later check would release. The
+    /// release is completed here from the trace, with a notice, and any edge
+    /// of the interface the trace lacks is recorded as not run (the book
+    /// counts an edge once). `true`: some party was released.
+    pub(super) async fn release_dropped_holds(&mut self) -> Result<bool, OrchestratorError> {
+        self.replay_contracts().await?;
+        let Some(desk) = self.contracts.as_ref() else {
+            return Ok(false);
+        };
+        let mut dropped: BTreeMap<String, (InterfaceContract, String)> = BTreeMap::new();
+        for c in &self.record.open_contracts {
+            let ContractStatus::Held { reason } = &c.status else {
+                continue;
+            };
+            for id in desk.book.interfaces_of(&c.contract) {
+                if dropped.contains_key(&id) || !held_under(reason, &id) {
+                    continue;
+                }
+                if let (Some(ic), Some(InterfaceState::Active), Some(why)) = (
+                    desk.book.get(&id),
+                    desk.book.state(&id),
+                    desk.book.checks_skipped(&id),
+                ) {
+                    dropped.insert(id, (ic.clone(), why.to_owned()));
+                }
+            }
+        }
+        let mut any = false;
+        for (id, (ic, why)) in dropped {
+            let released = self.release_parties(&id);
+            if released.is_empty() {
+                continue;
+            }
+            any = true;
+            let label = ic.label();
+            self.session_notice(
+                "",
+                "",
+                format!(
+                    "interface {label}: its checks were dropped before the run stopped ({why}); \
+                     the parties still held under it ({}) are released on resume",
+                    released.join(", ")
+                ),
+            );
+            let missing: Vec<(String, Vec<String>)> = self
+                .party_edges(&ic)
+                .into_iter()
+                .filter_map(|(consumer, producers)| {
+                    let book = &self.contracts.as_ref()?.book;
+                    let producers: Vec<String> = producers
+                        .into_iter()
+                        .filter(|p| !book.unchecked().contains(&(consumer.clone(), p.clone())))
+                        .collect();
+                    (!producers.is_empty()).then_some((consumer, producers))
+                })
+                .collect();
+            for (consumer, producers) in missing {
+                let reason = producers
+                    .iter()
+                    .map(|p| format!("{consumer} <- {p}: interface {label} checks dropped: {why}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.contract_event(ContractEvent::Unchecked {
@@ -1157,8 +1242,9 @@ impl RunLoop {
         edges
     }
 
-    /// The failures a re-plan sends back to the planner, or `None` when the
-    /// run's holds are not the planner's to correct by planning again.
+    /// The failures a re-plan sends back to the planner, or why the run's
+    /// holds are not the planner's to correct by planning again (said in the
+    /// notice of a check dropped instead, [`RunLoop::drop_failed_checks`]).
     ///
     /// Only a plan nothing has acted on yet is re-planned: no contract ever
     /// dispatched or verified, no merge onto the integration branch, and no
@@ -1168,27 +1254,32 @@ impl RunLoop {
     /// stage: artifact, stub-compile, vacuity, handshake) of an interface the
     /// planner wrote. An interface the run was given before planning is not
     /// the planner's: a plan bound by one is never re-planned.
-    pub(super) fn replan_failures(&self) -> Option<Vec<crate::run_state::HeldFailure>> {
-        let desk = self.contracts.as_ref()?;
+    pub(super) fn replan_failures(&self) -> Result<Vec<crate::run_state::HeldFailure>, String> {
+        let Some(desk) = self.contracts.as_ref() else {
+            return Err("contract checks are off".to_owned());
+        };
         let untouched = self.record.counters.dispatches == 0
             && self.record.verified_contracts.is_empty()
             && self.in_flight.is_empty()
             && self.record.coordination.integration_tip.is_none();
         if !untouched {
-            return None;
+            return Err("work has already started".to_owned());
         }
         let mut failures: BTreeMap<String, crate::run_state::HeldFailure> = BTreeMap::new();
         for c in &self.record.open_contracts {
             match &c.status {
                 ContractStatus::Planned => {}
                 ContractStatus::Held { .. } => {}
-                _ => return None,
+                _ => return Err("work has already started".to_owned()),
             }
             for id in desk.book.interfaces_of(&c.contract) {
                 // A re-plan renames every contract, which would unbind an
                 // interface the run was given: such a plan is never re-planned.
-                if desk.book.stub_landed(&id) || desk.seeded.contains(&id) {
-                    return None;
+                if desk.seeded.contains(&id) {
+                    return Err(format!("interface `{id}` was given before planning"));
+                }
+                if desk.book.stub_landed(&id) {
+                    return Err(format!("the stub of interface `{id}` has landed"));
                 }
                 if let (Some(ic), Some(InterfaceState::Failed { failure })) =
                     (desk.book.get(&id), desk.book.state(&id))
@@ -1212,9 +1303,9 @@ impl RunLoop {
             }
         }
         if failures.is_empty() {
-            return None;
+            return Err("no check failed, so a re-plan has nothing to correct".to_owned());
         }
-        Some(failures.into_values().collect())
+        Ok(failures.into_values().collect())
     }
 
     /// Ask each open party for its statement, independently, and compare.

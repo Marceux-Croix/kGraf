@@ -81,6 +81,18 @@ pub struct PlannedInterface {
     pub symbols: Vec<String>,
 }
 
+/// One route's rate-limit waiting, as the host reads it from the route's
+/// limiter: the source of [`TraceEvent::RateLimitWaits`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteWaits {
+    pub route: String,
+    pub waited_ms: u64,
+    pub waits: u64,
+}
+
+/// Reads every route's waits so far. Called once, when the run ends.
+pub type RateLimitWaitsSource = std::sync::Arc<dyn Fn() -> Vec<RouteWaits> + Send + Sync>;
+
 /// One trace record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -247,6 +259,17 @@ pub enum TraceEvent {
         at_ms: i64,
         changes: Vec<kgraf_graph::ExtractorChange>,
     },
+    /// Time one route's calls spent waiting on its rate limiter (decision
+    /// 0072), written once per route at the end of a run, only for a route
+    /// that waited. `waits` counts the calls that had to wait; `waited_ms`
+    /// totals their waiting time. Both count the waits that happened since
+    /// the run's orchestrator was built (the limiters outlive a run).
+    RateLimitWaits {
+        at_ms: i64,
+        route: String,
+        waited_ms: u64,
+        waits: u64,
+    },
     /// Question 6. Accounting only (decision 0080 removed every spend cap).
     Spend {
         at_ms: i64,
@@ -371,8 +394,16 @@ pub enum TraceEvent {
     /// A quality gate changed state (0018): planned, running, passed, failed with
     /// its remediation, held; or, with an empty `gate`, the notice that the run
     /// has no gates and why.
+    ///
+    /// `duration_ms` is the measured wall time of the gate's validation
+    /// commands, set on the records that end a run of them (`passed`,
+    /// `failed`, `held`, `inconclusive`, and the base-commit probe's own
+    /// result); absent on planning records and in a trace written before the
+    /// field existed.
     Gate {
         at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
         gate: String,
         state: String,
         detail: String,
@@ -389,8 +420,15 @@ pub enum TraceEvent {
     },
     /// Continuous merge-back of a verified attempt (0018): merged, empty,
     /// unversioned, a conflict (re-dispatched) or a refusal.
+    ///
+    /// `duration_ms` is the measured wall time of the merge-back itself, set
+    /// on the record `integrate_winner` writes for an attempt (`merged`,
+    /// `empty`, `conflict`, `refused`, ...); absent on the other records and
+    /// in a trace written before the field existed.
     Integration {
         at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
         contract: String,
         outcome: String,
         detail: String,
@@ -791,11 +829,13 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         },
         TraceEvent::Gate {
             at_ms,
+            duration_ms,
             gate,
             state,
             detail,
         } => TraceEvent::Gate {
             at_ms,
+            duration_ms,
             gate,
             state,
             detail: s(detail),
@@ -813,11 +853,13 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         },
         TraceEvent::Integration {
             at_ms,
+            duration_ms,
             contract,
             outcome,
             detail,
         } => TraceEvent::Integration {
             at_ms,
+            duration_ms,
             contract,
             outcome,
             detail: s(detail),
@@ -989,6 +1031,7 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         | TraceEvent::WorkerFinished { .. }
         | TraceEvent::Compaction { .. }
         | TraceEvent::ExtractorChanged { .. }
+        | TraceEvent::RateLimitWaits { .. }
         | TraceEvent::Spend { .. }) => other,
     }
 }
@@ -1099,6 +1142,82 @@ mod tests {
         s.iter().map(PathBuf::from).collect()
     }
 
+    /// The serialized shape a reader of the trace parses: `duration_ms` on
+    /// `gate` and `integration`, and the `rate_limit_waits` record.
+    #[test]
+    fn the_new_measurements_serialize_under_their_reader_facing_names() {
+        let gate = TraceEvent::Gate {
+            at_ms: 5,
+            duration_ms: Some(1234),
+            gate: "gate:h".into(),
+            state: "passed".into(),
+            detail: "cargo test".into(),
+        };
+        let integration = TraceEvent::Integration {
+            at_ms: 6,
+            duration_ms: Some(42),
+            contract: "c1".into(),
+            outcome: "merged".into(),
+            detail: "integration tip abc".into(),
+        };
+        let waits = TraceEvent::RateLimitWaits {
+            at_ms: 7,
+            route: "openai".into(),
+            waited_ms: 1500,
+            waits: 3,
+        };
+        let line = |e: &TraceEvent| serde_json::to_string(e).expect("serialize");
+        assert_eq!(
+            line(&gate),
+            r#"{"event":"gate","at_ms":5,"duration_ms":1234,"gate":"gate:h","state":"passed","detail":"cargo test"}"#
+        );
+        assert_eq!(
+            line(&integration),
+            r#"{"event":"integration","at_ms":6,"duration_ms":42,"contract":"c1","outcome":"merged","detail":"integration tip abc"}"#
+        );
+        assert_eq!(
+            line(&waits),
+            r#"{"event":"rate_limit_waits","at_ms":7,"route":"openai","waited_ms":1500,"waits":3}"#
+        );
+        for e in [&gate, &integration, &waits] {
+            let back: TraceEvent = serde_json::from_str(&line(e)).expect("round trip");
+            assert_eq!(&back, e);
+        }
+    }
+
+    /// A trace written before the field existed still parses, with no time.
+    #[test]
+    fn a_trace_line_without_duration_ms_still_parses() {
+        let gate: TraceEvent = serde_json::from_str(
+            r#"{"event":"gate","at_ms":5,"gate":"gate:h","state":"passed","detail":"d"}"#,
+        )
+        .expect("old gate line");
+        assert!(matches!(
+            gate,
+            TraceEvent::Gate {
+                duration_ms: None,
+                ..
+            }
+        ));
+        let integration: TraceEvent = serde_json::from_str(
+            r#"{"event":"integration","at_ms":6,"contract":"c1","outcome":"merged","detail":"d"}"#,
+        )
+        .expect("old integration line");
+        assert!(matches!(
+            integration,
+            TraceEvent::Integration {
+                duration_ms: None,
+                ..
+            }
+        ));
+        // An absent time is not written back as `null`.
+        assert!(
+            !serde_json::to_string(&integration)
+                .expect("serialize")
+                .contains("duration_ms")
+        );
+    }
+
     #[test]
     fn an_a_b_a_edit_sequence_in_one_lineage_is_detected() {
         let mut d = LoopDetector::default();
@@ -1165,6 +1284,7 @@ mod tests {
             },
             TraceEvent::Gate {
                 at_ms: 2,
+                duration_ms: None,
                 gate: "g1".into(),
                 state: "failed".into(),
                 detail: format!("gate output carried {registered} and {pattern}"),

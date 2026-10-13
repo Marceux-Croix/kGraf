@@ -2129,6 +2129,10 @@ impl Host {
                     .answer_wait_secs
                     .map(|s| std::time::Duration::from_secs(u64::from(s))),
             );
+        // The limiters outlive a run, so the run's waits are the growth since
+        // this point; the run's end writes one record per route that waited.
+        let orchestrator =
+            orchestrator.with_rate_limit_waits(rate_limit_waits_since_now(&self.limiters));
         // Decision 0089: the planner is told the run's model routes by kind,
         // and the orchestrator may call them itself.
         let orchestrator = match model_calls {
@@ -2563,6 +2567,31 @@ impl Host {
             .remove(run)?;
         Some(end.finish())
     }
+}
+
+/// A reader of each route's rate-limit waits since this call: the growth of
+/// its limiter's counters over the baseline taken now. Routes with no limiter
+/// have nothing to read and never appear.
+pub(crate) fn rate_limit_waits_since_now(
+    limiters: &Limiters,
+) -> kgraf_orchestrator::RateLimitWaitsSource {
+    let tracked: Vec<(
+        Arc<kgraf_provider::RouteLimiter>,
+        kgraf_provider::LimiterStats,
+    )> = limiters.values().map(|l| (l.clone(), l.stats())).collect();
+    Arc::new(move || {
+        tracked
+            .iter()
+            .map(|(limiter, base)| {
+                let now = limiter.stats();
+                kgraf_orchestrator::RouteWaits {
+                    route: limiter.route().to_owned(),
+                    waited_ms: now.waited_ms.saturating_sub(base.waited_ms),
+                    waits: now.waited.saturating_sub(base.waited),
+                }
+            })
+            .collect()
+    })
 }
 
 /// Run long synchronous work (git, the index pass, a dependency fetch) from

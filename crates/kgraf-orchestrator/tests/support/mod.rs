@@ -25,7 +25,7 @@ use kgraf_tools::{
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1133,6 +1133,9 @@ pub struct FakeIntegration {
     /// files, its committed files copied into the view, and removed once
     /// committed or discarded.
     pub comms_worktrees: AtomicBool,
+    /// How long each `integrate` call takes, in milliseconds (a test of the
+    /// measured merge-back time).
+    pub merge_delay_ms: AtomicU64,
     next: AtomicUsize,
 }
 
@@ -1151,6 +1154,7 @@ impl FakeIntegration {
             remove_on_merge: AtomicBool::new(false),
             view: Mutex::new(None),
             comms_worktrees: AtomicBool::new(false),
+            merge_delay_ms: AtomicU64::new(0),
             next: AtomicUsize::new(1),
         })
     }
@@ -1214,6 +1218,10 @@ impl kgraf_orchestrator::Workspaces for FakeIntegration {
         contract: &OpenContract,
         workspace: &Path,
     ) -> Result<kgraf_orchestrator::Integration, String> {
+        let delay = self.merge_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if self
             .conflict_once
             .lock()
