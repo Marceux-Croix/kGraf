@@ -715,6 +715,7 @@ fn run_now_with(
             small: Default::default(),
             own_checks: false,
             zero_test_plans: false,
+            cache_layout: false,
             edits: Default::default(),
         },
     );

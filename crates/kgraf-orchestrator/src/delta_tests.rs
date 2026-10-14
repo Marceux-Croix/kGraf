@@ -8,7 +8,7 @@ use crate::coordination::ClosedContract;
 use crate::run_state::RunStatus;
 use kgraf_core::{AgentId, RunId};
 
-fn spec(id: &str, write: &str, deps: &[&str]) -> ContractSpec {
+pub(super) fn spec(id: &str, write: &str, deps: &[&str]) -> ContractSpec {
     ContractSpec {
         id: id.into(),
         instruction: format!("do {id}"),
@@ -42,7 +42,7 @@ fn open(s: &ContractSpec) -> OpenContract {
 
 /// A record with `verified` closed and verified, and `open` queued, each
 /// with its plan spec kept.
-fn record(verified: &[ContractSpec], open_specs: &[ContractSpec]) -> RunStateRecord {
+pub(super) fn record(verified: &[ContractSpec], open_specs: &[ContractSpec]) -> RunStateRecord {
     let mut r = RunStateRecord::new(RunId::new("r1"), "build it", 0);
     for s in verified {
         r.coordination
@@ -60,7 +60,7 @@ fn record(verified: &[ContractSpec], open_specs: &[ContractSpec]) -> RunStateRec
     r
 }
 
-fn change(r: &RunStateRecord) -> RecordedChange {
+pub(super) fn change(r: &RunStateRecord) -> RecordedChange {
     let mut c = RecordedChange::received(
         u32::try_from(r.changes.len() + 1).expect("n"),
         ChangeSource::Change,
@@ -570,7 +570,7 @@ fn the_prompt_is_bounded_at_32_open_and_64_closed_contracts() {
         .map(|i| spec(&format!("o{i}"), &format!("src/o{i}.rs"), &[]))
         .collect();
     let r = record(&closed, &open_specs);
-    let prompt = delta_prompt(&r, &change(&r), "");
+    let prompt = delta_prompt(&r, &change(&r), "", false).text();
     assert!(!prompt.contains("more detail line"), "a closed body leaked");
     assert!(prompt.contains("verified step 63"));
     assert!(prompt.len() < 24_000, "prompt is {} bytes", prompt.len());
@@ -584,7 +584,7 @@ fn the_prompt_is_bounded_at_32_open_and_64_closed_contracts() {
 fn an_older_record_says_dependencies_not_recorded_and_staleness_unknown() {
     let mut r = record(&[spec("c1", "a.rs", &[]), spec("c2", "b.rs", &["c1"])], &[]);
     r.plan_specs.remove("c2");
-    let prompt = delta_prompt(&r, &change(&r), "");
+    let prompt = delta_prompt(&r, &change(&r), "", false).text();
     assert!(prompt.contains("dependencies not recorded"));
     let p = prep(
         &r,

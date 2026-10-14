@@ -431,10 +431,18 @@ impl RunLoop {
             return Ok(false);
         };
         let context = self.change_context(&change)?;
+        let cache_layout = self.config.cache_layout;
         let request = crate::plan::DeltaRequest {
-            prompt: delta::delta_prompt(&self.record, &change, &context),
+            prompt: delta::delta_prompt(&self.record, &change, &context, cache_layout),
             cap: delta::output_cap(&self.record, &change),
             own_checks: self.config.own_checks,
+            cache_layout,
+            mark_plan: cache_layout
+                && delta::plan_mark_due(
+                    self.s.decomposer.cache_ttl(),
+                    delta::previous_delta_ms(&self.record, change.number, self.last_delta_ms),
+                    self.now(),
+                ),
         };
         let basis = CostBasis {
             model: self.s.decomposer.cost_basis().model,
@@ -443,7 +451,7 @@ impl RunLoop {
                 .decomposer
                 .output_limit(delta::DELTA_KIND, Some(request.cap)),
         };
-        let reservation = self.reserve_call(&basis, estimate_tokens(&request.prompt) + 600);
+        let reservation = self.reserve_call(&basis, estimate_tokens(&request.prompt.text()) + 600);
         let stop = self.stop_token.clone();
         let asked_at = self.now();
         let out = tokio::select! {
@@ -452,6 +460,7 @@ impl RunLoop {
         };
         self.planner_budget
             .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
+        self.last_delta_ms = Some(self.now());
         let Some(out) = out else {
             // The answer never reached the record: a resume asks again. The
             // cut call is counted with this change all the same.

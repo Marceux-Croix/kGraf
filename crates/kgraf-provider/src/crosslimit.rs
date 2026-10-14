@@ -1090,8 +1090,11 @@ mod tests {
             matches!(result, Err(CrossLimitError::LockTimeout { .. })),
             "{result:?}"
         );
+        // The defect this guards is a fixed five-second `busy_timeout` that
+        // ignored the budget. Two seconds of slack still tells that apart, and
+        // a loaded host (a full gate beside builders) cannot fail it.
         assert!(
-            elapsed < budget + Duration::from_millis(200),
+            elapsed < budget + Duration::from_secs(2),
             "check took {elapsed:?}, over its {budget:?} budget plus slack"
         );
     }

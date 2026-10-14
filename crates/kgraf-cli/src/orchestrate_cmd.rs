@@ -130,6 +130,8 @@ pub struct OrchestrateArgs {
     pub own_checks: bool,
     /// `--zero-test-plans` over the `zero_test_plans` user setting.
     pub zero_test_plans: bool,
+    /// `--cache-layout` over the `cache_layout` user setting (decision 0100).
+    pub cache_layout: bool,
     /// `--change`, `--edit` and `--from-run` (decision 0100).
     pub edits: crate::edit_flags::EditFlags,
 }
@@ -172,6 +174,8 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         early_start: args.small.early_start.then_some(true),
         own_checks: args.own_checks.then_some(true),
         zero_test_plans: args.zero_test_plans.then_some(true),
+        cache_layout: args.cache_layout.then_some(true),
+        prompt_cache_key_routes: Vec::new(),
         worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
@@ -922,6 +926,7 @@ pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orches
         changes: Vec::new(),
         change_counts: Default::default(),
         decompose_tokens: None,
+        cache: Vec::new(),
         session: 0,
     }
 }
@@ -986,9 +991,22 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
             .join(" ");
         out.push(format!(
             "changes    per session {per_session}; applied {}, refused {}, pending {}, \
-             replan_all {}, verified work lost {}; delta tokens {}",
-            k.applied, k.refused, k.pending, k.replan_all, k.verified_work_lost, k.delta_tokens
+             replan_all {}, verified work lost {}; delta calls {}, re-asks {}, delta tokens {}",
+            k.applied,
+            k.refused,
+            k.pending,
+            k.replan_all,
+            k.verified_work_lost,
+            k.delta_calls,
+            k.delta_reasks,
+            k.delta_tokens
         ));
+    }
+    // The prompt cache per call kind, beside the counts above: a read share
+    // and the write premium paid, or "not reported" for a vendor that sends
+    // no cache field. Figures only, no claim about spend.
+    for line in &report.cache {
+        out.push(format!("cache      {}: {}", line.kind, line.text()));
     }
     // The newest split of each measured interaction, one line per kind.
     for line in &report.latency {
@@ -1731,6 +1749,7 @@ mod tests {
             changes: Vec::new(),
             change_counts: Default::default(),
             decompose_tokens: None,
+            cache: Vec::new(),
             session: 0,
         };
         assert!(
@@ -1776,6 +1795,73 @@ mod tests {
                 .any(|l| l.starts_with("analytics  FAILED: graph: database is locked")),
             "{lines:?}"
         );
+    }
+
+    /// The cache figures print per call kind beside the call counts: a read
+    /// share and the write premium, or "not reported" for a vendor with no
+    /// cache field (never 0%), and the delta calls and re-asks of the run.
+    #[test]
+    fn the_report_shows_the_cache_figures_and_the_delta_call_counts() {
+        use kgraf_orchestrator::cache_report::CacheLine;
+        let mut report = test_report(kgraf_orchestrator::RunStatus::Completed);
+        assert!(
+            !report_lines(&report)
+                .iter()
+                .any(|l| l.starts_with("cache ")),
+            "no calls, no cache line"
+        );
+        report.cache = vec![
+            CacheLine {
+                kind: "replan_delta".into(),
+                calls: 2,
+                hit_rate: Some(0.25),
+                reported_calls: 2,
+                reported_input: 400,
+                cache_read: 100,
+                uncached_input: 200,
+                cache_write: 100,
+                write_premium: Some(Money::from_micros(75)),
+            },
+            CacheLine {
+                kind: "decompose".into(),
+                calls: 1,
+                hit_rate: None,
+                reported_calls: 0,
+                reported_input: 0,
+                cache_read: 0,
+                uncached_input: 300,
+                cache_write: 0,
+                write_premium: Some(Money::ZERO),
+            },
+        ];
+        report.changes = vec![kgraf_orchestrator::delta::ChangeLine {
+            number: 1,
+            source: kgraf_orchestrator::delta::ChangeSource::Change,
+            session: 1,
+            state: "applied",
+            detail: String::new(),
+            delta_tokens: 10,
+        }];
+        report.change_counts.delta_calls = 3;
+        report.change_counts.delta_reasks = 1;
+        let lines = report_lines(&report);
+        let find = |p: &str| lines.iter().find(|l| l.starts_with(p)).expect(p).clone();
+        let delta = find("cache      replan_delta");
+        assert!(delta.contains("2 calls"), "{delta}");
+        assert!(
+            delta.contains("cache read 25.0% of input (100 of 400 tokens)"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("100 tokens written, premium $0.000075"),
+            "{delta}"
+        );
+        let plain = find("cache      decompose");
+        assert!(plain.contains("cache read share not reported"), "{plain}");
+        assert!(plain.contains("no cache write"), "{plain}");
+        assert!(!plain.contains("0.0%"), "{plain}");
+        let changes = find("changes ");
+        assert!(changes.contains("delta calls 3, re-asks 1"), "{changes}");
     }
 
     fn report_with(status: kgraf_orchestrator::RunStatus) -> kgraf_orchestrator::RunReport {
@@ -1900,6 +1986,7 @@ mod tests {
             small: Default::default(),
             own_checks: false,
             zero_test_plans: false,
+            cache_layout: false,
             edits: Default::default(),
         }
     }

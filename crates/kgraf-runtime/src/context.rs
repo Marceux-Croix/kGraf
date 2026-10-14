@@ -255,6 +255,8 @@ impl PrefixSnapshot {
             tools: self.inner.prefix.tools.clone(),
             reasoning_effort: None,
             tool_choice: kgraf_provider::ToolChoice::Auto,
+            cache_key: None,
+            layout_marks: false,
         }
     }
 

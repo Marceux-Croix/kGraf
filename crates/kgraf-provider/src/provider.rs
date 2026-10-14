@@ -56,6 +56,12 @@ pub struct ProviderConfig {
     /// Defaults to false where unknown, because emitting breakpoints at a
     /// provider that drops them costs money silently and gains nothing.
     pub honors_cache_control: bool,
+    /// Whether this route is declared to honor a request's `prompt_cache_key`
+    /// on Chat Completions. Off unless the route says so: a server that does
+    /// not know the field may reject it, and one that ignores it gains
+    /// nothing. The Responses adapter always sends the key when a request has
+    /// one.
+    pub honors_prompt_cache_key: bool,
     /// Request timeout: how long a provider may take to start responding, and
     /// the base allowance for a buffered (non-streamed) call.
     pub timeout: std::time::Duration,
@@ -91,6 +97,7 @@ impl ProviderConfig {
             models,
             protocol,
             honors_cache_control: false,
+            honors_prompt_cache_key: false,
             timeout: std::time::Duration::from_secs(600),
             floor_tokens_per_second: DEFAULT_FLOOR_TOKENS_PER_SECOND,
         })
@@ -115,6 +122,7 @@ impl ProviderConfig {
             models,
             protocol,
             honors_cache_control: false,
+            honors_prompt_cache_key: false,
             // Local inference on consumer hardware is slow, and a self-hosted model
             // has no rate limit to protect. A timeout tuned for a hosted endpoint
             // would cancel legitimate work.
@@ -141,6 +149,12 @@ impl ProviderConfig {
     /// Declare that this endpoint honors cache control.
     pub fn honoring_cache_control(mut self) -> Self {
         self.honors_cache_control = true;
+        self
+    }
+
+    /// Declare that this route honors `prompt_cache_key` on Chat Completions.
+    pub fn honoring_prompt_cache_key(mut self) -> Self {
+        self.honors_prompt_cache_key = true;
         self
     }
 

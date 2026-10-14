@@ -251,6 +251,18 @@ pub struct RunConfig {
     /// `zero_test_plans` setting, then off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_test_plans: Option<bool>,
+    /// The delta call's prompt-cache layout (decision 0100, `--cache-layout`
+    /// / `--no-cache-layout`). Unset takes the user's `cache_layout`
+    /// setting, then off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_layout: Option<bool>,
+    /// Chat Completions routes (catalog ids) declared to take a
+    /// `prompt_cache_key` field: the cache layout's key is sent to them and
+    /// to no other Chat route. Each must be a route of this file, and on a
+    /// Chat Completions wire, or the file is refused. The run file is the
+    /// record of it; `--resume` reads the file again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_cache_key_routes: Vec<String>,
 }
 
 /// Keys a run file may not set (decision 0094): the permission mode, its
@@ -461,6 +473,8 @@ impl RunConfig {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            cache_layout: None,
+            prompt_cache_key_routes: Vec::new(),
         }
     }
 
@@ -536,7 +550,38 @@ impl RunConfig {
             config.prices = dir.join(&config.prices);
         }
         config.notice_deprecated_caps(path);
+        config
+            .check_prompt_cache_key_routes()
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
         Ok(config)
+    }
+
+    /// Refuse a `prompt_cache_key_routes` entry that is not a route of this
+    /// run, or not a Chat Completions route (fail loud: a declaration that
+    /// reaches nothing is a mistake, not a setting).
+    pub fn check_prompt_cache_key_routes(&self) -> std::result::Result<(), String> {
+        let named: Vec<&str> = self
+            .routes
+            .iter()
+            .chain(self.planner.iter())
+            .filter_map(|spec| spec.split_once(':').map(|(route, _)| route))
+            .collect();
+        for id in &self.prompt_cache_key_routes {
+            if !named.contains(&id.as_str()) {
+                return Err(format!(
+                    "`prompt_cache_key_routes` names `{id}`, which is not a route of this run \
+                     (routes: {})",
+                    named.join(", ")
+                ));
+            }
+            kgraf_fleet::check_prompt_cache_key_route(id).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Whether route `route` is declared to take `prompt_cache_key`.
+    pub fn declares_prompt_cache_key(&self, route: &str) -> bool {
+        self.prompt_cache_key_routes.iter().any(|r| r == route)
     }
 
     /// Set each limit that the run file `text` leaves out to the user's
@@ -595,6 +640,9 @@ impl RunConfig {
         }
         if unset("zero_test_plans") {
             self.zero_test_plans = self.zero_test_plans.or(user.zero_test_plans);
+        }
+        if unset("cache_layout") {
+            self.cache_layout = self.cache_layout.or(user.cache_layout);
         }
         // Scope by scope: a scope the file sets wins, one it leaves out takes
         // the user's setting (decision 0098).
@@ -1050,38 +1098,62 @@ pub(crate) fn limiters(
     Ok(out)
 }
 
-pub(crate) fn provider_for(
-    route: &str,
-    model: &str,
-    limiters: &Limiters,
-) -> Result<Arc<dyn Provider>> {
-    provider_from(route, model, limiters, kgraf_core::legacy::env_var)
-}
-
-/// [`provider_for`] with the environment lookup given. A missing credential is
+/// The route's provider, with the environment lookup given. A missing credential is
 /// [`Error::Credential`]: a scheduler disables the schedule with that reason.
+#[cfg(test)]
 pub(crate) fn provider_from(
     route: &str,
     model: &str,
     limiters: &Limiters,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Arc<dyn Provider>> {
+    provider_from_declared(route, model, limiters, lookup, false)
+}
+
+/// [`provider_from`] for a route the run file declares to take
+/// `prompt_cache_key` (`prompt_cache_key`).
+pub(crate) fn provider_from_declared(
+    route: &str,
+    model: &str,
+    limiters: &Limiters,
+    lookup: impl Fn(&str) -> Option<String>,
+    prompt_cache_key: bool,
+) -> Result<Arc<dyn Provider>> {
     let entry = kgraf_fleet::entry(route).settings()?;
     let credential = kgraf_fleet::credential_from(entry, lookup)
         .map_err(|e| Error::Credential(crate::error::Chained::bare(Box::new(e))))?;
-    provider_with(route, &credential, model, limiters)
+    provider_with_declared(route, &credential, model, limiters, prompt_cache_key)
 }
 
 /// The route's provider from `credential`. A catalog entry that cannot be
 /// configured is a settings failure: it fails the same way every time.
+#[cfg(test)]
 pub(crate) fn provider_with(
     route: &str,
     credential: &str,
     model: &str,
     limiters: &Limiters,
 ) -> Result<Arc<dyn Provider>> {
-    let provider: Arc<dyn Provider> =
-        Arc::from(kgraf_fleet::build(route, credential, vec![model.to_owned()]).settings()?);
+    provider_with_declared(route, credential, model, limiters, false)
+}
+
+pub(crate) fn provider_with_declared(
+    route: &str,
+    credential: &str,
+    model: &str,
+    limiters: &Limiters,
+    prompt_cache_key: bool,
+) -> Result<Arc<dyn Provider>> {
+    let provider: Arc<dyn Provider> = Arc::from(
+        kgraf_fleet::build_declared(
+            route,
+            credential,
+            vec![model.to_owned()],
+            kgraf_core::legacy::env_var,
+            prompt_cache_key,
+        )
+        .settings()?,
+    );
     Ok(limited(provider, route, credential, limiters))
 }
 
@@ -1529,6 +1601,7 @@ mod tests {
         let opt_in = crate::limits::UserLimits {
             own_checks: Some(true),
             zero_test_plans: Some(true),
+            cache_layout: None,
             ..Default::default()
         };
         let c = RunConfig::load_with(dir.path(), &path, &opt_in).expect("load");
@@ -1555,6 +1628,22 @@ mod tests {
             SmallRequestConfig::default(),
             "no setting, no file key"
         );
+        // The cache layout: the user setting reaches a file that names no
+        // key, and the file's key outranks it.
+        assert_eq!(c.cache_layout, None);
+        let layout = crate::limits::UserLimits {
+            cache_layout: Some(true),
+            ..Default::default()
+        };
+        let c = RunConfig::load_with(dir.path(), &path, &layout).expect("load");
+        assert_eq!(c.cache_layout, Some(true));
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "cache_layout": false}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &layout).expect("load");
+        assert_eq!(c.cache_layout, Some(false), "the run file wins");
         std::fs::write(
             &path,
             r#"{"routes": ["kimi:model"], "prices": "p.json", "plan": "small"}"#,
@@ -1586,6 +1675,7 @@ mod tests {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            cache_layout: None,
         };
         std::fs::write(
             &path,
@@ -1644,5 +1734,40 @@ mod tests {
         assert_eq!(c.max_tokens, defaults::max_tokens(), "no setting: default");
         assert_eq!(c.planner_max_tokens, 32_768);
         assert_eq!(c.max_tokens, 16_384);
+    }
+
+    /// A run file declares which Chat Completions routes take
+    /// `prompt_cache_key`; a name that is not a route of the run, is unknown,
+    /// or is on another wire refuses the file.
+    #[test]
+    fn prompt_cache_key_routes_are_checked_when_the_run_file_is_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.json");
+        let load = |routes: &str, declared: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"routes": {routes}, "prices": "p.json", "prompt_cache_key_routes": {declared}}}"#
+                ),
+            )
+            .expect("write");
+            RunConfig::load(dir.path(), &path)
+        };
+        let ok = load(r#"["kimi:model"]"#, r#"["kimi"]"#).expect("a chat route of the run");
+        assert!(ok.declares_prompt_cache_key("kimi"));
+        assert!(!ok.declares_prompt_cache_key("deepseek"));
+        let none = RunConfig::load(dir.path(), &{
+            std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#)
+                .expect("write");
+            path.clone()
+        })
+        .expect("load");
+        assert!(!none.declares_prompt_cache_key("kimi"), "off by default");
+        let msg = |r: Result<RunConfig>| r.expect_err("refused").to_string();
+        assert!(
+            msg(load(r#"["kimi:model"]"#, r#"["deepseek"]"#)).contains("not a route of this run")
+        );
+        assert!(msg(load(r#"["nope:model"]"#, r#"["nope"]"#)).contains("unknown provider"));
+        assert!(msg(load(r#"["openai:model"]"#, r#"["openai"]"#)).contains("cannot be declared"));
     }
 }

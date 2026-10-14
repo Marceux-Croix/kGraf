@@ -66,6 +66,7 @@ pub mod answer_wait;
 mod ask_tool;
 mod asks;
 mod box_port;
+pub mod cache_report;
 mod challenge;
 mod challenge_tool;
 mod check_runner;

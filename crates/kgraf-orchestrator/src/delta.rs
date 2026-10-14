@@ -608,60 +608,189 @@ fn first_line(text: &str) -> String {
     }
 }
 
+/// The delta's request text in segments, in cache order (the most stable
+/// first): the plan block, the state block, the instruction log, the change.
+/// [`DeltaPrompt::text`] is the whole text; [`DeltaPrompt::content`] is what
+/// the request carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeltaPrompt {
+    /// Project context and the plan block, through `</plan>`.
+    pub plan: String,
+    /// The state block.
+    pub state: String,
+    /// The instruction log.
+    pub instruction_log: String,
+    /// The change, and the refusal of a previous answer where there is one.
+    pub change: String,
+}
+
+impl DeltaPrompt {
+    /// The segments joined: the one user text a request without the cache
+    /// layout carries.
+    pub fn text(&self) -> String {
+        let mut out = String::with_capacity(
+            self.plan.len() + self.state.len() + self.instruction_log.len() + self.change.len(),
+        );
+        out.push_str(&self.plan);
+        out.push_str(&self.state);
+        out.push_str(&self.instruction_log);
+        out.push_str(&self.change);
+        out
+    }
+
+    /// The request's user content. With `cache_plan` off, one text block
+    /// holding [`Self::text`], the request as it was before the cache layout.
+    /// With it on, the plan block ends in a cache breakpoint and the rest
+    /// follows as one block, so a re-ask (which appends to the last block)
+    /// and a later call on an unchanged plan share the bytes through the plan.
+    pub fn content(&self, cache_plan: bool) -> Vec<kgraf_provider::Content> {
+        use kgraf_provider::Content;
+        if !cache_plan {
+            return vec![Content::text(self.text())];
+        }
+        let mut rest = String::new();
+        rest.push_str(&self.state);
+        rest.push_str(&self.instruction_log);
+        rest.push_str(&self.change);
+        vec![Content::cached_text(self.plan.clone()), Content::text(rest)]
+    }
+}
+
+/// Whether the delta call's plan block should end in a cache breakpoint: the
+/// route takes breakpoints (`ttl` is its cache lifetime) and the run's last
+/// delta call did not end longer ago than that, so a read can still come.
+/// With no earlier call there is nothing to age: the block is marked, for the
+/// next change and for a re-ask inside this one. A write costs more than an
+/// uncached read; this gate keeps it from being paid for a read that has
+/// already expired.
+pub fn plan_mark_due(
+    ttl: Option<std::time::Duration>,
+    previous_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    let Some(ttl) = ttl else {
+        return false;
+    };
+    let Some(previous) = previous_ms else {
+        return true;
+    };
+    let age = u64::try_from(now_ms.saturating_sub(previous)).unwrap_or(0);
+    u128::from(age) <= ttl.as_millis()
+}
+
+/// When the run's previous `replan_delta` call was made: the newest of the
+/// receipt time of an earlier change that made one (the record keeps it
+/// across a resume and a reopen) and `in_process`, the end of the last call
+/// this process made. Receipt time is never later than the call, so the age
+/// read from it is never too small: a mark is skipped, never paid for a read
+/// that has expired.
+pub fn previous_delta_ms(
+    record: &RunStateRecord,
+    current: u32,
+    in_process: Option<i64>,
+) -> Option<i64> {
+    record
+        .changes
+        .iter()
+        .filter(|c| c.number != current && !c.calls.is_empty())
+        .map(|c| c.received_ms)
+        .chain(in_process)
+        .max()
+}
+
+/// An open contract's line of the plan block: its whole spec. A function of
+/// that contract alone, so a line changes only when its own contract does.
+fn open_line(record: &RunStateRecord, c: &OpenContract) -> String {
+    let model = |s: &str| kgraf_secrets::model_copy(s).into_owned();
+    let mut s = spec_of(record, c);
+    s.instruction = model(&s.instruction);
+    s.acceptance = model(&s.acceptance);
+    serde_json::to_string(&s).unwrap_or_default()
+}
+
+/// A closed contract's line, in short form: id, the first line of the
+/// instruction, writes and dependencies. The whole spec stays in the record
+/// for the rules.
+fn closed_line(record: &RunStateRecord, c: &ClosedContract) -> String {
+    let model = |s: &str| kgraf_secrets::model_copy(s).into_owned();
+    let deps = match record.plan_specs.get(&c.contract) {
+        Some(s) => serde_json::json!(s.depends_on),
+        None => serde_json::json!("dependencies not recorded"),
+    };
+    serde_json::json!({
+        "id": c.contract,
+        "instruction": first_line(&model(&c.instruction)),
+        "writes": c.writes,
+        "depends_on": deps,
+    })
+    .to_string()
+}
+
 /// The delta's request text: the plan block (open contracts whole, closed
 /// ones short), the state block, the instruction log, then the change, in
 /// cache order (the most stable first).
+///
+/// `by_id` (the cache layout): the plan block lists every contract in id
+/// order, so a contract that closes rewrites its own line and no other.
+/// Otherwise open contracts come first, then closed ones, in record order, as
+/// before the cache layout.
 pub fn delta_prompt(
     record: &RunStateRecord,
     change: &RecordedChange,
     project_context: &str,
-) -> String {
+    by_id: bool,
+) -> DeltaPrompt {
     let model = |s: &str| kgraf_secrets::model_copy(s).into_owned();
-    let mut out = String::new();
-    out.push_str(project_context);
-    out.push_str("\n\n<plan>\n");
-    for c in &record.open_contracts {
-        let mut s = spec_of(record, c);
-        s.instruction = model(&s.instruction);
-        s.acceptance = model(&s.acceptance);
-        out.push_str(&serde_json::to_string(&s).unwrap_or_default());
-        out.push('\n');
-    }
-    // Closed contracts in short form: id, the first line of the
-    // instruction, writes and dependencies. The whole spec stays in the
-    // record for the rules.
+    let mut plan = String::new();
+    plan.push_str(project_context);
+    plan.push_str("\n\n<plan>\n");
     let open: BTreeSet<&str> = record
         .open_contracts
         .iter()
         .map(|c| c.contract.as_str())
         .collect();
-    for c in &record.coordination.closed {
-        if open.contains(c.contract.as_str()) {
-            continue;
+    if by_id {
+        // One line per id; an open contract's whole spec outranks its closed
+        // short form (a contract reopened by a retry is open).
+        let mut lines: BTreeMap<&str, String> = BTreeMap::new();
+        for c in &record.coordination.closed {
+            lines
+                .entry(c.contract.as_str())
+                .or_insert_with(|| closed_line(record, c));
         }
-        let deps = match record.plan_specs.get(&c.contract) {
-            Some(s) => serde_json::json!(s.depends_on),
-            None => serde_json::json!("dependencies not recorded"),
-        };
-        let short = serde_json::json!({
-            "id": c.contract,
-            "instruction": first_line(&model(&c.instruction)),
-            "writes": c.writes,
-            "depends_on": deps,
-        });
-        out.push_str(&short.to_string());
-        out.push('\n');
+        for c in &record.open_contracts {
+            lines.insert(c.contract.as_str(), open_line(record, c));
+        }
+        for line in lines.values() {
+            plan.push_str(line);
+            plan.push('\n');
+        }
+    } else {
+        for c in &record.open_contracts {
+            plan.push_str(&open_line(record, c));
+            plan.push('\n');
+        }
+        for c in &record.coordination.closed {
+            if open.contains(c.contract.as_str()) {
+                continue;
+            }
+            plan.push_str(&closed_line(record, c));
+            plan.push('\n');
+        }
     }
-    out.push_str("</plan>\n\n<state>\n");
+    plan.push_str("</plan>");
+    let mut state = String::from("\n\n<state>\n");
     for (id, class) in snapshot(record) {
-        out.push_str(&format!("{id}: {}\n", class.as_str()));
+        state.push_str(&format!("{id}: {}\n", class.as_str()));
     }
-    out.push_str("</state>\n\n<instruction_log>\n");
+    state.push_str("</state>");
+    let mut log = String::from("\n\n<instruction_log>\n");
     for entry in instruction_log(record) {
-        out.push_str(&model(&entry).replace('<', "&lt;"));
-        out.push_str("\n\n");
+        log.push_str(&model(&entry).replace('<', "&lt;"));
+        log.push_str("\n\n");
     }
-    out.push_str("</instruction_log>\n\n<change>\n");
+    log.push_str("</instruction_log>");
+    let mut out = String::from("\n\n<change>\n");
     match &change.edited {
         Some(edited) => {
             out.push_str("The user edited the instruction. The edited instruction, whole:\n");
@@ -679,7 +808,12 @@ pub fn delta_prompt(
             crate::interface_plan::quote_safe(&model(refusal))
         ));
     }
-    out
+    DeltaPrompt {
+        plan,
+        state,
+        instruction_log: log,
+        change: out,
+    }
 }
 
 /// What [`prepare`] needs besides the record.
@@ -1471,6 +1605,13 @@ pub struct ChangeCounts {
     pub verified_work_lost: u32,
     /// Tokens of every delta call.
     pub delta_tokens: u64,
+    /// `replan_delta` calls the run made, and the re-asks among them (the
+    /// answer was refused or the plan moved), so a run with the cache layout
+    /// on is compared with one off by the calls it took, not only their cost.
+    #[serde(default)]
+    pub delta_calls: u32,
+    #[serde(default)]
+    pub delta_reasks: u32,
 }
 
 /// The counts of `record`'s change log.
@@ -1491,6 +1632,8 @@ pub fn counts(record: &RunStateRecord) -> ChangeCounts {
             out.replan_all += 1;
         }
         out.delta_tokens += c.tokens;
+        out.delta_calls += u32::try_from(c.calls.len()).unwrap_or(u32::MAX);
+        out.delta_reasks += c.reasks + c.conflict_reasks;
     }
     out
 }
@@ -1588,3 +1731,7 @@ pub fn reopen_refusal(record: &RunStateRecord) -> Option<String> {
 #[cfg(test)]
 #[path = "delta_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "delta_cache_tests.rs"]
+mod cache_tests;

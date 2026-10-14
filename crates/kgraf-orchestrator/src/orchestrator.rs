@@ -678,6 +678,11 @@ pub struct OrchestratorConfig {
     /// contract unverified until the root gate passes over it, and every
     /// root-gate pass clears those marks. Off: as before.
     pub zero_test_plans: bool,
+    /// The delta call's prompt-cache layout (decision 0100): the plan block
+    /// lists contracts in id order, is marked for the provider's cache where
+    /// the route takes marks and a read can still come, and the call carries
+    /// the run's cache key. Off: the request is as it was before.
+    pub cache_layout: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -706,6 +711,7 @@ impl Default for OrchestratorConfig {
             small: crate::triage::SmallRequestConfig::default(),
             own_checks: false,
             zero_test_plans: false,
+            cache_layout: false,
         }
     }
 }
@@ -1605,6 +1611,10 @@ pub struct RunReport {
     /// edit (the plan root's), to compare each change's delta tokens with.
     /// `None` when the run had no change.
     pub decompose_tokens: Option<u64>,
+    /// The prompt cache's figures per orchestrator call kind, from the
+    /// ledger ([`crate::cache_report`]): shown beside the call counts, so a
+    /// run with the cache layout on is read against one off by figures alone.
+    pub cache: Vec<crate::cache_report::CacheLine>,
     /// The newest working session: changes from it that did not apply fail
     /// the run's exit.
     pub session: u32,
@@ -2720,6 +2730,10 @@ struct RunLoop {
     intake_notices: Vec<String>,
     /// Planner time spent against the share of the run's time limit.
     planner_budget: crate::planner_budget::PlannerBudget,
+    /// When this process's last `replan_delta` call ended, by the run's
+    /// clock: the cache layout's lifetime gate. Not kept across a resume (no
+    /// mark is the safe answer when it is not known).
+    last_delta_ms: Option<i64>,
     /// The run's time limit applied to its workers (`run_deadline.rs`).
     /// `None`: the run has no limit.
     run_deadline: Option<crate::run_deadline::RunDeadline>,
@@ -3082,6 +3096,7 @@ impl RunLoop {
             notices: BTreeSet::new(),
             intake_notices: Vec::new(),
             planner_budget: crate::planner_budget::PlannerBudget::new(time_limit),
+            last_delta_ms: None,
             run_deadline,
             out_of_time: None,
             limit_refused: Vec::new(),
@@ -5173,7 +5188,20 @@ impl RunLoop {
             changes: crate::delta::change_lines(&self.record),
             change_counts: crate::delta::counts(&self.record),
             decompose_tokens: (!self.record.changes.is_empty()).then(|| self.decompose_tokens()),
+            cache: self.cache_lines(),
             session: self.record.reopens,
+        }
+    }
+
+    /// The cache figures of this run's orchestrator calls, per call kind. A
+    /// ledger that cannot be read gives none: the report is not the place a
+    /// failed read stops a run.
+    fn cache_lines(&self) -> Vec<crate::cache_report::CacheLine> {
+        let run = self.run_id();
+        let agent = format!("orchestrator:{run}");
+        match self.s.ledger.calls_under_task(&run, Some(&agent)) {
+            Ok(rows) => crate::cache_report::cache_lines(&rows, &self.s.prices),
+            Err(_) => Vec::new(),
         }
     }
 

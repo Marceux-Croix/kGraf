@@ -393,6 +393,13 @@ impl OpenAiAdapter {
         if let Some(temperature) = request.temperature {
             body["temperature"] = serde_json::json!(temperature);
         }
+        if let Some(key) = &request.cache_key {
+            // https://platform.openai.com/docs/api-reference/responses/create
+            // (`prompt_cache_key`): requests that share a key and a prefix are
+            // routed alike, which raises the share of the prefix read from the
+            // cache. It steers a cache and changes no answer.
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
         if let Some(effort) = request.reasoning_effort {
             // `summary: "auto"` asks the model to emit a natural-language summary of
             // its reasoning alongside the effort control. Decision 0067: OpenAI
@@ -1234,6 +1241,21 @@ mod tests {
             !wire.to_string().contains("private chain of thought"),
             "reasoning must never be replayed as visible text"
         );
+    }
+
+    /// The request's cache key goes out as `prompt_cache_key`, and a request
+    /// with none sends no such field.
+    #[test]
+    fn a_cache_key_is_sent_as_prompt_cache_key() {
+        let mut request = Request::new("model-x", "hi", 100);
+        assert!(
+            adapter()
+                .to_wire(&request)
+                .get("prompt_cache_key")
+                .is_none()
+        );
+        request.cache_key = Some("run:r1".into());
+        assert_eq!(adapter().to_wire(&request)["prompt_cache_key"], "run:r1");
     }
 
     #[test]

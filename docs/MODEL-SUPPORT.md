@@ -173,6 +173,35 @@ otherwise.
   send it there and the worker relies on a notice that names the tool. Chat Completions and
   Anthropic Messages routes send it (BUILT, UNTESTED). Responses, Bedrock and Gemini
   refuse it.
+- **The cache layout of a change request is BUILT, UNTESTED on every route.** With
+  `--cache-layout` (see [USAGE.md](USAGE.md)), the `replan_delta` call sends its plan block in
+  contract id order and ends it with a cache mark, then the state, instruction log and change as
+  a second block. No live exchange has shown a cache read from this layout.
+  - *Anthropic Messages* (`anthropic`, `kimi-anthropic`, where the route
+    honors cache control): the plan block's mark, the existing mark on the last block, the
+    lookback anchor and a marked system block stay within the four breakpoints the API allows
+    (adapter test). A mark the cache layout placed (the request says so) whose prefix is shorter
+    than the model's minimum cacheable length is not sent, and the adapter logs why at debug
+    level; every other request's marks, a worker's for one, go out unchanged. The minimums are data in the adapter
+    (`MIN_CACHEABLE_TOKENS`): 4096 tokens for names containing `opus-4-5` or `haiku-4-5`, 2048 for
+    `haiku-3`, 1024 for every other model. **UNVERIFIED**: they were written without a check
+    against the vendor's current table, and a wrong figure drops a useful mark or keeps a
+    useless one. A mark is also left out when the run's previous change request is older than
+    the route's cache lifetime, so a write is not paid for a read that cannot come. The lifetime
+    is adapter data per route (`AnthropicAdapter::with_cache_ttl`), 5 minutes by default; no
+    route sets another yet.
+  - *OpenAI Responses* (`openai`, `grok`, `meta`, `azure-openai-responses`): the request
+    carries `prompt_cache_key` = `run:<run id>`. There is no mark on this wire.
+  - *Chat Completions*: the key is sent only for a route named in the run file's
+    `prompt_cache_key_routes` (catalog route ids). Unset, none is. Each name must be a route of
+    the run and on a Chat Completions wire, or the run file is refused. A server that does not
+    know the field may refuse the request.
+  - Every other route ignores the key and takes no mark; the plan block is still byte-stable
+    and in id order.
+  The run report prints, per call kind, the share of input read from the cache and the write
+  premium paid, or "not reported" for a vendor whose usage carries no cache field. Where only some
+  calls of a kind report cache fields, the share is taken over those calls and the line says how
+  many reported.
 - **A model name is not a verified model.** A VERIFIED row covers the models named in its
   record. DeepSeek is known to replace an unsupported model name with a cheaper one and
   return HTTP 200. The model echo check exists to catch this.

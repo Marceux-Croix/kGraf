@@ -569,16 +569,29 @@ pub trait Decomposer: Send + Sync {
             "this planner makes no delta call".to_owned(),
         ))
     }
+
+    /// How long the planner's provider keeps a cached prefix, or `None` where
+    /// its route takes no cache breakpoints (so none is marked).
+    fn cache_ttl(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// What a delta call is asked: the whole request text
 /// ([`crate::delta::delta_prompt`]) and its output cap.
 #[derive(Clone, Debug)]
 pub struct DeltaRequest {
-    pub prompt: String,
+    pub prompt: crate::delta::DeltaPrompt,
     pub cap: u32,
     /// As [`PlanRequest::own_checks`].
     pub own_checks: bool,
+    /// The cache layout is on for this call: the request carries the run's
+    /// cache key. The prompt was built with the plan block in id order.
+    pub cache_layout: bool,
+    /// The plan block ends in a cache breakpoint. Off where a write would not
+    /// be read before it expires (the run's previous delta call is older than
+    /// the provider's cache lifetime, or there was none).
+    pub mark_plan: bool,
 }
 
 /// A delta call's answer and every ledger call it made.
@@ -1579,21 +1592,38 @@ impl ModelCaller {
         self.read_request(kind, request, parse).await
     }
 
-    /// [`Self::ask_read`] for a call held to `cap` with reasoning off unless
+    /// [`Self::ask_read`] with the user turn as blocks (a cache breakpoint can
+    /// sit between them) and an optional cache key, for a call held to `cap` with reasoning off unless
     /// its kind's own level is set ([`Self::once_effort_and_limit`], the
     /// triage call's rule): an interactive call whose answer size kGraf knows.
     pub(crate) async fn ask_read_capped<T>(
         &self,
         kind: &str,
         system: &str,
-        user: String,
+        user: Vec<kgraf_provider::Content>,
+        cache_key: Option<String>,
         cap: u32,
         parse: &impl Fn(&str) -> Result<T, PlanError>,
     ) -> (Result<ReadAnswer<T>, PlanError>, Vec<CallId>) {
         let (effort, limit) = self.once_effort_and_limit(kind, cap);
-        let mut request = Request::new(self.model.clone(), user, limit);
+        let mut request = Request::new(self.model.clone(), "", limit);
+        // The marks in this turn are the cache layout's own.
+        request.layout_marks = user.iter().any(|b| {
+            matches!(
+                b,
+                kgraf_provider::Content::Text {
+                    cache_breakpoint: true,
+                    ..
+                }
+            )
+        });
+        request.messages = vec![kgraf_provider::Message {
+            role: kgraf_provider::Role::User,
+            content: user,
+        }];
         request.reasoning_effort = effort;
         request.system = vec![kgraf_provider::Content::text(system)];
+        request.cache_key = cache_key;
         self.read_request(kind, request, parse).await
     }
 
@@ -2153,6 +2183,14 @@ impl Decomposer for ModelDecomposer {
         })
     }
 
+    fn cache_ttl(&self) -> Option<std::time::Duration> {
+        self.0
+            .provider
+            .capabilities()
+            .cache_control
+            .map(|c| c.cache_ttl())
+    }
+
     async fn replan_delta(&self, request: &DeltaRequest) -> Result<DeltaOutput, PlanError> {
         let mut calls = Vec::new();
         let mut cap = request.cap;
@@ -2164,7 +2202,8 @@ impl Decomposer for ModelDecomposer {
                 .ask_read_capped(
                     "replan_delta",
                     &system,
-                    request.prompt.clone(),
+                    request.prompt.content(request.mark_plan),
+                    request.cache_layout.then(|| format!("run:{}", self.0.task)),
                     cap,
                     &crate::delta::parse_delta,
                 )

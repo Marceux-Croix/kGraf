@@ -227,7 +227,7 @@ impl Message {
 }
 
 /// A completion request, in kGraf's own shape.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Request {
     /// The model to use. An adapter that cannot serve it refuses before the
     /// request goes out.
@@ -251,6 +251,58 @@ pub struct Request {
     /// adapter refuses the request before it goes out.
     #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]
     pub tool_choice: ToolChoice,
+    /// A key that groups requests sharing a prompt prefix, for a vendor that
+    /// routes its prompt cache by one (the Responses `prompt_cache_key`).
+    /// `None` sends nothing. An adapter without a wire form for it ignores it:
+    /// the key only steers a cache and changes no answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    /// The cache breakpoints in `messages` were placed by the delta call's
+    /// cache layout, so an adapter may drop one its model would not cache
+    /// (a prefix shorter than the model's minimum). False for every other
+    /// request: its marks are sent as they are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub layout_marks: bool,
+}
+
+/// The derived form, except that an unset `cache_key` is left out, so a
+/// request that carries none prints as it did before the field existed (the
+/// golden request fixtures compare this text).
+///
+/// Every field is named in the pattern below, with no `..`: a field added to
+/// [`Request`] is a compile error here until it is printed or left out on
+/// purpose.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Request {
+            model,
+            system,
+            messages,
+            max_output_tokens,
+            temperature,
+            tools,
+            reasoning_effort,
+            tool_choice,
+            cache_key,
+            layout_marks,
+        } = self;
+        let mut s = f.debug_struct("Request");
+        s.field("model", model)
+            .field("system", system)
+            .field("messages", messages)
+            .field("max_output_tokens", max_output_tokens)
+            .field("temperature", temperature)
+            .field("tools", tools)
+            .field("reasoning_effort", reasoning_effort)
+            .field("tool_choice", tool_choice);
+        if cache_key.is_some() {
+            s.field("cache_key", cache_key);
+        }
+        if *layout_marks {
+            s.field("layout_marks", layout_marks);
+        }
+        s.finish()
+    }
 }
 
 /// Whether the model may answer in text or must call a tool.
@@ -316,6 +368,8 @@ impl Request {
             tools: Vec::new(),
             reasoning_effort: None,
             tool_choice: ToolChoice::Auto,
+            cache_key: None,
+            layout_marks: false,
         }
     }
 }
@@ -554,6 +608,55 @@ pub const SPECIAL_TOKEN_ALLOWANCE: u64 = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `derive(Debug)` printed before `cache_key` and `layout_marks`
+    /// existed: the fields as they were, same names, same order.
+    mod mirror {
+        use super::super::{Content, Message, ReasoningEffort, ToolChoice, ToolDefinition};
+
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        pub struct Request {
+            pub model: String,
+            pub system: Vec<Content>,
+            pub messages: Vec<Message>,
+            pub max_output_tokens: u32,
+            pub temperature: Option<f32>,
+            pub tools: Vec<ToolDefinition>,
+            pub reasoning_effort: Option<ReasoningEffort>,
+            pub tool_choice: ToolChoice,
+        }
+    }
+
+    /// With no cache key and no layout marks, the hand-written `Debug` prints
+    /// exactly what a derive over the original fields printed, plain and
+    /// pretty (the golden request fixtures compare that text); either field
+    /// set shows up.
+    #[test]
+    fn debug_equals_a_derived_mirror_without_the_cache_fields_and_shows_them_when_set() {
+        let mut r = Request::new("m", "hi", 10);
+        r.system = vec![Content::cached_text("sys")];
+        r.temperature = Some(0.5);
+        r.reasoning_effort = Some(ReasoningEffort::Low);
+        let mirror = mirror::Request {
+            model: r.model.clone(),
+            system: r.system.clone(),
+            messages: r.messages.clone(),
+            max_output_tokens: r.max_output_tokens,
+            temperature: r.temperature,
+            tools: r.tools.clone(),
+            reasoning_effort: r.reasoning_effort,
+            tool_choice: r.tool_choice,
+        };
+        assert_eq!(format!("{r:?}"), format!("{mirror:?}"));
+        assert_eq!(format!("{r:#?}"), format!("{mirror:#?}"));
+        r.cache_key = Some("run:r1".into());
+        assert!(format!("{r:?}").contains("cache_key: Some(\"run:r1\")"));
+        assert!(format!("{r:#?}").contains("cache_key: Some("));
+        r.cache_key = None;
+        r.layout_marks = true;
+        assert!(format!("{r:?}").contains("layout_marks: true"));
+    }
 
     /// An adapter with no wire form refuses a forced tool choice; one with a
     /// form refuses it only when no tool is listed; the default always passes.

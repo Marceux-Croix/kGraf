@@ -241,6 +241,14 @@ pub struct Entry {
 /// Errors selecting or building a fleet member.
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
+    /// A route declared to take `prompt_cache_key` is not on a Chat
+    /// Completions wire.
+    #[error(
+        "`{id}` cannot be declared to take `prompt_cache_key`: its wire is {wire}, and only \
+         Chat Completions routes are declared (Responses routes always send it, other wires \
+         have no such field)"
+    )]
+    PromptCacheKeyWire { id: String, wire: &'static str },
     /// No catalog entry with that id.
     #[error("unknown provider `{id}`; known: {known}")]
     Unknown { id: String, known: String },
@@ -1029,6 +1037,22 @@ pub fn configure(
     Ok(config)
 }
 
+/// Check that route `id` can be declared to take a `prompt_cache_key` field
+/// (the run file's `prompt_cache_key_routes`): it must be a catalog route on
+/// a Chat Completions wire. A Responses route sends the key without a
+/// declaration, and every other wire has no such field, so naming one is an
+/// error, never a silent no-op.
+pub fn check_prompt_cache_key_route(id: &str) -> Result<(), FleetError> {
+    let entry = entry(id)?;
+    match entry.wire {
+        Wire::OpenAiChat(_) | Wire::AzureOpenAiChat => Ok(()),
+        _ => Err(FleetError::PromptCacheKeyWire {
+            id: id.to_owned(),
+            wire: entry.wire.as_str(),
+        }),
+    }
+}
+
 /// The key under which adapters record a route's observed rate limits and last
 /// 429, and under which the host reads them back.
 ///
@@ -1174,6 +1198,22 @@ pub fn build_with_lookup(
     models: Vec<String>,
     lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
 ) -> Result<Box<dyn Provider>, FleetError> {
+    build_declared(id, credential, models, lookup, false)
+}
+
+/// [`build_with_lookup`] for a route the run file declares to take
+/// `prompt_cache_key` on Chat Completions (`prompt_cache_key`): a declaration
+/// on any other wire is refused ([`check_prompt_cache_key_route`]).
+pub fn build_declared(
+    id: &str,
+    credential: &str,
+    models: Vec<String>,
+    lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    prompt_cache_key: bool,
+) -> Result<Box<dyn Provider>, FleetError> {
+    if prompt_cache_key {
+        check_prompt_cache_key_route(id)?;
+    }
     let entry = entry(id)?;
     if !serves(entry, ModelKind::GENERATIVE) {
         return Err(not_served(entry, ModelKind::GENERATIVE));
@@ -1222,7 +1262,10 @@ pub fn build_with_lookup(
             _ => Box::new(kgraf_provider_google::vertex_gemini(&settings, models).map_err(wrap)?),
         });
     }
-    let config = configure(entry, credential, models)?;
+    let mut config = configure(entry, credential, models)?;
+    if prompt_cache_key {
+        config = config.honoring_prompt_cache_key();
+    }
     if entry.wire.is_azure() {
         let settings = azure_settings(entry, credential)?;
         return Ok(match entry.wire {
@@ -1914,6 +1957,45 @@ mod tests {
         .await
         .expect_err("must refuse before sending");
         assert!(matches!(err, ProviderError::CapabilityNotHonored { .. }));
+    }
+
+    /// Only a Chat Completions route can be declared to take the key; an
+    /// unknown route or another wire fails loud.
+    #[test]
+    fn only_a_chat_route_can_be_declared_to_take_the_prompt_cache_key() {
+        assert!(check_prompt_cache_key_route("kimi").is_ok());
+        assert!(matches!(
+            check_prompt_cache_key_route("no-such-route"),
+            Err(FleetError::Unknown { .. })
+        ));
+        for non_chat in ["openai", "anthropic", "gemini"] {
+            assert!(
+                matches!(
+                    check_prompt_cache_key_route(non_chat),
+                    Err(FleetError::PromptCacheKeyWire { .. })
+                ),
+                "{non_chat}"
+            );
+        }
+        let declared = build_declared(
+            "kimi",
+            "placeholder-key-value",
+            vec!["m".into()],
+            |_| None,
+            true,
+        );
+        assert!(declared.is_ok());
+        let refused = build_declared(
+            "openai",
+            "placeholder-key-value",
+            vec!["m".into()],
+            |_| None,
+            true,
+        );
+        assert!(matches!(
+            refused.err(),
+            Some(FleetError::PromptCacheKeyWire { .. })
+        ));
     }
 
     #[test]

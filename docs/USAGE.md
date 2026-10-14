@@ -168,6 +168,7 @@ overwrites a node you changed.
 | `--early-start`, `--no-early-start` | off | With `--plan auto`, start the one worker beside the triage call when it can start at once. Also the run file key `early_start` and the `early_start` user setting. |
 | `--own-checks`, `--no-own-checks` | off | A plan's contract may carry a check command of its own, run only when `--verify` tests nothing for it. See [A contract's own check](#a-contracts-own-check). Also the run file key `own_checks` and the `own_checks` user setting. |
 | `--zero-test-plans`, `--no-zero-test-plans` | off | Apply the zero-test rule of [Small requests](#small-requests) to every contract. Also the run file key `zero_test_plans` and the `zero_test_plans` user setting. |
+| `--cache-layout`, `--no-cache-layout` | off | A change to a finished run sends its plan block in contract id order and marks it for the provider's prompt cache where the route takes marks and a read can still come, with the run's cache key. See [Change a run](#change-a-run). Also the run file key `cache_layout` and the `cache_layout` user setting (Settings > General). |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
 | `--interactive` | off | Read notes and `?` status questions from stdin during the run, and answer a change's ask with y or n. |
@@ -590,6 +591,20 @@ a full plan; with nobody at the card, Change runs a full plan as before. Re-grou
 and every applied change. The trace records each step as a `change` event, and each reopen as a
 `reopened` event; readers of the trace split working sessions there, so the time between them is
 not run time.
+
+With `--cache-layout`, each `replan_delta` call lists the plan's contracts in id order (so a
+contract that closes rewrites only its own line), ends the plan block with a cache mark, and
+sends the run's cache key. The mark is left out where the route takes none, where the plan is
+shorter than the model caches, and where the run's previous change request is older than the
+provider's cache lifetime. The mark costs a write at a higher rate than an uncached read, and
+nothing is claimed about what it saves: the run report prints, per call kind, `cache read N% of
+input` and the tokens written with the premium paid (`cache read share not reported` for a
+vendor whose usage has no cache field), and the `changes` line counts the run's delta calls and
+re-asks, so a run with the layout on can be compared with one off by calls as well as tokens.
+Which routes take a mark or a key is in [MODEL-SUPPORT.md](MODEL-SUPPORT.md); for a Chat
+Completions route that takes `prompt_cache_key`, name its route id in the run file's
+`prompt_cache_key_routes`; a name that is not a route of the run, or not a Chat Completions
+route, refuses the file. Triage, re-grounding and planning requests are not changed by it.
 
 ### A contract's own check
 

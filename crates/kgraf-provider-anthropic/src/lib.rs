@@ -247,6 +247,81 @@ fn unusable_stop(reason: &str) -> Option<&str> {
 /// The most cache breakpoints one request may carry on this wire.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
+/// How long a route's cache keeps a written prefix with no read to refresh
+/// it, by default: the vendor's standard lifetime, which the longer option
+/// (not requested) would extend. A route with another lifetime sets its own
+/// with [`AnthropicAdapter::with_cache_ttl`].
+const DEFAULT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The shortest prompt prefix, in tokens, a model caches, by a part of its
+/// name; the first row that matches wins. UNVERIFIED: written from memory of
+/// the vendor's table and not checked against its current documentation
+/// (`docs/MODEL-SUPPORT.md` says so). A prefix below the figure is not
+/// cached, and a write is not billed for it, so a wrong figure costs a
+/// missing or a useless mark and no money.
+const MIN_CACHEABLE_TOKENS: &[(&str, u64)] =
+    &[("opus-4-5", 4096), ("haiku-4-5", 4096), ("haiku-3", 2048)];
+
+/// The figure for a model no row names.
+const DEFAULT_MIN_CACHEABLE_TOKENS: u64 = 1024;
+
+/// The shortest cacheable prefix for `model`, in tokens.
+fn min_cacheable_tokens(model: &str) -> u64 {
+    MIN_CACHEABLE_TOKENS
+        .iter()
+        .find(|(part, _)| model.contains(part))
+        .map_or(DEFAULT_MIN_CACHEABLE_TOKENS, |(_, n)| *n)
+}
+
+/// The breakpoints a request's messages ask for that this adapter will not
+/// send, as `(message, block, reason)`: the prefix up to the block (tools,
+/// system, the messages before it) is shorter than the model caches. A mark
+/// there buys nothing, so it is dropped and the reason said.
+fn short_prefix_marks(request: &Request) -> Vec<(usize, usize, String)> {
+    let min = min_cacheable_tokens(&request.model);
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.input_schema.to_string().len())
+        .sum();
+    let mut chars = tools
+        + request
+            .system
+            .iter()
+            .filter_map(Content::as_text)
+            .map(str::len)
+            .sum::<usize>();
+    let mut out = Vec::new();
+    for (m, message) in request.messages.iter().enumerate() {
+        for (b, content) in message.content.iter().enumerate() {
+            chars += content.as_text().map_or(0, str::len);
+            if matches!(
+                content,
+                Content::Text {
+                    cache_breakpoint: true,
+                    ..
+                }
+            ) {
+                // Three bytes a token, as the core's estimate counts, over the bytes
+                // seen so far.
+                let tokens = (chars as u64).div_ceil(3);
+                if tokens < min {
+                    out.push((
+                        m,
+                        b,
+                        format!(
+                            "the prompt up to this block is about {tokens} tokens, below the \
+                             {min} tokens {} caches",
+                            request.model
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Blocks added by one tool round (the assistant turn plus the tool results)
 /// from which the previous tail gets its own breakpoint. The vendor's lookback
 /// is about 20 blocks; this leaves a margin.
@@ -262,6 +337,8 @@ pub struct AnthropicAdapter {
     /// `None` posts to `{base_url}/messages` with an API key. `Some` posts the
     /// same body to a per-model URL with a bearer token.
     transport: Option<ModelInUrlTransport>,
+    /// This route's cache lifetime ([`CacheControl::cache_ttl`]).
+    cache_ttl: std::time::Duration,
 }
 
 impl AnthropicAdapter {
@@ -290,6 +367,7 @@ impl AnthropicAdapter {
             config,
             http,
             transport: None,
+            cache_ttl: DEFAULT_CACHE_TTL,
         })
     }
 
@@ -300,6 +378,13 @@ impl AnthropicAdapter {
     /// observations; requests go to the transport's URL.
     pub fn with_transport(mut self, transport: ModelInUrlTransport) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Set this route's prompt-cache lifetime, for a route whose cache keeps a
+    /// prefix for another time than the vendor's default.
+    pub fn with_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.cache_ttl = ttl;
         self
     }
 
@@ -350,6 +435,32 @@ impl AnthropicAdapter {
     /// silently and gains nothing, so the default is off.
     fn to_wire(&self, request: &Request, stream: bool) -> serde_json::Value {
         let honor = self.config.honors_cache_control;
+        // A mark the cache layout placed on a block whose prefix is shorter
+        // than the model caches is not sent (and said): the request is copied
+        // only when there is one. Every other request's marks go out as they
+        // are, so a worker's wire bytes are not touched.
+        let dropped = if honor && request.layout_marks {
+            short_prefix_marks(request)
+        } else {
+            Vec::new()
+        };
+        let gated;
+        let request = if dropped.is_empty() {
+            request
+        } else {
+            let mut copy = request.clone();
+            for (m, b, why) in &dropped {
+                tracing::debug!(model = %request.model, "no cache breakpoint: {why}");
+                if let Some(Content::Text {
+                    cache_breakpoint, ..
+                }) = copy.messages[*m].content.get_mut(*b)
+                {
+                    *cache_breakpoint = false;
+                }
+            }
+            gated = copy;
+            &gated
+        };
         let block = |content: &Content| -> Option<serde_json::Value> {
             match content {
                 Content::Text {
@@ -924,6 +1035,10 @@ impl kgraf_provider::Provider for AnthropicAdapter {
 impl CacheControl for AnthropicAdapter {
     fn max_breakpoints(&self) -> usize {
         MAX_CACHE_BREAKPOINTS
+    }
+
+    fn cache_ttl(&self) -> std::time::Duration {
+        self.cache_ttl
     }
 
     fn minimum_cacheable_tokens(&self) -> Option<u32> {
@@ -2024,6 +2139,171 @@ mod tests {
     fn breakpoint_count(wire: &serde_json::Value) -> usize {
         let text = wire.to_string();
         text.matches("\"cache_control\"").count()
+    }
+
+    /// A delta-shaped request: a system block, a user turn of a marked plan
+    /// block (about `plan_bytes` long) and the rest of the change.
+    fn plan_request(model: &str, plan_bytes: usize) -> Request {
+        use kgraf_provider::{Content, Message, Role};
+        let mut request = Request::new(model, "", 10);
+        request.layout_marks = true;
+        request.system = vec![Content::text("system")];
+        request.messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::cached_text("p".repeat(plan_bytes)),
+                Content::text("the change"),
+            ],
+        }];
+        request
+    }
+
+    fn marked(wire: &serde_json::Value) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (m, message) in wire["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .enumerate()
+        {
+            for (b, block) in message["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .enumerate()
+            {
+                if block.get("cache_control").is_some() {
+                    out.push((m, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// The plan mark, the tail breakpoint and the lookback anchor together
+    /// never pass the vendor's four, with the system mark beside them.
+    #[test]
+    fn the_plan_mark_the_tail_and_the_anchor_stay_within_the_breakpoint_budget() {
+        use kgraf_provider::{Content, Message, Role};
+        let adapter = honoring_adapter();
+        // The plan mark and the tail: two of the messages' breakpoints.
+        let request = plan_request("model-a", 6_000);
+        let sent = adapter.to_wire(&request, false);
+        assert_eq!(marked(&sent), vec![(0, 0), (0, 1)], "plan mark, then tail");
+        assert_eq!(breakpoint_count(&sent), 2);
+        // A long tool round after the plan, and the system marked too: the
+        // plan mark, the anchor, the tail and the system make four.
+        let mut long = plan_request("model-a", 6_000);
+        long.system = vec![Content::cached_text("stable system")];
+        let calls: Vec<Content> = (0..9)
+            .map(|i| Content::ToolUse {
+                id: format!("t{i}"),
+                name: "read".into(),
+                input: serde_json::json!({}),
+                signature: None,
+            })
+            .collect();
+        let results: Vec<Content> = (0..9)
+            .map(|i| Content::ToolResult {
+                tool_use_id: format!("t{i}"),
+                content: "ok".into(),
+                is_error: false,
+            })
+            .collect();
+        long.messages.push(Message {
+            role: Role::Assistant,
+            content: calls,
+        });
+        long.messages.push(Message {
+            role: Role::User,
+            content: results,
+        });
+        let sent = adapter.to_wire(&long, false);
+        assert_eq!(breakpoint_count(&sent), MAX_CACHE_BREAKPOINTS, "{sent}");
+        // Three marks already asked for: the anchor is skipped, the tail fits.
+        let mut crowded = long.clone();
+        crowded.system = vec![Content::cached_text("one"), Content::cached_text("two")];
+        let sent = adapter.to_wire(&crowded, false);
+        assert!(breakpoint_count(&sent) <= MAX_CACHE_BREAKPOINTS, "{sent}");
+    }
+
+    /// A plan block shorter than the model caches gets no mark, and the
+    /// reason names the figure; a longer one keeps it. The figures are data
+    /// per model.
+    #[test]
+    fn a_plan_mark_below_the_models_minimum_is_not_sent_and_says_why() {
+        let adapter = honoring_adapter();
+        let short = plan_request("model-a", 600);
+        let drops = short_prefix_marks(&short);
+        assert_eq!(drops.len(), 1);
+        assert!(
+            drops[0].2.contains("below the 1024 tokens model-a caches"),
+            "{}",
+            drops[0].2
+        );
+        let sent = adapter.to_wire(&short, false);
+        assert_eq!(marked(&sent), vec![(0, 1)], "only the tail is marked");
+        // Long enough for the default figure, kept.
+        let long = plan_request("model-a", 6_000);
+        assert!(short_prefix_marks(&long).is_empty());
+        assert_eq!(marked(&adapter.to_wire(&long, false))[0], (0, 0));
+        // The same bytes are short for a model with a higher figure.
+        let opus = plan_request("claude-opus-4-5", 6_000);
+        let drops = short_prefix_marks(&opus);
+        assert_eq!(drops.len(), 1);
+        assert!(drops[0].2.contains("4096"), "{}", drops[0].2);
+        assert_eq!(min_cacheable_tokens("claude-sonnet-4-5"), 1024);
+        assert_eq!(min_cacheable_tokens("claude-haiku-3-5"), 2048);
+        // A system block's mark is not gated: it is not a plan mark.
+        let mut system = Request::new("claude-opus-4-5", "hi", 10);
+        system.system = vec![kgraf_provider::Content::cached_text("short system")];
+        assert!(short_prefix_marks(&system).is_empty());
+        assert_eq!(
+            adapter.to_wire(&system, false)["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    /// A request the cache layout did not make (a worker's, for one) keeps
+    /// every mark it asked for, short prefix or not: the wire is the same as
+    /// before the layout existed.
+    #[test]
+    fn a_short_marked_block_of_another_request_is_sent_as_it_was() {
+        let adapter = honoring_adapter();
+        let mut request = plan_request("claude-opus-4-5", 600);
+        request.layout_marks = false;
+        let sent = adapter.to_wire(&request, false);
+        assert_eq!(marked(&sent), vec![(0, 0), (0, 1)], "the short mark stays");
+        request.layout_marks = true;
+        assert_eq!(marked(&adapter.to_wire(&request, false)), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn a_route_can_set_its_own_cache_lifetime() {
+        let adapter = AnthropicAdapter::new(config("http://127.0.0.1:1").honoring_cache_control())
+            .expect("adapter")
+            .with_cache_ttl(std::time::Duration::from_secs(3600));
+        assert_eq!(
+            adapter
+                .capabilities()
+                .cache_control
+                .expect("honors")
+                .cache_ttl(),
+            std::time::Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn the_cache_lifetime_is_the_adapters_own() {
+        let adapter = honoring_adapter();
+        assert_eq!(
+            adapter
+                .capabilities()
+                .cache_control
+                .expect("honors")
+                .cache_ttl(),
+            std::time::Duration::from_secs(300)
+        );
     }
 
     /// A text block that is empty (one that carried another vendor's token in a

@@ -42,6 +42,16 @@ pub struct PlanFlags {
     /// setting says. Benchmark drivers pass it.
     #[arg(long)]
     pub no_zero_test_plans: bool,
+    /// A change to a finished run sends its plan block in id order, marked
+    /// for the provider's prompt cache where the provider takes marks and a
+    /// read can still come, with the run's cache key. Overrides the
+    /// `cache_layout` user setting; off by default.
+    #[arg(long, conflicts_with = "no_cache_layout")]
+    pub cache_layout: bool,
+    /// Send change requests as they were before the cache layout, whatever
+    /// the user setting says. Benchmark drivers pass it.
+    #[arg(long)]
+    pub no_cache_layout: bool,
 }
 
 fn parse_plan_mode(s: &str) -> Result<PlanMode, String> {
@@ -65,6 +75,12 @@ impl PlanFlags {
     /// user setting.
     pub fn zero_test_plans(&self) -> Option<bool> {
         pair(self.zero_test_plans, self.no_zero_test_plans)
+    }
+
+    /// The cache-layout answer from its flag pair; `None` leaves it to the
+    /// user setting.
+    pub fn cache_layout(&self) -> Option<bool> {
+        pair(self.cache_layout, self.no_cache_layout)
     }
 }
 
@@ -130,5 +146,20 @@ mod tests {
         );
         assert!(parse(&["--own-checks", "--no-own-checks"]).is_err());
         assert!(parse(&["--zero-test-plans", "--no-zero-test-plans"]).is_err());
+    }
+
+    /// The cache-layout pair: unset by default, each side read, both refused.
+    #[test]
+    fn the_cache_layout_pair_parses() {
+        assert_eq!(parse(&[]).expect("none").cache_layout(), None);
+        assert_eq!(
+            parse(&["--cache-layout"]).expect("on").cache_layout(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(&["--no-cache-layout"]).expect("off").cache_layout(),
+            Some(false)
+        );
+        assert!(parse(&["--cache-layout", "--no-cache-layout"]).is_err());
     }
 }

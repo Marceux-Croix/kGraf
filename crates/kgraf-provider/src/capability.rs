@@ -125,6 +125,14 @@ pub trait CacheControl: Send + Sync {
     /// The shortest prefix this provider will cache, in tokens, where it publishes
     /// one. `None` means unknown, which is a different claim from zero.
     fn minimum_cacheable_tokens(&self) -> Option<u32>;
+
+    /// How long a written prefix stays readable, with no read to refresh it.
+    /// A caller asks before paying a write for a read that would come later
+    /// than this. The default is five minutes, the figure the vendors that
+    /// publish one share.
+    fn cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(300)
+    }
 }
 
 /// A provider exposing a reasoning-effort control.

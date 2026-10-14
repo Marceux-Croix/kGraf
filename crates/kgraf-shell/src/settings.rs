@@ -447,6 +447,7 @@ impl RunLimitSliders {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            cache_layout: None,
         }
     }
 
@@ -636,6 +637,9 @@ pub struct Settings {
     /// unverified until the root gate passes over it, as a small request's
     /// does (decision 0100). Off by default.
     pub zero_test_plans: bool,
+    /// The delta call's prompt-cache layout (decision 0100): plan block in
+    /// id order, marked for a provider that takes marks. Off by default.
+    pub cache_layout: bool,
 }
 
 impl Settings {
@@ -659,6 +663,7 @@ impl Settings {
             // Written only when on: off is the default everywhere.
             own_checks: self.own_checks.then_some(true),
             zero_test_plans: self.zero_test_plans.then_some(true),
+            cache_layout: self.cache_layout.then_some(true),
             ..self.limits.user_limits()
         }
     }
@@ -689,6 +694,7 @@ impl Default for Settings {
             early_start: true,
             own_checks: false,
             zero_test_plans: false,
+            cache_layout: false,
         }
     }
 }
@@ -783,6 +789,8 @@ struct SettingsFile {
     own_checks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     zero_test_plans: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_layout: Option<bool>,
 }
 
 impl Settings {
@@ -850,6 +858,7 @@ impl Settings {
         settings.early_start = user.early_start.unwrap_or(settings.early_start);
         settings.own_checks = user.own_checks.unwrap_or(false);
         settings.zero_test_plans = user.zero_test_plans.unwrap_or(false);
+        settings.cache_layout = user.cache_layout.unwrap_or(false);
         settings.limits = RunLimitSliders::from_user_limits(user);
         if let Some(a) = file.appearance {
             settings.appearance = a;
@@ -940,6 +949,7 @@ impl Settings {
             early_start: (self.plan_auto || !self.early_start).then_some(self.early_start),
             own_checks: self.own_checks.then_some(true),
             zero_test_plans: self.zero_test_plans.then_some(true),
+            cache_layout: self.cache_layout.then_some(true),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -1501,10 +1511,15 @@ mod tests {
         let path = dir.path().join("settings.toml");
         Settings::default().save(&path).expect("save");
         let text = std::fs::read_to_string(&path).expect("read");
-        assert!(!text.contains("own_checks") && !text.contains("zero_test_plans"));
+        assert!(
+            !text.contains("own_checks")
+                && !text.contains("zero_test_plans")
+                && !text.contains("cache_layout")
+        );
         let chosen = Settings {
             own_checks: true,
             zero_test_plans: true,
+            cache_layout: true,
             ..Settings::default()
         };
         chosen.save(&path).expect("save");
@@ -1518,6 +1533,10 @@ mod tests {
         assert!(loaded.own_checks && loaded.zero_test_plans);
         assert_eq!(loaded.run_limits().own_checks, Some(true));
         assert_eq!(loaded.run_limits().zero_test_plans, Some(true));
+        assert!(loaded.cache_layout);
+        assert_eq!(loaded.run_limits().cache_layout, Some(true));
+        assert_eq!(user.cache_layout, Some(true));
+        assert!(!Settings::default().cache_layout, "off by default");
     }
 
     #[test]

@@ -28,9 +28,7 @@
 //! failure at any step returns [`Error`]; nothing is substituted.
 
 use crate::assembler::{AttemptAssembler, ResolverOverride, RouteParts, route_envs};
-use crate::config::{
-    Limiters, RouteSpec, RunConfig, limiters, provider_for, read_prices, split_route,
-};
+use crate::config::{Limiters, RouteSpec, RunConfig, limiters, read_prices, split_route};
 use crate::error::{Error, NotReady, Result, ResultExt};
 use crate::gates::{CommandGateRunner, GATE_OUTPUT_CAP, discover_validation_commands};
 use crate::verifier::CommandVerifier;
@@ -588,6 +586,7 @@ impl Host {
             small: config.small_requests(),
             own_checks: config.own_checks.unwrap_or(false),
             zero_test_plans: config.zero_test_plans.unwrap_or(false),
+            cache_layout: config.cache_layout.unwrap_or(false),
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at
@@ -1125,7 +1124,13 @@ impl Host {
                 route,
                 &self.limiters,
             )),
-            None => provider_for(route, model, &self.limiters),
+            None => crate::config::provider_from_declared(
+                route,
+                model,
+                &self.limiters,
+                kgraf_core::legacy::env_var,
+                self.config.declares_prompt_cache_key(route),
+            ),
         }
     }
 

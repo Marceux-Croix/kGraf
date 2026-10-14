@@ -1389,6 +1389,7 @@ fn run_cli() -> Result<()> {
                     early_start: plan_entry.early_start(),
                     own_checks: plan_entry.own_checks(),
                     zero_test_plans: plan_entry.zero_test_plans(),
+                    cache_layout: plan_entry.cache_layout(),
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1455,6 +1456,7 @@ fn run_cli() -> Result<()> {
                     small: limits.small(),
                     own_checks: limits.own_checks.0,
                     zero_test_plans: limits.zero_test_plans.0,
+                    cache_layout: limits.cache_layout.0,
                     edits,
                 },
             )
@@ -1500,6 +1502,7 @@ fn run_cli() -> Result<()> {
                     early_start: None,
                     own_checks: None,
                     zero_test_plans: None,
+                    cache_layout: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1597,6 +1600,7 @@ fn run_cli() -> Result<()> {
                         early_start: None,
                         own_checks: None,
                         zero_test_plans: None,
+                        cache_layout: None,
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -3188,6 +3192,7 @@ mod tests {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            cache_layout: None,
         };
         let user = UserLimits {
             rounds: Some(40),

@@ -3051,6 +3051,17 @@ impl ShellApp {
              small request's does.",
             &mut self.settings.zero_test_plans,
         );
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
+            "Lay out change requests for the prompt cache",
+            "Off by default. On: a change to a finished run sends its plan in id order, and \
+             marks it for the provider's prompt cache where the provider takes marks and a \
+             read can still come. The run report shows each call kind's cache read share and \
+             the write cost paid.",
+            &mut self.settings.cache_layout,
+        );
     }
 
     /// Runs: everything a run the app starts takes from Settings. A change

@@ -794,6 +794,14 @@ impl ChatCompletionsAdapter {
         if let Some(temperature) = request.temperature {
             body["temperature"] = serde_json::json!(temperature);
         }
+        if let Some(key) = &request.cache_key
+            && self.config.honors_prompt_cache_key
+        {
+            // Sent only where the route is declared to take it: a server that
+            // does not know the field may refuse the request, and one that
+            // ignores it gains nothing.
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
                 request
@@ -3832,6 +3840,27 @@ mod tests {
             .await
             .expect("the mock answers only a body that carries the field");
         assert_eq!(response.tool_uses().len(), 1);
+    }
+
+    /// The cache key goes out as `prompt_cache_key` only on a route declared
+    /// to honor it (off by default); every other route sends no such field.
+    #[test]
+    fn a_cache_key_is_sent_only_where_the_route_is_declared_to_honor_it() {
+        let mut request = Request::new("compatible-model", "hi", 100);
+        request.cache_key = Some("run:r1".into());
+        let plain =
+            ChatCompletionsAdapter::new(config("https://example.invalid"), UsageDialect::Details)
+                .expect("adapter");
+        assert!(plain.to_wire(&request).get("prompt_cache_key").is_none());
+        let declared = ChatCompletionsAdapter::new(
+            config("https://example.invalid").honoring_prompt_cache_key(),
+            UsageDialect::Details,
+        )
+        .expect("adapter");
+        assert_eq!(declared.to_wire(&request)["prompt_cache_key"], "run:r1");
+        // A request with no key sends none, declared or not.
+        let keyless = Request::new("compatible-model", "hi", 100);
+        assert!(declared.to_wire(&keyless).get("prompt_cache_key").is_none());
     }
 
     /// A forced tool choice with no tool to call is refused before sending.
