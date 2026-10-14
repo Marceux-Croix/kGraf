@@ -252,6 +252,9 @@ pub struct OrchestratorHost {
     starting_once: Vec<kgraf_host::deps::ConsentSubject>,
     /// The dependency question the box shows, until answered.
     fetch_prompt: Option<crate::dependency_prompt::FetchPrompt>,
+    /// Landing with no live loop and the land-suggestion facts, off the UI
+    /// thread (decision 0100).
+    land: crate::land_card::LandBackground,
 }
 
 /// An offer waiting on the user (step 3): its question (already scrubbed,
@@ -341,6 +344,7 @@ impl OrchestratorHost {
             starting_restart: None,
             starting_once: Vec::new(),
             fetch_prompt: None,
+            land: crate::land_card::LandBackground::default(),
         }
     }
 
@@ -370,6 +374,7 @@ impl OrchestratorHost {
             starting_restart: None,
             starting_once: Vec::new(),
             fetch_prompt: None,
+            land: crate::land_card::LandBackground::default(),
         })
     }
 
@@ -653,7 +658,29 @@ impl OrchestratorHost {
                 Err(e) => BackendEvent::Error(format!("question {question} not answered: {e}")),
             },
             RunEvent::SessionNotice { text } => BackendEvent::Notice(text),
+            RunEvent::Landed(outcome) => BackendEvent::Land(outcome),
         })
+    }
+
+    /// The project and run a land with no live loop applies to: this
+    /// window's run, else the last run it hosted.
+    fn land_target(&self) -> Result<(std::path::PathBuf, RunId), String> {
+        let host = self
+            .parts
+            .as_ref()
+            .and_then(|p| p.housekeeping.host())
+            .ok_or_else(|| NO_HOST.to_owned())?;
+        let run = match &self.slot {
+            Slot::Running(r) => r.run().clone(),
+            _ if !self.current.0.is_empty() => RunId::new(&self.current.0),
+            _ => {
+                return Err(
+                    "no run in this window to land; `kgraf land --run <run>` lands a stored one"
+                        .to_owned(),
+                );
+            }
+        };
+        Ok((host.root().to_path_buf(), run))
     }
 }
 
@@ -825,6 +852,7 @@ impl BoxBackend for OrchestratorHost {
 
     fn poll(&mut self) -> Vec<BackendEvent> {
         let mut out = std::mem::take(&mut self.events);
+        out.extend(self.land.drain());
         if let Slot::Starting(rx, starting) = &self.slot {
             let starting = starting.clone();
             let release = |parts: &Option<HostParts>| {
@@ -990,6 +1018,51 @@ impl BoxBackend for OrchestratorHost {
 
     fn status_from_record(&self) -> Option<String> {
         self.record_status.clone()
+    }
+
+    /// Through the live loop when this window runs the run; otherwise under
+    /// the run's lease, off the UI thread.
+    fn land(&mut self, request: kgraf_orchestrator::land_flow::LandRequest) -> Result<(), String> {
+        match &self.slot {
+            Slot::Running(r) => {
+                r.land(request);
+                Ok(())
+            }
+            Slot::Starting(..) => Err("the run is still starting".to_owned()),
+            Slot::Idle => {
+                let (root, run) = self.land_target()?;
+                let runtime = self.runtime.as_ref().ok_or_else(|| NO_HOST.to_owned())?;
+                self.land.land(runtime, root, run, request);
+                Ok(())
+            }
+        }
+    }
+
+    fn land_facts(
+        &mut self,
+        now_ms: i64,
+    ) -> Option<(
+        kgraf_orchestrator::land_record::LandBook,
+        kgraf_orchestrator::land_suggest::SuggestFacts,
+    )> {
+        let (root, run) = self.land_target().ok()?;
+        let runtime = self.runtime.as_ref()?;
+        self.land.facts(runtime, root, run, now_ms)
+    }
+
+    fn decline_land(&mut self, now_ms: i64) -> Result<(), String> {
+        match &self.slot {
+            Slot::Running(r) => {
+                r.decline_land(now_ms);
+                Ok(())
+            }
+            _ => {
+                let (root, run) = self.land_target()?;
+                let runtime = self.runtime.as_ref().ok_or_else(|| NO_HOST.to_owned())?;
+                self.land.decline(runtime, root, run, now_ms);
+                Ok(())
+            }
+        }
     }
 
     /// Sends through `InteractiveRun::send_to_session` (fire and forget); the

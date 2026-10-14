@@ -358,6 +358,19 @@ pub(crate) fn is_harness_worktree(name: &str) -> bool {
 /// yet; the plan's own work items are what write code, in their own worktrees,
 /// after this.
 pub(crate) fn ensure_integration_branch(root: &Path, run: &str) -> Result<String> {
+    ensure_integration_branch_within(root, run, GREENFIELD_COMMIT_BOUND)
+}
+
+/// The longest the greenfield first commit may take: a signer waiting on a
+/// passphrase prompt nobody sees would otherwise hold the run.
+pub(crate) const GREENFIELD_COMMIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`ensure_integration_branch`] with another bound on the first commit.
+pub(crate) fn ensure_integration_branch_within(
+    root: &Path,
+    run: &str,
+    commit_bound: std::time::Duration,
+) -> Result<String> {
     let safe: String = run
         .chars()
         .map(|c| {
@@ -384,26 +397,37 @@ pub(crate) fn ensure_integration_branch(root: &Path, run: &str) -> Result<String
              needs the owner's identity"
                 .to_owned()
         })?;
-        git.run(
+        git.clone()
+            .with_timeout(commit_bound)
+            .run(
             root,
             [
                 "-c",
                 &format!("user.name={}", identity.name),
                 "-c",
                 &format!("user.email={}", identity.email),
-                // Never signs, never prompts: the user's own global
-                // `commit.gpgsign` must not turn this internal bootstrap
-                // commit into a hang waiting on a passphrase (fail
-                // loud rather than silently hang).
-                "-c",
-                "commit.gpgsign=false",
                 "commit",
+                // The user's own signing choice, read with their own git
+                // (decision 0100); a signer that fails or would prompt
+                // refuses the commit with git's message.
+                &kgraf_sandbox::signing::user_commit_signing(
+                    &kgraf_sandbox::user_git::UserGit::from_git(&git),
+                    root,
+                )
+                .step("cannot read the commit signing setting")?
+                .commit_flag(),
                 "--allow-empty",
                 "-m",
                 "kGraf: first commit (a greenfield directory had none)",
             ],
         )
-        .step("cannot make the greenfield directory's first commit")?;
+        .with_step(|| {
+            format!(
+                "cannot make the greenfield directory's first commit (signing may be waiting for \
+                 a passphrase prompt; kGraf waits at most {} s)",
+                commit_bound.as_secs()
+            )
+        })?;
     }
     // A run started before the rename (decision 0062) has its integration
     // branch under the former prefix. Resuming it continues that branch; a

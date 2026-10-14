@@ -1348,6 +1348,7 @@ impl RunLoop {
         let passed = matches!(&verdict, Ok(v) if v.passed);
         let max_remediations = self.config_max_remediations();
         let verified: BTreeSet<String> = self.record.verified_contracts.iter().cloned().collect();
+        self.note_gate_verdict(&gate, passed, pinned.as_deref(), at);
         let fix = gates::record_verdict(
             &mut self.record.coordination.gates,
             &gate,
@@ -1536,6 +1537,7 @@ impl RunLoop {
         contract: &OpenContract,
         result: Option<&WorkerResult>,
     ) -> Result<(), OrchestratorError> {
+        self.note_contract_verified(&contract.contract);
         self.refresh_subscriptions()?;
         let changed: Vec<String> = result
             .map(|r| {

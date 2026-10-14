@@ -121,6 +121,7 @@ overwrites a node you changed.
 | Command | What it does |
 |---|---|
 | `kgraf orchestrate` | Run the orchestrator on an instruction, or resume a run. Flags below. |
+| `kgraf land --run RUN [--into BRANCH] [--commit SHA] [--untested] [--recover]` | Land a run onto your branch as one merge commit. See [Landing](#landing). |
 | `kgraf worker` | Run one worker in its own worktree under `.kgraf/workspaces/`. It commits to an attempt ref and never merges. |
 | `kgraf clean <worktree> [--force]` | Remove a kept or stranded worktree. Refused while its owner or any process started in it runs. `--force` is needed when a run record still names it. |
 | `kgraf allow mcp__<server>__<tool> [--note ...] [--revoke]` | Always allow an MCP tool in this project. |
@@ -588,6 +589,84 @@ Settings > Runs > "Delete worker worktrees after use". `kgraf clean <worktree>` 
 kept one. A worktree that a live worker, a stopped run or a pending merge needs is never
 deleted. A worktree that cannot be deleted stays, and the report names it.
 
+### Landing
+
+A run's work collects on its own branch, `kgraf/<run>`; your branch moves only when you
+land. `kgraf land --run RUN` (or `/land` in the app's box) lands it onto the branch the run
+started from, or onto `--into BRANCH`:
+
+- **The target.** With no `--into`, the target is the branch the run started from, and it must
+  be the branch checked out now; otherwise kGraf refuses and names both. A run that recorded
+  no start branch needs `--into`. The branch name must match exactly: on a file system that
+  ignores case, `--into Main` does not mean `main`. A branch with a rebase or bisect in
+  progress is refused. Every question kGraf asks names the target and the commit, with how
+  many commits it brings.
+
+- **What lands** is the newest commit of `kgraf/<run>` the root gate passed on (`--commit`
+  names another). Work still in progress does not block it; it lands next time.
+- **Always one merge commit**, even when a fast-forward is possible: your branch's old commit
+  is the first parent, the run's commit the second. There is no squash. The message lists
+  the verified contracts and ends with the trailers `kGraf-Run: <run>` and
+  `kGraf-Gate: <commit> tree <tree>` (the commit and tree the gate passed on).
+- **When your branch gained commits since**, the merge result is new code, so the root gate
+  runs on it first. A conflict lands nothing; resume the run so a resolver merges your branch
+  into `kgraf/<run>`, then land again.
+- **No passed gate** (the gate never ran, failed, or failed on the merge result): kGraf warns
+  loudly, names the gate and why, and lands only on your yes (`--untested`, or the prompt).
+  The yes holds for that commit and that target as it was; if the target moved before you
+  answered, kGraf warns again. `--untested` answers the question ahead of time, after the
+  warning is printed.
+  The merge commit then starts with `UNTESTED:`, carries the line
+  `kGraf: UNTESTED - root gate <gate> did not pass: <reason>` and the trailer
+  `kGraf-Gate: untested`. With nobody at the terminal, kGraf never lands untested.
+- **No interface stub lands** without its verified producer: a commit that holds a stub
+  whose producer has not verified is refused, naming the interface.
+- **Your checkout.** When the target is checked out (in your main checkout or a linked
+  worktree), kGraf moves it with your own git, `git merge --ff-only <merge commit>` in that
+  worktree. This is the only step of a land that runs your hooks (`post-merge`) and filters
+  (a smudge filter checks the landed files out filtered). Local edits to other files stay
+  as they are. When a local change would be overwritten (modified, staged, or an untracked
+  file in the way), git refuses and nothing changes. A target nobody has checked out moves
+  only if it is still where kGraf found it. A detached HEAD, or a branch with no commit
+  yet, is refused by name.
+- **What a land runs is fixed when the run starts.** kGraf copies your hooks then, into its own
+  run directory, and records every setting that names a program (filters, diff and merge
+  drivers, the file-system monitor, signing). The land's checkout runs with exactly those:
+  hooks or filters a worker committed or configured never run; yours (for example git-lfs) run
+  as they were. kGraf asks only about what it cannot fix this way: a signing setting changed
+  since the start, and a config file your git reads later (an included file in the work tree,
+  `.lfsconfig`) that the merge changes. Each is listed with its file and blob; the yes holds
+  for that list, commit and target, and is checked again right before the move.
+- **A checkout git did not finish** (stopped at its time limit, or by a signal) can leave files
+  partly written. kGraf says so and keeps the land open; `kgraf land --run RUN --recover` puts
+  back the files it can tell apart, removes files the land added, removes a stale lock, and
+  lists the rest. Then land again.
+- **Signing.** When your `commit.gpgSign` is on, the merge commit is signed with your
+  `user.signingKey` and `gpg.format`, without a prompt. If signing fails, nothing is
+  committed and no branch moves; kGraf shows git's message. kGraf's own commits on
+  `kgraf/<run>` are not signed.
+- **Afterward** `kgraf/<run>` moves forward to include the merge commit, keeping any work
+  verified after the landed commit; it never moves backward. A land interrupted between
+  moving your branch and that step finishes on the next `kgraf land`, also when you have
+  committed on top meanwhile. An error git reports after your branch moved (a hook killed at
+  its time limit) does not undo the land; kGraf finishes it and shows the error.
+- Landing needs git 2.42 or later; an older git is refused before anything is written. A
+  run whose loop is live is landed from its box with `/land`, never from a second process;
+  there the merge-result gate runs in the background, and the run keeps taking notes and
+  answers. One land waits at a time. When that gate fails, kGraf merges your branch into
+  `kgraf/<run>` and opens a fix contract there (a conflict lands nothing and says so). Your
+  repository's first commit, made when kGraf starts in an empty repository, is signed the
+  same way.
+
+**Land suggestions.** kGraf suggests landing, and never lands without your yes, in every
+permission mode. It asks when every contract is verified and the root gate passed on the
+newest commit, when your branch gained commits while gated work waits, or when the session
+closes with gated work not landed. In the app the suggestion is a card in the orchestrator
+box (Land, Not now, each with a confirm step); at the end of a `--interactive` run it is a
+`land?` line answered by `y` or `n`. At most one suggestion is open. After "Not now",
+kGraf asks again only after new verified work and 15 minutes; declines are kept in the run
+record. Benchmark runs never suggest a land.
+
 ### Start from existing documents
 
 `kgraf orchestrate --corpus --route ... --prices ...` reads the repository's documents and
@@ -719,7 +798,8 @@ interaction, `/status` adds one short line per kind of interaction, in budget or
 newest split of its kind, that splits its time into kGraf overhead, model time and tool time (for example
 `latency contract_merged (B10): 900.0 ms = kgraf 300.0 + model 600.0 + tools 0.0`). The run
 report prints the same lines. `/compact` compacts the
-orchestrator, and `/compact selected` or `/compact <worker>` targets a worker. `/help` lists
+orchestrator, and `/compact selected` or `/compact <worker>` targets a worker. `/land` (or
+`/land into <branch>`) lands the run onto your branch; see [Landing](#landing). `/help` lists
 them. Tool approvals are answered in place: allow once, allow always, deny.
 
 **Runs read `.kgraf/run.json`.** It holds the `orchestrate` flags as JSON, with snake_case

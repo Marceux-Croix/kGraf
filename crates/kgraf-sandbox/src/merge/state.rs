@@ -509,6 +509,10 @@ pub enum MergeError {
     /// (decision 0083); the branch did not move.
     #[error("attempt {name} changes paths outside its declared writes: {paths:?}; not merged")]
     OutsideDeclaredWrites { name: String, paths: Vec<String> },
+    /// The user's configuration asks for signed commits and signing failed;
+    /// no commit was made and no ref moved. `stderr` is git's own message.
+    #[error("signing the commit failed, so nothing was committed and no branch moved: {stderr}")]
+    SigningFailed { stderr: String },
 }
 
 /// What a command run in an attempt's worktree after [`super::MergeBack::commit_retaining`]

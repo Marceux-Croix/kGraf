@@ -628,6 +628,15 @@ impl ContractBook {
         self.entries.get(id).is_some_and(|e| e.stub_landed)
     }
 
+    /// Every interface whose stub has landed.
+    pub fn stubs_landed(&self) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.stub_landed)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Every stub path an earlier (or the current) version of `id` landed
     ///: a revision's stub may replace these at the tip.
     pub fn landed_paths(&self, id: &str) -> BTreeSet<String> {

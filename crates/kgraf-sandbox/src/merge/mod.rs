@@ -64,6 +64,7 @@
 
 pub mod blob;
 mod generated;
+mod land;
 mod parse;
 mod safe_git;
 mod state;
@@ -82,6 +83,7 @@ pub use generated::{
     is_compiled_binary, is_dependency_link, is_python_bytecode, lockfile_manifests,
     manifest_matches, manifests_beside,
 };
+pub use land::{Fold, LandingMerge};
 use parse::{
     GITLINK_MODE, MIN_GIT, SYMLINK_MODE, is_protected, new_collisions, parse_merge_tree_z,
     parse_raw_diff_z, parse_version,

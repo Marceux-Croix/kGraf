@@ -45,6 +45,8 @@ pub enum RunEvent {
     Ordered(Result<(), OrderError>),
     /// The run ended: its report, or the error that ended it.
     Finished(Result<Box<RunReport>, String>),
+    /// The answer to a land (decision 0100).
+    Landed(Box<Result<crate::land_flow::LandOutcome, String>>),
     /// Decision 0067, point 2: the answer to `send_to_session` (the persisted
     /// message's id, or the refusal).
     SessionSent {
@@ -246,6 +248,22 @@ impl InteractiveRun {
             move |h| async move { h.compact(t).await },
             move |result| RunEvent::Compacted { target, result },
         );
+    }
+
+    /// Land through the live loop (decision 0100), answered later as
+    /// [`RunEvent::Landed`]. Only on the user's explicit yes.
+    pub fn land(&self, request: crate::land_flow::LandRequest) {
+        self.spawn_reply(
+            move |h| async move { h.land(request).await.map_err(|e| e.to_string()) },
+            |r| RunEvent::Landed(Box::new(r)),
+        );
+    }
+
+    /// The user answered a land suggestion "Not now".
+    pub fn decline_land(&self, now_ms: i64) {
+        let handle = self.handle.clone();
+        self.runtime
+            .spawn(async move { handle.decline_land(now_ms).await });
     }
 
     /// The user's order (0014), answered later as [`RunEvent::Ordered`].

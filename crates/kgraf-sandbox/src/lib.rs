@@ -30,8 +30,10 @@ mod package_stores;
 pub use kgraf_core::repo_lock;
 mod sandbox;
 pub mod sandbox_user;
+pub mod signing;
 #[cfg(unix)]
 pub mod trust;
+pub mod user_git;
 mod win_command_line;
 #[cfg(windows)]
 mod win_process;
@@ -56,11 +58,11 @@ pub use dependencies::{
 pub use error::{SandboxError, WorkspaceError};
 pub use merge::{
     ATTEMPT_REF_PREFIX, Attempt, AttemptEvent, AttemptGroup, AttemptState, CommitOutcome,
-    ConflictMessage, ConflictSide, ConflictedPath, Excluded, FinishOutcome, GeneratedKind,
-    Identity, LOCKFILES, Leftovers, Limits, MergeBack, MergeConflict, MergeError, MergeOutcome,
-    MergedWorktree, Refusal, RefusalReason, SelectFailure, TreeManifests, TrialMerge, file_head,
-    generated_kind, is_compiled_binary, is_dependency_link, is_python_bytecode, lockfile_manifests,
-    manifest_matches, manifests_beside,
+    ConflictMessage, ConflictSide, ConflictedPath, Excluded, FinishOutcome, Fold, GeneratedKind,
+    Identity, LOCKFILES, LandingMerge, Leftovers, Limits, MergeBack, MergeConflict, MergeError,
+    MergeOutcome, MergedWorktree, Refusal, RefusalReason, SelectFailure, TreeManifests, TrialMerge,
+    file_head, generated_kind, is_compiled_binary, is_dependency_link, is_python_bytecode,
+    lockfile_manifests, manifest_matches, manifests_beside,
 };
 pub use package_stores::{
     PACKAGE_STORES_DIR, PackageStores, STORE_COMPLETE, jvm_path, layout as store_layout,

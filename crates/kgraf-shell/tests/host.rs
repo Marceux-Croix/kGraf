@@ -266,7 +266,8 @@ fn session_actions_reach_a_real_worker_through_the_host() {
                 let text = match &e {
                     kgraf_shell::orchestrator_box::BackendEvent::Notice(t)
                     | kgraf_shell::orchestrator_box::BackendEvent::Error(t) => t.clone(),
-                    kgraf_shell::orchestrator_box::BackendEvent::Reply { .. } => continue,
+                    kgraf_shell::orchestrator_box::BackendEvent::Reply { .. }
+                    | kgraf_shell::orchestrator_box::BackendEvent::Land(_) => continue,
                 };
                 if text.contains(worker) {
                     assert!(

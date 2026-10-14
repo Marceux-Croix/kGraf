@@ -53,7 +53,7 @@ use crate::stub_land::{StubLander, StubScope};
 use crate::trace::TraceEvent;
 use kgraf_core::{AgentId, CallId, estimate_tokens};
 use kgraf_tools::UntrustedText;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -808,6 +808,14 @@ impl RunLoop {
         Ok(true)
     }
 
+    /// Interfaces whose stub the contract book records as landed.
+    pub(super) fn landed_stub_ids(&self) -> BTreeSet<String> {
+        self.contracts
+            .as_ref()
+            .map(|d| d.book.stubs_landed())
+            .unwrap_or_default()
+    }
+
     /// Land `ic`'s stub unless the book already records it landed at the
     /// current version (0081): once per (interface, version), so a later
     /// party's gate on the same interface never lands it twice. Returns
@@ -834,7 +842,9 @@ impl RunLoop {
         let lander = d.stub_lander.clone();
         let landed_before = d.book.landed_paths(&ic.id);
         let writes = self.party_writes(ic);
-        let producer_writes = consumer_tests::producer_of(ic, &writes)
+        let producer = consumer_tests::producer_of(ic, &writes);
+        let producer_writes = producer
+            .clone()
             .and_then(|p| writes.get(&p).cloned())
             .unwrap_or_default()
             .into_iter()
@@ -846,6 +856,7 @@ impl RunLoop {
         };
         match lander.land(ic, &scope).await {
             Ok(commit) => {
+                self.note_stub_landed(&ic.id, &commit, producer.as_deref());
                 self.contract_event(ContractEvent::StubLanded {
                     interface: ic.id.clone(),
                     version: ic.version,

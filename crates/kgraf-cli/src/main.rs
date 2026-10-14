@@ -12,6 +12,7 @@
 
 mod deps_cmd;
 mod diag_cmd;
+mod land_cmd;
 mod orchestrate_cmd;
 mod permissions_cli;
 mod plan_cmd;
@@ -124,6 +125,8 @@ enum Command {
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
+    /// Land a run onto your branch as one merge commit (decision 0100).
+    Land(land_cmd::LandArgs),
     /// Report recorded provider spend.
     Spend {
         /// A JSON price table: {"model-name": {"uncached_input": 3000000, ...}},
@@ -984,6 +987,7 @@ fn feature_name(command: &Command) -> &'static str {
         Command::Query { .. } => "query",
         Command::Cochange { .. } => "cochange",
         Command::Partners { .. } => "partners",
+        Command::Land(_) => "land",
         Command::Spend { .. } => "spend",
         Command::Unreconciled { .. } => "unreconciled",
         Command::Demand => "demand",
@@ -1231,6 +1235,7 @@ fn run_cli() -> Result<()> {
             max_commit_size,
             limit,
         } => partners(&root, &path, min_count, max_commit_size, limit),
+        Command::Land(args) => land_cmd::run(&root, args),
         Command::Spend { prices } => spend(&root, prices.as_deref()),
         Command::Unreconciled { action: None } => unreconciled(&root),
         Command::Unreconciled {

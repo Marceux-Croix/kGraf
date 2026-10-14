@@ -150,6 +150,12 @@ use checkpoint_hooks::checkpoint_note;
 mod speculate;
 // The run's time limit applied to its workers (`run_deadline.rs`).
 mod time_limit;
+// Landing (decision 0100, section 5): records for a later land, the land
+// through a live loop, and the lease a land takes with none.
+mod land_hooks;
+pub use land_hooks::{
+    LAND_LEASE_TTL_MS, LandLease, take_run_lease_for_land, take_run_lease_for_land_with_ttl,
+};
 
 /// Default cap on contracts in one plan (one decomposition answer).
 pub const DEFAULT_MAX_CONTRACTS_PER_PLAN: usize = 32;
@@ -971,6 +977,24 @@ enum Control {
     /// A read of the questions waiting for the user (shown as pinned cards, and
     /// `InteractiveRun`'s own read for the box): the same shape as `Status`.
     PendingQuestions(oneshot::Sender<Vec<crate::asks::PendingQuestionView>>),
+    /// Land the run (decision 0100): the loop is the one writer of the
+    /// record and of `kgraf/<run>` while it is live.
+    Land {
+        request: Box<crate::land_flow::LandRequest>,
+        reply: oneshot::Sender<Result<crate::land_flow::LandOutcome, crate::land_flow::LandError>>,
+    },
+    /// The user answered a land suggestion "Not now" (decision 0100).
+    LandDeclined {
+        now_ms: i64,
+    },
+    /// A land's merge-result gate ended (run in the background).
+    LandGated {
+        verdict: Box<Result<crate::gates::GateVerdict, String>>,
+    },
+    /// A land's move of the target ended (run off the loop task).
+    LandMoved {
+        moved: Box<crate::land_flow::Moved>,
+    },
 }
 
 struct Finished {
@@ -2223,6 +2247,8 @@ pub struct Orchestrator {
     /// The user's live permission mode, the desk the box reads, and whether
     /// a person attends (decision 0094).
     pub(crate) perms: permission_hooks::PermissionParts,
+    /// Landing (decision 0100): the repository side and the start branch.
+    land: Box<land_hooks::LandParts>,
 }
 
 impl Orchestrator {
@@ -2262,6 +2288,7 @@ impl Orchestrator {
             start_notices: Vec::new(),
             check_network_notice: None,
             perms: permission_hooks::PermissionParts::default(),
+            land: Box::default(),
         })
     }
 
@@ -2654,6 +2681,8 @@ struct RunLoop {
     spec: speculate::SpecRuntime,
     /// The user's permission mode and the review desk (decision 0094).
     perms: permission_hooks::PermissionRuntime,
+    /// Landing (decision 0100).
+    land: Box<land_hooks::LandParts>,
 }
 
 fn run_lease_key(run: &RunId) -> String {
@@ -2777,6 +2806,7 @@ fn acquire_run_lease(
 /// through their own `Drop`.
 impl Drop for RunLoop {
     fn drop(&mut self) {
+        self.land.stop();
         self.release_gate_flights();
         self.release_speculation_slot();
         self.release_subagents_on_error();
@@ -2822,6 +2852,7 @@ impl RunLoop {
             start_notices,
             check_network_notice,
             perms,
+            land,
         } = o;
         // The check setting is the run's: kept in the record, and a resume with
         // another one is refused before anything is written.
@@ -2840,6 +2871,7 @@ impl RunLoop {
             }
         } else {
             record.contract_checks = checks;
+            land.seed(&mut record);
         }
         let store = RunStore::new(services.graph.clone());
 
@@ -2996,6 +3028,7 @@ impl RunLoop {
                 answer_wait,
             ),
             perms: permission_hooks::PermissionRuntime::new(perms),
+            land,
         };
         if let Some(torn) = torn_trace {
             let at = me.now();
@@ -9554,6 +9587,10 @@ impl RunLoop {
             Control::Order { contracts, reply } => {
                 let _ = reply.send(self.set_order(contracts));
             }
+            Control::Land { request, reply } => self.on_land(*request, reply).await,
+            Control::LandDeclined { now_ms } => self.on_land_declined(now_ms)?,
+            Control::LandGated { verdict } => self.on_land_gated(*verdict),
+            Control::LandMoved { moved } => self.on_land_moved(*moved),
             Control::DecideGate {
                 gate,
                 decision,

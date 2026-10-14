@@ -1805,6 +1805,9 @@ impl Host {
         // Continuous merge-back (0018) into the run's own integration branch. It
         // is never checked out (merge-back refuses a checked-out branch), so the
         // user's checkout is untouched; the user merges `kgraf/<run>`.
+        // Read before the run's branch exists: a fresh run records it as the
+        // branch it started from (decision 0100).
+        let start_branch = crate::land::checked_out_branch(root);
         let integration = ensure_integration_branch(root, run.as_str())?;
         // No commit identity, or one merge-back refuses (empty, or naming Claude),
         // and git too old: settings, which fail the same way every time.
@@ -1977,6 +1980,7 @@ impl Host {
             session_line,
             model_calls,
             extractor_changed: index_report.extractor_changed,
+            start_branch,
         })
     }
 
@@ -2003,6 +2007,7 @@ impl Host {
             session_line,
             model_calls,
             extractor_changed,
+            start_branch,
         } = base;
         let gate_commands = match plan {
             Some(plan) if self.config.gate_commands.is_empty() => plan.validation_commands(),
@@ -2216,6 +2221,17 @@ impl Host {
             timeout: self.config.gate_timeout,
             output_cap: GATE_OUTPUT_CAP,
         }));
+        let orchestrator = crate::land::attach(
+            orchestrator,
+            manager,
+            &merge_back,
+            start_branch,
+            &self
+                .state
+                .join("runs")
+                .join(run.as_str())
+                .join("land-hooks"),
+        )?;
         // Decision 0093: every worker's `report_shortfall` reaches this run's
         // orchestrator.
         shortfall_line
@@ -2877,6 +2893,9 @@ pub(crate) struct BuildBase {
     /// What the full index pass that opened this build reported about
     /// extractors that changed; the run's trace records it.
     pub(crate) extractor_changed: Vec<kgraf_graph::ExtractorChange>,
+    /// The branch checked out when the run was built, and its commit: a
+    /// fresh run records it as where it started (decision 0100).
+    start_branch: Option<(String, String)>,
 }
 
 impl BuildBase {

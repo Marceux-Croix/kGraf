@@ -84,6 +84,9 @@ mod intake;
 mod interactive;
 mod interface_plan;
 pub mod interface_review;
+pub mod land_flow;
+pub mod land_record;
+pub mod land_suggest;
 pub mod latency;
 mod message_tool;
 pub mod model_kinds;
@@ -198,6 +201,9 @@ pub use orchestrator::{
     OrchestratorConfig, OrchestratorError, OrchestratorHandle, OrderError, PrepareFailure, Route,
     RunReport, Services, SessionError, StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces,
     plan_review_refusal, run_lease_holder_is_live,
+};
+pub use orchestrator::{
+    LAND_LEASE_TTL_MS, LandLease, take_run_lease_for_land, take_run_lease_for_land_with_ttl,
 };
 pub use partition::{
     CONFIDENT, CauseScore, GraphPredictor, MissCause, PairScore, PartitionReport,

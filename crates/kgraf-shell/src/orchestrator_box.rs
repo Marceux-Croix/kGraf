@@ -15,6 +15,8 @@
 //!   the newest run record in the project store, and the answer says so.
 //! - `/compact`: compact the orchestrator (0057 addendum). `/compact selected`
 //!   targets the worker selected on the graph; `/compact <worker>` names one.
+//! - `/land` (or `/land into <branch>`): land the run onto your branch as one
+//!   merge commit (decision 0100, `crate::land_card`).
 //! - `/help`: the list. Anything else starting with `/` is refused, never sent as a
 //!   note. `//text` sends `/text` as a note.
 //!
@@ -23,6 +25,7 @@
 
 use kgraf_orchestrator::{AskAnswer, InboundKind, PendingAsk, UntrustedText};
 
+use crate::land_card;
 use crate::session_panel::AttachmentChip;
 
 /// One parsed line of input.
@@ -35,6 +38,8 @@ pub enum BoxCommand {
     Help,
     /// `/run <instruction>`: start a run, explicitly (it costs money).
     Run(String),
+    /// `/land [into <branch>]`.
+    Land(Option<String>),
     Unknown(String),
 }
 
@@ -50,7 +55,8 @@ pub enum CompactTarget {
 pub const HELP: &str = "Type a note for the running run. /run <instruction> starts a run \
 (a paid one: it is never started by a plain line). /status asks where the run stands. \
 /compact compacts the orchestrator; /compact selected or /compact <worker> targets a \
-worker. //text sends /text as a note.";
+worker. /land lands the run onto your branch as one merge commit (/land into <branch> picks \
+the branch). //text sends /text as a note.";
 
 /// Parse one line of input.
 pub fn parse(input: &str) -> BoxCommand {
@@ -84,6 +90,7 @@ pub fn parse(input: &str) -> BoxCommand {
         ("compact", []) => BoxCommand::Compact(CompactTarget::Orchestrator),
         ("compact", ["selected"]) => BoxCommand::Compact(CompactTarget::Selected),
         ("compact", [worker]) => BoxCommand::Compact(CompactTarget::Worker((*worker).to_owned())),
+        ("land", args) => land_card::parse(line, args),
         _ => BoxCommand::Unknown(line.to_owned()),
     }
 }
@@ -106,9 +113,14 @@ pub enum BackendState {
 /// What arrived from the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendEvent {
-    Reply { in_reply_to: String, text: String },
+    Reply {
+        in_reply_to: String,
+        text: String,
+    },
     Notice(String),
     Error(String),
+    /// The answer to a land (decision 0100).
+    Land(Box<Result<kgraf_orchestrator::land_flow::LandOutcome, String>>),
 }
 
 /// What the box talks to.
@@ -220,6 +232,29 @@ pub trait BoxBackend {
     fn answer_plan(&mut self, _answer: kgraf_orchestrator::PlanAnswer) -> Result<(), String> {
         Err("no run in this window".to_owned())
     }
+
+    /// Land the run (decision 0100) on the user's yes; the outcome arrives
+    /// as [`BackendEvent::Land`].
+    fn land(&mut self, _request: kgraf_orchestrator::land_flow::LandRequest) -> Result<(), String> {
+        Err("there is no run here to land".to_owned())
+    }
+
+    /// The run record's land state and the suggestion rules' facts, read
+    /// from the record and the repository. `None`: nothing to suggest.
+    fn land_facts(
+        &mut self,
+        _now_ms: i64,
+    ) -> Option<(
+        kgraf_orchestrator::land_record::LandBook,
+        kgraf_orchestrator::land_suggest::SuggestFacts,
+    )> {
+        None
+    }
+
+    /// Record the user's "Not now" to a land suggestion in the run record.
+    fn decline_land(&mut self, _now_ms: i64) -> Result<(), String> {
+        Err("there is no run here".to_owned())
+    }
 }
 
 /// One question-routing offer pending an answer, as
@@ -293,6 +328,8 @@ pub struct BoxModel {
     /// The permission controls, the grouped requests and the plan review
     /// (decision 0094).
     pub perm: crate::permission_bar::PermissionBar,
+    /// `/land`, the land suggestion and the untested-land warning.
+    pub land: land_card::LandCard,
 }
 
 impl BoxModel {
@@ -442,6 +479,7 @@ impl BoxModel {
                     )),
                 },
             },
+            BoxCommand::Land(into) => land_card::submit(self, backend, into),
             BoxCommand::Compact(target) => {
                 let target = match target {
                     CompactTarget::Orchestrator => Ok(None),
@@ -532,6 +570,7 @@ impl BoxModel {
                 }
                 BackendEvent::Notice(t) => self.push(Line::Notice(t)),
                 BackendEvent::Error(t) => self.push(Line::Error(t)),
+                BackendEvent::Land(outcome) => land_card::report(self, *outcome),
             }
         }
         any
@@ -988,6 +1027,7 @@ pub fn show_styled(
     for line in said {
         model.say(line);
     }
+    land_card::show(ui, model, backend, &p, land_card::now_ms());
 
     // Pinned question cards (design 0067, point 4). Empty on every backend
     // shipped so far (`BoxBackend::pending_questions`'s own default), so

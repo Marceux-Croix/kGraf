@@ -628,9 +628,13 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     }
 
     let mut signaled: Option<i32> = None;
+    // Kept after the run: an `--interactive` run's land suggestion is
+    // answered on the same stdin channel.
+    let stdin_port = args.interactive.then(|| Arc::new(StdinPort::start()));
+    let benchmark = args.tbench_bridge_socket.is_some();
     let outcome = runtime.block_on(async {
-        if args.interactive {
-            prepared.attach_port(Arc::new(StdinPort::start()));
+        if let Some(port) = &stdin_port {
+            prepared.attach_port(port.clone());
         }
         let summary = prepared.summary();
         println!("run        {}", summary.run);
@@ -754,6 +758,18 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
             signal,
             format!("; `--resume {}` continues it", outcome.report.run),
         ));
+    }
+    if let Some(port) = &stdin_port {
+        port.take_answers();
+        // An interrupt at the question is no answer: nothing lands.
+        crate::land_cmd::offer_after_run(root, &outcome.report.run, benchmark, &mut || {
+            runtime.block_on(async {
+                tokio::select! {
+                    line = port.next_line() => line,
+                    _ = interrupts.next() => None,
+                }
+            })
+        });
     }
     ensure_completed(&outcome.report)
 }
@@ -1016,16 +1032,30 @@ fn plain(text: &str) -> String {
 /// note. Replies print to stdout.
 struct StdinPort {
     lines: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
+    /// Set once the run has ended and kGraf waits for an answer: lines go to
+    /// `answers` instead of the port, so a receive the run left pending
+    /// never takes the answer as a note.
+    answering: Arc<std::sync::atomic::AtomicBool>,
+    answers: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 impl StdinPort {
     fn start() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (answer_tx, answers) = tokio::sync::mpsc::unbounded_channel();
+        let answering = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let to_answers = answering.clone();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut line = String::new();
             while stdin.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                if tx.blocking_send(line.trim_end().to_owned()).is_err() {
+                let text = line.trim_end().to_owned();
+                let sent = if to_answers.load(std::sync::atomic::Ordering::SeqCst) {
+                    answer_tx.send(text).is_ok()
+                } else {
+                    tx.blocking_send(text).is_ok()
+                };
+                if !sent {
                     break;
                 }
                 line.clear();
@@ -1033,7 +1063,22 @@ impl StdinPort {
         });
         Self {
             lines: tokio::sync::Mutex::new(rx),
+            answering,
+            answers: tokio::sync::Mutex::new(answers),
         }
+    }
+
+    /// From now on, lines are answers, not notes: called once the run has
+    /// ended, before kGraf asks anything.
+    fn take_answers(&self) {
+        self.answering
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The next answer typed (after [`Self::take_answers`]). `None` when
+    /// stdin closed.
+    async fn next_line(&self) -> Option<String> {
+        self.answers.lock().await.recv().await
     }
 }
 

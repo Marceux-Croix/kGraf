@@ -678,6 +678,15 @@ pub struct RunStateRecord {
     /// full by its setting and on every record from before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage: Option<crate::triage::TriageRecord>,
+    /// Landing (decision 0100, section 5): the start branch, root-gate
+    /// passes, interface stub and producer commits, the landing journal and
+    /// the answers to land suggestions. A record from before the field reads
+    /// as empty.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::land_record::LandBook::is_empty"
+    )]
+    pub land: crate::land_record::LandBook,
 }
 
 /// A hold a pre-dispatch interface check placed, with the route and model of
@@ -902,6 +911,7 @@ impl RunStateRecord {
             compactions: Vec::new(),
             check_holds: Vec::new(),
             triage: None,
+            land: crate::land_record::LandBook::default(),
         }
     }
 
