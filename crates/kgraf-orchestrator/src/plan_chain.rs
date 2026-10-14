@@ -148,7 +148,8 @@ fn push_unique<T: PartialEq + Clone>(into: &mut Vec<T>, from: &[T]) {
 ///   pins differ);
 /// - task kind: the links' shared kind, `Implementation` when they differ (the
 ///   merged contract mostly implements; the route is fixed, so no routing
-///   depends on it).
+///   depends on it);
+/// - check: every link's own check, joined with `&&` in order.
 pub fn merge_chain(links: &[&ContractSpec]) -> ContractSpec {
     let n = links.len();
     let head = links[0];
@@ -183,6 +184,9 @@ pub fn merge_chain(links: &[&ContractSpec]) -> ContractSpec {
         1 => head.task_kind,
         _ => Some(TaskKind::Implementation),
     };
+    // Each link's own check, in order: the merged contract does every step.
+    let checks: Vec<&str> = links.iter().filter_map(|l| l.check.as_deref()).collect();
+    merged.check = (!checks.is_empty()).then(|| checks.join(" && "));
     merged
 }
 
@@ -291,6 +295,7 @@ mod tests {
 
     fn spec(id: &str, deps: &[&str]) -> ContractSpec {
         ContractSpec {
+            check: None,
             id: id.into(),
             instruction: format!("do {id}"),
             acceptance: format!("{id} holds"),

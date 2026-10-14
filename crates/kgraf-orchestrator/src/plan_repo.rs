@@ -1716,6 +1716,7 @@ mod tests {
         deps: &[&str],
     ) -> ContractSpec {
         ContractSpec {
+            check: None,
             id: id.into(),
             instruction: instruction.into(),
             acceptance: acceptance.into(),

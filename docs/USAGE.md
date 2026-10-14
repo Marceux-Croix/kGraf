@@ -136,6 +136,9 @@ overwrites a node you changed.
 | `--model-route kind=route:model` | none | A route of another model kind. Repeatable. |
 | `--instruction FILE` | | The instruction text. Conflicts with `--resume`. |
 | `--resume RUN` | | Continue a run from its record. |
+| `--change FILE` | | With `--resume`: reopen the run with a change. See [Change a run](#change-a-run). |
+| `--edit FILE` | | With `--resume`: reopen the run with its instruction as you edited it. See [Change a run](#change-a-run). |
+| `--from-run RUN` | | With `--instruction`: start a new run from a copy of RUN's plan. See [Change a run](#change-a-run). |
 | `--run ID` | `run-<unix seconds>` | Id for a new run. |
 | `--prices FILE` | required | The prices file. |
 | `--max-items N` | 4 | Work items in flight at once. |
@@ -163,9 +166,11 @@ overwrites a node you changed.
 | `--early-nonparty` | off | With `--contract-checks`, start the contracts whose gate has nothing to do on the loop before a contract whose gate still has a stub to land or a handshake to make. Those two steps run on the loop, and the run starts one contract at a time, so a ready contract waits behind them. A contract an interface binds whose checks still run, or whose checks passed and whose stub is landed, keeps its place. The order you chose and every contract's own checks are unchanged. Routes are handed out in the order of dispatch, so a contract can get another route than without the flag. Also the run file key `early_nonparty` (`true`). The run record does not keep it: give it again with `--resume`. |
 | `--plan auto\|full` | `full` | `auto` sizes the instruction first: a small request runs as one contract with no planning call, a large one is planned, and one in between gets one short triage call. See [Small requests](#small-requests). Also the run file key `plan` and the `plan_mode` user setting. |
 | `--early-start`, `--no-early-start` | off | With `--plan auto`, start the one worker beside the triage call when it can start at once. Also the run file key `early_start` and the `early_start` user setting. |
+| `--own-checks`, `--no-own-checks` | off | A plan's contract may carry a check command of its own, run only when `--verify` tests nothing for it. See [A contract's own check](#a-contracts-own-check). Also the run file key `own_checks` and the `own_checks` user setting. |
+| `--zero-test-plans`, `--no-zero-test-plans` | off | Apply the zero-test rule of [Small requests](#small-requests) to every contract. Also the run file key `zero_test_plans` and the `zero_test_plans` user setting. |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
-| `--interactive` | off | Read notes and `?` status questions from stdin during the run. |
+| `--interactive` | off | Read notes and `?` status questions from stdin during the run, and answer a change's ask with y or n. |
 | `--fetch-deps`, `--no-fetch-deps` | ask | Answer the dependency question for this run only. |
 | `--warn-rule-conflicts`, `--no-warn-rule-conflicts` | off | Warn when your verify or gate command runs a program your rules block for workers. The command still runs. |
 | `--retry-gate NAME`, `--waive-gate NAME` | | With `--resume` and `--gate-note TEXT`: run a held gate again, or waive it. |
@@ -430,8 +435,9 @@ the files it writes. A narrowed `cargo test` that selects no recognized test (a 
 `tests/`, a `#[test]`, `#[tokio::test]`, `#[rstest]`, `proptest!` or a doctest), with no
 dependent package's check beside it, leaves the contract unverified (`scoped_check_vacuous`)
 until the root gate passes on a tip that holds its merge; a notice says when the mark is
-cleared. This applies to a small request's contract only; a planned contract's check is judged
-as before. A request that names no file is never small: its one contract would have no write
+cleared. This applies to a small request's contract only, unless `--zero-test-plans` (Settings >
+General > "Hold planned work that no test checks") applies it to every contract; then every pass
+of the root gate, not only a background one, clears the marks of the contracts merged on its tip. A request that names no file is never small: its one contract would have no write
 scope, so it is asked about (or planned in full when it is large). A name with no directory
 (`config.rs`) counts as a file only when exactly one indexed file has that name; a dotted word
 (`Node.js`, `self.plan`) is not a file and makes the request ask. The triage call has a deadline:
@@ -492,7 +498,120 @@ code is 128 plus the signal number (130 for Ctrl-C, 143 for SIGTERM). Stopping c
 
 Continue a stopped or killed run with `kgraf orchestrate --resume <run-id> --route ... --prices ...`.
 A resume does not repeat a paid call. A held or failed gate is run again, or waived, with
-`--resume`, `--retry-gate` or `--waive-gate`, and `--gate-note`.
+`--resume`, `--retry-gate` or `--waive-gate`, and `--gate-note`. `--resume` alone refuses a
+completed run; reopen one with a change instead.
+
+### Change a run
+
+A change to a run's plan costs one `replan_delta` call against the plan the run already has,
+not a new plan (decision 0100). The run's branch `kgraf/<run>` continues, and only what the
+change adds or changes runs.
+
+| Command | What it does |
+|---|---|
+| `kgraf orchestrate --resume RUN --change FILE ...` | Reopen a completed or stopped run with the change in FILE. |
+| `kgraf orchestrate --resume RUN --edit FILE ...` | Reopen it with its instruction as you edited it. The lines that differ are the change; the planner reads the whole edited text. An edit that changes no line sends nothing and exits 0. |
+| `kgraf orchestrate --instruction FILE --from-run RUN ...` | Start a new run from a copy of RUN's plan. A contract whose verified commit is already in the new run's base (you landed RUN), or whose merge changed nothing, is done; the rest remain. One `replan_delta` call applies the difference between RUN's instruction and FILE. Work in plain directories (no git) counts as remaining. RUN is read, never written. |
+| `/edit` in the box | Open the run's instruction (the original and every applied change, as one text) in the composer; send to apply the edit as one change. It targets the run in this window, else the newest stored run, and names it. |
+| `/edit --new` in the box | The same, as a new run copied from that run. |
+
+A reopen makes no `decompose` call and no re-grounding call. The answer is one of: a delta (contracts
+to add, change or remove), `no_change` (the planner's answer is printed as a notice), or
+`replan_all` (the plan is left as it is and the change waits: a full plan runs only on your yes).
+The call has reasoning off and an output cap of 600 tokens per contract the change names, at
+least 1,200; an answer cut at the cap is asked once more with the cap doubled.
+
+**What a change does.** Added contracts take the id `d<n>.<id>`, where `n` is the change's
+number in the run (an id already taken is refused). A change that only adds text at the end of a
+contract's instruction and acceptance amends it; any change to its files, dependencies, route or
+check supersedes it with a new revision `d<n>.<id>`, and the contracts that depended on it depend
+on the new revision. By the contract's state:
+
+| State | Amended | Superseded | Removed |
+|---|---|---|---|
+| Not started, or held | the brief is rewritten; a hold clears | the old one closes as replaced; the new one is queued | closes as removed; never runs |
+| Running (a stopped run's attempt that would resume) | a redirect waits in the worker's inbox; it sees it at its next round | the attempt is stopped: its transcript is kept, its worktree is released as your worktree setting says, its leases are released | the same |
+| Verified | a follow-up `<id>.f<n>` that depends on it; contracts still to run that depended on it depend on the follow-up too | the same; verified work that depended on it is named as possibly stale and checked again in the background once the follow-up has merged; the run waits for that check, and a failure is a notice, never a block. A check the run's end cuts short is named | refused |
+
+The merged plan passes the same checks a new plan does; a refused answer is asked once more
+with the reason, and a second refusal leaves the plan unchanged. If a contract the change names
+moved state while the change was planned, the answer is asked once more naming each conflict. A
+change applies whole or not at all. Quality gates over a changed contract run again; the root
+gate covers the added contracts. An added contract may depend only on verified work outside the
+change: a dependency on a contract that was replaced, removed or never verified is refused by name.
+The cap on new contracts per change counts follow-ups and new revisions too.
+
+**Who must say yes.** Your permission mode decides, by what the change does to work: *additive*
+(adds, amends, a follow-up), *reshaping* (supersedes or removes work that has not started), or
+*cutting* (stops running work, or supersedes verified work).
+
+| Mode | Additive | Reshaping | Cutting |
+|---|---|---|---|
+| Manual | asks | asks | asks |
+| Accept edits | applies | asks | asks |
+| Auto | applies | applies | asks |
+| Orchestrator decides | applies | applies | applies, but refuses to supersede verified work with no contract that writes its files |
+| Bypass | applies | applies | applies |
+
+A change you wrote (`--change`, `--edit`, `/edit`, plan review's Change) is your yes for an
+additive or reshaping change in every mode; a cutting one follows the mode. When the mode asks, the
+box shows the change as a card (Yes applies it, No refuses it), and `--interactive` asks the same
+on the terminal (`apply change N? [y/n]`). The answer is bound to that change's number: a card that
+changed meanwhile is not answered by it. A card withdrawn before you answer (the run stopped, or
+the mode stopped asking) gives the terminal back, so the next line you type is a note again. With
+nobody to answer, or when the run's time limit runs out before you answer, the change waits
+(pending) with a notice. A pending or refused change taken at a reopen, a copy or a resume stops
+the run before anything is dispatched, so work the change would have altered does not run; the
+run exits nonzero, naming each change and why. Refusing plan review's Change leaves the shown plan
+as it was. Plan review itself also ends at the run's time limit, with nothing started.
+
+Outside Orchestrator decides, a change that supersedes verified work with no contract writing its
+files applies; a notice names those files (the verified code stays merged on the run's branch),
+and the report counts it as verified work lost.
+
+**Refused before anything is written.** A reopen of a run another process holds (a live run, or
+a land in progress) is refused, and nothing is written: the change file stays as it was. So is a
+run whose land journal is still open, and a land that stopped while git updated your checkout is
+named so you can finish it first (`kgraf land`). In the box, the edit stays in the composer.
+
+**A kill is safe.** Each step of a change is saved: received, planning, answered, applied (or
+refused, or pending). A resume goes on from the saved step: an answer already saved is applied
+with no new call, and a call that never answered is made once more. A change is never applied
+twice or in part. The redirects a change sends to running work are saved with the change, and a
+resume delivers each once.
+
+**The report.** Each change has a line (`change  N (source, session S) state: what it did;
+delta T tokens, plan P tokens (ratio of it)`): its delta tokens beside the tokens of the
+`decompose` call that made the plan, so you can see what a change cost. A `changes` line counts
+changes per working session, refused and pending changes, `replan_all` answers and verified
+work lost. Delta tokens include calls that failed and calls cut by a stop. When you are at the
+plan review card, its Change is a delta on the shown plan too, and a `replan_all` answer there runs
+a full plan; with nobody at the card, Change runs a full plan as before. Re-grounding reads the original instruction
+and every applied change. The trace records each step as a `change` event, and each reopen as a
+`reopened` event; readers of the trace split working sessions there, so the time between them is
+not run time.
+
+### A contract's own check
+
+With `--own-checks` (Settings > General > "Let a contract carry its own check"), the planner may
+give a contract a `check`: a command that fails when the contract's work is wrong. kGraf runs it
+only when `--verify` tests nothing for that contract (the command checks nothing, like `true`,
+or the narrowed check selects no test), and a pass verifies the contract. A check's exit status
+must be able to fail because a test run, a build (`cargo test`, `cargo build`, `npm test`, `go
+test`), or an assertion over a file the contract writes (such as `grep` on it) failed. `true`, `:`,
+`exit 0`, `echo`, `test -f`, `test -e`, `ls`, `cat` and version or help requests (`cargo
+--version`) check nothing; neither does a check whose status a trailing `|| true`, `; true` or
+`exit 0` masks, or one that takes its status from a pipe's last command (`cargo test | tee log`,
+unless `set -o pipefail` comes first). Substitutions, subshells and `if`/`for` blocks are not
+judged: write plain commands joined by `&&`. The
+planner hears about `check` only with `--own-checks` on; without it, no check is stored. A plan
+copied with `--from-run` keeps a copied check only if it passes the same test, else a notice says
+it was dropped. Where `--verify` does
+test it, the check is not run. A check that checks nothing, or that runs a program your deny or
+ask rules name, is refused when the plan is read, and the planner is asked again. Past your
+rules, the mode decides: Bypass and Orchestrator decides take it; the other modes take it only
+when every program it runs is in your allow set, since nobody is there to answer an ask. A
+change to a contract's check supersedes the contract.
 
 ### Run limits
 
@@ -798,9 +917,11 @@ interaction, `/status` adds one short line per kind of interaction, in budget or
 newest split of its kind, that splits its time into kGraf overhead, model time and tool time (for example
 `latency contract_merged (B10): 900.0 ms = kgraf 300.0 + model 600.0 + tools 0.0`). The run
 report prints the same lines. `/compact` compacts the
-orchestrator, and `/compact selected` or `/compact <worker>` targets a worker. `/land` (or
-`/land into <branch>`) lands the run onto your branch; see [Landing](#landing). `/help` lists
-them. Tool approvals are answered in place: allow once, allow always, deny.
+orchestrator, and `/compact selected` or `/compact <worker>` targets a worker. `/edit` opens a
+run's instruction in the composer to change it as one change, and `/edit --new` starts a new run
+copied from it (see [Change a run](#change-a-run)). `/land` (or `/land into <branch>`) lands the
+run onto your branch; see [Landing](#landing). `/help` lists them. Tool approvals are answered in
+place: allow once, allow always, deny.
 
 **Runs read `.kgraf/run.json`.** It holds the `orchestrate` flags as JSON, with snake_case
 keys. Unknown keys are refused. `worktrees` is refused too: the Settings switch decides it.

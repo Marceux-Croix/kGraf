@@ -981,6 +981,15 @@ impl Workspaces for GitWorkspaces {
     /// (a worker that failed, an empty attempt) is removed under `Delete` and
     /// kept under `Keep`. A removal or discard that fails is reported once
     /// ([`Workspaces::take_problems`]), never dropped.
+    async fn discard_stopped(&self, contract: &OpenContract, worker: &kgraf_core::AgentId) {
+        // Reopened from its recorded handle only: a worktree already gone
+        // (a restart after the first release) gives `None`, and nothing is
+        // made in its place.
+        if let Ok(Some(path)) = self.reopen_recorded(contract, worker.as_str(), false).await {
+            self.release(&path, false).await;
+        }
+    }
+
     async fn release(&self, workspace: &Path, keep: bool) {
         let live = self.live().remove(workspace);
         self.empty

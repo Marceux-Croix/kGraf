@@ -481,8 +481,10 @@ impl RunLoop {
             }
         }
         let request = JudgeRequest {
-            original_instruction: kgraf_secrets::model_copy(&self.record.original_instruction)
-                .into_owned(),
+            original_instruction: kgraf_secrets::model_copy(&crate::delta::instruction_text(
+                &self.record,
+            ))
+            .into_owned(),
             requests,
             agents,
         };

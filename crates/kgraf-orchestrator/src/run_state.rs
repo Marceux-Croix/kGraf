@@ -297,6 +297,19 @@ pub struct OpenContract {
     /// change grants or refuses it. Persisted, so a resumed run asks again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<PendingPermission>,
+    /// The contract's own checks (decision 0100), from its plan's `check`,
+    /// with contract checks of their own on. The verifier runs them only when
+    /// the run's check, narrowed or whole, tests nothing; a pass confirms the
+    /// work. Not [`Self::gate_commands`], which a gate remediation carries
+    /// and which widens what the verifier runs on every attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract_checks: Vec<String>,
+    /// A small request's one contract (decision 0100, section 6): the
+    /// zero-test rule applies to it. A record from before the field tells
+    /// one apart by its acceptance text
+    /// ([`crate::triage::is_small_contract`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub small: bool,
 }
 
 /// One permission request waiting for the user (decision 0094).
@@ -419,6 +432,8 @@ impl OpenContract {
             shortfall_stuck: Vec::new(),
             shortfall_hold: None,
             pending_permission: None,
+            contract_checks: Vec::new(),
+            small: false,
         }
     }
 
@@ -687,6 +702,45 @@ pub struct RunStateRecord {
         skip_serializing_if = "crate::land_record::LandBook::is_empty"
     )]
     pub land: crate::land_record::LandBook,
+    // Between-run edits (decision 0100, sections 3, 5 and 7). A record from
+    // before these fields reads as having no changes, no copy source and no
+    // recorded specs.
+    /// The change log: every change, verbatim (scrubbed), with its state.
+    /// Changes never enter `notes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<crate::delta::RecordedChange>,
+    /// The run whose `decompose` call made the plan this record continues:
+    /// this run for a plan it made, the source's for a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_root: Option<RunId>,
+    /// The run this one's plan was copied from (`--from-run`). Not
+    /// `parent_run`, which names a run started by another run (0067).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<RunId>,
+    /// Each contract's spec as planned (or as a change last set it), kept
+    /// after the contract closes: the dependencies, route and task kind the
+    /// delta rules read. Never rebuilt from an open contract, whose route is
+    /// overwritten at dispatch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plan_specs: BTreeMap<String, ContractSpec>,
+    /// Times the run was reopened with a change: its working sessions after
+    /// the first.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reopens: u32,
+    /// `replans` when the newest change applied: the held-plan re-plan bound
+    /// counts from here, so each change has its own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replan_base: u32,
+    /// Ledger ids of the calls that made the run's first plan (its
+    /// `decompose` calls with their re-asks and sizing splits; not a held
+    /// plan's re-plan): what a change's delta tokens are measured against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_calls: Vec<String>,
+    /// When the newest working session ended (the run loop's end), Unix ms.
+    /// A reopen names it as the start of the time between sessions; a later
+    /// save (a land, a decline) moves `updated_ms`, never this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_end_ms: Option<i64>,
 }
 
 /// A hold a pre-dispatch interface check placed, with the route and model of
@@ -859,6 +913,12 @@ impl RunStateRecord {
         for n in &self.notes {
             n.text.forget_model_copy();
         }
+        for c in &self.changes {
+            forget(&c.text);
+            if let Some(e) = &c.edited {
+                forget(e);
+            }
+        }
         for m in &self.coordination.mailbox.messages {
             m.body.forget_model_copy();
         }
@@ -873,6 +933,12 @@ impl RunStateRecord {
                 forget(&c.instruction);
             }
         }
+    }
+
+    /// Held-plan re-plans taken since the newest change applied: the bound
+    /// `MAX_REPLANS` counts these, so each change has its own (decision 0100).
+    pub fn replans_this_change(&self) -> u32 {
+        self.replans.saturating_sub(self.replan_base)
     }
 
     /// A fresh record for a run.
@@ -912,6 +978,14 @@ impl RunStateRecord {
             check_holds: Vec::new(),
             triage: None,
             land: crate::land_record::LandBook::default(),
+            changes: Vec::new(),
+            plan_root: None,
+            copied_from: None,
+            plan_specs: BTreeMap::new(),
+            reopens: 0,
+            replan_base: 0,
+            plan_calls: Vec::new(),
+            session_end_ms: None,
         }
     }
 

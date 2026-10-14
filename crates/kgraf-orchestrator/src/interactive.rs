@@ -110,6 +110,14 @@ impl std::fmt::Debug for InteractiveRun {
 enum Begin {
     Start(String),
     Resume,
+    /// Reopen with a change or an edit (decision 0100).
+    Reopen(Box<crate::ChangeInput>),
+    /// A new run from a copy of `source`'s plan (decision 0100).
+    Copy {
+        source: RunId,
+        instruction: String,
+        received: crate::Received,
+    },
 }
 
 impl InteractiveRun {
@@ -133,6 +141,36 @@ impl InteractiveRun {
         wake: Wake,
     ) -> Result<Self, HostError> {
         Self::begin(runtime, factory, run, Begin::Resume, wake).await
+    }
+
+    /// Reopen `run` with a change or an edited instruction (decision 0100):
+    /// one delta call against its plan, and the run continues on its branch.
+    pub async fn reopen(
+        runtime: tokio::runtime::Handle,
+        factory: Arc<dyn OrchestratorFactory>,
+        run: RunId,
+        change: crate::ChangeInput,
+        wake: Wake,
+    ) -> Result<Self, HostError> {
+        Self::begin(runtime, factory, run, Begin::Reopen(Box::new(change)), wake).await
+    }
+
+    /// Start `run` from a copy of `source`'s plan with an edited instruction
+    /// (decision 0100): one delta call for the edit.
+    pub async fn copy(
+        runtime: tokio::runtime::Handle,
+        factory: Arc<dyn OrchestratorFactory>,
+        run: RunId,
+        source: RunId,
+        instruction: String,
+        wake: Wake,
+    ) -> Result<Self, HostError> {
+        let begin = Begin::Copy {
+            source,
+            instruction,
+            received: crate::Received::now(),
+        };
+        Self::begin(runtime, factory, run, begin, wake).await
     }
 
     async fn begin(
@@ -182,6 +220,16 @@ impl InteractiveRun {
             let result = match begin {
                 Begin::Start(instruction) => orchestrator.start(id, instruction).await,
                 Begin::Resume => orchestrator.resume(id).await,
+                Begin::Reopen(change) => orchestrator.reopen(id, *change).await,
+                Begin::Copy {
+                    source,
+                    instruction,
+                    received,
+                } => {
+                    orchestrator
+                        .start_from_run(id, source, instruction, received)
+                        .await
+                }
             };
             let _ = tx.send(RunEvent::Finished(
                 result.map(Box::new).map_err(|e| e.to_string()),
@@ -264,6 +312,19 @@ impl InteractiveRun {
         let handle = self.handle.clone();
         self.runtime
             .spawn(async move { handle.decline_land(now_ms).await });
+    }
+
+    /// A change to the plan waiting for the user's yes (decision 0100).
+    pub fn pending_change(&self) -> Option<crate::review_desk::ChangeView> {
+        self.review.pending_change()
+    }
+
+    /// Apply (`true`) or refuse (`false`) the waiting change; the loop
+    /// applies the answer.
+    pub fn answer_change(&self, number: u32, yes: bool) -> Result<(), String> {
+        self.review
+            .answer_change(number, yes)
+            .map_err(|e| e.to_string())
     }
 
     /// The user's order (0014), answered later as [`RunEvent::Ordered`].

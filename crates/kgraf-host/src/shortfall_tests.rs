@@ -110,6 +110,10 @@ pub(super) struct Script {
     planner_calls: AtomicUsize,
     /// The newest decomposition request, as text.
     last_planner_request: std::sync::Mutex<String>,
+    /// Change requests answered (`replan_delta`, decision 0100).
+    delta_calls: AtomicUsize,
+    /// The newest change request, as text.
+    last_delta_request: std::sync::Mutex<String>,
     /// The project checkout, for [`Worker::NeedsLaterMember`].
     root: std::sync::Mutex<Option<PathBuf>>,
     /// The failed tool results the worker requests carried, first lines
@@ -126,6 +130,8 @@ impl Script {
             granted_ran: AtomicBool::new(false),
             planner_calls: AtomicUsize::new(0),
             last_planner_request: std::sync::Mutex::new(String::new()),
+            delta_calls: AtomicUsize::new(0),
+            last_delta_request: std::sync::Mutex::new(String::new()),
             root: std::sync::Mutex::new(None),
             failed_results: std::sync::Mutex::new(Vec::new()),
         })
@@ -255,6 +261,20 @@ impl Provider for Script {
                     } else {
                         r#"{"contracts":[{"id":"a","instruction":"copy README.md to a.txt","acceptance":"a.txt exists","writes":[{"path":"a.txt"}],"tools":[]}]}"#
                     },
+                )],
+                StopReason::EndTurn,
+            )
+        } else if system.contains("re-plan only the change") {
+            // A change to the shown plan (decision 0100): contract `a` writes
+            // the file the change names instead, a supersession.
+            self.delta_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_delta_request
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = format!("{system}{:?}", request.messages);
+            (
+                vec![Content::text(
+                    r#"{"kind":"delta","change":[{"id":"a","spec":{"id":"a","instruction":"copy README.md to b-side.txt","acceptance":"b-side.txt exists","writes":[{"path":"b-side.txt"}],"tools":[]},"why":"the user named the file"}]}"#,
                 )],
                 StopReason::EndTurn,
             )
@@ -1351,10 +1371,11 @@ async fn plan_review_blocks_dispatch_until_the_user_approves() {
     assert_eq!(a.script.attempts.load(Ordering::SeqCst), 1);
 }
 
-/// Change sends a note to the planner and shows a new plan; Reject ends the
-/// run with nothing dispatched.
+/// Change is one change to the shown plan (decision 0100): one delta call
+/// carrying the user's words, no second decomposition, and the changed plan
+/// shown; Reject ends the run with nothing dispatched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_change_re_plans_with_the_note_and_a_rejection_dispatches_nothing() {
+async fn a_change_is_one_delta_on_the_shown_plan_and_a_rejection_dispatches_nothing() {
     let a = attended(
         Worker::Writes,
         control_with(
@@ -1376,10 +1397,20 @@ async fn a_change_re_plans_with_the_note_and_a_rejection_dispatches_nothing() {
     })
     .await;
     assert_eq!(second.items.len(), 1);
-    assert_eq!(a.script.planner_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        second.items[0].contract, "d1.a",
+        "the superseded contract's new revision"
+    );
+    assert_eq!(second.touched_paths(), vec!["b-side.txt".to_owned()]);
+    assert_eq!(
+        a.script.planner_calls.load(Ordering::SeqCst),
+        1,
+        "no second decomposition"
+    );
+    assert_eq!(a.script.delta_calls.load(Ordering::SeqCst), 1);
     assert!(
         a.script
-            .last_planner_request
+            .last_delta_request
             .lock()
             .expect("lock")
             .contains("name the file b-side"),

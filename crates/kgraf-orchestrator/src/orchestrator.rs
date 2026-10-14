@@ -144,6 +144,9 @@ mod compaction_hooks;
 /// Small requests skip planning (decision 0100): the rule, the triage task,
 /// early start and its merge hold.
 mod triage_entry;
+// Between-run edits (decision 0100): reopen, copy, and one delta per change.
+mod delta_hooks;
+pub use delta_hooks::{ChangeInput, Received};
 // Decision 0096: progress-gated round budgets, seen from the run loop.
 mod checkpoint_hooks;
 use checkpoint_hooks::checkpoint_note;
@@ -304,6 +307,13 @@ pub trait Workspaces: Send + Sync {
     /// attempt in it is discarded. The orchestrator passes `keep = false` only
     /// once no open contract names the worktree.
     async fn release(&self, workspace: &Path, keep: bool);
+    /// A stopped attempt that a change to the plan cancelled (decision 0100):
+    /// its worktree, reopened from the handle `contract.worktrees` recorded,
+    /// is released with `keep = false`, so the retention setting decides
+    /// whether it stays. Never makes a worktree: one already gone is nothing
+    /// to do, so a second call (after a restart) does nothing. The default,
+    /// for plain directories, does nothing.
+    async fn discard_stopped(&self, _contract: &OpenContract, _worker: &AgentId) {}
     /// Worktrees or attempts [`Self::release`] could not remove, since the last
     /// call: the run's report shows each as a warning, so a removal that failed
     /// is never silent. A provider that removes nothing has none.
@@ -659,6 +669,15 @@ pub struct OrchestratorConfig {
     /// whether the one worker starts beside a triage call. The default,
     /// `full` with no early start, plans every request as before.
     pub small: crate::triage::SmallRequestConfig,
+    /// Contract checks of their own (decision 0100): a plan's contract may
+    /// carry a `check`, run by the verifier only when the run's check tests
+    /// nothing. Off: a `check` in a plan is ignored, as before.
+    pub own_checks: bool,
+    /// The zero-test rule for every contract (decision 0100), not only a
+    /// small request's: a narrowed check that selects no test leaves the
+    /// contract unverified until the root gate passes over it, and every
+    /// root-gate pass clears those marks. Off: as before.
+    pub zero_test_plans: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -685,6 +704,8 @@ impl Default for OrchestratorConfig {
             route_fault_cooldown: Duration::from_secs(30),
             time_limit: None,
             small: crate::triage::SmallRequestConfig::default(),
+            own_checks: false,
+            zero_test_plans: false,
         }
     }
 }
@@ -788,6 +809,14 @@ pub enum OrchestratorError {
          orchestrator box, turn plan review off, or pass --approve-plan"
     )]
     PlanReviewUnattended,
+    /// Decision 0100: a reopen that would race a land, refused before
+    /// anything is written; the change stays with the user.
+    #[error("run `{run}` cannot be reopened now: {reason}; nothing was changed")]
+    ReopenRefused { run: String, reason: String },
+    /// Decision 0100: an edit that changes no line of the instruction, or an
+    /// empty change. No call is made and nothing is written.
+    #[error("the edit changes nothing in the instruction, so nothing was sent")]
+    NothingChanged,
 }
 
 impl kgraf_diag::DiagCode for OrchestratorError {
@@ -994,6 +1023,13 @@ enum Control {
     /// A land's move of the target ended (run off the loop task).
     LandMoved {
         moved: Box<crate::land_flow::Moved>,
+    },
+    /// The background re-check of verified work a change made stale ended
+    /// (decision 0100, section 3 rule 6).
+    StaleChecked {
+        change: u32,
+        stale: Vec<String>,
+        verdict: Box<Result<crate::gates::GateVerdict, String>>,
     },
 }
 
@@ -1559,6 +1595,19 @@ pub struct RunReport {
     /// contracts still open (a stopped run) and gates still running. Zero for
     /// a run that finished.
     pub latency_clocks_held: usize,
+    /// The change log (decision 0100), one line per change. Empty for a run
+    /// no change reached.
+    pub changes: Vec<crate::delta::ChangeLine>,
+    /// The induced-demand counts: changes per session, refused and pending
+    /// changes, `replan_all` answers, and the tokens of every delta call.
+    pub change_counts: crate::delta::ChangeCounts,
+    /// The tokens of the `decompose` calls that made the plan the changes
+    /// edit (the plan root's), to compare each change's delta tokens with.
+    /// `None` when the run had no change.
+    pub decompose_tokens: Option<u64>,
+    /// The newest working session: changes from it that did not apply fail
+    /// the run's exit.
+    pub session: u32,
 }
 
 /// How long a release waits for a worker that ignores its cancel before it
@@ -2545,14 +2594,34 @@ impl Orchestrator {
         if record.plan_approved.is_none() {
             self.check_plan_review()?;
         }
+        let open_change = record.changes.iter().any(|c| {
+            c.state.is_open() || (c.state == crate::delta::ChangeState::Applied && !c.outside_done)
+        });
         let mut state = on_heap(|| RunLoop::open(self, record, true)).await?;
         // A triage the restart cut is planned in full, never asked again
         // (decision 0100); an early start it cut is cancelled first.
         on_heap(|| state.resume_triage()).await?;
+        // A change a killed process left part way (decision 0100) goes on
+        // from its saved state: a saved answer is applied with no new call.
+        // Such a resume is the reopen's own, so it re-grounds nothing.
+        if open_change {
+            state.reground_on_resume = false;
+        }
         let result = if state.record.planned {
             Ok(true)
         } else {
             on_heap(|| state.plan()).await
+        };
+        let result = match result {
+            Ok(true) if open_change => {
+                match on_heap(|| state.advance_changes()).await {
+                    // A change that did not apply stops the run before it
+                    // dispatches (decision 0100).
+                    Ok(()) => state.stop_if_change_blocks().await.map(|()| true),
+                    Err(e) => Err(e),
+                }
+            }
+            other => other,
         };
         on_heap(|| state.run_reviewed(result)).await
     }
@@ -2681,6 +2750,8 @@ struct RunLoop {
     spec: speculate::SpecRuntime,
     /// The user's permission mode and the review desk (decision 0094).
     perms: permission_hooks::PermissionRuntime,
+    /// Changes this process took in (decision 0100).
+    delta_rt: delta_hooks::DeltaRuntime,
     /// Landing (decision 0100).
     land: Box<land_hooks::LandParts>,
 }
@@ -2807,6 +2878,9 @@ fn acquire_run_lease(
 impl Drop for RunLoop {
     fn drop(&mut self) {
         self.land.stop();
+        for (_, _, task) in &self.delta_rt.stale_tasks {
+            task.abort();
+        }
         self.release_gate_flights();
         self.release_speculation_slot();
         self.release_subagents_on_error();
@@ -3028,6 +3102,7 @@ impl RunLoop {
                 answer_wait,
             ),
             perms: permission_hooks::PermissionRuntime::new(perms),
+            delta_rt: delta_hooks::DeltaRuntime::default(),
             land,
         };
         if let Some(torn) = torn_trace {
@@ -4021,8 +4096,11 @@ impl RunLoop {
                 let Some((specs, interfaces, unchecked)) = self
                     .decompose(
                         PlanRequest {
+                            // The original instruction and every applied
+                            // change (decision 0100); for a run no change
+                            // reached, the original, byte for byte.
                             instruction: kgraf_secrets::model_copy(
-                                &self.record.original_instruction,
+                                &crate::delta::instruction_text(&self.record),
                             )
                             .into_owned(),
                             split_reason: None,
@@ -4035,6 +4113,7 @@ impl RunLoop {
                             templates,
                             interfaces: false,
                             project_context: String::new(),
+                            own_checks: false,
                         },
                         &note_ids,
                         &BTreeSet::new(),
@@ -4155,6 +4234,7 @@ impl RunLoop {
                             templates: Vec::new(),
                             interfaces: false,
                             project_context: String::new(),
+                            own_checks: false,
                         },
                         &[],
                         // The whole plan so far: a split's interface may bind
@@ -4281,10 +4361,28 @@ impl RunLoop {
             deps.sort();
             deps.dedup();
             deps.retain(|d| *d != contract.contract);
+            // The plan-time spec, kept after the contract closes (decision
+            // 0100): what a later change's rules read.
+            let mut kept = spec;
+            kept.id.clone_from(&contract.contract);
+            kept.depends_on.clone_from(&deps);
+            if self.config.own_checks {
+                contract.contract_checks = kept.check.iter().cloned().collect();
+            } else {
+                // With own checks off a `check` the planner wrote is not
+                // kept: a later copy or change must never run it unjudged.
+                kept.check = None;
+            }
+            self.record
+                .plan_specs
+                .insert(contract.contract.clone(), kept);
             contract.depends_on = deps;
             contracts.push(contract);
         }
         self.record.open_contracts = contracts;
+        if self.record.plan_root.is_none() {
+            self.record.plan_root = Some(self.record.run.clone());
+        }
         // Traced before the plan is saved as done: a crash between the two
         // plans again, and a second registration of an id changes nothing. A
         // refused registration drops the saved progress, so a resume plans
@@ -4514,6 +4612,7 @@ impl RunLoop {
     }
 
     fn shutdown(&mut self) -> Result<(), OrchestratorError> {
+        self.end_stale_rechecks();
         self.shutdown_sessions();
         self.release_gate_flights();
         self.release_speculation_slot();
@@ -4547,6 +4646,7 @@ impl RunLoop {
         // whatever the status (decision 0067, amendment of 2026-10-06).
         self.report_undelivered_at_run_end();
         self.shutdown()?;
+        self.record.session_end_ms = Some(self.now());
         self.queue_rate_limit_waits();
         self.flush_coord().await?;
         self.save()?;
@@ -4640,6 +4740,9 @@ impl RunLoop {
             // injector (sessions.rs, connections.rs).
             self.pump_sessions()?;
             self.speculate_tick();
+            if !self.stopping {
+                self.start_due_stale_rechecks()?;
+            }
             if self.in_flight.is_empty() && (self.stopping || !self.gates_busy()) {
                 if self.stopping {
                     on_heap(|| self.stop_triage()).await?;
@@ -4793,10 +4896,12 @@ impl RunLoop {
         if self.record.source_plan.is_some() {
             return Ok(Replan::NotPlanned("the plan was approved".to_owned()));
         }
-        if self.record.replans >= MAX_REPLANS {
+        // Counted from the newest applied change (decision 0100): each
+        // change has its own re-plan.
+        let replans = self.record.replans_this_change();
+        if replans >= MAX_REPLANS {
             return Ok(Replan::NotPlanned(format!(
-                "the re-plan is spent ({} of {MAX_REPLANS})",
-                self.record.replans
+                "the re-plan is spent ({replans} of {MAX_REPLANS})"
             )));
         }
         let parts = match self.replan_failures() {
@@ -5065,7 +5170,48 @@ impl RunLoop {
             unfinished: self.record.unfinished(),
             latency: self.latency.book.lines(),
             latency_clocks_held: self.latency.clocks_held(),
+            changes: crate::delta::change_lines(&self.record),
+            change_counts: crate::delta::counts(&self.record),
+            decompose_tokens: (!self.record.changes.is_empty()).then(|| self.decompose_tokens()),
+            session: self.record.reopens,
         }
+    }
+
+    /// Tokens of the `decompose` calls of the run whose plan this one
+    /// continues: itself, or the run its plan was copied from.
+    fn decompose_tokens(&self) -> u64 {
+        let root = self
+            .record
+            .plan_root
+            .clone()
+            .unwrap_or_else(|| self.record.run.clone());
+        // The first plan's own calls, when the root's record kept them.
+        let kept = if root == self.record.run {
+            self.record.plan_calls.clone()
+        } else {
+            self.store
+                .load(&root)
+                .ok()
+                .flatten()
+                .map(|r| r.plan_calls)
+                .unwrap_or_default()
+        };
+        if !kept.is_empty() {
+            return kept
+                .iter()
+                .filter_map(|c| self.s.ledger.call(&CallId::new(c.clone())).ok().flatten())
+                .map(|c| c.usage.total_input() + c.usage.total_output())
+                .sum();
+        }
+        let agent = format!("orchestrator:{root}");
+        self.s
+            .ledger
+            .calls_under_task(root.as_str(), Some(&agent))
+            .unwrap_or_default()
+            .iter()
+            .filter(|c| c.trace.kind.as_deref() == Some("decompose"))
+            .map(|c| c.usage.total_input() + c.usage.total_output())
+            .sum()
     }
 
     fn held(&self) -> Vec<(String, String)> {
@@ -5689,9 +5835,11 @@ impl RunLoop {
         };
         let id = contract.contract.clone();
         let (notes, note_ids) = self.pending_notes();
+        // The original instruction and every applied change, verbatim
+        // (decision 0057 as amended by 0100).
+        let log = crate::delta::instruction_text(&self.record);
         let request = GroundRequest {
-            original_instruction: kgraf_secrets::model_copy(&self.record.original_instruction)
-                .into_owned(),
+            original_instruction: kgraf_secrets::model_copy(&log).into_owned(),
             next_contract: id.clone(),
             next_instruction: kgraf_secrets::model_copy(&contract.instruction).into_owned(),
             verified: self.record.verified_contracts.clone(),
@@ -8677,7 +8825,8 @@ impl RunLoop {
                 let standing = crate::shortfall::accepted_standing(
                     &id,
                     by,
-                    !contract.gate_commands.is_empty(),
+                    !contract.gate_commands.is_empty()
+                        || crate::shortfall::own_check_counts(&contract, by),
                     result.as_ref(),
                 );
                 let worker = flight.attempts[winner].worker.to_string();
@@ -9026,6 +9175,7 @@ impl RunLoop {
                 }
             };
             let spec = ContractSpec {
+                check: None,
                 id: format!("h{}", i + 1),
                 // A worker's own text, taken in here.
                 // `acceptance` below is the parent's, already stored.
@@ -9590,6 +9740,11 @@ impl RunLoop {
             Control::Land { request, reply } => self.on_land(*request, reply).await,
             Control::LandDeclined { now_ms } => self.on_land_declined(now_ms)?,
             Control::LandGated { verdict } => self.on_land_gated(*verdict),
+            Control::StaleChecked {
+                change,
+                stale,
+                verdict,
+            } => self.on_stale_checked(change, &stale, *verdict).await?,
             Control::LandMoved { moved } => self.on_land_moved(*moved),
             Control::DecideGate {
                 gate,

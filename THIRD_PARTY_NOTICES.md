@@ -9,7 +9,7 @@ into this repository is listed under `third_party/`, each block with its
 
 ## Overview
 
-- Apache License 2.0 (Apache-2.0): 480 crate(s)
+- Apache License 2.0 (Apache-2.0): 481 crate(s)
 - MIT License (MIT): 166 crate(s)
 - Unicode License v3 (Unicode-3.0): 23 crate(s)
 - ISC License (ISC): 21 crate(s)
@@ -1089,7 +1089,7 @@ Used by:
 
 Used by:
 
-- [deranged 0.5.8](https://github.com/jhpratt/deranged)
+- [deranged 0.5.9](https://github.com/jhpratt/deranged)
 
 ```text
 
@@ -2699,7 +2699,7 @@ Used by:
 
 Used by:
 
-- [zopfli 0.8.3](https://github.com/zopfli-rs/zopfli)
+- [zopfli 0.8.4](https://github.com/zopfli-rs/zopfli)
 
 ```text
                                  Apache License
@@ -2910,8 +2910,8 @@ Used by:
 
 Used by:
 
-- [zerocopy-derive 0.8.62](https://github.com/google/zerocopy)
-- [zerocopy 0.8.62](https://github.com/google/zerocopy)
+- [zerocopy-derive 0.8.63](https://github.com/google/zerocopy)
+- [zerocopy 0.8.63](https://github.com/google/zerocopy)
 
 ```text
                                  Apache License
@@ -4189,10 +4189,10 @@ Used by:
 - [clap_derive 4.6.7](https://github.com/clap-rs/clap)
 - [clap_lex 1.1.1](https://github.com/clap-rs/clap)
 - [serde_spanned 1.1.2](https://github.com/toml-rs/toml)
-- [toml 1.1.7+spec-1.1.0](https://github.com/toml-rs/toml)
+- [toml 1.1.8+spec-1.1.0](https://github.com/toml-rs/toml)
 - [toml_datetime 1.1.2+spec-1.1.0](https://github.com/toml-rs/toml)
-- [toml_edit 0.25.16+spec-1.1.0](https://github.com/toml-rs/toml)
-- [toml_parser 1.1.4+spec-1.1.0](https://github.com/toml-rs/toml)
+- [toml_edit 0.25.17+spec-1.1.0](https://github.com/toml-rs/toml)
+- [toml_parser 1.1.5+spec-1.1.0](https://github.com/toml-rs/toml)
 - [toml_writer 1.1.3+spec-1.1.0](https://github.com/toml-rs/toml)
 
 ```text
@@ -7805,7 +7805,7 @@ limitations under the License.
 Used by:
 
 - [apple-native-keyring-store 1.0.2](https://github.com/open-source-cooperative/apple-native-keyring-store.git)
-- [keyring-core 1.0.0](https://github.com/open-source-cooperative/keyring-core.git)
+- [keyring-core 1.0.1](https://github.com/open-source-cooperative/keyring-core.git)
 - [keyring 4.2.0](https://github.com/open-source-cooperative/keyring-rs)
 - [zbus-secret-service-keyring-store 1.0.1](https://github.com/open-source-cooperative/zbus-secret-service-keyring-store.git)
 
@@ -8254,7 +8254,7 @@ Used by:
 - [bytes-utils 0.1.4](https://github.com/vorner/bytes-utils)
 - [cap-primitives 4.0.3](https://github.com/bytecodealliance/cap-std)
 - [cap-std 4.0.3](https://github.com/bytecodealliance/cap-std)
-- [cc 1.6.0](https://github.com/rust-lang/cc-rs)
+- [cc 1.8.0](https://github.com/rust-lang/cc-rs)
 - [cff-parser 0.2.0](https://github.com/jrmuizel/cff-parser)
 - [cfg-if 1.0.5](https://github.com/rust-lang/cfg-if)
 - [cmake 0.1.58](https://github.com/rust-lang/cmake-rs)
@@ -8271,7 +8271,7 @@ Used by:
 - [displaydoc 0.2.7](https://github.com/yaahc/displaydoc)
 - [either 1.19.0](https://github.com/rayon-rs/either)
 - [encoding_rs_io 0.1.8](https://github.com/BurntSushi/encoding_rs_io)
-- [equivalent 1.0.2](https://github.com/indexmap-rs/equivalent)
+- [equivalent 1.0.3](https://github.com/indexmap-rs/equivalent)
 - [errno 0.3.14](https://github.com/lambda-fairy/rust-errno)
 - [euclid 0.20.14](https://github.com/servo/euclid)
 - [euclid 0.22.14](https://github.com/servo/euclid)
@@ -8338,15 +8338,16 @@ Used by:
 - [rustix-linux-procfs 0.1.1](https://github.com/sunfishcode/rustix-linux-procfs)
 - [rustix 0.38.44](https://github.com/bytecodealliance/rustix)
 - [rustix 1.1.5](https://github.com/bytecodealliance/rustix)
-- [rustls-native-certs 0.8.4](https://github.com/rustls/rustls-native-certs)
-- [rustls 0.23.45](https://github.com/rustls/rustls)
+- [rustls-native-certs 0.8.5](https://github.com/rustls/rustls-native-certs)
+- [rustls 0.23.46](https://github.com/rustls/rustls)
 - [scoped-tls 1.0.1](https://github.com/alexcrichton/scoped-tls)
 - [scopeguard 1.2.0](https://github.com/bluss/scopeguard)
 - [secret-service 5.2.0](https://github.com/hwchen/secret-service-rs.git)
 - [security-framework-sys 2.17.0](https://github.com/kornelski/rust-security-framework)
 - [security-framework 3.7.0](https://github.com/kornelski/rust-security-framework)
 - [signal-hook-registry 1.4.8](https://github.com/vorner/signal-hook)
-- [smallvec 1.16.2](https://github.com/servo/rust-smallvec)
+- [similar 3.2.0](https://github.com/mitsuhiko/similar)
+- [smallvec 1.16.3](https://github.com/servo/rust-smallvec)
 - [smol_str 0.2.2](https://github.com/rust-analyzer/smol_str)
 - [socket2 0.6.5](https://github.com/rust-lang/socket2)
 - [stable_deref_trait 1.2.1](https://github.com/storyyeller/stable_deref_trait)
@@ -8360,7 +8361,7 @@ Used by:
 - [unicode-segmentation 1.13.3](https://github.com/unicode-rs/unicode-segmentation)
 - [unicode-width 0.2.2](https://github.com/unicode-rs/unicode-width)
 - [url 2.5.8](https://github.com/servo/rust-url)
-- [uuid 1.27.0](https://github.com/uuid-rs/uuid)
+- [uuid 1.28.0](https://github.com/uuid-rs/uuid)
 - [version_check 0.9.5](https://github.com/SergioBenitez/version_check)
 
 ```text
@@ -9227,7 +9228,7 @@ Used by:
 - [inout 0.2.2](https://github.com/RustCrypto/utils)
 - [md-5 0.11.0](https://github.com/RustCrypto/hashes)
 - [sha2 0.10.9](https://github.com/RustCrypto/hashes)
-- [sha2 0.11.0](https://github.com/RustCrypto/hashes)
+- [sha2 0.11.1](https://github.com/RustCrypto/hashes)
 
 ```text
                               Apache License
@@ -11968,7 +11969,7 @@ Used by:
 - [async-trait 0.1.92](https://github.com/dtolnay/async-trait)
 - [auto_enums 0.8.10](https://github.com/taiki-e/auto_enums)
 - [aws-credential-types 1.3.0](https://github.com/smithy-lang/smithy-rs)
-- [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
+- [aws-lc-sys 0.46.0](https://github.com/aws/aws-lc-rs)
 - [aws-sigv4 1.6.0](https://github.com/smithy-lang/smithy-rs)
 - [aws-smithy-async 1.3.0](https://github.com/smithy-lang/smithy-rs)
 - [aws-smithy-eventstream 0.61.4](https://github.com/smithy-lang/smithy-rs)
@@ -12006,7 +12007,7 @@ Used by:
 - [khronos_api 3.1.0](https://github.com/brendanzab/gl-rs/)
 - [libc 0.2.190](https://github.com/rust-lang/libc)
 - [linebender_resource_handle 0.1.1](https://github.com/linebender/raw_resource_handle)
-- [litrs 1.0.0](https://github.com/LukasKalbertodt/litrs)
+- [litrs 1.0.1](https://github.com/LukasKalbertodt/litrs)
 - [miniz_oxide 0.8.9](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - [miniz_oxide 0.9.1](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide)
 - [naga-types 30.0.1](https://github.com/gfx-rs/wgpu)
@@ -12045,7 +12046,7 @@ Used by:
 - [serde_core 1.0.229](https://github.com/serde-rs/serde)
 - [serde_derive 1.0.229](https://github.com/serde-rs/serde)
 - [serde_derive_internals 0.30.0](https://github.com/serde-rs/serde)
-- [serde_json 1.0.151](https://github.com/serde-rs/json)
+- [serde_json 1.0.154](https://github.com/serde-rs/json)
 - [serde_path_to_error 0.1.20](https://github.com/dtolnay/path-to-error)
 - [serde_repr 0.1.21](https://github.com/dtolnay/serde-repr)
 - [serde_urlencoded 0.7.1](https://github.com/nox/serde_urlencoded)
@@ -12053,7 +12054,7 @@ Used by:
 - [simdutf8 0.1.5](https://github.com/rusticstuff/simdutf8)
 - [spirv 0.4.0+sdk-1.4.341.0](https://github.com/gfx-rs/rspirv)
 - [syn 2.0.119](https://github.com/dtolnay/syn)
-- [syn 3.0.6](https://github.com/dtolnay/syn)
+- [syn 3.0.9](https://github.com/dtolnay/syn)
 - [sync_wrapper 1.0.2](https://github.com/Actyx/sync_wrapper)
 - [task-local 0.1.1](https://github.com/BugenZhao/task-local)
 - [thiserror-impl 1.0.69](https://github.com/dtolnay/thiserror)
@@ -12064,7 +12065,7 @@ Used by:
 - [time 0.3.55](https://github.com/time-rs/time)
 - [type-map 0.5.1](https://github.com/kardeiz/type-map)
 - [typed-path 0.12.3](https://github.com/chipsenkbeil/typed-path)
-- [unicode-ident 1.0.26](https://github.com/dtolnay/unicode-ident)
+- [unicode-ident 1.0.27](https://github.com/dtolnay/unicode-ident)
 - [utf8parse 0.2.2](https://github.com/alacritty/vte)
 - [vello_common 0.1.0](https://github.com/linebender/vello)
 - [vello_cpu 0.1.0](https://github.com/linebender/vello)
@@ -12848,7 +12849,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Used by:
 
 - [alloc-stdlib 0.2.4](https://github.com/dropbox/rust-alloc-no-stdlib)
-- [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
+- [aws-lc-sys 0.46.0](https://github.com/aws/aws-lc-rs)
 
 ```text
 Copyright (c) <year> <owner>. 
@@ -13652,8 +13653,8 @@ third-party/chromium/LICENSE.
 
 Used by:
 
-- [aws-lc-rs 1.18.1](https://github.com/aws/aws-lc-rs)
-- [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
+- [aws-lc-rs 1.18.2](https://github.com/aws/aws-lc-rs)
+- [aws-lc-sys 0.46.0](https://github.com/aws/aws-lc-rs)
 
 ```text
 ISC License:
@@ -13738,7 +13739,7 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 
 Used by:
 
-- [schemars 1.2.2](https://github.com/GREsau/schemars)
+- [schemars 1.2.3](https://github.com/GREsau/schemars)
 
 ```text
 #![allow(clippy::all)]
@@ -15009,8 +15010,8 @@ SOFTWARE.
 
 Used by:
 
-- [schemars 1.2.2](https://github.com/GREsau/schemars)
-- [schemars_derive 1.2.2](https://github.com/GREsau/schemars)
+- [schemars 1.2.3](https://github.com/GREsau/schemars)
+- [schemars_derive 1.2.3](https://github.com/GREsau/schemars)
 
 ```text
 MIT License
@@ -15421,8 +15422,8 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 Used by:
 
 - [tokio-stream 0.1.19](https://github.com/tokio-rs/tokio)
-- [tokio-util 0.7.19](https://github.com/tokio-rs/tokio)
-- [tokio 1.53.2](https://github.com/tokio-rs/tokio)
+- [tokio-util 0.7.20](https://github.com/tokio-rs/tokio)
+- [tokio 1.53.3](https://github.com/tokio-rs/tokio)
 
 ```text
 MIT License
@@ -15937,7 +15938,7 @@ SOFTWARE.
 
 Used by:
 
-- [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
+- [aws-lc-sys 0.46.0](https://github.com/aws/aws-lc-rs)
 
 ```text
 The MIT License (MIT)
@@ -17064,7 +17065,7 @@ DEALINGS IN THE FONT SOFTWARE.
 
 Used by:
 
-- [unicode-ident 1.0.26](https://github.com/dtolnay/unicode-ident)
+- [unicode-ident 1.0.27](https://github.com/dtolnay/unicode-ident)
 
 ```text
 UNICODE LICENSE V3

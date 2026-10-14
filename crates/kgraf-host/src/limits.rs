@@ -52,6 +52,13 @@ pub const KEY_PLAN_MODE: &str = "plan_mode";
 /// `settings.toml` key: whether a request the rule cannot size starts its one
 /// worker beside the triage call (decision 0100). Unset is off.
 pub const KEY_EARLY_START: &str = "early_start";
+/// `settings.toml` key: whether a plan's contract may carry a check of its
+/// own, run only when the run's check tests nothing (decision 0100). Unset
+/// is off.
+pub const KEY_OWN_CHECKS: &str = "own_checks";
+/// `settings.toml` key: whether the zero-test rule applies to every
+/// contract, not only a small request's (decision 0100). Unset is off.
+pub const KEY_ZERO_TEST_PLANS: &str = "zero_test_plans";
 
 /// Slider bounds (inclusive).
 pub const ROUNDS_BOUNDS: (u32, u32) = (4, 200);
@@ -105,6 +112,10 @@ pub struct UserLimits {
     pub plan_mode: Option<kgraf_orchestrator::triage::PlanMode>,
     /// Not a limit: early start beside a triage call (decision 0100).
     pub early_start: Option<bool>,
+    /// Not a limit: contract checks of their own (decision 0100).
+    pub own_checks: Option<bool>,
+    /// Not a limit: the zero-test rule for every contract (decision 0100).
+    pub zero_test_plans: Option<bool>,
 }
 
 /// `settings.toml` table: the reasoning level of each model call (decision
@@ -183,6 +194,8 @@ impl UserLimits {
             reasoning: read_reasoning(&table)?,
             plan_mode: read_plan_mode(&table)?,
             early_start: read_bool_key(&table, KEY_EARLY_START)?,
+            own_checks: read_bool_key(&table, KEY_OWN_CHECKS)?,
+            zero_test_plans: read_bool_key(&table, KEY_ZERO_TEST_PLANS)?,
         })
     }
 
@@ -268,6 +281,10 @@ pub struct ResolvedLimits {
     pub plan_mode: (kgraf_orchestrator::triage::PlanMode, Source),
     /// Off by default.
     pub early_start: (bool, Source),
+    /// Off by default.
+    pub own_checks: (bool, Source),
+    /// Off by default.
+    pub zero_test_plans: (bool, Source),
 }
 
 impl ResolvedLimits {
@@ -306,6 +323,8 @@ impl ResolvedLimits {
             reasoning_flags: flags.reasoning,
             plan_mode: pick(flags.plan_mode, user.plan_mode, Default::default()),
             early_start: pick(flags.early_start, user.early_start, false),
+            own_checks: pick(flags.own_checks, user.own_checks, false),
+            zero_test_plans: pick(flags.zero_test_plans, user.zero_test_plans, false),
         }
     }
 

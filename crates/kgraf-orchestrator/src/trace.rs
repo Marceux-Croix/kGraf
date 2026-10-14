@@ -353,6 +353,34 @@ pub enum TraceEvent {
         decided_us: i64,
         detail: String,
     },
+    /// A stopped or completed run reopened with a change (decision 0100,
+    /// section 5): a new working session begins. Readers that sum run time
+    /// split sessions here, so the idle gap before it is not run time.
+    Reopened {
+        at_ms: i64,
+        /// The working session that begins: 1 for the first reopen.
+        session: u32,
+        /// The run's status before the reopen.
+        from: String,
+        /// The change it carries.
+        change: u32,
+        /// When the session before ended: the record's last save before the
+        /// reopen. Readers count the time from it to this event as between
+        /// sessions, not run time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev_session_end_ms: Option<i64>,
+    },
+    /// One change's step (decision 0100, section 3): `received`, `planning`,
+    /// `answered`, `applied`, `refused`, `pending`, `reasked` or `cancelled`
+    /// (a running attempt the change stopped), with what it did.
+    Change {
+        at_ms: i64,
+        number: u32,
+        step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
+        detail: String,
+    },
     /// Question 6. Accounting only (decision 0080 removed every spend cap).
     Spend {
         at_ms: i64,
@@ -1156,7 +1184,21 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             decided_us,
             detail: s(detail),
         },
+        TraceEvent::Change {
+            at_ms,
+            number,
+            step,
+            class,
+            detail,
+        } => TraceEvent::Change {
+            at_ms,
+            number,
+            step,
+            class,
+            detail: s(detail),
+        },
         other @ (TraceEvent::Dispatch { .. }
+        | TraceEvent::Reopened { .. }
         | TraceEvent::RouteRecovered { .. }
         | TraceEvent::AnswerRepaired { .. }
         | TraceEvent::WorkerFinished { .. }

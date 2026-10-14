@@ -43,6 +43,10 @@ pub enum ReasoningProcess {
     /// 0100): one capped call, sent with reasoning off unless this kind's own
     /// level is set.
     Triage,
+    /// A change re-planned against an existing plan (decision 0100): one
+    /// capped call, sent with reasoning off unless this kind's own level is
+    /// set.
+    ReplanDelta,
     /// A party's statement of an interface, on that party's own route.
     Handshake,
     /// A consumer's own test of a producer's interface, on its route.
@@ -84,7 +88,7 @@ impl ReasoningGroup {
 
 impl ReasoningProcess {
     /// Every kind, grouped, in the order a user is shown them.
-    pub const ALL: [ReasoningProcess; 15] = [
+    pub const ALL: [ReasoningProcess; 16] = [
         ReasoningProcess::Decompose,
         ReasoningProcess::Interfaces,
         ReasoningProcess::Reground,
@@ -95,6 +99,7 @@ impl ReasoningProcess {
         ReasoningProcess::QuestionAnswer,
         ReasoningProcess::ChallengeReview,
         ReasoningProcess::Triage,
+        ReasoningProcess::ReplanDelta,
         ReasoningProcess::Handshake,
         ReasoningProcess::ConsumerTest,
         ReasoningProcess::InterfaceReview,
@@ -116,6 +121,7 @@ impl ReasoningProcess {
             ReasoningProcess::QuestionAnswer => "question_answer",
             ReasoningProcess::ChallengeReview => "challenge_review",
             ReasoningProcess::Triage => "triage",
+            ReasoningProcess::ReplanDelta => "replan_delta",
             ReasoningProcess::Handshake => "handshake",
             ReasoningProcess::ConsumerTest => "consumer_test",
             ReasoningProcess::InterfaceReview => "interface_review",
@@ -140,7 +146,8 @@ impl ReasoningProcess {
             | ReasoningProcess::QuestionRoute
             | ReasoningProcess::QuestionAnswer
             | ReasoningProcess::ChallengeReview
-            | ReasoningProcess::Triage => ReasoningGroup::Planner,
+            | ReasoningProcess::Triage
+            | ReasoningProcess::ReplanDelta => ReasoningGroup::Planner,
             ReasoningProcess::Handshake
             | ReasoningProcess::ConsumerTest
             | ReasoningProcess::InterfaceReview => ReasoningGroup::Checks,

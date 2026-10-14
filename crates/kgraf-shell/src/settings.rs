@@ -445,6 +445,8 @@ impl RunLimitSliders {
             reasoning: kgraf_provider::ReasoningLevels::new(),
             plan_mode: None,
             early_start: None,
+            own_checks: None,
+            zero_test_plans: None,
         }
     }
 
@@ -627,6 +629,13 @@ pub struct Settings {
     /// once (decision 0100; on by default). Only has an effect with
     /// `plan_auto`.
     pub early_start: bool,
+    /// A plan's contract may carry a check of its own, run only when the
+    /// run's check tests nothing (decision 0100). Off by default.
+    pub own_checks: bool,
+    /// A planned contract whose narrowed check selects no test stays
+    /// unverified until the root gate passes over it, as a small request's
+    /// does (decision 0100). Off by default.
+    pub zero_test_plans: bool,
 }
 
 impl Settings {
@@ -647,6 +656,9 @@ impl Settings {
             // Only with small requests on: the setting has no effect
             // otherwise, and a run file or a flag decides with it unset.
             early_start: self.plan_auto.then_some(self.early_start),
+            // Written only when on: off is the default everywhere.
+            own_checks: self.own_checks.then_some(true),
+            zero_test_plans: self.zero_test_plans.then_some(true),
             ..self.limits.user_limits()
         }
     }
@@ -675,6 +687,8 @@ impl Default for Settings {
             reasoning: kgraf_provider::ReasoningLevels::new(),
             plan_auto: false,
             early_start: true,
+            own_checks: false,
+            zero_test_plans: false,
         }
     }
 }
@@ -763,6 +777,12 @@ struct SettingsFile {
     /// default.
     #[serde(skip_serializing_if = "Option::is_none")]
     early_start: Option<bool>,
+    /// Decision 0100's two opt-in settings; absent is off. Read with the
+    /// host's reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    own_checks: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zero_test_plans: Option<bool>,
 }
 
 impl Settings {
@@ -828,6 +848,8 @@ impl Settings {
         settings.reasoning = user.reasoning;
         settings.plan_auto = user.plan_mode == Some(kgraf_orchestrator::triage::PlanMode::Auto);
         settings.early_start = user.early_start.unwrap_or(settings.early_start);
+        settings.own_checks = user.own_checks.unwrap_or(false);
+        settings.zero_test_plans = user.zero_test_plans.unwrap_or(false);
         settings.limits = RunLimitSliders::from_user_limits(user);
         if let Some(a) = file.appearance {
             settings.appearance = a;
@@ -916,6 +938,8 @@ impl Settings {
             // Written when it applies or differs from the default, so a file
             // with neither keeps the command line's own default (off).
             early_start: (self.plan_auto || !self.early_start).then_some(self.early_start),
+            own_checks: self.own_checks.then_some(true),
+            zero_test_plans: self.zero_test_plans.then_some(true),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -1457,6 +1481,43 @@ mod tests {
         assert_eq!(loaded.run_limits().plan_mode, Some(PlanMode::Auto));
         assert_eq!(loaded.run_limits().early_start, Some(false));
         assert!(Settings::from_toml_str("plan_mode = \"small\"").is_err());
+    }
+
+    /// Decision 0100's opt-in settings: off by default and absent from a
+    /// saved file; on, they round-trip through the file the command line
+    /// reads and reach every run the app starts.
+    #[test]
+    fn the_own_check_and_zero_test_toggles_round_trip_and_reach_the_run_limits() {
+        let fresh = Settings::from_toml_str("").expect("valid");
+        assert!(!fresh.own_checks && !fresh.zero_test_plans);
+        assert_eq!(
+            (
+                fresh.run_limits().own_checks,
+                fresh.run_limits().zero_test_plans
+            ),
+            (None, None)
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("own_checks") && !text.contains("zero_test_plans"));
+        let chosen = Settings {
+            own_checks: true,
+            zero_test_plans: true,
+            ..Settings::default()
+        };
+        chosen.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let user = kgraf_host::limits::UserLimits::from_toml_str(&text).expect("host reads it");
+        assert_eq!(
+            (user.own_checks, user.zero_test_plans),
+            (Some(true), Some(true))
+        );
+        let loaded = Settings::load(&path).expect("load");
+        assert!(loaded.own_checks && loaded.zero_test_plans);
+        assert_eq!(loaded.run_limits().own_checks, Some(true));
+        assert_eq!(loaded.run_limits().zero_test_plans, Some(true));
     }
 
     #[test]

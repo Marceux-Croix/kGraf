@@ -291,6 +291,7 @@ fn plan_request() -> PlanRequest {
         templates: vec![],
         interfaces: false,
         project_context: String::new(),
+        own_checks: false,
     }
 }
 

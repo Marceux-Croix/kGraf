@@ -140,6 +140,11 @@ pub enum Closure {
     Verified,
     /// Its handoff was re-split into children, which replaced it.
     Superseded,
+    /// A change replaced it with a new revision under another id (decision
+    /// 0100): its writes, dependencies, route or check changed.
+    Replaced,
+    /// A change removed it before it was verified (decision 0100).
+    Removed,
 }
 
 /// A verified contract's own account of its reasons, labeled with the model

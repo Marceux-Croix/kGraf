@@ -87,6 +87,20 @@ impl RunLoop {
         specs: Vec<ContractSpec>,
         outer: &BTreeSet<String>,
     ) -> Result<Vec<ContractSpec>, OrchestratorError> {
+        self.collapse_chains_with(specs, outer, &BTreeSet::new())
+            .await
+    }
+
+    /// [`Self::collapse_chains`] for contracts that may depend on others
+    /// outside them (`external`): a change's added contracts depend on the
+    /// plan's open and verified ones, which the merged result's validation
+    /// takes as given.
+    pub(super) async fn collapse_chains_with(
+        &mut self,
+        specs: Vec<ContractSpec>,
+        outer: &BTreeSet<String>,
+        external: &BTreeSet<String>,
+    ) -> Result<Vec<ContractSpec>, OrchestratorError> {
         if !outer.is_empty() || !self.config.collapse_chains || specs.len() < 2 {
             return Ok(specs);
         }
@@ -119,7 +133,7 @@ impl RunLoop {
         // traced.
         let checked = validate_plan_with(
             &collapsed,
-            &BTreeSet::new(),
+            external,
             &self.roster(),
             &self.tools(),
             self.config.max_contracts_per_plan,

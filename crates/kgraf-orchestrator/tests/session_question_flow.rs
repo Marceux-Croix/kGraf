@@ -114,12 +114,18 @@ struct Fake {
     answer_gate: Option<Arc<tokio::sync::Semaphore>>,
     judged: Mutex<Vec<usize>>,
     asked: AtomicUsize,
+    /// The instruction each answer and judgment call was given.
+    instructions: Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl QuestionAnswerer for Fake {
-    async fn try_answer(&self, _r: &AnswerRequest) -> Result<AnswerOutput, PlanError> {
+    async fn try_answer(&self, r: &AnswerRequest) -> Result<AnswerOutput, PlanError> {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        self.instructions
+            .lock()
+            .expect("lock")
+            .push(r.original_instruction.clone());
         if self.answer_parks {
             std::future::pending::<()>().await;
         }
@@ -154,6 +160,10 @@ impl QuestionAnswerer for Fake {
 
     async fn judge_connections(&self, r: &JudgeRequest) -> Result<JudgeOutput, PlanError> {
         self.judged.lock().expect("lock").push(r.requests.len());
+        self.instructions
+            .lock()
+            .expect("lock")
+            .push(r.original_instruction.clone());
         if self.judge_panics {
             panic!("the judgment call panicked, on purpose");
         }
@@ -1062,6 +1072,60 @@ async fn a_judge_that_returns_no_verdict_refuses_the_pair_and_the_loop_lives() {
     handle.stop().await;
     let report = run.await.expect("join").expect("the run ends normally");
     assert_eq!(report.status, RunStatus::Stopped);
+}
+
+/// Answering a question and judging a message read the instruction log
+/// (decision 0100): the original instruction and every applied change, not
+/// the original alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_and_judgments_read_the_instruction_log() {
+    use kgraf_orchestrator::delta::{ChangeSource, ChangeState, RecordedChange};
+    let dir = tempfile::tempdir().expect("dir");
+    let p = parts(
+        dir.path(),
+        &[
+            c("a", "make a HANG", "src/a.rs", &[]),
+            c("b", "make b HANG", "src/b.rs", &[]),
+        ],
+        Duration::from_millis(5),
+    );
+    let mut r = kgraf_orchestrator::RunStateRecord::new(RunId::new("r1"), "make a and b", 0);
+    let mut change = RecordedChange::received(1, ChangeSource::Change, "LOGMARK", None, 1, 0);
+    change.state = ChangeState::Applied;
+    change.outside_done = true;
+    r.changes.push(change);
+    RunStore::new(p.graph.clone()).save(&r).expect("save");
+    hang(&p);
+    let fake = Arc::new(Fake {
+        answer: Some(ANSWER.into()),
+        ..Fake::default()
+    });
+    let o = Orchestrator::new(config(), p.services(WINDOW))
+        .expect("orchestrator")
+        .with_question_answerer(fake.clone());
+    let handle = o.handle();
+    let run = tokio::spawn(o.resume(RunId::new("r1")));
+    until("both park", || {
+        p.stats.requests().iter().filter(|r| r.2 == 1).count() >= 2
+    })
+    .await;
+    let (a0, b0) = (AgentId::new("r1-a-r0-a0"), AgentId::new("r1-b-r0-a0"));
+    handle
+        .ask_question(a0.clone(), "which file?".into())
+        .await
+        .expect("answered");
+    let _ = handle.send_message(a0, b0, "hi".into()).await;
+    let seen = fake.instructions.lock().expect("lock").clone();
+    assert_eq!(seen.len(), 2, "one answer and one judgment: {seen:?}");
+    for instruction in &seen {
+        assert!(
+            instruction.contains("make a and b") && instruction.contains("LOGMARK"),
+            "{instruction}"
+        );
+    }
+    unhang(&p);
+    handle.stop().await;
+    let _ = run.await.expect("join");
 }
 
 // ------------------------------------------------------------------

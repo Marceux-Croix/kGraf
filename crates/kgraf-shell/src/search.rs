@@ -449,6 +449,8 @@ fn briefs_of(runs: &[StoredRun]) -> Vec<BriefDoc> {
                 state: match c.closure {
                     Closure::Verified => "verified",
                     Closure::Superseded => "superseded",
+                    Closure::Replaced => "replaced",
+                    Closure::Removed => "removed",
                 },
                 instruction: c.instruction.clone(),
                 routes: c.worker_routes.join(" ").to_lowercase(),

@@ -85,6 +85,11 @@ pub(crate) struct CommandVerifier {
     /// be deferred to it ([`deferred_notice`]); without it a deferred check
     /// would never run.
     pub(crate) root_gate: bool,
+    /// The zero-test rule for every contract, not only a small request's
+    /// (decision 0100, an opt-in setting): a narrowed cargo check that
+    /// selects no test marks the verdict, and the contract stays unverified
+    /// until the root gate passes over it.
+    pub(crate) zero_test_plans: bool,
 }
 
 /// Tries of the hold check, and the pause between them: a process that has
@@ -1410,6 +1415,7 @@ impl Verifier for CommandVerifier {
         // complete. Without one, a check that waits on open contracts fails
         // and says why it cannot judge this contract alone.
         let root_gate = self.root_gate;
+        let zero_test_plans = self.zero_test_plans;
         let unmerged = unmerged.to_vec();
         let Some(ws) = self.workspaces.get(workspace) else {
             return Err(format!(
@@ -1576,6 +1582,42 @@ impl Verifier for CommandVerifier {
                 if !ok {
                     (passed, output, failing) = (false, out, gate_command.clone());
                     break;
+                }
+            }
+            // Decision 0100: the contract's own checks run only where the
+            // run's check tests nothing, the whole command (`true`) or a
+            // narrowed cargo check that selects no test, so a contract the
+            // run's check does judge is judged as before. A failure fails the
+            // attempt with the check's output; a pass is marked in the
+            // verdict, and the orchestrator counts it as a check beside the
+            // vacuous one. Run before the dependents' checks below, so a
+            // contract whose own check ran is judged by it whether or not a
+            // dependent package also tests it.
+            let mut own_checked: Vec<String> = Vec::new();
+            if passed && commit.is_some() && kgraf_orchestrator::own_checks_real(&contract) {
+                let writes: Vec<&str> = contract.writes.iter().map(|w| w.path.as_str()).collect();
+                let zero_test = (zero_test_plans
+                    || kgraf_orchestrator::triage::is_small_contract(&contract))
+                    && crate::scoped_check::cargo_selects_no_tests(&whole, ws.root(), &writes)
+                        .is_some();
+                if kgraf_orchestrator::vacuous_check(&command) || zero_test {
+                    for check in &contract.contract_checks {
+                        let (ok, out) = run_confined(
+                            &ws,
+                            manager.repo(),
+                            &denies,
+                            check,
+                            timeout,
+                            CHECK_OUTPUT_CAP,
+                            warm.as_deref(),
+                        )?;
+                        if !ok {
+                            (passed, output, failing) = (false, out, check.clone());
+                            own_checked.clear();
+                            break;
+                        }
+                        own_checked.push(check.clone());
+                    }
                 }
             }
             // Decision 0018, amended 2026-10-02: the whole command judges the
@@ -1927,12 +1969,23 @@ impl Verifier for CommandVerifier {
                         contract.writes.iter().map(|w| w.path.as_str()).collect();
                     let vacuous = (dependents.passed.is_empty()
                         && contract.gate_commands.is_empty()
-                        && kgraf_orchestrator::triage::is_small_contract(&contract))
+                        && own_checked.is_empty()
+                        && (zero_test_plans
+                            || kgraf_orchestrator::triage::is_small_contract(&contract)))
                     .then(|| {
                         crate::scoped_check::cargo_selects_no_tests(&whole, ws.root(), &writes)
                     })
                     .flatten();
                     let by = by_with_dependents(command, &dependents);
+                    let by = if own_checked.is_empty() {
+                        by
+                    } else {
+                        format!(
+                            "{by} [{}: {}]",
+                            kgraf_orchestrator::CONTRACT_CHECK_PASSED,
+                            own_checked.join(" && ")
+                        )
+                    };
                     match vacuous {
                         Some(packages) => format!(
                             "{by} [{}: {} has no recognized test target]",

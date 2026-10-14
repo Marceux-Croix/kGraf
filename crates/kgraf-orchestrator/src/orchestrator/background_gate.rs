@@ -178,7 +178,7 @@ impl RunLoop {
     /// left unverified because its narrowed check selected no test
     /// ([`crate::shortfall::SCOPED_CHECK_VACUOUS`]) is now judged by the
     /// whole suite, so its mark is cleared, with a notice.
-    async fn clear_vacuous_marks(
+    pub(super) async fn clear_vacuous_marks(
         &mut self,
         gate: &str,
         merged: &[String],

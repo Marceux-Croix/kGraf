@@ -211,6 +211,28 @@ impl RunLoop {
             })
             .collect();
         contract.slice_from = writes.first().cloned();
+        contract.small = true;
+        // Its spec, kept after it closes as a planned contract's is
+        // (decision 0100): a later change reads what it wrote.
+        self.record.plan_specs.insert(
+            id.clone(),
+            ContractSpec {
+                id: id.clone(),
+                instruction: contract.instruction.clone(),
+                acceptance: contract.acceptance.clone(),
+                writes: contract.writes.clone(),
+                depends_on: Vec::new(),
+                slices: Vec::new(),
+                tools: Vec::new(),
+                route: None,
+                attempts: 1,
+                task_kind: None,
+                check: None,
+            },
+        );
+        if self.record.plan_root.is_none() {
+            self.record.plan_root = Some(self.record.run.clone());
+        }
         self.record.open_contracts = vec![contract];
         // No interface is registered for it: one contract has no edge. The
         // early contract is never an interface party.

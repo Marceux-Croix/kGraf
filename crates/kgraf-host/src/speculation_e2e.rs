@@ -282,6 +282,7 @@ async fn run_pair(
             timeout: Duration::from_secs(120),
             permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
             root_gate: false,
+            zero_test_plans: false,
         }),
         workspaces: workspaces.clone(),
         clock: Arc::new(SystemClock),

@@ -1125,6 +1125,17 @@ pub fn shortfall_brief(c: &OpenContract) -> String {
 /// commands is judged by them and never carries it.
 pub const SCOPED_CHECK_VACUOUS: &str = "scoped_check_vacuous";
 
+/// The mark a passing verdict's `by` carries when the contract's own checks
+/// (decision 0100, `OpenContract::contract_checks`) ran because the run's
+/// check tested nothing, and passed: `[contract_check_passed: <commands>]`.
+/// [`accepted_standing`] counts it as a check beside the vacuous one.
+pub const CONTRACT_CHECK_PASSED: &str = "contract_check_passed";
+
+/// Whether a verdict's `by` carries [`CONTRACT_CHECK_PASSED`].
+pub fn contract_check_passed(verified_by: &str) -> bool {
+    verified_by.contains(&format!("[{CONTRACT_CHECK_PASSED}:"))
+}
+
 /// The zero-test mark in a verdict's `by`, with what it names.
 fn scoped_check_vacuous(verified_by: &str) -> Option<&str> {
     let start = verified_by.find(&format!("[{SCOPED_CHECK_VACUOUS}:"))?;
@@ -1139,6 +1150,108 @@ pub fn vacuous_check(command: &str) -> bool {
         c,
         "" | "true" | ":" | "exit 0" | "/bin/true" | "/usr/bin/true" | "true;" | "exit"
     )
+}
+
+/// Why a contract's own check (decision 0100, `ContractSpec::check`) is
+/// refused at intake, or `None` when it is taken. The planner writes the
+/// command, so it is judged as a worker's shell call would be under the
+/// user's permissions: it must check something ([`vacuous_check`]); no
+/// program in it may meet a deny or ask rule of the user's (those bind in
+/// every mode); and past the rules the mode decides. Bypass and Orchestrator
+/// decides take it; Auto takes it when every program is in the allow set;
+/// Manual and Accept edits would ask, and an intake check has nobody to ask,
+/// so they take it only when every program is in the allow set the user
+/// wrote.
+pub fn check_refusal(
+    command: &str,
+    writes: &[String],
+    settings: &kgraf_tools::permissions::PermissionSettings,
+) -> Option<String> {
+    use kgraf_tools::permissions::{HardLimit, PermissionMode, hard_limit, simple_commands};
+    if let Some(why) = own_check_vacuous(command, writes) {
+        return Some(format!(
+            "the contract's check `{}` checks nothing: {why}; give a command that runs a test, a \
+             build or an assertion over the files the contract writes, or none",
+            command.trim()
+        ));
+    }
+    let argv = vec!["sh".to_owned(), "-c".to_owned(), command.to_owned()];
+    let mut programs = Vec::new();
+    // Entry 0 is the wrapper shell; the rest are the script's own commands.
+    for words in simple_commands(&argv).into_iter().skip(1) {
+        let call = kgraf_tools::approval::PendingCall {
+            call_id: String::new(),
+            tool: "shell".into(),
+            input: serde_json::json!({ "command": words }),
+            worker: kgraf_core::AgentId::new("contract-check"),
+            task: kgraf_core::TaskId::new("contract-check"),
+        };
+        if let Some(HardLimit::Deny(reason) | HardLimit::Ask(reason)) =
+            hard_limit(&settings.rules, &call, None, None)
+        {
+            return Some(format!(
+                "the contract's check `{}` runs what your rules refuse or ask about: {reason}",
+                command.trim()
+            ));
+        }
+        if let Some(p) = words.first() {
+            programs.push(p.clone());
+        }
+    }
+    match settings.mode {
+        PermissionMode::Bypass | PermissionMode::OrchestratorDecides => None,
+        mode => {
+            let missing: Vec<&String> = programs
+                .iter()
+                .filter(|p| !settings.allow.allows_program(p))
+                .collect();
+            (!missing.is_empty()).then(|| {
+                format!(
+                    "the contract's check `{}` runs {} outside your allow set, and your \
+                     permission mode ({}) would ask before running it",
+                    command.trim(),
+                    missing
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    mode.as_str()
+                )
+            })
+        }
+    }
+}
+
+/// Why a contract's own check (decision 0100) checks nothing, or `None` when
+/// its exit status can fail because a test run, a build, or an assertion over
+/// a file the contract writes (`writes`) failed (`own_check.rs`). Listing,
+/// printing, existence tests, no-ops, version requests and a status masked
+/// by `|| true`, `; true` or `exit 0` never count.
+pub fn own_check_vacuous(command: &str, writes: &[String]) -> Option<String> {
+    if vacuous_check(command) {
+        return Some("it always passes".to_owned());
+    }
+    crate::own_check::vacuous(command, writes)
+}
+
+/// Whether `contract`'s own checks may count as a real check of its work: it
+/// has some, and none of them checks nothing. An older record, or a copy,
+/// may carry a check intake would refuse today; it never overrules a vacuous
+/// verdict or a worker's shortfall.
+pub fn own_checks_real(contract: &OpenContract) -> bool {
+    let writes: Vec<String> = contract.writes.iter().map(|w| w.path.clone()).collect();
+    !contract.contract_checks.is_empty()
+        && contract
+            .contract_checks
+            .iter()
+            .all(|c| own_check_vacuous(c, &writes).is_none())
+}
+
+/// Whether a pass verdict `by` was checked by `contract`'s own check: the
+/// verifier marked it as run and passed, and the check tests something. A
+/// vacuous own check never overrules a vacuous verdict or a shortfall.
+pub fn own_check_counts(contract: &OpenContract, by: &str) -> bool {
+    contract_check_passed(by) && own_checks_real(contract)
 }
 
 /// What an accepted attempt's check and its worker's refusals say about it
@@ -1219,7 +1332,12 @@ pub fn accepted_standing(
             refusal_notice: None,
         };
     }
-    if gate_checked || !vacuous_check(verified_by) {
+    // A contract's own-check mark is no check by itself: the caller counts
+    // it in `gate_checked` only when the check is real.
+    let base = verified_by
+        .find(&format!(" [{CONTRACT_CHECK_PASSED}:"))
+        .map_or(verified_by, |at| &verified_by[..at]);
+    if gate_checked || !vacuous_check(base) {
         return AcceptedStanding {
             unverified: None,
             refusal_notice: refused

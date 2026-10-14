@@ -94,6 +94,7 @@ impl RunLoop {
         outer: &BTreeSet<String>,
     ) -> Result<Option<Decomposition>, OrchestratorError> {
         request.interfaces = self.contracts.is_some();
+        request.own_checks = self.config.own_checks;
         // The planner is told the package names and the signatures of what the
         // instruction names, from the manifests and the graph, so it does not
         // invent them (`planner_context`). Built once: a re-ask sees the same.
@@ -364,6 +365,28 @@ impl RunLoop {
         };
         // The planner's own model-tool calls, settled now whatever the answer.
         self.settle_model_tool_calls()?;
+        // The first plan's calls, kept for the change report's measure
+        // (decision 0100): not a held plan's re-plan, nor a handoff's split,
+        // nor plan review's full re-plan (it leaves a `plan-change-*` note).
+        let first_plan = !self.record.planned
+            && self.record.replans == 0
+            && !self
+                .record
+                .notes
+                .iter()
+                .any(|n| n.id.starts_with("plan-change-"));
+        let calls_of: Vec<String> = match &out {
+            Ok(o) => o.calls.iter().map(ToString::to_string).collect(),
+            Err(e) => e
+                .calls()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        };
+        if first_plan {
+            self.record.plan_calls.extend(calls_of);
+        }
         match out {
             Ok(out) => {
                 self.settle_call(reservation, Some(&out.calls))?;
@@ -391,6 +414,24 @@ impl RunLoop {
                 if let Some(refusal) = crate::plan::writeless_refusal(&specs) {
                     return Err(refusal.into());
                 }
+                // A contract's own check is judged at intake (decision
+                // 0100): one that checks nothing, or that the user's
+                // permissions would not run, is refused and asked again.
+                if self.config.own_checks {
+                    let settings = self.perms.control.settings();
+                    if let Some(why) = specs
+                        .iter()
+                        .filter_map(|s| s.check.as_deref().map(|c| (s, c)))
+                        .find_map(|(s, c)| {
+                            let writes: Vec<String> =
+                                s.writes.iter().map(|w| w.path.clone()).collect();
+                            crate::shortfall::check_refusal(c, &writes, &settings)
+                                .map(|why| format!("contract `{}`: {why}", s.id))
+                        })
+                    {
+                        return Err(PlanError::Invalid(why).into());
+                    }
+                }
                 Ok(Some(specs))
             }
             Err(e) => {
@@ -417,7 +458,7 @@ impl RunLoop {
     /// interfaces alone and their refusals. Every consumed edge no behavior
     /// interface binds is returned as unchecked, with the reason. `None`: a
     /// stop arrived during a call.
-    async fn interface_asks(
+    pub(super) async fn interface_asks(
         &mut self,
         context: PlanRequest,
         specs: &[ContractSpec],

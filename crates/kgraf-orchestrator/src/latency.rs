@@ -42,17 +42,17 @@ use std::time::Instant;
 /// | B1 | `note_ack` | the loop takes a note or box line | the note is persisted and its reply sent |
 /// | B2 | `small_request_dispatch` | the contract is eligible (its plan was accepted, or its last dependency merged; the last planner call ends when that is unknown); for a request the rule sized small, the request is received (a `triage` event marks the decision) | the worker's first ledger row starts. Its `kgraf_us` is the part the 1.5 s / 3 s target applies to: the wait for a slot (`capacity_wait_us`) and the sandbox checks (`checks_us`) are measured and named apart |
 /// | B3 | `triage_dispatch` | the request is received | the worker's first ledger row starts |
-/// | B4 | `delta_applied` | a change is received | it is applied to the plan and written |
+/// | B4 | `delta_applied` | the loop takes a change in | it is applied to the plan and written; model time is its delta calls |
 /// | B4a | `streamed_delta_dispatch` | an added contract's object parses | it is dispatched |
 /// | B5 | `queued_rewrite` | a rewriting op parses | the queued contract is rewritten |
 /// | B6 | `running_redirect` | a redirecting change is applied | the running worker sees it |
 /// | B6a | `node_files_redirect` | a change names a running worker's files | that worker sees it |
 /// | B7 | `watch_poll` | a run watch poll starts | its update is ready to send |
 /// | B8 | `land` | a land is requested | the merge commit is built |
-/// | B9 | `reopen` | a stopped run is reopened with a change | it is running again |
+/// | B9 | `reopen` | the request to reopen a stopped or completed run reaches kGraf (the host's start and the loop's opening are in it) | its change is applied and the run is running again |
 /// | B10 | `contract_merged` | the contract's dispatch starts | its verified work is merged |
 /// | B10a | `root_gate` | the gate is ready to start | its result is in |
-/// | B11 | `edit_applied` | an earlier instruction is opened | the edit is applied |
+/// | B11 | `edit_applied` | the loop takes an edited instruction in (the box's open step is measured apart, in its own tests) | the edit is applied |
 /// | B12 | `streamed_plan_dispatch` | an independent contract's object parses | it is dispatched |
 /// | B13 | `land_suggestion` | the trigger fires | the suggestion is raised |
 /// | B14 | `node_note_ack` | a message to a work node arrives | it is acknowledged |
@@ -135,9 +135,12 @@ impl LatencyKind {
             Self::NoteAck
                 | Self::SmallRequestDispatch
                 | Self::TriageDispatch
+                | Self::DeltaApplied
                 | Self::WatchPoll
+                | Self::Reopen
                 | Self::ContractMerged
                 | Self::RootGate
+                | Self::EditApplied
         )
     }
 }
@@ -1025,7 +1028,10 @@ mod tests {
             .filter(|k| k.is_emitted())
             .map(|k| k.budget())
             .collect();
-        assert_eq!(emitted, ["B1", "B2", "B3", "B7", "B10", "B10a"]);
+        assert_eq!(
+            emitted,
+            ["B1", "B2", "B3", "B4", "B7", "B9", "B10", "B10a", "B11"]
+        );
     }
 
     #[test]

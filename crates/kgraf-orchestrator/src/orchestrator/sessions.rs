@@ -943,8 +943,10 @@ impl RunLoop {
         };
         let request = AnswerRequest {
             session: session.clone(),
-            original_instruction: kgraf_secrets::model_copy(&self.record.original_instruction)
-                .into_owned(),
+            original_instruction: kgraf_secrets::model_copy(&crate::delta::instruction_text(
+                &self.record,
+            ))
+            .into_owned(),
             question: question.for_model(),
             verified: self.record.verified_contracts.clone(),
             // Untrusted (the user's or another agent's words): quoted as

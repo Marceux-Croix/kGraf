@@ -13,6 +13,7 @@ pub mod chrome;
 pub mod compaction_measure;
 pub mod dependency_prompt;
 pub mod diag;
+pub mod edit_card;
 pub mod error;
 pub mod icon;
 pub mod icons;

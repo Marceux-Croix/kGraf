@@ -64,9 +64,11 @@ pub const SMALL_ACCEPTANCE: &str =
     "the run's acceptance check, narrowed to the tests of the files this contract writes, passes";
 
 /// Whether `contract` is a small request's one contract: the zero-test rule
-/// applies to it, not (yet) to a planned contract.
+/// applies to it (and to a planned contract only with that setting on). Its
+/// `small` flag says so; a record from before the flag is told by its
+/// acceptance text.
 pub fn is_small_contract(contract: &crate::run_state::OpenContract) -> bool {
-    contract.acceptance == SMALL_ACCEPTANCE
+    contract.small || contract.acceptance == SMALL_ACCEPTANCE
 }
 
 /// The longest a triage call may run, whatever the route's speed: past it a
@@ -1097,5 +1099,24 @@ mod tests {
         assert_eq!("auto".parse::<PlanMode>(), Ok(PlanMode::Auto));
         assert_eq!("full".parse::<PlanMode>(), Ok(PlanMode::Full));
         assert!("small".parse::<PlanMode>().is_err());
+    }
+
+    /// The `small` flag names a small request's contract whatever its
+    /// acceptance says (a change may amend it); a record from before the flag
+    /// is still told by its acceptance text.
+    #[test]
+    fn the_small_flag_names_the_contract_and_an_older_record_keeps_the_text_test() {
+        let mut flagged =
+            crate::run_state::OpenContract::planned("c1", "r/c1".into(), "fix it", "tests pass");
+        assert!(!is_small_contract(&flagged));
+        flagged.small = true;
+        assert!(is_small_contract(&flagged));
+        let older = crate::run_state::OpenContract::planned(
+            "c1",
+            "r/c1".into(),
+            "fix it",
+            SMALL_ACCEPTANCE,
+        );
+        assert!(is_small_contract(&older));
     }
 }

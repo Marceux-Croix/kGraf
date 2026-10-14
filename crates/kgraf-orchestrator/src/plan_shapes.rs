@@ -884,6 +884,7 @@ impl Act for Thing {
 
     fn spec(instruction: &str) -> ContractSpec {
         ContractSpec {
+            check: None,
             id: "c1".into(),
             instruction: instruction.into(),
             acceptance: "cargo test -p a".into(),

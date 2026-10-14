@@ -15,6 +15,9 @@
 //!   the newest run record in the project store, and the answer says so.
 //! - `/compact`: compact the orchestrator (0057 addendum). `/compact selected`
 //!   targets the worker selected on the graph; `/compact <worker>` names one.
+//! - `/edit` (or `/edit --new`): open the run's instruction in the composer;
+//!   the edit is sent as one change to its plan, or as a new run copied from
+//!   it (decision 0100, `crate::edit_card`).
 //! - `/land` (or `/land into <branch>`): land the run onto your branch as one
 //!   merge commit (decision 0100, `crate::land_card`).
 //! - `/help`: the list. Anything else starting with `/` is refused, never sent as a
@@ -38,6 +41,10 @@ pub enum BoxCommand {
     Help,
     /// `/run <instruction>`: start a run, explicitly (it costs money).
     Run(String),
+    /// `/edit` or `/edit --new` (decision 0100).
+    Edit {
+        new: bool,
+    },
     /// `/land [into <branch>]`.
     Land(Option<String>),
     Unknown(String),
@@ -55,8 +62,9 @@ pub enum CompactTarget {
 pub const HELP: &str = "Type a note for the running run. /run <instruction> starts a run \
 (a paid one: it is never started by a plain line). /status asks where the run stands. \
 /compact compacts the orchestrator; /compact selected or /compact <worker> targets a \
-worker. /land lands the run onto your branch as one merge commit (/land into <branch> picks \
-the branch). //text sends /text as a note.";
+worker. /edit opens the run's instruction to edit it as one change (/edit --new: a new run \
+copied from it). /land lands the run onto your branch as one merge commit (/land into <branch> \
+picks the branch). //text sends /text as a note.";
 
 /// Parse one line of input.
 pub fn parse(input: &str) -> BoxCommand {
@@ -90,6 +98,7 @@ pub fn parse(input: &str) -> BoxCommand {
         ("compact", []) => BoxCommand::Compact(CompactTarget::Orchestrator),
         ("compact", ["selected"]) => BoxCommand::Compact(CompactTarget::Selected),
         ("compact", [worker]) => BoxCommand::Compact(CompactTarget::Worker((*worker).to_owned())),
+        ("edit", args) => crate::edit_card::parse(line, args),
         ("land", args) => land_card::parse(line, args),
         _ => BoxCommand::Unknown(line.to_owned()),
     }
@@ -233,6 +242,29 @@ pub trait BoxBackend {
         Err("no run in this window".to_owned())
     }
 
+    /// The run `/edit` applies to (decision 0100): the attached run, else
+    /// the newest stored one, with its instruction as it stands. `None`:
+    /// there is none.
+    fn edit_target(&self) -> Option<crate::edit_card::EditTarget> {
+        None
+    }
+
+    /// Send an edit: one change to the run's plan, or a new run copied from
+    /// it. A refusal keeps the edit in the composer.
+    fn edit(&mut self, _request: crate::edit_card::EditRequest) -> Result<(), String> {
+        Err("no project is open here to edit a run of".to_owned())
+    }
+
+    /// A change to the plan waiting for the user's yes (decision 0100).
+    fn pending_change(&self) -> Option<kgraf_orchestrator::ChangeView> {
+        None
+    }
+
+    /// Apply (`true`) or refuse (`false`) change `number`, the one shown.
+    fn answer_change(&mut self, _number: u32, _yes: bool) -> Result<(), String> {
+        Err("no change is waiting here".to_owned())
+    }
+
     /// Land the run (decision 0100) on the user's yes; the outcome arrives
     /// as [`BackendEvent::Land`].
     fn land(&mut self, _request: kgraf_orchestrator::land_flow::LandRequest) -> Result<(), String> {
@@ -328,6 +360,8 @@ pub struct BoxModel {
     /// The permission controls, the grouped requests and the plan review
     /// (decision 0094).
     pub perm: crate::permission_bar::PermissionBar,
+    /// An `/edit` open in the composer (decision 0100).
+    pub edit: crate::edit_card::EditCard,
     /// `/land`, the land suggestion and the untested-land warning.
     pub land: land_card::LandCard,
 }
@@ -404,6 +438,9 @@ impl BoxModel {
     /// `/compact selected`.
     pub fn submit(&mut self, backend: &mut dyn BoxBackend, selected_worker: Option<&str>) {
         let input = std::mem::take(&mut self.input);
+        if crate::edit_card::take_input(self, backend, &input) {
+            return;
+        }
         let command = parse(&input);
         if command != BoxCommand::Empty {
             self.push(Line::You(input.trim().to_owned()));
@@ -479,6 +516,7 @@ impl BoxModel {
                     )),
                 },
             },
+            BoxCommand::Edit { new } => crate::edit_card::open(self, backend, new),
             BoxCommand::Land(into) => land_card::submit(self, backend, into),
             BoxCommand::Compact(target) => {
                 let target = match target {
@@ -1028,6 +1066,7 @@ pub fn show_styled(
         model.say(line);
     }
     land_card::show(ui, model, backend, &p, land_card::now_ms());
+    crate::edit_card::show_change(ui, model, backend, &p);
 
     // Pinned question cards (design 0067, point 4). Empty on every backend
     // shipped so far (`BoxBackend::pending_questions`'s own default), so

@@ -3030,6 +3030,27 @@ impl ShellApp {
              stops it. Only applies when small requests run without a plan.",
             &mut self.settings.early_start,
         );
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
+            "Let a contract carry its own check",
+            "Off by default. On: the planner may give a contract a check command of its own; \
+             kGraf runs it only when the run's check tests nothing for that contract, and a \
+             pass verifies it. A check that tests nothing, or that your permissions would not \
+             run, is refused.",
+            &mut self.settings.own_checks,
+        );
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
+            "Hold planned work that no test checks",
+            "Off by default. On: a planned contract whose check, narrowed to its files, selects \
+             no test stays unverified until the whole check passes on the merged result, as a \
+             small request's does.",
+            &mut self.settings.zero_test_plans,
+        );
     }
 
     /// Runs: everything a run the app starts takes from Settings. A change

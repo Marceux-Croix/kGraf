@@ -8,7 +8,9 @@
 //!   planned --shown--> waiting
 //!   waiting --Approve--> approved by the user --> run
 //!   waiting --Reject--> blocked, nothing dispatched
-//!   waiting --Change(note)--> the note is recorded for the planner --> planned again --> shown
+//!   waiting --Change(note)--> one replan_delta call on the shown plan (decision 0100)
+//!                            --> applied: shown again; refused or pending: the
+//!                                same plan shown again, with the reason
 //!   waiting --review turned off--> approved by turning review off --> run
 //!   waiting --stop--> stopped (resumable; the plan is shown again on resume)
 //! ```
@@ -168,9 +170,18 @@ impl RunLoop {
                     break None;
                 }
                 let answered = self.perms.desk.answered();
+                let limit = self.limit_reached();
                 tokio::select! {
                     () = answered => {}
                     _ = changes.changed() => {}
+                    () = limit => {
+                        self.notices.insert(
+                            "the run's time limit ran out while the plan waited for your review; \
+                             nothing was started"
+                                .to_owned(),
+                        );
+                        self.stopping = true;
+                    }
                     m = self.rx.recv() => match m {
                         Some(LoopMsg::Control(Control::Stop)) => self.stopping = true,
                         Some(other) => self.backlog.push_back(other),
@@ -230,23 +241,62 @@ impl RunLoop {
                         format!("plan {revision} sent back to the planner with a change"),
                     )
                     .await?;
-                    let n = self.record.notes.len();
-                    self.record.notes.push(RecordedNote {
-                        id: format!("plan-change-{revision}-{n}"),
-                        channel: "plan_review".into(),
-                        received_ms: at_ms,
-                        kind: InboundKind::Note,
-                        // Scrubbed at intake; the planner reads it as data.
-                        text: UntrustedText::new(format!(
-                            "The user reviewed the plan and asked for this change before \
-                             any work starts: {note}"
-                        ))
-                        .for_storage(),
-                        delivered: false,
-                    });
-                    self.discard_plan()?;
-                    if !self.plan().await? {
-                        return Ok(false);
+                    if note.trim().is_empty() {
+                        self.notices.insert(
+                            "the plan change was empty, so the plan is shown again unchanged"
+                                .to_owned(),
+                        );
+                        continue;
+                    }
+                    // With the user at the card, a change on the shown plan
+                    // is one delta call and no decomposition (decision 0100,
+                    // DECIDED-BY-CLAUDE in the build plan: cheaper, and the
+                    // card shows the changed plan before anything runs). The
+                    // change goes to the change log, never to `notes`. A
+                    // `replan_all` answer plans in full with the note, as
+                    // before; a record from before keeps its `plan-change-*`
+                    // notes, which the planner still reads.
+                    let full = if self.perms.attended {
+                        let received = super::delta_hooks::Received {
+                            instant: std::time::Instant::now(),
+                            at_ms,
+                        };
+                        let session = self.record.reopens;
+                        self.take_change(
+                            crate::delta::ChangeSource::PlanReview,
+                            &note,
+                            None,
+                            received,
+                            session,
+                        )?;
+                        self.advance_changes().await?;
+                        if self.stopping {
+                            self.perms.desk.clear_plan();
+                            return Ok(false);
+                        }
+                        std::mem::take(&mut self.delta_rt.full_replan)
+                    } else {
+                        true
+                    };
+                    if full {
+                        let n = self.record.notes.len();
+                        self.record.notes.push(RecordedNote {
+                            id: format!("plan-change-{revision}-{n}"),
+                            channel: "plan_review".into(),
+                            received_ms: at_ms,
+                            kind: InboundKind::Note,
+                            // Scrubbed at intake; the planner reads it as data.
+                            text: UntrustedText::new(format!(
+                                "The user reviewed the plan and asked for this change before \
+                                 any work starts: {note}"
+                            ))
+                            .for_storage(),
+                            delivered: false,
+                        });
+                        self.discard_plan()?;
+                        if !self.plan().await? {
+                            return Ok(false);
+                        }
                     }
                 }
             }

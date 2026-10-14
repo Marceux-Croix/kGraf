@@ -252,9 +252,22 @@ pub struct OrchestratorHost {
     starting_once: Vec<kgraf_host::deps::ConsentSubject>,
     /// The dependency question the box shows, until answered.
     fetch_prompt: Option<crate::dependency_prompt::FetchPrompt>,
+    /// The stored runs `/edit` may target, newest first, from the run watch
+    /// (decision 0100).
+    edit_records: Vec<EditRecord>,
     /// Landing with no live loop and the land-suggestion facts, off the UI
     /// thread (decision 0100).
     land: crate::land_card::LandBackground,
+}
+
+/// One stored run as `/edit` sees it: its instruction as it stands, and why
+/// it cannot be reopened now, if it cannot (another process holds it, a land
+/// is pending).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditRecord {
+    pub run: String,
+    pub instruction: String,
+    pub refusal: Option<String>,
 }
 
 /// An offer waiting on the user (step 3): its question (already scrubbed,
@@ -344,6 +357,7 @@ impl OrchestratorHost {
             starting_restart: None,
             starting_once: Vec::new(),
             fetch_prompt: None,
+            edit_records: Vec::new(),
             land: crate::land_card::LandBackground::default(),
         }
     }
@@ -374,6 +388,7 @@ impl OrchestratorHost {
             starting_restart: None,
             starting_once: Vec::new(),
             fetch_prompt: None,
+            edit_records: Vec::new(),
             land: crate::land_card::LandBackground::default(),
         })
     }
@@ -438,6 +453,49 @@ impl OrchestratorHost {
     /// The run watch's newest status line.
     pub fn set_record_status(&mut self, line: Option<String>) {
         self.record_status = line;
+    }
+
+    /// The stored runs `/edit` may target, newest first (decision 0100).
+    pub fn set_edit_records(&mut self, records: Vec<EditRecord>) {
+        self.edit_records = records;
+    }
+
+    /// Reopen `run` with an edited instruction (decision 0100).
+    fn reopen_with(
+        &mut self,
+        run: RunId,
+        change: kgraf_orchestrator::ChangeInput,
+    ) -> Result<(), String> {
+        self.mark_interactive(&run);
+        let id = run.clone();
+        self.begin(id, move |rt, factory, wake| {
+            Box::pin(InteractiveRun::reopen(rt, factory, run, change, wake))
+        })?;
+        self.fetch_prompt = None;
+        self.starting_restart = None;
+        self.starting_once = Vec::new();
+        Ok(())
+    }
+
+    /// Start a new run from a copy of `source`'s plan (decision 0100).
+    fn copy_from(&mut self, source: RunId, instruction: String) -> Result<(), String> {
+        let run = RunId::new(format!("box-{}", now_ms()));
+        self.mark_interactive(&run);
+        let id = run.clone();
+        self.begin(id, move |rt, factory, wake| {
+            Box::pin(InteractiveRun::copy(
+                rt,
+                factory,
+                run,
+                source,
+                instruction,
+                wake,
+            ))
+        })?;
+        self.fetch_prompt = None;
+        self.starting_restart = None;
+        self.starting_once = Vec::new();
+        Ok(())
     }
 
     /// Resume `run` from its record (the play control, 0014).
@@ -1018,6 +1076,62 @@ impl BoxBackend for OrchestratorHost {
 
     fn status_from_record(&self) -> Option<String> {
         self.record_status.clone()
+    }
+
+    fn pending_change(&self) -> Option<kgraf_orchestrator::ChangeView> {
+        match &self.slot {
+            Slot::Running(r) => r.pending_change(),
+            _ => None,
+        }
+    }
+
+    fn answer_change(&mut self, number: u32, yes: bool) -> Result<(), String> {
+        match &self.slot {
+            Slot::Running(r) => r.answer_change(number, yes),
+            _ => Err("no run in this window".to_owned()),
+        }
+    }
+
+    fn edit_target(&self) -> Option<crate::edit_card::EditTarget> {
+        let attached = match &self.slot {
+            Slot::Running(r) => Some(r.run().to_string()),
+            Slot::Starting(_, run) => Some(run.to_string()),
+            Slot::Idle => (!self.current.0.is_empty()).then(|| self.current.0.clone()),
+        };
+        let found = attached
+            .as_ref()
+            .and_then(|a| self.edit_records.iter().find(|r| &r.run == a));
+        let (record, attached) = match found {
+            Some(r) => (r, true),
+            None => (self.edit_records.first()?, false),
+        };
+        Some(crate::edit_card::EditTarget {
+            run: record.run.clone(),
+            instruction: record.instruction.clone(),
+            attached,
+        })
+    }
+
+    fn edit(&mut self, request: crate::edit_card::EditRequest) -> Result<(), String> {
+        if !request.new
+            && let Some(why) = self
+                .edit_records
+                .iter()
+                .find(|r| r.run == request.run)
+                .and_then(|r| r.refusal.clone())
+        {
+            return Err(why);
+        }
+        if request.new {
+            self.copy_from(RunId::new(request.run), request.edited)
+        } else {
+            let change = kgraf_orchestrator::ChangeInput::edit(
+                request.edited,
+                Some(request.opened),
+                kgraf_orchestrator::Received::now(),
+            );
+            self.reopen_with(RunId::new(request.run), change)
+        }
     }
 
     /// Through the live loop when this window runs the run; otherwise under

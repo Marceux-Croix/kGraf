@@ -240,6 +240,16 @@ pub enum RunStart {
     Resume,
     /// Run a plan the user approved ([`Host::approve_plan`]).
     Plan(Box<ApprovedPlan>),
+    /// Reopen the run with a change or an edited instruction (decision
+    /// 0100): one delta call against its plan.
+    Reopen(Box<kgraf_orchestrator::ChangeInput>),
+    /// A new run from a copy of `source`'s plan, with an edited instruction
+    /// (decision 0100): one delta call for the edit.
+    Copy {
+        source: RunId,
+        instruction: String,
+        received: kgraf_orchestrator::Received,
+    },
 }
 
 impl RunStart {
@@ -576,6 +586,8 @@ impl Host {
             time_limit: config.time_limit,
             // Decision 0100: flag or run file, then the user's setting.
             small: config.small_requests(),
+            own_checks: config.own_checks.unwrap_or(false),
+            zero_test_plans: config.zero_test_plans.unwrap_or(false),
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at
@@ -2112,6 +2124,7 @@ impl Host {
                 timeout: self.config.gate_timeout,
                 permissions: self.permissions.clone(),
                 root_gate,
+                zero_test_plans: self.config.zero_test_plans.unwrap_or(false),
             }),
             workspaces: workspaces.clone(),
             clock: Arc::new(SystemClock),
@@ -3219,6 +3232,12 @@ impl PreparedRun {
     }
 
     /// Stop, steer and status for the run once it runs.
+    /// Where the run's plan, permission requests and change cards wait for
+    /// the user (decisions 0094, 0100).
+    pub fn review_desk(&self) -> Arc<kgraf_orchestrator::ReviewDesk> {
+        self.orchestrator.review_desk()
+    }
+
     pub fn handle(&self) -> OrchestratorHandle {
         self.orchestrator.handle()
     }
@@ -3277,6 +3296,27 @@ impl PreparedRun {
             }
             (RunStart::Resume, None) => {
                 on_heap(|| self.orchestrator.resume(self.run.clone())).await?
+            }
+            (RunStart::Reopen(change), None) => {
+                on_heap(|| self.orchestrator.reopen(self.run.clone(), *change)).await?
+            }
+            (
+                RunStart::Copy {
+                    source,
+                    instruction,
+                    received,
+                },
+                None,
+            ) => {
+                on_heap(|| {
+                    self.orchestrator.start_from_run(
+                        self.run.clone(),
+                        source,
+                        instruction,
+                        received,
+                    )
+                })
+                .await?
             }
             (RunStart::Instruction(text), None) => {
                 if text.trim().is_empty() {

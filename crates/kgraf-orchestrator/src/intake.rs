@@ -343,6 +343,7 @@ pub(crate) fn seeded_record(
         .items()
         .iter()
         .map(|i| ContractSpec {
+            check: None,
             id: i.id.clone(),
             instruction: i.instruction.clone(),
             acceptance: i.acceptance.clone(),

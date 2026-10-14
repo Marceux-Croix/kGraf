@@ -240,6 +240,17 @@ pub struct RunConfig {
     /// Unset takes the user's `early_start` setting, then off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub early_start: Option<bool>,
+    /// A plan's contract may carry a check of its own, run only when the
+    /// run's check tests nothing (decision 0100, `--own-checks` /
+    /// `--no-own-checks`). Unset takes the user's `own_checks` setting, then
+    /// off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_checks: Option<bool>,
+    /// The zero-test rule for every contract (decision 0100,
+    /// `--zero-test-plans` / `--no-zero-test-plans`). Unset takes the user's
+    /// `zero_test_plans` setting, then off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_test_plans: Option<bool>,
 }
 
 /// Keys a run file may not set (decision 0094): the permission mode, its
@@ -448,6 +459,8 @@ impl RunConfig {
             approve_plan: false,
             plan: None,
             early_start: None,
+            own_checks: None,
+            zero_test_plans: None,
         }
     }
 
@@ -576,6 +589,12 @@ impl RunConfig {
         }
         if unset("early_start") {
             self.early_start = self.early_start.or(user.early_start);
+        }
+        if unset("own_checks") {
+            self.own_checks = self.own_checks.or(user.own_checks);
+        }
+        if unset("zero_test_plans") {
+            self.zero_test_plans = self.zero_test_plans.or(user.zero_test_plans);
         }
         // Scope by scope: a scope the file sets wins, one it leaves out takes
         // the user's setting (decision 0098).
@@ -1506,6 +1525,29 @@ mod tests {
         );
         let c = RunConfig::load(dir.path(), &path).expect("load");
         assert_eq!(c.small_requests(), SmallRequestConfig::default());
+        assert_eq!((c.own_checks, c.zero_test_plans), (None, None));
+        let opt_in = crate::limits::UserLimits {
+            own_checks: Some(true),
+            zero_test_plans: Some(true),
+            ..Default::default()
+        };
+        let c = RunConfig::load_with(dir.path(), &path, &opt_in).expect("load");
+        assert_eq!(
+            (c.own_checks, c.zero_test_plans),
+            (Some(true), Some(true)),
+            "the user setting reaches a run file that names neither"
+        );
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "own_checks": false, "zero_test_plans": false}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &opt_in).expect("load");
+        assert_eq!(
+            (c.own_checks, c.zero_test_plans),
+            (Some(false), Some(false)),
+            "the run file wins"
+        );
         std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
         let c = RunConfig::load(dir.path(), &path).expect("load");
         assert_eq!(
@@ -1542,6 +1584,8 @@ mod tests {
             reasoning: kgraf_provider::ReasoningLevels::new(),
             plan_mode: None,
             early_start: None,
+            own_checks: None,
+            zero_test_plans: None,
         };
         std::fs::write(
             &path,

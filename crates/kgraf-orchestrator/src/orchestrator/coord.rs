@@ -965,8 +965,10 @@ impl RunLoop {
             && (gates::halting(gates).is_none() || gates::is_remediation(gates, &c.contract))
     }
 
+    /// A gate in flight, or a stale re-check of a change (information the
+    /// run waits for, so it is not dropped by the run's end).
     pub(super) fn gates_busy(&self) -> bool {
-        !self.coord.gate_flights.is_empty()
+        !self.coord.gate_flights.is_empty() || !self.delta_rt.stale_tasks.is_empty()
     }
 
     pub(super) fn gates_passed(&self) -> bool {
@@ -1348,6 +1350,15 @@ impl RunLoop {
         let passed = matches!(&verdict, Ok(v) if v.passed);
         let max_remediations = self.config_max_remediations();
         let verified: BTreeSet<String> = self.record.verified_contracts.iter().cloned().collect();
+        // Decision 0100, with the zero-test rule on for every contract: any
+        // root-gate pass judges every contract merged on its tip, so a
+        // contract left unverified because its narrowed check selected no
+        // test is cleared, as a background pass clears it.
+        if passed && gate == gates::ROOT_GATE && self.config.zero_test_plans {
+            let merged: Vec<String> = verified.iter().cloned().collect();
+            self.clear_vacuous_marks(&gate, &merged, pinned.as_deref())
+                .await?;
+        }
         self.note_gate_verdict(&gate, passed, pinned.as_deref(), at);
         let fix = gates::record_verdict(
             &mut self.record.coordination.gates,

@@ -88,6 +88,26 @@ pub enum PlanAnswer {
     Change { note: String },
 }
 
+/// A change to the run's plan waiting for the user's yes (decision 0100):
+/// the permission mode asks before a change of its kind applies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeView {
+    pub run: String,
+    pub number: u32,
+    /// `additive`, `reshaping` or `cutting`.
+    pub class: String,
+    /// The permission mode that asks.
+    pub mode: String,
+    /// The change as the user gave it (stored, scrubbed).
+    pub change: String,
+    /// What the delta does, one line per contract.
+    pub ops: Vec<String>,
+    /// A refusal stops the run before it dispatches anything (a change taken
+    /// at a reopen, copy or resume); `false` for plan review's Change, whose
+    /// refusal leaves the shown plan as it was.
+    pub stops_run: bool,
+}
+
 /// Why an answer was not taken.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReviewError {
@@ -97,6 +117,10 @@ pub enum ReviewError {
     NoPlan,
     #[error("a change needs a note saying what to change")]
     EmptyChange,
+    #[error("no change to the plan is waiting for your yes")]
+    NoChange,
+    #[error("change {asked} is not the one waiting: change {shown} is; answer it by its number")]
+    ChangeMoved { asked: u32, shown: u32 },
 }
 
 #[derive(Default)]
@@ -105,6 +129,10 @@ struct State {
     answers: VecDeque<(u64, bool)>,
     plan: Option<PlanView>,
     plan_answer: Option<PlanAnswer>,
+    change: Option<ChangeView>,
+    change_answer: Option<bool>,
+    /// A person at a terminal answers change cards (`--interactive`).
+    terminal: bool,
 }
 
 /// Permission requests and the plan, waiting for the user.
@@ -187,6 +215,67 @@ impl ReviewDesk {
         Ok(())
     }
 
+    /// The change waiting for the user's yes, if any.
+    pub fn pending_change(&self) -> Option<ChangeView> {
+        self.state().change.clone()
+    }
+
+    /// Answer change `number`: `true` applies it, `false` refuses it. The
+    /// answer is bound to the change the user saw: a card replaced meanwhile
+    /// by another change is refused, never answered for it. The loop applies
+    /// the answer.
+    pub fn answer_change(&self, number: u32, yes: bool) -> Result<(), ReviewError> {
+        {
+            let mut s = self.state();
+            match s.change.as_ref().map(|c| c.number) {
+                None => return Err(ReviewError::NoChange),
+                Some(shown) if shown != number => {
+                    return Err(ReviewError::ChangeMoved {
+                        asked: number,
+                        shown,
+                    });
+                }
+                Some(_) => {}
+            }
+            s.change = None;
+            s.change_answer = Some(yes);
+        }
+        self.notify.notify_one();
+        self.woke();
+        Ok(())
+    }
+
+    /// A person at the terminal answers change cards (`kgraf orchestrate
+    /// --interactive`): a change the mode asks about waits for them instead
+    /// of staying pending.
+    pub fn answer_changes_at_terminal(&self) {
+        self.state().terminal = true;
+    }
+
+    pub(crate) fn terminal_answers_changes(&self) -> bool {
+        self.state().terminal
+    }
+
+    pub(crate) fn show_change(&self, view: ChangeView) {
+        {
+            let mut s = self.state();
+            s.change = Some(view);
+            s.change_answer = None;
+        }
+        self.woke();
+    }
+
+    pub(crate) fn clear_change(&self) {
+        let had = self.state().change.take().is_some();
+        if had {
+            self.woke();
+        }
+    }
+
+    pub(crate) fn take_change_answer(&self) -> Option<bool> {
+        self.state().change_answer.take()
+    }
+
     pub(crate) fn show_request(&self, view: PermissionRequestView) {
         self.state().requests.insert(view.id, view);
         self.woke();
@@ -240,6 +329,8 @@ impl ReviewDesk {
             s.answers.clear();
             s.plan = None;
             s.plan_answer = None;
+            s.change = None;
+            s.change_answer = None;
         }
         self.woke();
     }

@@ -705,6 +705,7 @@ mod tests {
 
     fn spec(id: &str, writes: &[&str], deps: &[&str]) -> ContractSpec {
         ContractSpec {
+            check: None,
             id: id.into(),
             instruction: format!("do {id}"),
             acceptance: "tests pass".into(),
@@ -896,6 +897,7 @@ mod tests {
                 templates: vec![],
                 interfaces: true,
                 project_context: String::new(),
+                own_checks: false,
             },
             contracts: vec![],
             outer: vec![],

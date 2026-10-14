@@ -24,6 +24,24 @@ pub struct PlanFlags {
     /// setting says. Benchmark drivers pass it.
     #[arg(long)]
     pub no_early_start: bool,
+    /// A plan's contract may carry a check of its own, run only when the
+    /// run's check tests nothing; its pass verifies the contract. Overrides
+    /// the `own_checks` user setting; off by default.
+    #[arg(long, conflicts_with = "no_own_checks")]
+    pub own_checks: bool,
+    /// Ignore contracts' own checks, whatever the user setting says.
+    /// Benchmark drivers pass it.
+    #[arg(long)]
+    pub no_own_checks: bool,
+    /// A planned contract whose narrowed check selects no test stays
+    /// unverified until the root gate passes over it, as a small request's
+    /// does. Overrides the `zero_test_plans` user setting; off by default.
+    #[arg(long, conflicts_with = "no_zero_test_plans")]
+    pub zero_test_plans: bool,
+    /// Apply the zero-test rule to small requests only, whatever the user
+    /// setting says. Benchmark drivers pass it.
+    #[arg(long)]
+    pub no_zero_test_plans: bool,
 }
 
 fn parse_plan_mode(s: &str) -> Result<PlanMode, String> {
@@ -34,11 +52,28 @@ impl PlanFlags {
     /// This run's early-start answer from the flag pair (clap refuses both):
     /// `None` leaves it to the user setting.
     pub fn early_start(&self) -> Option<bool> {
-        match (self.early_start, self.no_early_start) {
-            (true, _) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-        }
+        pair(self.early_start, self.no_early_start)
+    }
+
+    /// The own-checks answer from its flag pair; `None` leaves it to the
+    /// user setting.
+    pub fn own_checks(&self) -> Option<bool> {
+        pair(self.own_checks, self.no_own_checks)
+    }
+
+    /// The zero-test answer from its flag pair; `None` leaves it to the
+    /// user setting.
+    pub fn zero_test_plans(&self) -> Option<bool> {
+        pair(self.zero_test_plans, self.no_zero_test_plans)
+    }
+}
+
+/// A `--x` / `--no-x` pair (clap refuses both): `None` when neither is given.
+fn pair(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
     }
 }
 
@@ -75,5 +110,25 @@ mod tests {
         );
         assert!(parse(&["--plan", "small"]).is_err());
         assert!(parse(&["--early-start", "--no-early-start"]).is_err());
+    }
+
+    /// The two opt-in settings' pairs: unset by default, each side read,
+    /// both together refused.
+    #[test]
+    fn the_own_check_and_zero_test_pairs_parse() {
+        let none = parse(&[]).expect("no flags");
+        assert_eq!((none.own_checks(), none.zero_test_plans()), (None, None));
+        let on = parse(&["--own-checks", "--zero-test-plans"]).expect("on");
+        assert_eq!(
+            (on.own_checks(), on.zero_test_plans()),
+            (Some(true), Some(true))
+        );
+        let off = parse(&["--no-own-checks", "--no-zero-test-plans"]).expect("off");
+        assert_eq!(
+            (off.own_checks(), off.zero_test_plans()),
+            (Some(false), Some(false))
+        );
+        assert!(parse(&["--own-checks", "--no-own-checks"]).is_err());
+        assert!(parse(&["--zero-test-plans", "--no-zero-test-plans"]).is_err());
     }
 }

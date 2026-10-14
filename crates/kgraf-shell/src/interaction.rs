@@ -54,6 +54,31 @@ pub enum Resumable {
     None,
 }
 
+/// `/edit`'s targets (decision 0100): each stored run's instruction as it
+/// stands, newest first, and why it cannot be reopened now: a land in
+/// progress or stopped part way (its journal is open), or another process
+/// holding the run.
+pub fn edit_records(
+    runs: &[StoredRun],
+    leased: &std::collections::BTreeSet<String>,
+) -> Vec<crate::orchestrator_host::EditRecord> {
+    let mut records: Vec<&kgraf_orchestrator::RunStateRecord> =
+        runs.iter().filter_map(|r| r.record.as_ref().ok()).collect();
+    records.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
+    records
+        .into_iter()
+        .map(|r| crate::orchestrator_host::EditRecord {
+            run: r.run.to_string(),
+            instruction: kgraf_orchestrator::delta::effective_instruction(r),
+            refusal: kgraf_orchestrator::delta::reopen_refusal(r).or_else(|| {
+                leased
+                    .contains(r.run.as_str())
+                    .then(|| format!("run {} is held by another process now", r.run))
+            }),
+        })
+        .collect()
+}
+
 /// What Play would resume from the stored runs. A completed run is never offered
 /// (resume refuses it: `OrchestratorError::AlreadyCompleted`), nor one whose lease
 /// a live process holds; the newest remaining one is.
@@ -613,6 +638,8 @@ impl Interaction {
             }
         });
         self.host.set_record_status(status);
+        self.host
+            .set_edit_records(edit_records(&self.runs.runs, &self.runs.leased));
         self.plan_dirty = true;
         self.runs_generation += 1;
         true
@@ -1190,6 +1217,56 @@ mod tests {
             active: true,
             record: Ok(r),
         }
+    }
+
+    /// `/edit` refuses a run whose land journal is open (named) or that
+    /// another process holds, and offers the newest first.
+    #[test]
+    fn edit_records_refuse_an_open_land_and_a_held_run() {
+        use kgraf_orchestrator::RunStatus;
+        let mut landing = stored("landing", RunStatus::Completed, 30);
+        if let Ok(r) = landing.record.as_mut() {
+            r.land.landing = Some(kgraf_orchestrator::land_record::LandingEntry {
+                run_branch: "kgraf/landing".into(),
+                candidate: "aaaa".into(),
+                merge_commit: "bbbb".into(),
+                target: "main".into(),
+                target_old: "cccc".into(),
+                gate: kgraf_orchestrator::land_record::LandGate::Untested {
+                    gate: "gate:root".into(),
+                    reason: "never ran".into(),
+                },
+                started_ms: 1,
+                target_moved: false,
+                checkout_interrupted: true,
+                include_changes: Vec::new(),
+                programs_digest: None,
+                fold: None,
+                finished_ms: None,
+            });
+        }
+        let runs = vec![
+            stored("old", RunStatus::Stopped, 10),
+            landing,
+            stored("held", RunStatus::Stopped, 20),
+        ];
+        let leased: std::collections::BTreeSet<String> = ["held".to_owned()].into();
+        let records = edit_records(&runs, &leased);
+        let names: Vec<&str> = records.iter().map(|r| r.run.as_str()).collect();
+        assert_eq!(names, ["landing", "held", "old"]);
+        assert!(
+            records[0]
+                .refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("stopped while git updated your checkout"))
+        );
+        assert!(
+            records[1]
+                .refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("held by another"))
+        );
+        assert_eq!(records[2].refusal, None);
     }
 
     /// Play never offers a completed run (resume's AlreadyCompleted guard) nor one

@@ -74,6 +74,7 @@ mod clock;
 pub mod cluster_cap;
 mod consumer_tests;
 mod coordination;
+pub mod delta;
 pub mod demand;
 mod derive_interface;
 mod envelope;
@@ -93,6 +94,7 @@ pub mod model_kinds;
 pub mod occupancy;
 mod orchestrator;
 mod outside_error;
+mod own_check;
 pub mod pairing;
 mod partition;
 mod placeholder;
@@ -196,11 +198,11 @@ pub use orchestrator::sessions::{
     QuestionAnswerer, SessionNoticeSink,
 };
 pub use orchestrator::{
-    AttemptEnv, AttemptEnvs, AttemptProcesses, CloseEnv, CompactError,
+    AttemptEnv, AttemptEnvs, AttemptProcesses, ChangeInput, CloseEnv, CompactError,
     DEFAULT_MAX_CONTRACTS_PER_PLAN, DEFAULT_MAX_SPLITS, DirWorkspaces, Orchestrator,
-    OrchestratorConfig, OrchestratorError, OrchestratorHandle, OrderError, PrepareFailure, Route,
-    RunReport, Services, SessionError, StatusReport, SteerError, VERIFIER_REFUSAL_TAG, Workspaces,
-    plan_review_refusal, run_lease_holder_is_live,
+    OrchestratorConfig, OrchestratorError, OrchestratorHandle, OrderError, PrepareFailure,
+    Received, Route, RunReport, Services, SessionError, StatusReport, SteerError,
+    VERIFIER_REFUSAL_TAG, Workspaces, plan_review_refusal, run_lease_holder_is_live,
 };
 pub use orchestrator::{
     LAND_LEASE_TTL_MS, LandLease, take_run_lease_for_land, take_run_lease_for_land_with_ttl,
@@ -211,9 +213,9 @@ pub use partition::{
     score_pairs, score_serialization, score_write_sets,
 };
 pub use plan::{
-    ContractSpec, CostBasis, Decomposer, GroundOutput, GroundRequest, Grounder,
-    INCOMPLETE_ANSWER_NOTE, ModelAnswerer, ModelCaller, ModelDecomposer, ModelGrounder, PlanError,
-    PlanOutput, PlanRequest, answer_prompt, judge_prompt, normalize_plan, parse_answer,
+    ContractSpec, CostBasis, Decomposer, DeltaOutput, DeltaRequest, GroundOutput, GroundRequest,
+    Grounder, INCOMPLETE_ANSWER_NOTE, ModelAnswerer, ModelCaller, ModelDecomposer, ModelGrounder,
+    PlanError, PlanOutput, PlanRequest, answer_prompt, judge_prompt, normalize_plan, parse_answer,
     parse_grounding, parse_plan, parse_verdicts, sanitize_id, sanitize_interfaces, sanitize_plan,
     valid_write_path, validate_plan, validate_plan_with,
 };
@@ -228,7 +230,7 @@ pub use question_route::{
 pub use readiness::{AlwaysReady, FnProbe, ReadinessFailure, ReadinessProbe, check_tools};
 pub use reports::{Delivery, Recipient, ReportError, ReportKind, ReportQueue, WorkerReport};
 pub use review_desk::{
-    PermissionRequestView, PlanAnswer, PlanItemView, PlanView, ReviewDesk, ReviewError,
+    ChangeView, PermissionRequestView, PlanAnswer, PlanItemView, PlanView, ReviewDesk, ReviewError,
 };
 pub use routing::{
     CLUSTER_COCHANGE_MIN_COUNT, EXPLORATION_EVERY, FigureSource, INTERFACE_FLOOR,
@@ -245,9 +247,11 @@ pub use scheduler_loop::{
 };
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
 pub use shortfall::{
-    AcceptedStanding, Authority, Grant, GrantRecord, Grounding, MAX_ANSWERED_SHORTFALLS,
-    MAX_SHORTFALL_REDISPATCHES, RequestScope, SCOPED_CHECK_VACUOUS, SHORTFALL_TAG, SHORTFALL_TOOL,
-    ShortfallDecision, ShortfallKind, ShortfallTool, accepted_standing, vacuous_check,
+    AcceptedStanding, Authority, CONTRACT_CHECK_PASSED, Grant, GrantRecord, Grounding,
+    MAX_ANSWERED_SHORTFALLS, MAX_SHORTFALL_REDISPATCHES, RequestScope, SCOPED_CHECK_VACUOUS,
+    SHORTFALL_TAG, SHORTFALL_TOOL, ShortfallDecision, ShortfallKind, ShortfallTool,
+    accepted_standing, check_refusal, contract_check_passed, own_check_counts, own_check_vacuous,
+    own_checks_real, vacuous_check,
 };
 pub use sizing::{
     ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,

@@ -5276,6 +5276,7 @@ fn verifier(r: &Repo, command: &str) -> CommandVerifier {
         timeout: Duration::from_secs(300),
         permissions: Arc::new(kgraf_tools::PermissionControl::manual()),
         root_gate: false,
+        zero_test_plans: false,
     }
 }
 
@@ -9605,4 +9606,96 @@ async fn the_rate_limit_wait_reader_counts_only_waits_after_its_baseline() {
     assert_eq!(read["paced"].1, 1, "{read:?}");
     assert!(read["paced"].0 >= 50, "{read:?}");
     assert_eq!(read["idle"], (0, 0));
+}
+
+/// Decision 0100: a contract's own check runs only where the run's check
+/// tests nothing (here the whole command is `true`), and its pass is marked
+/// in the verdict so the orchestrator counts it as a real check.
+#[tokio::test]
+async fn a_contracts_own_check_runs_where_the_run_check_tests_nothing() {
+    let r = repo();
+    let mut c = contract("b.txt");
+    c.contract_checks = vec!["grep -q b b.txt".into()];
+    let ws = r.workspaces.prepare(&c, &"w-own".into()).await.expect("ws");
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("the own check passed: {verdict:?}");
+    };
+    assert!(
+        by.contains("[contract_check_passed: grep -q b b.txt]"),
+        "{by}"
+    );
+    assert!(kgraf_orchestrator::contract_check_passed(by));
+}
+
+/// A failing own check fails the attempt, naming the check.
+#[tokio::test]
+async fn a_failing_own_check_fails_the_attempt() {
+    let r = repo();
+    let mut c = contract("b.txt");
+    c.contract_checks = vec!["grep -q missing b.txt".into()];
+    let ws = r
+        .workspaces
+        .prepare(&c, &"w-own-fail".into())
+        .await
+        .expect("ws");
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Fail { reason } = &verdict else {
+        panic!("a failing own check fails: {verdict:?}");
+    };
+    assert!(reason.contains("grep -q missing b.txt"), "{reason}");
+}
+
+/// An own check that tests nothing is never run: it could only pass, so it
+/// would mark a vacuous verdict as checked.
+#[tokio::test]
+async fn a_vacuous_own_check_is_not_run() {
+    let r = repo();
+    let mut c = contract("b.txt");
+    c.contract_checks = vec!["test -f missing.txt".into()];
+    let ws = r
+        .workspaces
+        .prepare(&c, &"w-own-vacuous".into())
+        .await
+        .expect("ws");
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let verdict = verifier(&r, "true")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("the vacuous own check is not run, so it cannot fail: {verdict:?}");
+    };
+    assert!(!kgraf_orchestrator::contract_check_passed(by), "{by}");
+}
+
+/// Where the run's check does test the work, the contract's own check is
+/// not run: the contract is judged as before.
+#[tokio::test]
+async fn an_own_check_is_not_run_beside_a_real_run_check() {
+    let r = repo();
+    let mut c = contract("b.txt");
+    c.contract_checks = vec!["false".into()];
+    let ws = r
+        .workspaces
+        .prepare(&c, &"w-own-skip".into())
+        .await
+        .expect("ws");
+    std::fs::write(ws.join("b.txt"), "b").expect("write");
+    let verdict = verifier(&r, "test -f b.txt")
+        .verify(&c, &ws, &result())
+        .await
+        .expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("the run's real check judges the contract: {verdict:?}");
+    };
+    assert!(!kgraf_orchestrator::contract_check_passed(by), "{by}");
 }

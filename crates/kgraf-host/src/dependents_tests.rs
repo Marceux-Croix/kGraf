@@ -90,6 +90,7 @@ async fn verdict_for(r: &Repo, worker: &str, a_lib: &str) -> Verdict {
     std::fs::write(ws.join("a/src/lib.rs"), a_lib).expect("write");
     let v = CommandVerifier {
         root_gate: true,
+        zero_test_plans: false,
         ..verifier(r, CHECK)
     };
     v.verify_among(&ca, &ws, &result(), &open)

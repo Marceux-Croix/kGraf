@@ -126,6 +126,12 @@ pub struct OrchestrateArgs {
     /// `--plan` and the early-start pair over the user's settings (decision
     /// 0100): `full` with no early start unless one of them says otherwise.
     pub small: kgraf_orchestrator::triage::SmallRequestConfig,
+    /// `--own-checks` over the `own_checks` user setting (decision 0100).
+    pub own_checks: bool,
+    /// `--zero-test-plans` over the `zero_test_plans` user setting.
+    pub zero_test_plans: bool,
+    /// `--change`, `--edit` and `--from-run` (decision 0100).
+    pub edits: crate::edit_flags::EditFlags,
 }
 
 /// The per-project part of the flags, as the host takes it. What is per
@@ -164,6 +170,8 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         plan: (args.small.plan != kgraf_orchestrator::triage::PlanMode::Full)
             .then_some(args.small.plan),
         early_start: args.small.early_start.then_some(true),
+        own_checks: args.own_checks.then_some(true),
+        zero_test_plans: args.zero_test_plans.then_some(true),
         worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
@@ -395,6 +403,12 @@ fn cut_short(why: &str, signal: i32) -> ! {
 }
 
 pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
+    // Decision 0100: a reopen's time (B9) and an edit's (B11) start when the
+    // request reaches kGraf, so the host's start is in them.
+    let received = kgraf_orchestrator::Received::now();
+    // A change or an edited instruction is read first: a missing or empty
+    // file stops here, before anything opens.
+    let edit = args.edits.read()?;
     // Decision 0094: the user-level permissions file and this command's
     // flags, the only sources of the mode. Bypass is announced on stderr.
     let permissions = crate::permissions_cli::control(root, &args.permissions)?;
@@ -631,10 +645,20 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
     // Kept after the run: an `--interactive` run's land suggestion is
     // answered on the same stdin channel.
     let stdin_port = args.interactive.then(|| Arc::new(StdinPort::start()));
+    let mut change_cards: Option<tokio::task::JoinHandle<()>> = None;
     let benchmark = args.tbench_bridge_socket.is_some();
     let outcome = runtime.block_on(async {
         if let Some(port) = &stdin_port {
             prepared.attach_port(port.clone());
+            // Decision 0100: a change the permission mode asks about waits
+            // for a y or n typed here instead of staying pending.
+            let desk = prepared.review_desk();
+            desk.answer_changes_at_terminal();
+            change_cards = Some(tokio::spawn(answer_change_cards(
+                desk,
+                port.clone(),
+                Duration::from_millis(200),
+            )));
         }
         let summary = prepared.summary();
         println!("run        {}", summary.run);
@@ -668,7 +692,30 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
             RunStart::Plan(Box::new(plan))
         } else {
             match (&args.resume, &args.instruction) {
-                (Some(_), _) => RunStart::Resume,
+                (Some(_), _) => match &edit {
+                    Some(crate::edit_flags::Edit::Change(text)) => RunStart::Reopen(Box::new(
+                        kgraf_orchestrator::ChangeInput::change(text.clone(), received),
+                    )),
+                    Some(crate::edit_flags::Edit::Edited(text)) => RunStart::Reopen(Box::new(
+                        kgraf_orchestrator::ChangeInput::edit(text.clone(), None, received),
+                    )),
+                    _ => RunStart::Resume,
+                },
+                (None, Some(path)) if matches!(edit, Some(crate::edit_flags::Edit::Copy { .. })) => {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("cannot read {}", path.display()))?;
+                    if text.trim().is_empty() {
+                        bail!("the instruction file {} is empty", path.display());
+                    }
+                    let Some(crate::edit_flags::Edit::Copy { source }) = &edit else {
+                        bail!("--from-run needs the run to copy");
+                    };
+                    RunStart::Copy {
+                        source: RunId::new(source.clone()),
+                        instruction: text,
+                        received,
+                    }
+                }
                 (None, Some(path)) => {
                     let text = std::fs::read_to_string(path)
                         .with_context(|| format!("cannot read {}", path.display()))?;
@@ -711,7 +758,15 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
             }
         };
         match ended {
-            Ok(outcome) => Ok(outcome),
+            Ok(outcome) => Ok(Some(outcome)),
+            // An edit that changes no line sends nothing and changes nothing:
+            // said, and not a failure (decision 0100).
+            Err(kgraf_host::Error::Orchestrator(
+                kgraf_orchestrator::OrchestratorError::NothingChanged,
+            )) => {
+                println!("edit       no line of the instruction changed; nothing was sent");
+                Ok(None)
+            }
             Err(e) => {
                 // A run that fails has no report, so the planner refusals it
                 // recorded would be lost with it.
@@ -722,6 +777,9 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
             }
         }
     })?;
+    let Some(outcome) = outcome else {
+        return Ok(());
+    };
 
     for line in report_lines(&outcome.report) {
         println!("{line}");
@@ -760,6 +818,9 @@ pub fn run(root: &Path, args: OrchestrateArgs) -> Result<()> {
         ));
     }
     if let Some(port) = &stdin_port {
+        if let Some(task) = change_cards.take() {
+            runtime.block_on(stop_change_cards(task));
+        }
         port.take_answers();
         // An interrupt at the question is no answer: nothing lands.
         crate::land_cmd::offer_after_run(root, &outcome.report.run, benchmark, &mut || {
@@ -801,6 +862,22 @@ fn kept_lines(kept: &kgraf_host::Result<Vec<PathBuf>>, run: &RunId) -> Vec<Strin
 /// as `schedule run-now` see a blocked or stopped run as the failure it is.
 pub(crate) fn ensure_completed(report: &kgraf_orchestrator::RunReport) -> Result<()> {
     use kgraf_orchestrator::RunStatus;
+    // A change this session asked for that did not apply fails the exit,
+    // named with why (decision 0100): never read as a success.
+    let missed: Vec<String> = report
+        .changes
+        .iter()
+        .filter(|c| c.blocks_exit(report.session))
+        .map(|c| format!("change {} {}: {}", c.number, c.state, plain(&c.detail)))
+        .collect();
+    if !missed.is_empty() {
+        bail!(
+            "run {} ended {:?} with a change not applied: {}",
+            report.run,
+            report.status,
+            missed.join("; ")
+        );
+    }
     match &report.status {
         RunStatus::Completed => Ok(()),
         RunStatus::Blocked { reason } => bail!("run {} is blocked: {reason}", report.run),
@@ -842,6 +919,10 @@ pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orches
         unfinished: Vec::new(),
         latency: Vec::new(),
         latency_clocks_held: 0,
+        changes: Vec::new(),
+        change_counts: Default::default(),
+        decompose_tokens: None,
+        session: 0,
     }
 }
 
@@ -870,6 +951,45 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         "dispatched {} (serialized {}, fraction {:.3})",
         report.counters.dispatches, report.counters.serialized, report.serialized_fraction
     ));
+    // The change log (decision 0100): each change's state, and its delta
+    // tokens beside the decompose tokens of the plan it edits.
+    for c in &report.changes {
+        let tokens = match report.decompose_tokens {
+            Some(d) if d > 0 => format!(
+                "delta {} tokens, plan {} tokens ({:.3} of it)",
+                c.delta_tokens,
+                d,
+                c.delta_tokens as f64 / d as f64
+            ),
+            _ => format!("delta {} tokens", c.delta_tokens),
+        };
+        let detail = if c.detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", plain(&c.detail))
+        };
+        out.push(format!(
+            "change     {} ({}, session {}) {}{detail}; {tokens}",
+            c.number,
+            c.source.as_str(),
+            c.session,
+            c.state
+        ));
+    }
+    if !report.changes.is_empty() {
+        let k = &report.change_counts;
+        let per_session = k
+            .per_session
+            .iter()
+            .map(|(s, n)| format!("{s}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(format!(
+            "changes    per session {per_session}; applied {}, refused {}, pending {}, \
+             replan_all {}, verified work lost {}; delta tokens {}",
+            k.applied, k.refused, k.pending, k.replan_all, k.verified_work_lost, k.delta_tokens
+        ));
+    }
     // The newest split of each measured interaction, one line per kind.
     for line in &report.latency {
         out.push(format!(
@@ -1028,6 +1148,25 @@ fn plain(text: &str) -> String {
         .collect()
 }
 
+/// Where a typed line goes: an answer while kGraf waits for one, else the
+/// port's notes. Blocking: called from stdin's thread.
+struct LineFeed {
+    notes: tokio::sync::mpsc::Sender<String>,
+    answers: tokio::sync::mpsc::UnboundedSender<String>,
+    answering: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LineFeed {
+    /// `false` once nobody reads the port any more.
+    fn send(&self, text: String) -> bool {
+        if self.answering.load(std::sync::atomic::Ordering::SeqCst) {
+            self.answers.send(text).is_ok()
+        } else {
+            self.notes.blocking_send(text).is_ok()
+        }
+    }
+}
+
 /// stdin as a message port: `?` starts a status question, anything else is a
 /// note. Replies print to stdout.
 struct StdinPort {
@@ -1040,32 +1179,41 @@ struct StdinPort {
 }
 
 impl StdinPort {
+    /// The port and a thread feeding it stdin's lines.
     fn start() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let (answer_tx, answers) = tokio::sync::mpsc::unbounded_channel();
-        let answering = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let to_answers = answering.clone();
+        let (port, feed) = Self::with_feed();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut line = String::new();
             while stdin.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                let text = line.trim_end().to_owned();
-                let sent = if to_answers.load(std::sync::atomic::Ordering::SeqCst) {
-                    answer_tx.send(text).is_ok()
-                } else {
-                    tx.blocking_send(text).is_ok()
-                };
-                if !sent {
+                if !feed.send(line.trim_end().to_owned()) {
                     break;
                 }
                 line.clear();
             }
         });
-        Self {
-            lines: tokio::sync::Mutex::new(rx),
-            answering,
-            answers: tokio::sync::Mutex::new(answers),
-        }
+        port
+    }
+
+    /// The port and the feed its lines come from (stdin's thread, or a
+    /// test).
+    fn with_feed() -> (Self, LineFeed) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (answer_tx, answers) = tokio::sync::mpsc::unbounded_channel();
+        let answering = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feed = LineFeed {
+            notes: tx,
+            answers: answer_tx,
+            answering: answering.clone(),
+        };
+        (
+            Self {
+                lines: tokio::sync::Mutex::new(rx),
+                answering,
+                answers: tokio::sync::Mutex::new(answers),
+            },
+            feed,
+        )
     }
 
     /// From now on, lines are answers, not notes: called once the run has
@@ -1080,6 +1228,240 @@ impl StdinPort {
     async fn next_line(&self) -> Option<String> {
         self.answers.lock().await.recv().await
     }
+
+    /// Lines are notes again, after one answer during the run.
+    fn give_back(&self) {
+        self.answering
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The change cards a terminal answers: the review desk, or a test's fake.
+trait ChangeCards: Send + Sync {
+    fn pending(&self) -> Option<kgraf_orchestrator::ChangeView>;
+    fn answer(&self, number: u32, yes: bool) -> Result<(), String>;
+}
+
+impl ChangeCards for kgraf_orchestrator::ReviewDesk {
+    fn pending(&self) -> Option<kgraf_orchestrator::ChangeView> {
+        self.pending_change()
+    }
+    fn answer(&self, number: u32, yes: bool) -> Result<(), String> {
+        self.answer_change(number, yes).map_err(|e| e.to_string())
+    }
+}
+
+/// A change card on the terminal (decision 0100): the change and what it
+/// does are printed, and the next line typed answers that change, by its
+/// number (`y` applies, anything else refuses). A card withdrawn before an
+/// answer (the run stopped, or the mode stopped asking) gives the line back
+/// to the notes, so the next line typed is not eaten as an answer. Lines are
+/// notes again after each card. Ends when stdin closes; aborted at the run's
+/// end ([`stop_change_cards`]).
+async fn answer_change_cards<C: ChangeCards + ?Sized>(
+    cards: Arc<C>,
+    port: Arc<StdinPort>,
+    poll: Duration,
+) {
+    loop {
+        let Some(card) = cards.pending() else {
+            tokio::time::sleep(poll).await;
+            continue;
+        };
+        for line in change_card_lines(&card) {
+            println!("{line}");
+        }
+        port.take_answers();
+        let withdrawn = async {
+            loop {
+                tokio::time::sleep(poll).await;
+                if cards.pending().map(|c| c.number) != Some(card.number) {
+                    break;
+                }
+            }
+        };
+        let answer = tokio::select! {
+            line = port.next_line() => Some(line),
+            () = withdrawn => None,
+        };
+        port.give_back();
+        let Some(answer) = answer else {
+            println!("change     {} no longer waits for an answer", card.number);
+            continue;
+        };
+        let Some(answer) = answer else {
+            return;
+        };
+        let yes = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        if let Err(e) = cards.answer(card.number, yes) {
+            println!("change     {} not answered: {e}", card.number);
+        }
+    }
+}
+
+/// Stop the change-card task before kGraf asks anything else on stdin, and
+/// wait until it has stopped: a card it still showed would otherwise take
+/// the next line (the land offer's answer) as the change's.
+async fn stop_change_cards(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
+}
+
+#[cfg(test)]
+mod change_card_tests {
+    /// The terminal card names the change, its kind, the mode and each op,
+    /// and ends with the y/n question.
+    #[test]
+    fn the_terminal_card_names_the_change_and_asks_y_or_n() {
+        let lines = super::change_card_lines(&kgraf_orchestrator::ChangeView {
+            run: "r1".into(),
+            number: 3,
+            class: "cutting".into(),
+            mode: "manual".into(),
+            change: "x".into(),
+            ops: vec!["remove c2".into()],
+            stops_run: true,
+        });
+        assert!(lines[0].contains("3 is a cutting change") && lines[0].contains("(manual)"));
+        assert!(lines[1].contains("remove c2"));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.ends_with("apply change 3? [y/n]"))
+        );
+    }
+
+    use super::{ChangeCards, StdinPort, answer_change_cards, stop_change_cards};
+    use kgraf_orchestrator::{ChangeView, InboundKind, MessagePort};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A card shown by the test, and the answers given to it.
+    #[derive(Default)]
+    struct Cards {
+        shown: Mutex<Option<ChangeView>>,
+        answered: Mutex<Vec<(u32, bool)>>,
+    }
+
+    impl ChangeCards for Cards {
+        fn pending(&self) -> Option<ChangeView> {
+            self.shown.lock().expect("lock").clone()
+        }
+        fn answer(&self, number: u32, yes: bool) -> Result<(), String> {
+            self.answered.lock().expect("lock").push((number, yes));
+            Ok(())
+        }
+    }
+
+    fn card(number: u32) -> ChangeView {
+        ChangeView {
+            run: "r1".into(),
+            number,
+            class: "cutting".into(),
+            mode: "manual".into(),
+            change: "x".into(),
+            ops: Vec::new(),
+            stops_run: true,
+        }
+    }
+
+    async fn until(what: &str, f: impl Fn() -> bool) {
+        let end = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn answering(port: &StdinPort) -> bool {
+        port.answering.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A card withdrawn before an answer gives stdin back: the next line is
+    /// a note, not the withdrawn change's answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_withdrawn_card_does_not_eat_the_next_note() {
+        let (port, feed) = StdinPort::with_feed();
+        let port = Arc::new(port);
+        let cards = Arc::new(Cards::default());
+        let task = tokio::spawn(answer_change_cards(
+            cards.clone(),
+            port.clone(),
+            Duration::from_millis(10),
+        ));
+        *cards.shown.lock().expect("lock") = Some(card(4));
+        until("the card asks", || answering(&port)).await;
+        *cards.shown.lock().expect("lock") = None;
+        until("the line is given back", || !answering(&port)).await;
+        tokio::task::spawn_blocking(move || feed.send("hello".into()))
+            .await
+            .expect("send");
+        let note = tokio::time::timeout(Duration::from_secs(2), port.receive())
+            .await
+            .expect("the line reaches the notes")
+            .expect("port")
+            .expect("a message");
+        assert_eq!(note.kind, InboundKind::Note);
+        assert!(cards.answered.lock().expect("lock").is_empty());
+        stop_change_cards(task).await;
+    }
+
+    /// At the run's end the card task is stopped before the land offer asks,
+    /// so the offer's `y` reaches the land even while a card was still shown;
+    /// an answer is bound to the number of the card it answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_land_offers_y_reaches_the_land() {
+        let (port, feed) = StdinPort::with_feed();
+        let port = Arc::new(port);
+        let feed = Arc::new(feed);
+        let cards = Arc::new(Cards::default());
+        let task = tokio::spawn(answer_change_cards(
+            cards.clone(),
+            port.clone(),
+            Duration::from_millis(10),
+        ));
+        *cards.shown.lock().expect("lock") = Some(card(2));
+        until("the card asks", || answering(&port)).await;
+        let f = feed.clone();
+        tokio::task::spawn_blocking(move || f.send("y".into()))
+            .await
+            .expect("send");
+        until("the answer", || {
+            !cards.answered.lock().expect("lock").is_empty()
+        })
+        .await;
+        assert_eq!(*cards.answered.lock().expect("lock"), vec![(2, true)]);
+        // The run ends with another card still shown.
+        *cards.shown.lock().expect("lock") = Some(card(3));
+        until("the next card asks", || answering(&port)).await;
+        stop_change_cards(task).await;
+        port.take_answers();
+        let f = feed.clone();
+        tokio::task::spawn_blocking(move || f.send("y".into()))
+            .await
+            .expect("send");
+        let line = tokio::time::timeout(Duration::from_secs(2), port.next_line())
+            .await
+            .expect("the land offer reads the line");
+        assert_eq!(line.as_deref(), Some("y"));
+        assert_eq!(cards.answered.lock().expect("lock").len(), 1);
+    }
+}
+
+/// The terminal's card for a change the permission mode asks about.
+fn change_card_lines(card: &kgraf_orchestrator::ChangeView) -> Vec<String> {
+    let mut out = vec![format!(
+        "change     {} is a {} change, and your permission mode ({}) asks before it applies:",
+        card.number, card.class, card.mode
+    )];
+    for op in &card.ops {
+        out.push(format!("change       {}", plain(op)));
+    }
+    out.push(format!("change     apply change {}? [y/n]", card.number));
+    out
 }
 
 #[async_trait::async_trait]
@@ -1346,6 +1728,10 @@ mod tests {
             unfinished: Vec::new(),
             latency: Vec::new(),
             latency_clocks_held: 0,
+            changes: Vec::new(),
+            change_counts: Default::default(),
+            decompose_tokens: None,
+            session: 0,
         };
         assert!(
             !report_lines(&report)
@@ -1512,6 +1898,9 @@ mod tests {
             warn_rule_conflicts: false,
             answer_wait_secs: None,
             small: Default::default(),
+            own_checks: false,
+            zero_test_plans: false,
+            edits: Default::default(),
         }
     }
 

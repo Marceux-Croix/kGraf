@@ -717,7 +717,7 @@ impl PermissionBar {
             PlanAnswer::Approve => "Plan approved: workers start now".to_owned(),
             PlanAnswer::Reject { .. } => "Plan rejected: nothing was dispatched".to_owned(),
             PlanAnswer::Change { .. } => {
-                "Change sent to the planner: a new plan will be shown".to_owned()
+                "Change sent to the planner as one change to this plan; the changed plan will be shown".to_owned()
             }
         };
         match backend.answer_plan(answer) {

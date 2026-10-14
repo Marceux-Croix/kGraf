@@ -502,8 +502,20 @@ impl RunLoop {
             .record
             .contract(contract_id)
             .is_some_and(|c| !c.gate_commands.is_empty());
+        // A contract's own check overrules a shortfall only when it checks
+        // something (decision 0100).
+        let own_checked = |by: &str| {
+            self.record
+                .contract(contract_id)
+                .is_some_and(|c| crate::shortfall::own_check_counts(c, by))
+        };
         let verdict = match verdict {
-            Verdict::Pass { by, .. } if !gate_checked && crate::shortfall::vacuous_check(&by) => {
+            Verdict::Pass { by, .. }
+                if !gate_checked
+                    && !own_checked(&by)
+                    && (crate::shortfall::vacuous_check(&by)
+                        || crate::shortfall::contract_check_passed(&by)) =>
+            {
                 Verdict::Fail {
                     reason: format!(
                         "the check `{}` checks nothing, so it cannot overrule the shortfall",
