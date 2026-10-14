@@ -435,11 +435,24 @@ mod tests {
             parse_openai_style(&without).reset_ms
         );
         assert_eq!(parse_openai_style(&throttled).reset_ms, Some(360_000));
+        // No absolute reset here: the reader turns a reset date into a delay
+        // from now, so two reads a millisecond apart would differ.
+        let anthropic = map(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "0"),
+            ("retry-after-ms", "1500"),
+            ("retry-after", "9"),
+        ]);
+        let anthropic_without = map(&[
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("anthropic-ratelimit-requests-remaining", "0"),
+        ]);
         assert_eq!(
-            parse_anthropic_style(&throttled),
-            parse_anthropic_style(&without),
+            parse_anthropic_style(&anthropic),
+            parse_anthropic_style(&anthropic_without),
             "retry-after changes nothing the anthropic reader records"
         );
+        assert_eq!(parse_anthropic_style(&anthropic).reset_ms, None);
         assert_eq!(
             parse_openai_style(&map(&[("retry-after", "7")])).reset_ms,
             None

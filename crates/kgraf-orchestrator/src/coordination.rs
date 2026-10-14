@@ -117,6 +117,11 @@ pub struct Coordination {
     /// with their brief kept: search reaches them (0032: "contract: ... including
     /// superseded ones"), and the text surface shows their brief.
     pub closed: Vec<ClosedContract>,
+    /// Gates that run in the background on each verified tip (decision 0100,
+    /// a small request's root gate), by gate id, with their coalescing slot.
+    /// A gate not here runs as decision 0018 states.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub background_gates: BTreeMap<String, crate::gates::BackgroundRun>,
 }
 
 /// The validation commands' outcome at the run's base commit.

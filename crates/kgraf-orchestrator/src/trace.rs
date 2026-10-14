@@ -339,6 +339,20 @@ pub enum TraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_queued_ms: Option<i64>,
     },
+    /// How a request was sized (decision 0100, section 6): the rule's
+    /// decision (`small`, `large`, `ask`), and later how an `ask` settled.
+    /// `step` names the moment: `decision` (the rule decided, `decided_us`
+    /// after the request was received: the step mark of a small request's
+    /// dispatch interaction), `template`, `asked`, `answer`, `early_start`,
+    /// `early_unmet`, `merge_held`, `early_cancelled`, `fallback`, `lost`.
+    Triage {
+        at_ms: i64,
+        step: String,
+        size: crate::triage::Size,
+        /// Microseconds from the request's receipt to this step.
+        decided_us: i64,
+        detail: String,
+    },
     /// Question 6. Accounting only (decision 0080 removed every spend cap).
     Spend {
         at_ms: i64,
@@ -1129,6 +1143,19 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
                 notices: notices.into_iter().map(s).collect(),
             }
         }
+        TraceEvent::Triage {
+            at_ms,
+            step,
+            size,
+            decided_us,
+            detail,
+        } => TraceEvent::Triage {
+            at_ms,
+            step,
+            size,
+            decided_us,
+            detail: s(detail),
+        },
         other @ (TraceEvent::Dispatch { .. }
         | TraceEvent::RouteRecovered { .. }
         | TraceEvent::AnswerRepaired { .. }

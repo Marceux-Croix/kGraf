@@ -3000,7 +3000,36 @@ impl ShellApp {
             });
         }
         settings_rows::divider(ui, p);
+        self.settings_planning(ui, p);
+        settings_rows::divider(ui, p);
         self.settings_updates(ui, p);
+    }
+
+    /// Planning (decision 0100): whether a small request skips the planning
+    /// call, and whether its worker may start before the triage answer.
+    /// Configuration only (decision 0017); a run started after the change
+    /// takes it. A run file's `plan` and `early_start` outrank it.
+    fn settings_planning(&mut self, ui: &mut Ui, p: &Palette) {
+        settings_rows::heading(ui, p, "Planning");
+        settings_rows::toggle(
+            ui,
+            p,
+            "Run small requests without a plan",
+            "Off by default. On: a request of one sentence that names one or two files runs \
+             as one contract with no planning call; a request kGraf cannot size gets one \
+             short triage call first. Off: every request is planned.",
+            &mut self.settings.plan_auto,
+        );
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
+            "Start a worker before triage answers",
+            "On by default. On: while the triage call runs, the one worker starts if it can \
+             start at once; its work merges only after the answer, and a \"split\" answer \
+             stops it. Only applies when small requests run without a plan.",
+            &mut self.settings.early_start,
+        );
     }
 
     /// Runs: everything a run the app starts takes from Settings. A change

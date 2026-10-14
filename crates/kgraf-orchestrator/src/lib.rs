@@ -121,6 +121,7 @@ mod stub_land;
 mod subagent_tool;
 pub mod templates;
 mod trace;
+pub mod triage;
 mod verify;
 mod waits;
 
@@ -239,8 +240,8 @@ pub use scheduler_loop::{
 pub use session_tools::{SESSION_TOOL_NAMES, SessionLine, session_tools};
 pub use shortfall::{
     AcceptedStanding, Authority, Grant, GrantRecord, Grounding, MAX_ANSWERED_SHORTFALLS,
-    MAX_SHORTFALL_REDISPATCHES, RequestScope, SHORTFALL_TAG, SHORTFALL_TOOL, ShortfallDecision,
-    ShortfallKind, ShortfallTool, accepted_standing, vacuous_check,
+    MAX_SHORTFALL_REDISPATCHES, RequestScope, SCOPED_CHECK_VACUOUS, SHORTFALL_TAG, SHORTFALL_TOOL,
+    ShortfallDecision, ShortfallKind, ShortfallTool, accepted_standing, vacuous_check,
 };
 pub use sizing::{
     ORCHESTRATOR_AGENT_PREFIX, Projection, ProjectionSource, Sizer, dear_usage, dear_usage_on,

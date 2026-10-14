@@ -288,6 +288,11 @@ impl Desk {
             compile_timeout_s: self.runner.compile_timeout().as_secs(),
         }
     }
+
+    /// Whether any registered interface names `contract` as a party.
+    pub(super) fn parties_include(&self, contract: &str) -> bool {
+        !self.book.interfaces_of(contract).is_empty()
+    }
 }
 
 impl Drop for Desk {

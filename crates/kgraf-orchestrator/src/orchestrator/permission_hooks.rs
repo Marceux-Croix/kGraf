@@ -319,9 +319,12 @@ impl RunLoop {
             question: question.to_owned(),
             raised_at_ms: self.now(),
         };
-        self.perms
-            .desk
-            .show_request(self.view_of(contract, &request));
+        let view = self.view_of(contract, &request);
+        // Decision 0100: an early-started worker's card waits for the
+        // triage answer in the modes that ask.
+        if !self.hold_card_for_triage(contract, &view) {
+            self.perms.desk.show_request(view);
+        }
         request
     }
 

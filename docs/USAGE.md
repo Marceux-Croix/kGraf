@@ -160,6 +160,8 @@ overwrites a node you changed.
 | `--interface-review` | off | Before a producer attempt counts as verified, one model on a different vendor's route reviews it. The finding is advisory. |
 | `--no-collapse-chains` | off | Keep a plan's straight chains of contracts as the planner wrote them. By default a chain (each contract waiting on the one before) becomes one contract when its steps run on one route and one worker can carry it; a link stays split when its first step writes source code an interface can check and both steps are large (each at least a quarter of the route's plan target), so both can start at once against the first step's stub. Plan review and an order you chose always keep the plan as written. Also the run file key `collapse_chains` (`false`). The run record does not keep it: give it again with `--resume`. |
 | `--early-nonparty` | off | With `--contract-checks`, start the contracts whose gate has nothing to do on the loop before a contract whose gate still has a stub to land or a handshake to make. Those two steps run on the loop, and the run starts one contract at a time, so a ready contract waits behind them. A contract an interface binds whose checks still run, or whose checks passed and whose stub is landed, keeps its place. The order you chose and every contract's own checks are unchanged. Routes are handed out in the order of dispatch, so a contract can get another route than without the flag. Also the run file key `early_nonparty` (`true`). The run record does not keep it: give it again with `--resume`. |
+| `--plan auto\|full` | `full` | `auto` sizes the instruction first: a small request runs as one contract with no planning call, a large one is planned, and one in between gets one short triage call. See [Small requests](#small-requests). Also the run file key `plan` and the `plan_mode` user setting. |
+| `--early-start`, `--no-early-start` | off | With `--plan auto`, start the one worker beside the triage call when it can start at once. Also the run file key `early_start` and the `early_start` user setting. |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
 | `--interactive` | off | Read notes and `?` status questions from stdin during the run. |
@@ -407,6 +409,72 @@ When `--verify` is a whole-suite runner kGraf recognizes (`cargo test --workspac
 `pytest`, `go test ./...`, `npm test`, `mvn test`, `gradle test` and others), each contract is
 first checked on the tests of its own files only. A check that fails only because other
 contracts have not merged yet is deferred to the root gate (0018).
+
+### Small requests
+
+With `--plan auto` (Settings > General > "Run small requests without a plan" in the app), kGraf
+sizes the instruction by a rule before it asks the planner, with no model call (decision 0100):
+
+| Size | When |
+|---|---|
+| small | at most 400 characters, one sentence or one list item, one or two named files that exist or sit in an existing directory, no roadmap phase or decision named, and no other contract holding a lease on a named file |
+| large | over 1,500 characters, three or more sentences or list items, four or more named files across two or more top-level directories, or a roadmap section named |
+| neither | one `triage` call: reasoning off, at most 64 output tokens, never asked again |
+
+A small request, or one the triage call answers "one", is one contract: the instruction
+verbatim, writing the named files and the other files of their package (at most 64; past that,
+the named files alone, and a write outside them goes through the permission mode's grant).
+There is no `decompose` or `interfaces` call. Its check is `--verify` narrowed to the tests of
+the files it writes. A narrowed `cargo test` that selects no recognized test (a file under
+`tests/`, a `#[test]`, `#[tokio::test]`, `#[rstest]`, `proptest!` or a doctest), with no
+dependent package's check beside it, leaves the contract unverified (`scoped_check_vacuous`)
+until the root gate passes on a tip that holds its merge; a notice says when the mark is
+cleared. This applies to a small request's contract only; a planned contract's check is judged
+as before. A request that names no file is never small: its one contract would have no write
+scope, so it is asked about (or planned in full when it is large). A name with no directory
+(`config.rs`) counts as a file only when exactly one indexed file has that name; a dotted word
+(`Node.js`, `self.plan`) is not a file and makes the request ask. The triage call has a deadline:
+twice the planner route's measured (or default) p90 for it, at most 30 s and the run's time
+left; past it the call is cut, settles cancelled, and the request is planned in full with a
+notice. A large request, a "split" answer, and a triage call that fails or answers with anything but
+the JSON asked for are planned in full; the last two print a notice. A verified one-step workflow
+template that writes exactly the named files decides "one" with no call. A run started this way
+is not made into a template.
+
+The root gate of a small request runs in the background on each verified tip of `kgraf/<run>`,
+one run at a time. A tip that is verified while it runs waits for that run to end; the next run
+is on the newest tip, and older waiting tips are dropped. A failure after the merge is printed
+as a notice and opens a remediation. The run completes when the gate passes.
+
+**Early start.** With `--early-start` (on by default in the app), the one worker starts beside
+the triage call when five conditions hold: it has a write scope (the named files' package, the
+named files when another contract holds a lease in that package, or the repository when no file
+is named and no other contract is live), a worker slot is free, the triage call is predicted
+slower than kGraf's dispatch (from the route's measured triage calls, else 3 s for a hosted
+route and 8 s for a local one), fewer than half of the past triage answers were "split", and
+plan review would not show the contract first. Each unmet condition is in the trace (`triage`,
+step `early_unmet`). The early worker may verify, but its work merges only after the answer.
+In the Manual, Accept edits and Auto modes, a permission request it raises waits for the answer
+too. "split" stops it, releases its worktree and leases, records what it used, and then plans
+the request.
+
+**Plan review.** In the modes that ask (Manual, Accept edits, Auto), plan review shows a small
+request's one contract as its card, with no planning call behind it. Orchestrator decides and
+Bypass never ask, so the contract runs without a card. With plan review on, no worker starts
+before the triage answer.
+
+**Resume.** A run stopped while its triage call was out is planned in full when resumed, with
+no second triage call; an early worker it had started is cancelled first.
+
+**Precedence.** Each setting is taken from the flag, then the run file (`plan`, `early_start`
+in `.kgraf/run.json`), then the user setting (`plan_mode = "auto"`, `early_start` in
+`settings.toml`), then the default: `full`, no early start. `kgraf schedule run-now` ignores
+`plan_mode` and the early-start setting and plans in full.
+
+The trace records each step as a `triage` event (`decision` with the time from the request,
+`asked`, `answer`, `early_start`, `merge_held`, `early_cancelled`, `fallback`, `lost`). The
+dispatch of a small request is measured from the request's receipt (`small_request_dispatch`,
+or `triage_dispatch` when the triage call decided it).
 
 ### Resume and stop
 

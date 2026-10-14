@@ -137,7 +137,13 @@ mod shell_writes;
 /// answers it (decision 0093).
 mod shortfall_hooks;
 // Decision 0095: runtime compaction, seen from the run loop.
+/// A small request's root gate runs in the background on verified tips
+/// (decision 0100).
+mod background_gate;
 mod compaction_hooks;
+/// Small requests skip planning (decision 0100): the rule, the triage task,
+/// early start and its merge hold.
+mod triage_entry;
 // Decision 0096: progress-gated round budgets, seen from the run loop.
 mod checkpoint_hooks;
 use checkpoint_hooks::checkpoint_note;
@@ -642,6 +648,11 @@ pub struct OrchestratorConfig {
     /// attempt starts that cannot run one round before it
     /// ([`crate::run_deadline`]). `None`: nothing is held back or stopped.
     pub time_limit: Option<Duration>,
+    /// Small requests (decision 0100, section 6): `plan` decides whether the
+    /// rule sizes a request before the planner is asked, `early_start`
+    /// whether the one worker starts beside a triage call. The default,
+    /// `full` with no early start, plans every request as before.
+    pub small: crate::triage::SmallRequestConfig,
 }
 
 impl Default for OrchestratorConfig {
@@ -667,6 +678,7 @@ impl Default for OrchestratorConfig {
             early_nonparty: false,
             route_fault_cooldown: Duration::from_secs(30),
             time_limit: None,
+            small: crate::triage::SmallRequestConfig::default(),
         }
     }
 }
@@ -1201,6 +1213,9 @@ enum LoopMsg {
     Subagent(Box<subagents::SubagentMsg>),
     /// A speculative merge round finished off the loop (decision 0074).
     Speculated(Box<speculate::SpecDone>),
+    /// The triage call of a small request answered (decision 0100), off the
+    /// loop.
+    TriageAnswered(Box<triage_entry::TriageDone>),
     /// A fact an attempt's environment build reports (decision 0043: the
     /// shared prefix it replaced), traced as a notice.
     AttemptNotice {
@@ -2466,7 +2481,7 @@ impl Orchestrator {
         // Each on the heap: the run loop's futures are hundreds of
         // kilobytes in a debug build (`kgraf_core::heap_future`).
         let mut state = on_heap(|| RunLoop::open(self, record, false)).await?;
-        let planned = on_heap(|| state.plan()).await;
+        let planned = on_heap(|| state.plan_entry(now)).await;
         on_heap(|| state.run_reviewed(planned)).await
     }
 
@@ -2500,12 +2515,14 @@ impl Orchestrator {
         if record.status == RunStatus::Completed {
             return Err(OrchestratorError::AlreadyCompleted(run.to_string()));
         }
-        let planned = record.planned;
         if record.plan_approved.is_none() {
             self.check_plan_review()?;
         }
         let mut state = on_heap(|| RunLoop::open(self, record, true)).await?;
-        let result = if planned {
+        // A triage the restart cut is planned in full, never asked again
+        // (decision 0100); an early start it cut is cancelled first.
+        on_heap(|| state.resume_triage()).await?;
+        let result = if state.record.planned {
             Ok(true)
         } else {
             on_heap(|| state.plan()).await
@@ -2565,6 +2582,9 @@ struct RunLoop {
     /// attempt being timed, and the clocks of work in progress
     /// ([`crate::latency`]).
     latency: crate::latency::LatencyState,
+    /// Small requests (decision 0100): the early contract's held merge and
+    /// cards, and the triage call's hold (`orchestrator/triage_entry.rs`).
+    triage_rt: triage_entry::TriageRuntime,
     /// When each waiting contract was first found not ready: the give-up is
     /// measured in time from here, not in dispatch attempts, since any loop
     /// message runs a dispatch pass.
@@ -2944,6 +2964,7 @@ impl RunLoop {
             deferred_logged: BTreeSet::new(),
             readiness_waits: BTreeMap::new(),
             latency: crate::latency::LatencyState::new(latency_events),
+            triage_rt: triage_entry::TriageRuntime::default(),
             readiness_since: BTreeMap::new(),
             not_ready_routes: BTreeMap::new(),
             route_health: crate::route_health::RouteHealth::new(route_fault_cooldown_ms),
@@ -4588,6 +4609,7 @@ impl RunLoop {
             self.speculate_tick();
             if self.in_flight.is_empty() && (self.stopping || !self.gates_busy()) {
                 if self.stopping {
+                    on_heap(|| self.stop_triage()).await?;
                     if !matches!(self.record.status, RunStatus::Blocked { .. }) {
                         self.record.status = RunStatus::Stopped;
                     }
@@ -4673,6 +4695,9 @@ impl RunLoop {
                 Some(LoopMsg::Session(w)) => on_heap(|| self.on_session_work(*w)).await?,
                 Some(LoopMsg::Subagent(m)) => on_heap(|| self.on_subagent(*m)).await?,
                 Some(LoopMsg::Speculated(done)) => on_heap(|| self.on_speculated(*done)).await?,
+                Some(LoopMsg::TriageAnswered(done)) => {
+                    on_heap(|| self.on_triage_answered(*done)).await?
+                }
                 Some(LoopMsg::AttemptNotice {
                     contract,
                     worker,
@@ -5026,6 +5051,10 @@ impl RunLoop {
 
     /// With nothing in flight: finished, blocked, or still waiting on time.
     fn terminal_status(&self) -> Option<RunStatus> {
+        // An early start waits on its triage answer (decision 0100).
+        if self.triage_pending() {
+            return None;
+        }
         if self.record.open_contracts.is_empty() && self.gates_passed() {
             return Some(RunStatus::Completed);
         }
@@ -8233,6 +8262,11 @@ impl RunLoop {
         if let Some(original) = contract.resolver_for.clone() {
             return self.finalize_resolver(contract, flight, original).await;
         }
+        // Decision 0100: an early-started contract verifies, but merges only
+        // once the triage answer that justified it arrives.
+        let Some((contract, flight)) = self.hold_merge_for_triage(contract, flight).await? else {
+            return Ok(());
+        };
         self.finalize_ordinary(contract, flight).await
     }
 
@@ -8273,6 +8307,11 @@ impl RunLoop {
         worker: &AgentId,
     ) -> Result<(), OrchestratorError> {
         if !self.latency.enabled || self.latency.gap_written.contains(contract) {
+            return Ok(());
+        }
+        // A small request's contract is measured from the request's receipt
+        // (decision 0100, B2 and B3), not from a planner call it never had.
+        if self.small_dispatch_latency(contract, worker).await? {
             return Ok(());
         }
         let planner = format!("orchestrator:{}", self.run_id());

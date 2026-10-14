@@ -40,7 +40,7 @@ use std::time::Instant;
 /// | Budget | Kind | Starts | Ends |
 /// |---|---|---|---|
 /// | B1 | `note_ack` | the loop takes a note or box line | the note is persisted and its reply sent |
-/// | B2 | `small_request_dispatch` | the contract is eligible (its plan was accepted, or its last dependency merged; the last planner call ends when that is unknown) | the worker's first ledger row starts. Its `kgraf_us` is the part the 1.5 s / 3 s target applies to: the wait for a slot (`capacity_wait_us`) and the sandbox checks (`checks_us`) are measured and named apart |
+/// | B2 | `small_request_dispatch` | the contract is eligible (its plan was accepted, or its last dependency merged; the last planner call ends when that is unknown); for a request the rule sized small, the request is received (a `triage` event marks the decision) | the worker's first ledger row starts. Its `kgraf_us` is the part the 1.5 s / 3 s target applies to: the wait for a slot (`capacity_wait_us`) and the sandbox checks (`checks_us`) are measured and named apart |
 /// | B3 | `triage_dispatch` | the request is received | the worker's first ledger row starts |
 /// | B4 | `delta_applied` | a change is received | it is applied to the plan and written |
 /// | B4a | `streamed_delta_dispatch` | an added contract's object parses | it is dispatched |
@@ -134,6 +134,7 @@ impl LatencyKind {
             self,
             Self::NoteAck
                 | Self::SmallRequestDispatch
+                | Self::TriageDispatch
                 | Self::WatchPoll
                 | Self::ContractMerged
                 | Self::RootGate
@@ -1024,7 +1025,7 @@ mod tests {
             .filter(|k| k.is_emitted())
             .map(|k| k.budget())
             .collect();
-        assert_eq!(emitted, ["B1", "B2", "B7", "B10", "B10a"]);
+        assert_eq!(emitted, ["B1", "B2", "B3", "B7", "B10", "B10a"]);
     }
 
     #[test]

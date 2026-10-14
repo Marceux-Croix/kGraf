@@ -123,6 +123,9 @@ pub struct OrchestrateArgs {
     /// `--answer-wait`, else the user setting; `None` derives the wait per
     /// call from the planner model's recent latencies.
     pub answer_wait_secs: Option<u32>,
+    /// `--plan` and the early-start pair over the user's settings (decision
+    /// 0100): `full` with no early start unless one of them says otherwise.
+    pub small: kgraf_orchestrator::triage::SmallRequestConfig,
 }
 
 /// The per-project part of the flags, as the host takes it. What is per
@@ -155,6 +158,12 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         interface_review: args.interface_review,
         collapse_chains: args.collapse_chains,
         early_nonparty: args.early_nonparty,
+        // Resolved already (flag, then the user's setting): this command
+        // reads no run file. The defaults are left unset, as a run file
+        // that does not name them reads.
+        plan: (args.small.plan != kgraf_orchestrator::triage::PlanMode::Full)
+            .then_some(args.small.plan),
+        early_start: args.small.early_start.then_some(true),
         worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
@@ -1457,6 +1466,7 @@ mod tests {
             approve_plan: false,
             warn_rule_conflicts: false,
             answer_wait_secs: None,
+            small: Default::default(),
         }
     }
 

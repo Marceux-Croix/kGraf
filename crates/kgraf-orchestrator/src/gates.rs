@@ -689,6 +689,147 @@ pub fn open_remediation(gates: &mut [GateNode], gate: &str, remediation: &str) {
     }
 }
 
+/// A gate that runs in the background on verified tips of the integration
+/// branch (decision 0100, a small request's root gate), and its one queued
+/// slot.
+///
+/// - **One run at a time.** A running gate is never started again and never
+///   preempted: a run in flight always finishes.
+/// - **Coalesce onto the newest tip.** A tip verified while a run is in flight
+///   takes the queued slot; a newer one replaces it (the older is dropped and
+///   counted). When the run ends, the next run starts on the newest tip.
+/// - **Information while covers are open.** A run started while a contract the
+///   gate covers is still open, or whose tip is older than a queued one, is
+///   information: a pass records the sha it ran on, a failure is shown, and
+///   neither opens a remediation or changes `ran_on`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundRun {
+    /// The tip the running (or last) run validates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_tip: Option<String>,
+    /// Whether the running (or last) run is information only.
+    #[serde(default)]
+    pub info: bool,
+    /// The newest tip verified while a run was in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_tip: Option<String>,
+    /// The integration commit the newest passing run validated, whether it
+    /// judged the gate or was information: the source of a small request's
+    /// landable commit (the gate's commands passed on exactly this tree).
+    /// `None` until a run passes, and for unversioned workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed_on: Option<String>,
+    /// The contracts merged on the integration branch when the running (or
+    /// last) run started: the work its tip holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_at_start: Vec<String>,
+    /// Runs that were information only.
+    #[serde(default)]
+    pub info_runs: u32,
+    /// Queued tips replaced by a newer one before they ran.
+    #[serde(default)]
+    pub dropped: u32,
+}
+
+/// How a background gate starts, when it is due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundStart {
+    /// Every cover is verified: the run judges the gate (decision 0018).
+    Full,
+    /// A cover is still open: the run is information only.
+    Info,
+}
+
+/// Whether background gate `g` is due on the integration tip `tip`: not
+/// running, and either ready as any gate is (`full`, from [`ready`]), or
+/// pending on a tip it has not run on while some cover is verified (`Info`).
+pub fn background_due(
+    g: &GateNode,
+    run: &BackgroundRun,
+    tip: Option<&str>,
+    full: bool,
+    verified: &dyn Fn(&str) -> bool,
+) -> Option<BackgroundStart> {
+    if matches!(g.status, GateStatus::Running { .. }) {
+        return None;
+    }
+    if full {
+        return Some(BackgroundStart::Full);
+    }
+    let tip = tip?;
+    let fresh = run.ran_tip.as_deref() != Some(tip) || run.queued_tip.is_some();
+    let some_verified = g.covers.iter().any(|c| verified(c));
+    (g.status == GateStatus::Pending && fresh && some_verified).then_some(BackgroundStart::Info)
+}
+
+/// A tip was verified while the gate may be running: a running gate keeps
+/// running and the tip takes the queued slot, replacing an older one.
+/// Returns whether a queued tip was dropped.
+pub fn background_tip(g: &GateNode, run: &mut BackgroundRun, tip: &str) -> bool {
+    let GateStatus::Running { pinned, .. } = &g.status else {
+        return false;
+    };
+    if pinned.as_deref() == Some(tip) || run.queued_tip.as_deref() == Some(tip) {
+        return false;
+    }
+    let dropped = run.queued_tip.replace(tip.to_owned()).is_some();
+    if dropped {
+        run.dropped += 1;
+    }
+    dropped
+}
+
+/// A background run is starting on `tip`: the slot is taken.
+pub fn background_started(run: &mut BackgroundRun, tip: Option<String>, start: BackgroundStart) {
+    run.ran_tip = tip;
+    run.queued_tip = None;
+    run.info = start == BackgroundStart::Info;
+    if run.info {
+        run.info_runs += 1;
+    }
+}
+
+/// Whether a finished background run judges the gate (`false`: it is
+/// information). It does not when it started as information, when a cover is
+/// open now, or when a newer tip is queued (the gate runs again there).
+pub fn background_judges(run: &BackgroundRun, covers_open: bool) -> bool {
+    !run.info && !covers_open && run.queued_tip.is_none()
+}
+
+/// A finished information run: a pass records its sha; the gate goes back
+/// to pending (or to failed, for a rerun after a failure), keeping `ran_on`,
+/// with no remediation.
+pub fn background_information(
+    gates: &mut [GateNode],
+    run: &mut BackgroundRun,
+    gate: &str,
+    passed: bool,
+    pinned: Option<String>,
+    now_ms: i64,
+) {
+    if passed {
+        run.passed_on = pinned.clone();
+    }
+    if let Some(g) = gates.iter_mut().find(|g| g.id == gate) {
+        g.runs += 1;
+        let after_failure = matches!(
+            g.status,
+            GateStatus::Running {
+                after_failure: true,
+                ..
+            }
+        );
+        g.status = match (after_failure, g.remediations.last()) {
+            (true, Some(r)) => GateStatus::Failed {
+                pinned,
+                at_ms: now_ms,
+                remediation: r.clone(),
+            },
+            _ => GateStatus::Pending,
+        };
+    }
+}
+
 /// On resume, a gate that was running when the process died runs again (a rerun
 /// after a failure goes back to failed, keeping the halt). A held gate stays
 /// held until the user decides ([`decide`], which works on a stopped run's
@@ -1010,5 +1151,101 @@ mod tests {
         // b depends (after the re-point) on the last child: the gate holds it.
         let b = contract("b", &["a.h2"], "b.rs");
         assert_eq!(blocking(&gates, &b).map(|g| g.id.as_str()), Some("gate:a"));
+    }
+
+    fn running(g: &mut GateNode, tip: &str) {
+        g.status = GateStatus::Running {
+            pinned: Some(tip.into()),
+            started_ms: 0,
+            after_failure: false,
+        };
+    }
+
+    /// Tips verified faster than one suite run: the running run is never
+    /// started again or replaced, the queued slot keeps only the newest tip,
+    /// and the next run starts there.
+    #[test]
+    fn a_background_gate_coalesces_onto_the_newest_tip_and_never_preempts() {
+        let contracts = vec![contract("a", &[], "a.rs"), contract("b", &[], "b.rs")];
+        let mut gates = plan_gates(&contracts, &BTreeMap::new());
+        let mut run = BackgroundRun::default();
+        let only_a = |c: &str| c == "a";
+        // a verified on t1, b still open: an information run.
+        let start = background_due(&gates[0], &run, Some("t1"), false, &only_a);
+        assert_eq!(start, Some(BackgroundStart::Info));
+        background_started(&mut run, Some("t1".into()), BackgroundStart::Info);
+        running(&mut gates[0], "t1");
+        // While it runs, it is not due again, whatever the tip.
+        assert_eq!(
+            background_due(&gates[0], &run, Some("t2"), true, &|_| true),
+            None
+        );
+        assert!(
+            !background_tip(&gates[0], &mut run, "t2"),
+            "first queued tip"
+        );
+        assert!(
+            background_tip(&gates[0], &mut run, "t3"),
+            "t2 is dropped for t3"
+        );
+        assert!(
+            !background_tip(&gates[0], &mut run, "t3"),
+            "the same tip again"
+        );
+        assert_eq!(run.queued_tip.as_deref(), Some("t3"));
+        assert_eq!(run.dropped, 1);
+        assert!(
+            matches!(&gates[0].status, GateStatus::Running { pinned: Some(p), .. } if p == "t1")
+        );
+        // The information run ends: no remediation, ran_on kept, back to
+        // pending; the next run is due on the newest tip.
+        assert!(!background_judges(&run, true));
+        let ran_on = gates[0].ran_on.clone();
+        background_information(&mut gates, &mut run, ROOT_GATE, false, Some("t1".into()), 5);
+        assert_eq!(gates[0].status, GateStatus::Pending);
+        assert_eq!(gates[0].ran_on, ran_on);
+        assert!(gates[0].remediations.is_empty());
+        let both = |_: &str| true;
+        assert_eq!(
+            background_due(&gates[0], &run, Some("t3"), true, &both),
+            Some(BackgroundStart::Full)
+        );
+        background_started(&mut run, Some("t3".into()), BackgroundStart::Full);
+        assert_eq!(run.queued_tip, None, "the slot is taken");
+        assert!(background_judges(&run, false));
+    }
+
+    /// A full run whose tip is older than a queued one is information: the
+    /// gate runs again on the newest tip before it can pass.
+    #[test]
+    fn a_full_run_overtaken_by_a_newer_tip_is_information() {
+        let contracts = vec![contract("a", &[], "a.rs")];
+        let mut gates = plan_gates(&contracts, &BTreeMap::new());
+        let mut run = BackgroundRun::default();
+        background_started(&mut run, Some("t1".into()), BackgroundStart::Full);
+        running(&mut gates[0], "t1");
+        background_tip(&gates[0], &mut run, "t2");
+        assert!(!background_judges(&run, false));
+        background_information(&mut gates, &mut run, ROOT_GATE, true, Some("t1".into()), 5);
+        assert_eq!(run.passed_on.as_deref(), Some("t1"), "the pass is recorded");
+        assert_eq!(
+            gates[0].status,
+            GateStatus::Pending,
+            "and the gate runs again"
+        );
+        // Nothing verified and nothing new: not due.
+        let mut idle = BackgroundRun {
+            ran_tip: Some("t2".into()),
+            ..BackgroundRun::default()
+        };
+        assert_eq!(
+            background_due(&gates[0], &idle, Some("t2"), false, &|_| true),
+            None
+        );
+        idle.ran_tip = None;
+        assert_eq!(
+            background_due(&gates[0], &idle, Some("t2"), false, &|_| false),
+            None
+        );
     }
 }

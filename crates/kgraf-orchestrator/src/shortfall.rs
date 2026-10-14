@@ -1116,6 +1116,22 @@ pub fn shortfall_brief(c: &OpenContract) -> String {
     s
 }
 
+/// The reason code of a contract left unverified because its narrowed cargo
+/// check selected no test target and no dependent check ran beside it
+/// (decision 0100, the zero-test rule). The verifier marks the passing
+/// verdict's `by` with `[scoped_check_vacuous: ...]`; [`accepted_standing`]
+/// reads the mark. The code is the hook a later executable per-contract
+/// acceptance (`OpenContract::gate_commands`) replaces: a contract with gate
+/// commands is judged by them and never carries it.
+pub const SCOPED_CHECK_VACUOUS: &str = "scoped_check_vacuous";
+
+/// The zero-test mark in a verdict's `by`, with what it names.
+fn scoped_check_vacuous(verified_by: &str) -> Option<&str> {
+    let start = verified_by.find(&format!("[{SCOPED_CHECK_VACUOUS}:"))?;
+    let rest = &verified_by[start + SCOPED_CHECK_VACUOUS.len() + 2..];
+    Some(rest.trim_end().trim_end_matches(']').trim())
+}
+
 /// Whether an acceptance command checks nothing: it always passes.
 pub fn vacuous_check(command: &str) -> bool {
     let c = command.trim().trim_end_matches(';').trim();
@@ -1189,6 +1205,20 @@ pub fn accepted_standing(
         })
     });
     let by = verified_by.trim();
+    if !gate_checked && let Some(what) = scoped_check_vacuous(by) {
+        let reason = format!(
+            "{SCOPED_CHECK_VACUOUS}: the narrowed check selected no recognized test ({what}) \
+             and no dependent check ran beside it; the contract stays unverified until the root \
+             gate passes on a tip that holds its merge"
+        );
+        return AcceptedStanding {
+            unverified: Some(match refused {
+                Some(r) => format!("{reason}; {r}"),
+                None => reason,
+            }),
+            refusal_notice: None,
+        };
+    }
     if gate_checked || !vacuous_check(verified_by) {
         return AcceptedStanding {
             unverified: None,
@@ -2816,6 +2846,30 @@ mod tests {
             &a,
         );
         assert!(matches!(d, ShortfallDecision::Hold { .. }), "{d:?}");
+    }
+
+    /// Decision 0100's zero-test rule: a passing narrowed cargo check the
+    /// verifier marked as selecting no test leaves the contract unverified
+    /// under its own reason code; a gate command beside it judges instead.
+    #[test]
+    fn a_narrowed_check_that_selected_no_test_is_unverified_with_its_code() {
+        let r = WorkerResult::bare("t", "w", kgraf_runtime::WorkerOutcome::Completed);
+        let by = "cargo test -p alpha [scoped_check_vacuous: package alpha has no recognized test target]";
+        let s = accepted_standing("c1", by, false, Some(&r));
+        let reason = s.unverified.expect("unverified");
+        assert!(reason.starts_with("scoped_check_vacuous: "), "{reason}");
+        assert!(
+            reason.contains("package alpha has no recognized test target"),
+            "{reason}"
+        );
+        assert_eq!(
+            accepted_standing("c1", by, true, Some(&r)),
+            AcceptedStanding::default()
+        );
+        assert_eq!(
+            accepted_standing("c1", "cargo test -p alpha", false, Some(&r)),
+            AcceptedStanding::default()
+        );
     }
 
     /// A vacuous check is unverified, with an unretried refusal in its

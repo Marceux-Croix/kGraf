@@ -46,6 +46,12 @@ pub const KEY_WARN_RULE_CONFLICTS: &str = "warn_rule_conflicts";
 /// the orchestrator's model to answer it (and how long a connection judgment
 /// may run). Unset derives it from the answering model's recent latencies.
 pub const KEY_ANSWER_WAIT: &str = "answer_wait_secs";
+/// `settings.toml` key: how a run is planned, `auto` (a small request is one
+/// contract with no plan call) or `full` (decision 0100). Unset is `full`.
+pub const KEY_PLAN_MODE: &str = "plan_mode";
+/// `settings.toml` key: whether a request the rule cannot size starts its one
+/// worker beside the triage call (decision 0100). Unset is off.
+pub const KEY_EARLY_START: &str = "early_start";
 
 /// Slider bounds (inclusive).
 pub const ROUNDS_BOUNDS: (u32, u32) = (4, 200);
@@ -94,6 +100,11 @@ pub struct UserLimits {
     /// the `[reasoning]` table. It shares the settings file and the
     /// flag-then-setting order with the limits, scope by scope.
     pub reasoning: kgraf_provider::ReasoningLevels,
+    /// Not a limit: how a run is planned (decision 0100). It shares the
+    /// flag-then-setting order; a run file outranks the setting.
+    pub plan_mode: Option<kgraf_orchestrator::triage::PlanMode>,
+    /// Not a limit: early start beside a triage call (decision 0100).
+    pub early_start: Option<bool>,
 }
 
 /// `settings.toml` table: the reasoning level of each model call (decision
@@ -118,6 +129,18 @@ fn read_bool_key(table: &toml::Table, key: &str) -> Result<Option<bool>> {
             .as_bool()
             .map(Some)
             .ok_or_else(|| Error::Invalid(format!("settings: `{key}` must be true or false"))),
+    }
+}
+
+fn read_plan_mode(table: &toml::Table) -> Result<Option<kgraf_orchestrator::triage::PlanMode>> {
+    match table.get(KEY_PLAN_MODE) {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| "a string".to_owned())
+            .and_then(str::parse)
+            .map(Some)
+            .map_err(|e| Error::Invalid(format!("settings: `{KEY_PLAN_MODE}`: {e}"))),
     }
 }
 
@@ -158,6 +181,8 @@ impl UserLimits {
             compaction_point: None,
             answer_wait_secs: b32(KEY_ANSWER_WAIT, ANSWER_WAIT_BOUNDS)?,
             reasoning: read_reasoning(&table)?,
+            plan_mode: read_plan_mode(&table)?,
+            early_start: read_bool_key(&table, KEY_EARLY_START)?,
         })
     }
 
@@ -239,6 +264,10 @@ pub struct ResolvedLimits {
     pub reasoning: kgraf_provider::ReasoningLevels,
     /// Where each scope's level came from, for the report.
     reasoning_flags: kgraf_provider::ReasoningLevels,
+    /// `full` by default, so a command with no flag plans as before.
+    pub plan_mode: (kgraf_orchestrator::triage::PlanMode, Source),
+    /// Off by default.
+    pub early_start: (bool, Source),
 }
 
 impl ResolvedLimits {
@@ -275,6 +304,16 @@ impl ResolvedLimits {
             ),
             reasoning: flags.reasoning.over(user.reasoning),
             reasoning_flags: flags.reasoning,
+            plan_mode: pick(flags.plan_mode, user.plan_mode, Default::default()),
+            early_start: pick(flags.early_start, user.early_start, false),
+        }
+    }
+
+    /// The small-request settings a command runs with (decision 0100).
+    pub fn small(&self) -> kgraf_orchestrator::triage::SmallRequestConfig {
+        kgraf_orchestrator::triage::SmallRequestConfig {
+            plan: self.plan_mode.0,
+            early_start: self.early_start.0,
         }
     }
 
@@ -687,5 +726,36 @@ mod tests {
         let (cap, why) = clamp_output(131_072, [("openai", "gpt-4o")]);
         assert_eq!(cap, 16_384);
         assert!(why.is_some());
+    }
+
+    /// Decision 0100's settings: read from the file, a flag over the
+    /// setting, and `full` with no early start when neither says.
+    #[test]
+    fn the_small_request_settings_resolve_flag_then_setting_then_default() {
+        use kgraf_orchestrator::triage::{PlanMode, SmallRequestConfig};
+        let user =
+            UserLimits::from_toml_str("plan_mode = \"auto\"\nearly_start = true\n").expect("read");
+        assert_eq!(user.plan_mode, Some(PlanMode::Auto));
+        assert_eq!(user.early_start, Some(true));
+        assert!(UserLimits::from_toml_str("plan_mode = \"small\"").is_err());
+        assert!(UserLimits::from_toml_str("early_start = 1").is_err());
+        let none = ResolvedLimits::resolve(&UserLimits::default(), &UserLimits::default(), 30);
+        assert_eq!(none.small(), SmallRequestConfig::default());
+        let setting = ResolvedLimits::resolve(&UserLimits::default(), &user, 30);
+        assert_eq!(
+            setting.small(),
+            SmallRequestConfig {
+                plan: PlanMode::Auto,
+                early_start: true
+            }
+        );
+        let flags = UserLimits {
+            plan_mode: Some(PlanMode::Full),
+            early_start: Some(false),
+            ..UserLimits::default()
+        };
+        let flag = ResolvedLimits::resolve(&flags, &user, 30);
+        assert_eq!(flag.small(), SmallRequestConfig::default());
+        assert_eq!(flag.plan_mode.1, Source::Flag);
     }
 }

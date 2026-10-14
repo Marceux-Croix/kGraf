@@ -1914,7 +1914,34 @@ impl Verifier for CommandVerifier {
                     ));
                     format!("{command} (deferred to the root gate)")
                 }
-                None => by_with_dependents(command, &dependents),
+                None => {
+                    // Decision 0100, the zero-test rule (cargo only): a
+                    // narrowed check that selects no recognized test target,
+                    // with no dependent check beside it, compiled the work and
+                    // tested nothing. The verdict says so, and the
+                    // orchestrator leaves the contract unverified under that
+                    // reason code until the root gate passes over it. Applied
+                    // to a small request's contract only for now: a planned
+                    // contract's verdict is as it was.
+                    let writes: Vec<&str> =
+                        contract.writes.iter().map(|w| w.path.as_str()).collect();
+                    let vacuous = (dependents.passed.is_empty()
+                        && contract.gate_commands.is_empty()
+                        && kgraf_orchestrator::triage::is_small_contract(&contract))
+                    .then(|| {
+                        crate::scoped_check::cargo_selects_no_tests(&whole, ws.root(), &writes)
+                    })
+                    .flatten();
+                    let by = by_with_dependents(command, &dependents);
+                    match vacuous {
+                        Some(packages) => format!(
+                            "{by} [{}: {} has no recognized test target]",
+                            kgraf_orchestrator::SCOPED_CHECK_VACUOUS,
+                            packages.join(", ")
+                        ),
+                        None => by,
+                    }
+                }
             };
             Ok(Verdict::Pass {
                 by: by.clone(),

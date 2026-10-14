@@ -1000,7 +1000,11 @@ impl RunLoop {
             let record = &self.record;
             gates::ready(&record.coordination.gates, &|c| record.is_verified(c))
         };
+        // Decision 0100: a background gate coalesces tips and may run as
+        // information while a cover is open (`background_gate.rs`).
+        let (ready, info_runs) = self.background_ready(ready);
         for id in ready {
+            let info_run = info_runs.contains(&id);
             if self.stopping {
                 break;
             }
@@ -1042,7 +1046,9 @@ impl RunLoop {
                         .map(|why| format!("{c} ({why})"))
                 })
                 .collect();
-            if !missing.is_empty() || !superseded.is_empty() {
+            // An information run validates the tip as it stands, open covers
+            // and all: nothing it finds is held against the gate.
+            if !info_run && (!missing.is_empty() || !superseded.is_empty()) {
                 self.s.admission.gate().release(admitted);
                 let reason = if superseded.is_empty() {
                     format!(
@@ -1111,7 +1117,10 @@ impl RunLoop {
                 started_ms: at,
                 after_failure,
             };
-            g.ran_on = covers.clone();
+            if !info_run {
+                g.ran_on = covers.clone();
+            }
+            self.background_started(&id, pin.clone(), info_run);
             let request = GateRequest {
                 gate: id.clone(),
                 covers: covers.clone(),
@@ -1289,6 +1298,12 @@ impl RunLoop {
                     )),
                 }),
             }
+        }
+        if self
+            .background_finished(&gate, &verdict, pinned.clone(), duration_ms)
+            .await?
+        {
+            return self.save();
         }
         let failed_below_root = gate != gates::ROOT_GATE && matches!(&verdict, Ok(v) if !v.passed);
         let base_fails = self

@@ -1334,6 +1334,133 @@ pub(crate) fn dependents(
     out
 }
 
+/// The cargo packages a narrowed check of `writes` runs when none of them has
+/// a test of its own (decision 0100, the zero-test rule): the narrowed check
+/// is then a compile. `None` when the command is not a cargo run over a
+/// workspace, when it is not narrowed, or when some package has a test.
+/// Read statically: a `.rs` file under `tests/` or a test attribute in the
+/// sources counts as a test target ([`has_tests`]).
+pub(crate) fn cargo_selects_no_tests(
+    command: &str,
+    root: &Path,
+    writes: &[&str],
+) -> Option<Vec<String>> {
+    if !matches!(runner(command, root), Ok(Runner::Cargo { .. })) {
+        return None;
+    }
+    let Scope::Narrowed { selected, .. } = scope(command, root, writes) else {
+        return None;
+    };
+    let dirs: BTreeSet<PathBuf> = writes
+        .iter()
+        .filter_map(|w| cargo_package_dir_of(root, w))
+        .collect();
+    if dirs.is_empty() || dirs.iter().any(|d| has_recognized_tests(&root.join(d))) {
+        return None;
+    }
+    Some(selected)
+}
+
+/// Markers of a test in a Rust source file, beyond `#[test]`: an attribute
+/// path ending in `test` (`#[tokio::test]`), `rstest`, `test_case`,
+/// `quickcheck`, and a `proptest!` block.
+const TEST_MARKERS: &[&str] = &[
+    "#[test]",
+    "::test]",
+    "::test(",
+    "#[rstest",
+    "#[test_case",
+    "#[quickcheck",
+    "proptest!",
+];
+
+/// Code-fence languages a doctest never runs.
+const NOT_DOCTEST: &[&str] = &[
+    "text", "ignore", "console", "sh", "bash", "shell", "json", "toml", "yaml", "md",
+];
+
+/// Whether a source file holds a doctest: a doc comment opening a code fence
+/// that rustdoc compiles (no language, `rust`, `no_run`, `should_panic`, ...).
+fn has_doctest(text: &str) -> bool {
+    // Fences pair up: only an opening fence names a language.
+    let mut open = false;
+    for l in text.lines() {
+        let t = l.trim_start();
+        let Some(doc) = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")) else {
+            continue;
+        };
+        let Some(lang) = doc.trim_start().strip_prefix("```") else {
+            continue;
+        };
+        if open {
+            open = false;
+            continue;
+        }
+        open = true;
+        if !lang
+            .trim()
+            .split(',')
+            .any(|w| NOT_DOCTEST.contains(&w.trim()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`has_tests`] for the zero-test rule, counting what `cargo test` runs:
+/// a `.rs` file under `tests/`, a test marker ([`TEST_MARKERS`]) in `src/`
+/// or `benches/`, or a doctest in `src/`. Kept apart from `has_tests`, which
+/// the dependents' choice reads unchanged. Past the file bound it counts as
+/// having tests: the rule never marks what it did not read.
+fn has_recognized_tests(dir: &Path) -> bool {
+    if has_tests(dir) {
+        return true;
+    }
+    let mut stack = vec![dir.join("src"), dir.join("benches")];
+    let mut seen = 0usize;
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_FILES {
+                return true;
+            }
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file()
+                && path.extension().is_some_and(|e| e == "rs")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|t| TEST_MARKERS.iter().any(|m| t.contains(m)) || has_doctest(&t))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The directory of the package `write` belongs to, relative to `root`.
+fn cargo_package_dir_of(root: &Path, write: &str) -> Option<PathBuf> {
+    let mut dir: PathBuf = Path::new(write.trim_start_matches("./"))
+        .parent()?
+        .to_path_buf();
+    loop {
+        if package_name(&root.join(&dir)).is_some() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Whether the package at `dir` has tests of its own: a `.rs` file under
 /// `tests/`, or a test attribute in its sources. Bounded like the test search.
 fn has_tests(dir: &Path) -> bool {
@@ -1672,6 +1799,63 @@ mod tests {
         ("crates/beta/src/lib.rs", ""),
         ("crates/beta/src/deep/mod.rs", ""),
     ];
+
+    /// The zero-test rule reads test targets statically: a package with none
+    /// narrows to a compile; one test file or one test attribute in either
+    /// package is a test; another runner is not judged.
+    #[test]
+    fn a_narrowed_cargo_check_with_no_test_target_is_named() {
+        let t = tree(RS);
+        let cmd = "cargo test --workspace";
+        assert_eq!(
+            cargo_selects_no_tests(cmd, t.path(), &["crates/alpha/src/lib.rs"]),
+            Some(vec!["package alpha".to_owned()])
+        );
+        std::fs::write(
+            t.path().join("crates/beta/src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn x() {}\n}\n",
+        )
+        .expect("write");
+        assert_eq!(
+            cargo_selects_no_tests(
+                cmd,
+                t.path(),
+                &["crates/alpha/src/lib.rs", "crates/beta/src/lib.rs"]
+            ),
+            None,
+            "beta has a test"
+        );
+        std::fs::create_dir_all(t.path().join("crates/alpha/tests")).expect("mkdir");
+        std::fs::write(t.path().join("crates/alpha/tests/it.rs"), "").expect("write");
+        assert_eq!(
+            cargo_selects_no_tests(cmd, t.path(), &["crates/alpha/src/lib.rs"]),
+            None,
+            "alpha has a test file"
+        );
+        let marked = |text: &str| {
+            let t = tree(RS);
+            std::fs::write(t.path().join("crates/alpha/src/lib.rs"), text).expect("write");
+            cargo_selects_no_tests(cmd, t.path(), &["crates/alpha/src/lib.rs"])
+        };
+        for counted in [
+            "#[rstest]\nfn a() {}\n",
+            "proptest! { fn p(x in 0..1) {} }\n",
+            "#[tokio::test]\nasync fn a() {}\n",
+            "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
+            "//! ```rust,no_run\n//! f();\n//! ```\n",
+        ] {
+            assert_eq!(marked(counted), None, "counted as a test: {counted}");
+        }
+        assert!(
+            marked("/// ```text\n/// not code\n/// ```\npub fn f() {}\n").is_some(),
+            "a text fence is no doctest"
+        );
+        let py = tree(&[("tests/test_a.py", ""), ("a.py", "")]);
+        assert_eq!(
+            cargo_selects_no_tests("python3 -m pytest", py.path(), &["a.py"]),
+            None
+        );
+    }
 
     #[test]
     fn cargo_test_over_a_workspace_runs_the_packages_of_the_declared_files() {

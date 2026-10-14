@@ -443,6 +443,8 @@ impl RunLimitSliders {
             answer_wait_secs: self.answer_wait.chosen().map(|v| v as u32),
             // Not one of these sliders: `Settings::run_limits` adds it.
             reasoning: kgraf_provider::ReasoningLevels::new(),
+            plan_mode: None,
+            early_start: None,
         }
     }
 
@@ -617,6 +619,14 @@ pub struct Settings {
     /// `[reasoning]` table, read with the host's reader and written back
     /// unchanged. No control shows it yet; every run the app starts takes it.
     pub reasoning: kgraf_provider::ReasoningLevels,
+    /// Size a request before planning it (decision 0100): a small request
+    /// runs as one contract with no planning call. Off plans every request
+    /// in full; off by default.
+    pub plan_auto: bool,
+    /// Start a worker before the triage call answers, when it can start at
+    /// once (decision 0100; on by default). Only has an effect with
+    /// `plan_auto`.
+    pub early_start: bool,
 }
 
 impl Settings {
@@ -631,6 +641,12 @@ impl Settings {
         kgraf_host::limits::UserLimits {
             compaction_point: self.compaction.run_point(),
             reasoning: self.reasoning,
+            plan_mode: self
+                .plan_auto
+                .then_some(kgraf_orchestrator::triage::PlanMode::Auto),
+            // Only with small requests on: the setting has no effect
+            // otherwise, and a run file or a flag decides with it unset.
+            early_start: self.plan_auto.then_some(self.early_start),
             ..self.limits.user_limits()
         }
     }
@@ -657,6 +673,8 @@ impl Default for Settings {
             delete_worker_worktrees: true,
             install_registries: kgraf_host::deps::InstallHosts::defaults(),
             reasoning: kgraf_provider::ReasoningLevels::new(),
+            plan_auto: false,
+            early_start: true,
         }
     }
 }
@@ -737,6 +755,14 @@ struct SettingsFile {
         skip_serializing_if = "kgraf_provider::ReasoningLevels::is_empty"
     )]
     reasoning: kgraf_provider::ReasoningLevels,
+    /// `auto` or `full` (decision 0100); written only for `auto`, so absent
+    /// is `full`. Read with the host's reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_mode: Option<String>,
+    /// Absent (an older file, or small requests off) means on, the
+    /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    early_start: Option<bool>,
 }
 
 impl Settings {
@@ -800,6 +826,8 @@ impl Settings {
         let user = kgraf_host::limits::UserLimits::from_toml_str(text)
             .map_err(|e| ShellError::Config(e.to_string()))?;
         settings.reasoning = user.reasoning;
+        settings.plan_auto = user.plan_mode == Some(kgraf_orchestrator::triage::PlanMode::Auto);
+        settings.early_start = user.early_start.unwrap_or(settings.early_start);
         settings.limits = RunLimitSliders::from_user_limits(user);
         if let Some(a) = file.appearance {
             settings.appearance = a;
@@ -884,6 +912,10 @@ impl Settings {
                 })
                 .collect(),
             reasoning: self.reasoning,
+            plan_mode: self.plan_auto.then(|| "auto".to_owned()),
+            // Written when it applies or differs from the default, so a file
+            // with neither keeps the command line's own default (off).
+            early_start: (self.plan_auto || !self.early_start).then_some(self.early_start),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
     }
@@ -1390,6 +1422,41 @@ mod tests {
                 .expect("read")
                 .contains("delete_worker_worktrees = false")
         );
+    }
+
+    /// Decision 0100's two toggles round-trip through the file the command
+    /// line also reads, and reach every run the app starts: plan mode off
+    /// (full) and early start on by default.
+    #[test]
+    fn the_small_request_toggles_round_trip_and_reach_the_run_limits() {
+        use kgraf_orchestrator::triage::PlanMode;
+        let fresh = Settings::from_toml_str("").expect("valid");
+        assert!(!fresh.plan_auto);
+        assert!(fresh.early_start);
+        assert_eq!(fresh.run_limits().plan_mode, None);
+        assert_eq!(
+            fresh.run_limits().early_start,
+            None,
+            "no effect with plan mode off"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let chosen = Settings {
+            plan_auto: true,
+            early_start: false,
+            ..Settings::default()
+        };
+        chosen.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let user = kgraf_host::limits::UserLimits::from_toml_str(&text).expect("host reads it");
+        assert_eq!(user.plan_mode, Some(PlanMode::Auto));
+        assert_eq!(user.early_start, Some(false));
+        let loaded = Settings::load(&path).expect("load");
+        assert!(loaded.plan_auto);
+        assert!(!loaded.early_start);
+        assert_eq!(loaded.run_limits().plan_mode, Some(PlanMode::Auto));
+        assert_eq!(loaded.run_limits().early_start, Some(false));
+        assert!(Settings::from_toml_str("plan_mode = \"small\"").is_err());
     }
 
     #[test]

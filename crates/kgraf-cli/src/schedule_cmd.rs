@@ -711,6 +711,8 @@ fn run_now_with(
             approve_plan: false,
             warn_rule_conflicts: args.warn_rule_conflicts,
             answer_wait_secs: args.answer_wait_secs,
+            // A scheduled run is planned in full, as before decision 0100.
+            small: Default::default(),
         },
     );
     let spend = match run_spend(root, &run_id, &prices_path) {

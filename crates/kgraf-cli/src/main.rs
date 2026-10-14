@@ -15,6 +15,7 @@ mod diag_cmd;
 mod orchestrate_cmd;
 mod permissions_cli;
 mod plan_cmd;
+mod plan_flags;
 mod sandbox_cmd;
 mod schedule_cmd;
 mod worker_cmd;
@@ -459,6 +460,8 @@ enum Command {
         /// 120 to 900 s; 300 s with too little history).
         #[arg(long, value_parser = clap::value_parser!(u32).range(30..=1800))]
         answer_wait: Option<u32>,
+        #[command(flatten)]
+        plan_entry: plan_flags::PlanFlags,
         /// With --resume: run this held or failed gate again, with a fresh
         /// remediation allowance. Needs --gate-note.
         #[arg(long, requires = "resume", requires = "gate_note")]
@@ -1359,6 +1362,7 @@ fn run_cli() -> Result<()> {
             warn_rule_conflicts,
             no_warn_rule_conflicts,
             answer_wait,
+            plan_entry,
         } => {
             let limits = resolve_limits(
                 kgraf_host::limits::UserLimits {
@@ -1372,6 +1376,8 @@ fn run_cli() -> Result<()> {
                     compaction_point: None,
                     answer_wait_secs: answer_wait,
                     reasoning: reasoning_flags(&reasoning, planner_reasoning)?,
+                    plan_mode: plan_entry.plan,
+                    early_start: plan_entry.early_start(),
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                 true,
@@ -1435,6 +1441,7 @@ fn run_cli() -> Result<()> {
                     approve_plan,
                     warn_rule_conflicts: limits.warn_rule_conflicts.0,
                     answer_wait_secs: limits.answer_wait_secs.0,
+                    small: limits.small(),
                 },
             )
         }
@@ -1475,6 +1482,8 @@ fn run_cli() -> Result<()> {
                     compaction_point: None,
                     answer_wait_secs: None,
                     reasoning: reasoning_flags(&reasoning, None)?,
+                    plan_mode: None,
+                    early_start: None,
                 },
                 kgraf_host::limits::DEFAULT_ROUNDS_SINGLE_WORKER,
                 false,
@@ -1568,6 +1577,8 @@ fn run_cli() -> Result<()> {
                         // No flag of its own: a scheduled run takes the
                         // `[reasoning]` user setting.
                         reasoning: kgraf_provider::ReasoningLevels::new(),
+                        plan_mode: None,
+                        early_start: None,
                     },
                     kgraf_host::limits::DEFAULT_ROUNDS_ORCHESTRATED,
                     true,
@@ -3155,6 +3166,8 @@ mod tests {
             compaction_point: None,
             answer_wait_secs: None,
             reasoning: kgraf_provider::ReasoningLevels::new(),
+            plan_mode: None,
+            early_start: None,
         };
         let user = UserLimits {
             rounds: Some(40),

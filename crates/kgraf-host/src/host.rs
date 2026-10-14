@@ -574,6 +574,8 @@ impl Host {
             collapse_chains: config.collapse_chains,
             early_nonparty: config.early_nonparty,
             time_limit: config.time_limit,
+            // Decision 0100: flag or run file, then the user's setting.
+            small: config.small_requests(),
             ..OrchestratorConfig::default()
         };
         // Decision 0075: loaded once here, so a malformed store fails loud at

@@ -70,6 +70,7 @@ impl RunLoop {
     /// and nothing of the plan has started.
     fn plan_review_due(&self) -> bool {
         self.perms.control.plan_review()
+            && !self.small_review_skipped()
             && self.record.plan_approved.is_none()
             && self.record.planned
             && !self.record.open_contracts.is_empty()

@@ -229,6 +229,17 @@ pub struct RunConfig {
     /// plan without showing it. Command line only: never in `run.json`.
     #[serde(skip)]
     pub approve_plan: bool,
+    /// How a run is planned (decision 0100, `--plan`): `auto` sizes the
+    /// request first and runs a small one as one contract with no plan call;
+    /// `full` plans every request. Unset takes the user's `plan_mode`
+    /// setting, then `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<kgraf_orchestrator::triage::PlanMode>,
+    /// Start a request's one worker beside its triage call when decision
+    /// 0100's five conditions hold (`--early-start` / `--no-early-start`).
+    /// Unset takes the user's `early_start` setting, then off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_start: Option<bool>,
 }
 
 /// Keys a run file may not set (decision 0094): the permission mode, its
@@ -435,6 +446,8 @@ impl RunConfig {
             install_hosts: None,
             worktrees: WorktreeRetention::default(),
             approve_plan: false,
+            plan: None,
+            early_start: None,
         }
     }
 
@@ -558,9 +571,25 @@ impl RunConfig {
         {
             self.answer_wait_secs = Some(v);
         }
+        if unset("plan") {
+            self.plan = self.plan.or(user.plan_mode);
+        }
+        if unset("early_start") {
+            self.early_start = self.early_start.or(user.early_start);
+        }
         // Scope by scope: a scope the file sets wins, one it leaves out takes
         // the user's setting (decision 0098).
         self.reasoning = self.reasoning.over(user.reasoning);
+    }
+
+    /// The small-request settings this run takes (decision 0100): the flag or
+    /// run file, else the user's setting (merged by [`Self::load_with`]),
+    /// else `full` with no early start.
+    pub fn small_requests(&self) -> kgraf_orchestrator::triage::SmallRequestConfig {
+        kgraf_orchestrator::triage::SmallRequestConfig {
+            plan: self.plan.unwrap_or_default(),
+            early_start: self.early_start.unwrap_or(false),
+        }
     }
 
     /// The run's reasoning setting, with `planner_reasoning` read as the
@@ -1442,6 +1471,59 @@ mod tests {
             .expect("a local route needs no key");
     }
 
+    /// Decision 0100's two settings: the run file's `plan` and `early_start`
+    /// outrank the user's settings, which outrank `full` with no early
+    /// start; a file with neither and no setting plans as before.
+    #[test]
+    fn the_small_request_settings_take_the_run_file_then_the_user_setting() {
+        use kgraf_orchestrator::triage::{PlanMode, SmallRequestConfig};
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.json");
+        let user = crate::limits::UserLimits {
+            plan_mode: Some(PlanMode::Auto),
+            early_start: Some(true),
+            ..Default::default()
+        };
+        std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert_eq!(
+            c.small_requests(),
+            SmallRequestConfig {
+                plan: PlanMode::Auto,
+                early_start: true
+            }
+        );
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "plan": "full", "early_start": false}"#,
+        )
+        .expect("write");
+        let c = RunConfig::load_with(dir.path(), &path, &user).expect("load");
+        assert_eq!(
+            c.small_requests(),
+            SmallRequestConfig::default(),
+            "the file wins"
+        );
+        let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(c.small_requests(), SmallRequestConfig::default());
+        std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
+        let c = RunConfig::load(dir.path(), &path).expect("load");
+        assert_eq!(
+            c.small_requests(),
+            SmallRequestConfig::default(),
+            "no setting, no file key"
+        );
+        std::fs::write(
+            &path,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "plan": "small"}"#,
+        )
+        .expect("write");
+        assert!(
+            RunConfig::load(dir.path(), &path).is_err(),
+            "an unknown mode is refused"
+        );
+    }
+
     /// A limit the run file leaves out takes the user's setting, then the
     /// default; a limit the file names stays the file's (like a flag).
     #[test]
@@ -1458,6 +1540,8 @@ mod tests {
             compaction_point: Some(60),
             answer_wait_secs: Some(600),
             reasoning: kgraf_provider::ReasoningLevels::new(),
+            plan_mode: None,
+            early_start: None,
         };
         std::fs::write(
             &path,

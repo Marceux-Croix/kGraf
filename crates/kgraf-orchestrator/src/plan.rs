@@ -326,6 +326,25 @@ pub struct PlanOutput {
     pub calls: Vec<CallId>,
 }
 
+/// What the triage call is asked (decision 0100): the request, the files it
+/// names, and the repository's files.
+#[derive(Clone, Debug)]
+pub struct TriageRequest {
+    pub request: String,
+    pub named: Vec<String>,
+    pub known_files: Vec<String>,
+    /// The call is cut here, settling cancelled; the request is then planned
+    /// in full. `None`: no deadline of its own.
+    pub deadline: Option<std::time::Duration>,
+}
+
+/// The triage call's answer and its one ledger call.
+#[derive(Clone, Debug)]
+pub struct TriageOutput {
+    pub answer: crate::triage::TriageAnswer,
+    pub calls: Vec<CallId>,
+}
+
 /// What re-grounding is asked (0057).
 #[derive(Clone, Debug)]
 pub struct GroundRequest {
@@ -513,6 +532,14 @@ pub trait Decomposer: Send + Sync {
     fn output_limit(&self, _kind: &str, cap: Option<u32>) -> u32 {
         let limit = self.cost_basis().max_output_tokens;
         cap.map_or(limit, |c| c.min(limit))
+    }
+    /// Whether a small request is one contract (decision 0100): one capped
+    /// call, never asked again. A planner that cannot make it refuses, and the
+    /// request is planned in full.
+    async fn triage(&self, _request: &TriageRequest) -> Result<TriageOutput, PlanError> {
+        Err(PlanError::Invalid(
+            "this planner makes no triage call".to_owned(),
+        ))
     }
 }
 
@@ -1600,6 +1627,63 @@ impl ModelCaller {
         (result.map(|response| response.text()), call)
     }
 
+    /// One request of call kind `kind`, sent once (decision 0100, the
+    /// triage call): a malformed answer is not asked again and an incomplete
+    /// one gets no second request, unlike [`Self::ask_json`] and
+    /// [`Self::ask_read`]. The answer is cut at `cap` output tokens. The call
+    /// carries reasoning off unless the kind's own level is set: a group or
+    /// universal level does not reach it, since the budget it answers to (B3)
+    /// is one short answer.
+    ///
+    /// Returns the parsed answer, or the failure, with the one ledger call
+    /// (`None` only when no request was sent).
+    /// The reasoning level and output limit [`Self::ask_once`] sends: off and
+    /// `cap` unless the kind's own level is set, which then gets the caller's
+    /// limit (a reasoning model held to `cap` would spend it reasoning). The
+    /// reservation for the call reads the same figure
+    /// ([`ModelDecomposer`]'s `output_limit`), so it holds what can be billed.
+    pub(crate) fn once_effort_and_limit(
+        &self,
+        kind: &str,
+        cap: u32,
+    ) -> (Option<kgraf_provider::ReasoningEffort>, u32) {
+        use kgraf_provider::{ReasoningEffort, ReasoningProcess, ReasoningScope};
+        let own = ReasoningProcess::from_call_kind(kind)
+            .and_then(|p| self.reasoning.get(ReasoningScope::Process(p)));
+        let effort = match own {
+            Some(level) => level.effort(),
+            None => Some(ReasoningEffort::Off),
+        };
+        let limit = match effort {
+            Some(ReasoningEffort::Off) => cap.min(self.max_output_tokens),
+            _ => self.max_output_tokens,
+        };
+        (effort, limit)
+    }
+
+    pub(crate) async fn ask_once<T>(
+        &self,
+        kind: &str,
+        system: &str,
+        user: String,
+        cap: u32,
+        deadline: Option<std::time::Duration>,
+        parse: &impl Fn(&str) -> Result<T, PlanError>,
+    ) -> (Result<T, PlanError>, Option<CallId>) {
+        let (effort, limit) = self.once_effort_and_limit(kind, cap);
+        let mut request = Request::new(self.model.clone(), user, limit);
+        request.reasoning_effort = effort;
+        request.system = vec![kgraf_provider::Content::text(system)];
+        let (result, call) = self.complete_once_within(kind, &request, deadline).await;
+        let calls: Vec<CallId> = call.iter().cloned().collect();
+        let parsed = match result {
+            Ok(response) => parse(&response.text())
+                .map_err(|e| PlanError::attributed(calls.clone(), e.into_unattributed())),
+            Err(e) => Err(PlanError::attributed(calls.clone(), e.into_unattributed())),
+        };
+        (parsed, call)
+    }
+
     /// Ask with the run's model tools offered (decision 0089): each tool call
     /// the model makes is run through `tools`, attributed to the orchestrator
     /// and accounted, and its result sent back, until the model answers
@@ -1763,6 +1847,18 @@ impl ModelCaller {
         kind: &str,
         request: &Request,
     ) -> (Result<kgraf_provider::Response, PlanError>, Option<CallId>) {
+        self.complete_once_within(kind, request, None).await
+    }
+
+    /// [`Self::complete_once`], cut at `deadline` when one is given: the call
+    /// is stopped on purpose, so its row settles cancelled with the usage
+    /// seen, and the failure names the deadline.
+    async fn complete_once_within(
+        &self,
+        kind: &str,
+        request: &Request,
+        deadline: Option<std::time::Duration>,
+    ) -> (Result<kgraf_provider::Response, PlanError>, Option<CallId>) {
         let provider = self.provider.clone();
         let ledger = self.ledger.clone();
         let trace = CallTrace {
@@ -1791,7 +1887,26 @@ impl ModelCaller {
         // This call is not streamed, so the row has no time to first token:
         // `ttft_ms` stays absent (NULL), and `RouteSpeed` reports it absent,
         // never as zero.
-        match provider.complete(request, &token).await {
+        let answered = match deadline {
+            None => provider.complete(request, &token).await,
+            Some(d) => match tokio::time::timeout(d, provider.complete(request, &token)).await {
+                Ok(answered) => answered,
+                Err(_) => {
+                    token.stop_on_purpose();
+                    return (
+                        Err(PlanError::attributed(
+                            vec![call.clone()],
+                            PlanError::Invalid(format!(
+                                "the {kind} call passed its deadline of {} ms and was cut",
+                                d.as_millis()
+                            )),
+                        )),
+                        Some(call),
+                    );
+                }
+            },
+        };
+        match answered {
             Ok(response) if response.stop_reason == kgraf_provider::StopReason::MaxTokens => (
                 Err(PlanError::attributed(
                     vec![call.clone()],
@@ -1911,7 +2026,38 @@ impl Decomposer for ModelDecomposer {
     }
 
     fn output_limit(&self, kind: &str, cap: Option<u32>) -> u32 {
-        self.0.output_limit(kind, cap)
+        // The triage call is sent by `ask_once`, which decides its limit by
+        // its own rule: the reservation must read the same.
+        match (kind, cap) {
+            ("triage", Some(cap)) => self.0.once_effort_and_limit(kind, cap).1,
+            _ => self.0.output_limit(kind, cap),
+        }
+    }
+
+    async fn triage(&self, request: &TriageRequest) -> Result<TriageOutput, PlanError> {
+        let user =
+            crate::triage::triage_prompt(&request.request, &request.named, &request.known_files);
+        let parse = |text: &str| {
+            crate::triage::parse_answer(text).map_err(|reason| PlanError::BadOutput {
+                reason,
+                excerpt: text.chars().take(200).collect(),
+            })
+        };
+        let (answer, call) = self
+            .0
+            .ask_once(
+                "triage",
+                crate::triage::TRIAGE_SYSTEM,
+                user,
+                crate::triage::TRIAGE_MAX_OUTPUT_TOKENS,
+                request.deadline,
+                &parse,
+            )
+            .await;
+        Ok(TriageOutput {
+            answer: answer?,
+            calls: call.into_iter().collect(),
+        })
     }
 
     async fn decompose(&self, request: &PlanRequest) -> Result<PlanOutput, PlanError> {
@@ -4435,6 +4581,129 @@ mod tests {
         }
     }
 
+    /// The triage call (decision 0100, budget B3) is sent once: an answer
+    /// that is not the JSON asked for ends it, with no second request, and
+    /// the one request carries reasoning off and the 64-token cap, under a
+    /// universal level that would otherwise reach it. `ask_json` would ask
+    /// again (`MAX_MALFORMED_OUTPUT_RETRIES`); this is the difference.
+    #[tokio::test]
+    async fn the_triage_call_is_one_request_with_reasoning_off_and_its_cap() {
+        use kgraf_provider::{ReasoningEffort, ReasoningLevels, ReasoningScope};
+        let provider = Arc::new(WireBodies::new());
+        let caller = ModelCaller {
+            reasoning: ReasoningLevels::new()
+                .with(ReasoningScope::All, ReasoningEffort::High.into()),
+            provider: provider.clone(),
+            ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+            model: "m".into(),
+            max_output_tokens: 2_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        };
+        let decomposer = ModelDecomposer(caller);
+        // The reservation holds what the request can bill: the 64-token cap,
+        // not the universal level's full limit.
+        assert_eq!(
+            decomposer.output_limit("triage", Some(crate::triage::TRIAGE_MAX_OUTPUT_TOKENS)),
+            crate::triage::TRIAGE_MAX_OUTPUT_TOKENS
+        );
+        let refused = decomposer
+            .triage(&TriageRequest {
+                request: "Fix src/a.rs".into(),
+                named: vec!["src/a.rs".into()],
+                known_files: Vec::new(),
+                deadline: None,
+            })
+            .await
+            .expect_err("`{}` is not a triage answer");
+        assert_eq!(refused.calls().map(<[CallId]>::len), Some(1), "{refused}");
+        let bodies = provider.bodies.lock().expect("lock").clone();
+        assert_eq!(bodies.len(), 1, "one request, never asked again");
+        assert_eq!(
+            bodies[0].get("reasoning_effort"),
+            Some(&serde_json::json!("none"))
+        );
+        let cap = bodies[0]
+            .get("max_tokens")
+            .or_else(|| bodies[0].get("max_completion_tokens"))
+            .cloned();
+        assert_eq!(
+            cap,
+            Some(serde_json::json!(crate::triage::TRIAGE_MAX_OUTPUT_TOKENS))
+        );
+        let rows = decomposer
+            .0
+            .ledger
+            .calls_under_task("r", None)
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trace.kind.as_deref(), Some("triage"));
+    }
+
+    /// A route that never answers.
+    struct Never;
+
+    #[async_trait::async_trait]
+    impl Provider for Never {
+        fn adapter(&self) -> &'static str {
+            "never"
+        }
+        fn protocol(&self) -> kgraf_core::Protocol {
+            kgraf_core::Protocol::Inclusive
+        }
+        async fn complete(
+            &self,
+            _request: &Request,
+            _token: &kgraf_provider::CallToken,
+        ) -> Result<kgraf_provider::Response, kgraf_provider::ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A triage call that passes its deadline is cut: it fails naming the
+    /// deadline, and its ledger row settles cancelled, never left open.
+    #[tokio::test]
+    async fn a_triage_call_past_its_deadline_is_cut_and_settles_cancelled() {
+        let decomposer = ModelDecomposer(ModelCaller {
+            reasoning: Default::default(),
+            provider: Arc::new(Never),
+            ledger: Arc::new(Ledger::open_in_memory().expect("ledger")),
+            model: "m".into(),
+            max_output_tokens: 2_000,
+            agent: "orchestrator:r".into(),
+            task: "r".into(),
+        });
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            decomposer.triage(&TriageRequest {
+                request: "Fix src/a.rs".into(),
+                named: vec!["src/a.rs".into()],
+                known_files: Vec::new(),
+                deadline: Some(std::time::Duration::from_millis(50)),
+            }),
+        )
+        .await
+        .expect("the deadline ends the call")
+        .expect_err("cut");
+        assert!(cut.to_string().contains("deadline"), "{cut}");
+        // The row is closed by the token's drop, on the ledger's writer.
+        let mut settled = None;
+        for _ in 0..200 {
+            let rows = decomposer
+                .0
+                .ledger
+                .calls_under_task("r", None)
+                .expect("rows");
+            assert_eq!(rows.len(), 1);
+            if rows[0].finished_ms.is_some() {
+                settled = Some(rows[0].settlement);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(settled, Some(kgraf_provider::Settlement::Cancelled));
+    }
+
     /// Decision 0098, on the wire: each orchestrator call kind, asked through
     /// the one caller every orchestrator call goes through, sends the level
     /// its own override sets (each of the five values in turn), not the
@@ -4450,7 +4719,7 @@ mod tests {
             .into_iter()
             .filter(|p| p.group() != ReasoningGroup::Worker)
             .collect();
-        assert_eq!(kinds.len(), 12);
+        assert_eq!(kinds.len(), 13);
         for (i, process) in kinds.into_iter().enumerate() {
             let own = ReasoningLevel::ALL[i % ReasoningLevel::ALL.len()];
             let universal = if own == ReasoningEffort::Low.into() {
@@ -4552,6 +4821,7 @@ mod tests {
             ".ask_keeping_call_capped(",
             ".ask_read(",
             ".ask_with_model_tools(",
+            ".ask_once(",
         ] {
             for (at, _) in code.match_indices(method) {
                 let rest = code[at + method.len()..].trim_start();

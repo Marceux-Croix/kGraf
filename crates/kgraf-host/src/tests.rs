@@ -4392,6 +4392,29 @@ async fn an_attempt_that_needs_work_merged_after_its_dispatch_passes_on_the_merg
     assert!(matches!(merged, Integration::Merged { .. }), "{merged:?}");
 }
 
+/// Decision 0100's zero-test rule, on a small request's contract only: the
+/// same passing attempt, whose package has no recognized test target and no
+/// dependent, is marked as having tested nothing. The planned contract above
+/// is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_small_requests_narrowed_check_with_no_test_target_is_marked() {
+    let (r, mut c4, ws) = wcl_with_count_merged_after_dispatch("w-c4s").await;
+    c4.acceptance = kgraf_orchestrator::triage::SMALL_ACCEPTANCE.to_owned();
+    std::fs::write(ws.join("wcl/src/main.rs"), WCL_MAIN).expect("main");
+    let v = CommandVerifier {
+        root_gate: true,
+        ..verifier(&r, GREENFIELD_CHECK)
+    };
+    let verdict = v.verify_among(&c4, &ws, &result(), &[]).await.expect("ran");
+    let Verdict::Pass { by, .. } = &verdict else {
+        panic!("it passes on the tree that merges: {verdict:?}");
+    };
+    assert_eq!(
+        by,
+        "cargo test -p wcl --offline [scoped_check_vacuous: package wcl has no recognized test target]"
+    );
+}
+
 /// The same attempt with an error of its own (a duplicate import): it fails
 /// on the merged tip too, and the reason quotes that run, where `count`
 /// exists, so the retry is told only what is still wrong.

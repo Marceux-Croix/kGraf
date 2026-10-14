@@ -65,7 +65,7 @@ impl From<crate::demand::DemandError> for OrchestratorError {
 }
 
 impl RunLoop {
-    fn meta_json<T: serde::de::DeserializeOwned + Default>(
+    pub(super) fn meta_json<T: serde::de::DeserializeOwned + Default>(
         &self,
         key: &str,
     ) -> Result<T, OrchestratorError> {
@@ -82,7 +82,7 @@ impl RunLoop {
         }
     }
 
-    fn set_meta_json<T: serde::Serialize>(
+    pub(super) fn set_meta_json<T: serde::Serialize>(
         &self,
         key: &str,
         value: &T,
@@ -258,8 +258,20 @@ impl RunLoop {
             .iter()
             .any(|g| matches!(g.status, GateStatus::Waived { .. }));
 
+        // Decision 0100: a run the small path started had no plan to learn
+        // from; a template that decided it and missed is demoted.
+        let small = self.small_path_run();
+        self.small_path_frugality().await?;
         let graph = self.s.graph.clone();
-        if completed && !waived && !steps.is_empty() {
+        if completed && small {
+            self.trace(TraceEvent::Templates {
+                at_ms: now,
+                action: "not_mined".into(),
+                templates: Vec::new(),
+                detail: "a small request is one contract with no plan call".into(),
+            })
+            .await?;
+        } else if completed && !waived && !steps.is_empty() {
             let (action, id) = match &reused {
                 Some(id) => {
                     blocking(|| {

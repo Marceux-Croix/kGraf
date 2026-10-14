@@ -726,6 +726,9 @@ pub struct FileVerifier {
     /// When set, what `plan_check_scope` returns for every write set: the
     /// one test file a narrowed check would run.
     pub plan_scope: Mutex<Option<Vec<String>>>,
+    /// When set, the `by` of a passing verdict with a commit (the
+    /// zero-test mark of decision 0100 is written there).
+    pub by: Mutex<Option<String>>,
 }
 
 impl FileVerifier {
@@ -742,6 +745,7 @@ impl FileVerifier {
             gate_commands: Mutex::new(Vec::new()),
             acceptance: Mutex::new(None),
             plan_scope: Mutex::new(None),
+            by: Mutex::new(None),
         })
     }
 }
@@ -802,11 +806,17 @@ impl Verifier for FileVerifier {
             });
         }
         let n = self.verified.fetch_add(1, Ordering::SeqCst) + 1;
+        let by = self
+            .by
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or_else(|| "fake-tests".into());
         Ok(Verdict::Pass {
-            by: "fake-tests".into(),
+            by: by.clone(),
             commit: Some(VerifiedCommit {
                 sha: format!("{n:040x}"),
-                verified_by: "fake-tests".into(),
+                verified_by: by,
                 verified_ms: 0,
             }),
             notices: Vec::new(),

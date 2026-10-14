@@ -673,6 +673,11 @@ pub struct RunStateRecord {
     /// before the field reads as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_holds: Vec<CheckHold>,
+    /// How the request was sized (decision 0100): the rule's decision, the
+    /// triage call's answer and any early start. Absent on a run planned in
+    /// full by its setting and on every record from before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<crate::triage::TriageRecord>,
 }
 
 /// A hold a pre-dispatch interface check placed, with the route and model of
@@ -896,6 +901,7 @@ impl RunStateRecord {
             replan_failure_parts: Vec::new(),
             compactions: Vec::new(),
             check_holds: Vec::new(),
+            triage: None,
         }
     }
 
