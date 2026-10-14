@@ -35,7 +35,7 @@ pub mod streaming;
 pub use accounting::{
     CallRecord, CallToken, CallTrace, DispatchGapFacts, GroupBy, GroupKey, Ledger, LedgerAck,
     LedgerError, McpCall, McpCallRecord, ROUTE_STATS_MIN_ROUNDS, RouteCallRow, RouteRoundStats,
-    Settlement, SpendGroup, SpendOf, TaskUsage,
+    Settlement, SpendGroup, SpendOf, TaskUsage, within_stop_scope,
 };
 pub use call_errors::{
     AgentLog, AnswerRecovery, AnswerRecoveryAction, CallError, CallErrorLog,

@@ -539,6 +539,9 @@ pub struct ScriptFake {
     pub prompts: Mutex<Vec<String>>,
     /// A prompt containing this never gets an answer.
     pub hang_on: Mutex<Option<String>>,
+    /// A prompt containing the marker waits for a permit before it is
+    /// answered ([`ScriptFake::hold`]).
+    pub hold_on: Mutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
 }
 
 impl ScriptFake {
@@ -547,7 +550,16 @@ impl ScriptFake {
             reply: Box::new(reply),
             prompts: Mutex::new(Vec::new()),
             hang_on: Mutex::new(None),
+            hold_on: Mutex::new(None),
         })
+    }
+
+    /// Holds every prompt containing `marker` until a permit is added to
+    /// the returned semaphore (one permit per held prompt).
+    pub fn hold(&self, marker: &str) -> Arc<tokio::sync::Semaphore> {
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.hold_on.lock().expect("lock") = Some((marker.to_owned(), permits.clone()));
+        permits
     }
 
     pub fn calls(&self) -> usize {
@@ -585,6 +597,12 @@ impl Provider for ScriptFake {
         let hang = self.hang_on.lock().expect("lock").clone();
         if hang.is_some_and(|h| prompt.contains(&h)) {
             std::future::pending::<()>().await;
+        }
+        let hold = self.hold_on.lock().expect("lock").clone();
+        if let Some((marker, permits)) = hold
+            && prompt.contains(&marker)
+        {
+            permits.acquire().await.expect("permits").forget();
         }
         let text = (self.reply)(&prompt);
         // `SERVER_PARSE_ERROR:<status>:<body>`: the server answered with the

@@ -1068,10 +1068,10 @@ pub fn show_styled(
     land_card::show(ui, model, backend, &p, land_card::now_ms());
     crate::edit_card::show_change(ui, model, backend, &p);
 
-    // Pinned question cards (design 0067, point 4). Empty on every backend
-    // shipped so far (`BoxBackend::pending_questions`'s own default), so
-    // nothing draws here yet in the running app; the path is real and tested
-    // against a fake backend that does return one (`orchestrator_box::tests`).
+    // Pinned question cards (design 0067, point 4). A hosted run's backend
+    // reads them from the snapshot its loop publishes (decision 0100), so
+    // drawing a frame never waits for the loop; tested against a fake backend
+    // that returns one (`orchestrator_box::tests`).
     let questions = backend.pending_questions();
     for pair in questions.chunks(2) {
         ui.columns(2, |cols| {

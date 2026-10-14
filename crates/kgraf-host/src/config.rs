@@ -251,6 +251,12 @@ pub struct RunConfig {
     /// `zero_test_plans` setting, then off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_test_plans: Option<bool>,
+    /// Planner calls a contract's dispatch waits on run as tasks beside the
+    /// loop (decision 0100, `--concurrent-planner` /
+    /// `--no-concurrent-planner`). Unset takes the user's
+    /// `concurrent_planner` setting, then off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent_planner: Option<bool>,
     /// The delta call's prompt-cache layout (decision 0100, `--cache-layout`
     /// / `--no-cache-layout`). Unset takes the user's `cache_layout`
     /// setting, then off.
@@ -473,6 +479,7 @@ impl RunConfig {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            concurrent_planner: None,
             cache_layout: None,
             prompt_cache_key_routes: Vec::new(),
         }
@@ -640,6 +647,9 @@ impl RunConfig {
         }
         if unset("zero_test_plans") {
             self.zero_test_plans = self.zero_test_plans.or(user.zero_test_plans);
+        }
+        if unset("concurrent_planner") {
+            self.concurrent_planner = self.concurrent_planner.or(user.concurrent_planner);
         }
         if unset("cache_layout") {
             self.cache_layout = self.cache_layout.or(user.cache_layout);
@@ -1598,27 +1608,29 @@ mod tests {
         let c = RunConfig::load(dir.path(), &path).expect("load");
         assert_eq!(c.small_requests(), SmallRequestConfig::default());
         assert_eq!((c.own_checks, c.zero_test_plans), (None, None));
+        assert_eq!(c.concurrent_planner, None);
         let opt_in = crate::limits::UserLimits {
             own_checks: Some(true),
             zero_test_plans: Some(true),
+            concurrent_planner: Some(true),
             cache_layout: None,
             ..Default::default()
         };
         let c = RunConfig::load_with(dir.path(), &path, &opt_in).expect("load");
         assert_eq!(
-            (c.own_checks, c.zero_test_plans),
-            (Some(true), Some(true)),
-            "the user setting reaches a run file that names neither"
+            (c.own_checks, c.zero_test_plans, c.concurrent_planner),
+            (Some(true), Some(true), Some(true)),
+            "the user setting reaches a run file that names none"
         );
         std::fs::write(
             &path,
-            r#"{"routes": ["kimi:model"], "prices": "p.json", "own_checks": false, "zero_test_plans": false}"#,
+            r#"{"routes": ["kimi:model"], "prices": "p.json", "own_checks": false, "zero_test_plans": false, "concurrent_planner": false}"#,
         )
         .expect("write");
         let c = RunConfig::load_with(dir.path(), &path, &opt_in).expect("load");
         assert_eq!(
-            (c.own_checks, c.zero_test_plans),
-            (Some(false), Some(false)),
+            (c.own_checks, c.zero_test_plans, c.concurrent_planner),
+            (Some(false), Some(false), Some(false)),
             "the run file wins"
         );
         std::fs::write(&path, r#"{"routes": ["kimi:model"], "prices": "p.json"}"#).expect("write");
@@ -1675,6 +1687,7 @@ mod tests {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            concurrent_planner: None,
             cache_layout: None,
         };
         std::fs::write(

@@ -1,4 +1,4 @@
-error[E0451]: fields `ledger`, `id`, `settled`, `adapter`, `stopped` and `stop_probe` of struct `CallToken` are private
+error[E0451]: fields `ledger`, `id`, `settled`, `adapter`, `stopped` and `stop_probes` of struct `CallToken` are private
   --> tests/compile_fail/token_cannot_be_built_by_hand.rs:14:9
    |
 13 |     let _token = CallToken {
@@ -13,5 +13,5 @@ error[E0451]: fields `ledger`, `id`, `settled`, `adapter`, `stopped` and `stop_p
    |         ^^^^^^^ private field
 18 |         stopped: unimplemented!(),
    |         ^^^^^^^ private field
-19 |         stop_probe: unimplemented!(),
-   |         ^^^^^^^^^^ private field
+19 |         stop_probes: unimplemented!(),
+   |         ^^^^^^^^^^^ private field

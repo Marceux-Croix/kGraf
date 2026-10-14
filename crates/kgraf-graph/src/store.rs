@@ -2415,7 +2415,274 @@ CREATE TRIGGER IF NOT EXISTS edges_ad AFTER DELETE ON edges BEGIN
     VALUES ('edges', 'delete', OLD.id,
             json_object('src', OLD.src, 'dst', OLD.dst, 'kind', OLD.kind));
 END;
+
+-- Input taken in outside the run loop (decision 0100): a box or stdin line, an
+-- answer, a planner call's answer. Each row names its run and is routed at append
+-- (`kind`, `target`), so the loop folds it later and the writer acknowledges as soon
+-- as the row is committed. Append-only (the two triggers below refuse an update or a
+-- delete). Not derived data: absent from `DROP_DERIVED_ON_SCHEMA_CHANGE`, because a
+-- row can be input no record holds yet. The change-log trigger writes the row's ids
+-- and kind only, never its text: the change log is never pruned.
+CREATE TABLE IF NOT EXISTS run_intake (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    target      TEXT NOT NULL DEFAULT '',
+    channel     TEXT NOT NULL DEFAULT '',
+    message_id  TEXT NOT NULL DEFAULT '',
+    received_ms INTEGER NOT NULL,
+    body        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS run_intake_run ON run_intake(run_id, id);
+CREATE TRIGGER IF NOT EXISTS run_intake_ai AFTER INSERT ON run_intake BEGIN
+    INSERT INTO change_log(table_name, op, row_id, payload)
+    VALUES ('run_intake', 'insert', NEW.id,
+            json_object('run_id', NEW.run_id, 'kind', NEW.kind));
+END;
+CREATE TRIGGER IF NOT EXISTS run_intake_no_update BEFORE UPDATE ON run_intake BEGIN
+    SELECT RAISE(ABORT, 'run_intake is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS run_intake_no_delete BEFORE DELETE ON run_intake BEGIN
+    SELECT RAISE(ABORT, 'run_intake is append-only');
+END;
 "#;
+
+/// One row of `run_intake` (decision 0100), as read back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntakeRow {
+    /// Assigned by the table, rising: the loop folds the rows past the last
+    /// id it folded.
+    pub id: i64,
+    pub run: String,
+    /// What the row is (`note`, `change`, `node_message`, `answer`,
+    /// `planner_answer`); the orchestrator owns the names.
+    pub kind: String,
+    /// What the row addresses: the run itself, a work node, a question, or a
+    /// planner call's key.
+    pub target: String,
+    pub channel: String,
+    pub message_id: String,
+    pub received_ms: i64,
+    /// The row's text or data, already scrubbed by its writer.
+    pub body: String,
+}
+
+/// A row to append; the table assigns its id.
+#[derive(Clone, Copy, Debug)]
+pub struct NewIntakeRow<'a> {
+    pub run: &'a str,
+    pub kind: &'a str,
+    pub target: &'a str,
+    pub channel: &'a str,
+    pub message_id: &'a str,
+    pub received_ms: i64,
+    pub body: &'a str,
+}
+
+fn append_intake_on(conn: &Connection, row: &NewIntakeRow<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO run_intake(run_id, kind, target, channel, message_id, received_ms, body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            row.run,
+            row.kind,
+            row.target,
+            row.channel,
+            row.message_id,
+            row.received_ms,
+            row.body
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn intake_after_on(conn: &Connection, run: &str, after: i64) -> Result<Vec<IntakeRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, run_id, kind, target, channel, message_id, received_ms, body
+           FROM run_intake WHERE run_id = ?1 AND id > ?2 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![run, after], |r| {
+        Ok(IntakeRow {
+            id: r.get(0)?,
+            run: r.get(1)?,
+            kind: r.get(2)?,
+            target: r.get(3)?,
+            channel: r.get(4)?,
+            message_id: r.get(5)?,
+            received_ms: r.get(6)?,
+            body: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+impl GraphStore {
+    /// Append one `run_intake` row through this store's own connection: for a
+    /// store with no file (in memory), which no second connection can open. A
+    /// file store's writers use an [`IntakeWriter`].
+    pub fn append_intake(&self, row: &NewIntakeRow<'_>) -> Result<i64> {
+        append_intake_on(&self.conn, row)
+    }
+
+    /// `run`'s intake rows with an id above `after`, oldest first.
+    pub fn intake_after(&self, run: &str, after: i64) -> Result<Vec<IntakeRow>> {
+        intake_after_on(&self.conn, run, after)
+    }
+
+    /// The database file this store opened; `None` in memory.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+}
+
+/// A connection of its own to a store's file, for the intake writers (decision
+/// 0100): an append never waits for the lock the run loop holds on the shared
+/// store, only for SQLite's own write lock, which WAL keeps short.
+pub struct IntakeWriter {
+    conn: Connection,
+}
+
+impl IntakeWriter {
+    /// Open `db_path`, which a [`GraphStore`] has already created (the table is
+    /// part of its schema). `synchronous = FULL`: an acknowledged row survives
+    /// a crash of the operating system, not only of the process.
+    pub fn open(db_path: &Path) -> Result<Self> {
+        require_index_file(db_path)?;
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        Ok(Self { conn })
+    }
+
+    /// Append one row; returns once it is committed.
+    pub fn append(&self, row: &NewIntakeRow<'_>) -> Result<i64> {
+        append_intake_on(&self.conn, row)
+    }
+
+    /// `run`'s rows with an id above `after`, oldest first.
+    pub fn after(&self, run: &str, after: i64) -> Result<Vec<IntakeRow>> {
+        intake_after_on(&self.conn, run, after)
+    }
+}
+
+#[cfg(test)]
+mod run_intake_tests {
+    use super::*;
+
+    fn row<'a>(run: &'a str, kind: &'a str, body: &'a str) -> NewIntakeRow<'a> {
+        NewIntakeRow {
+            run,
+            kind,
+            target: "run",
+            channel: "box",
+            message_id: "m1",
+            received_ms: 7,
+            body,
+        }
+    }
+
+    fn intake_payloads(store: &GraphStore) -> Vec<String> {
+        store
+            .conn
+            .prepare("SELECT payload FROM change_log WHERE table_name = 'run_intake' ORDER BY seq")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows")
+    }
+
+    /// The table is append-only, its change-log rows carry ids and kind only,
+    /// a second connection appends and reads, and another run's rows are not
+    /// read.
+    #[test]
+    fn rows_append_through_their_own_connection_and_the_change_log_has_no_text() {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join("graph.db");
+        let store = GraphStore::open(&db, dir.path()).expect("store");
+        assert!(store.db_path().is_some_and(|p| p.ends_with("graph.db")));
+        let writer = IntakeWriter::open(&db).expect("writer");
+        let a = writer
+            .append(&row("r1", "note", "secret plan text"))
+            .expect("append");
+        let b = store
+            .append_intake(&row("r2", "note", "x"))
+            .expect("append");
+        let c = writer.append(&row("r1", "answer", "y")).expect("append");
+        assert!(a < b && b < c);
+        let read = store.intake_after("r1", 0).expect("read");
+        assert_eq!(
+            read.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a, c],
+            "only r1's rows, oldest first"
+        );
+        assert_eq!(read[0].body, "secret plan text");
+        assert_eq!(writer.after("r1", a).expect("read").len(), 1);
+        let payloads = intake_payloads(&store);
+        assert_eq!(payloads.len(), 3);
+        for p in &payloads {
+            let v: serde_json::Value = serde_json::from_str(p).expect("json");
+            let keys: Vec<&String> = v.as_object().expect("object").keys().collect();
+            assert_eq!(keys, ["kind", "run_id"], "ids and kind only: {p}");
+        }
+        assert!(!payloads.iter().any(|p| p.contains("secret")));
+        assert!(
+            store
+                .conn
+                .execute("UPDATE run_intake SET body = 'z' WHERE id = ?1", [a])
+                .is_err(),
+            "an update is refused"
+        );
+        assert!(
+            store
+                .conn
+                .execute("DELETE FROM run_intake WHERE id = ?1", [a])
+                .is_err(),
+            "a delete is refused"
+        );
+        assert_eq!(store.intake_after("r1", 0).expect("read").len(), 2);
+        assert!(
+            GraphStore::open_in_memory(dir.path())
+                .expect("memory")
+                .db_path()
+                .is_none()
+        );
+    }
+
+    /// A schema-version change rebuilds the derived tables and keeps every
+    /// intake row and its trigger.
+    #[test]
+    fn intake_rows_survive_a_schema_rebuild() {
+        assert!(!DROP_DERIVED_ON_SCHEMA_CHANGE.contains("run_intake"));
+        let dir = tempfile::tempdir().expect("dir");
+        let db = dir.path().join("graph.db");
+        {
+            let store = GraphStore::open(&db, dir.path()).expect("store");
+            store
+                .append_intake(&row("r1", "note", "kept"))
+                .expect("append");
+            store.set_meta("schema_version", "1").expect("old version");
+        }
+        let store = GraphStore::open(&db, dir.path()).expect("reopen rebuilds");
+        let rows = store.intake_after("r1", 0).expect("read");
+        assert_eq!(rows.len(), 1, "the row outlived the rebuild");
+        assert_eq!(rows[0].body, "kept");
+        store
+            .append_intake(&row("r1", "note", "next"))
+            .expect("append");
+        assert_eq!(
+            intake_payloads(&store).len(),
+            1,
+            "the trigger still writes after the rebuild (the change log itself is rebuilt)"
+        );
+    }
+}
 
 #[cfg(test)]
 mod wal_scrub_tests {

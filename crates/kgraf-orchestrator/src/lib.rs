@@ -114,6 +114,7 @@ mod route_health;
 pub mod route_speed;
 pub mod routing;
 mod run_deadline;
+pub mod run_intake;
 mod run_state;
 pub mod scheduler_loop;
 mod script_tests;

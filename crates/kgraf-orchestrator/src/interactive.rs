@@ -389,14 +389,17 @@ impl InteractiveRun {
         );
     }
 
-    /// Questions waiting for the user right now (for the box's pinned
-    /// cards). Blocks the calling thread on the loop's own answer, the same
-    /// way `stop_and_wait` does; call from a thread that is not a runtime
-    /// worker.
+    /// Questions waiting for the user (for the box's pinned cards), as the
+    /// loop last published them (decision 0100): never waits for the loop, so
+    /// the box may call it while it draws a frame, whatever the loop is doing.
     pub fn pending_questions(&self) -> Vec<PendingQuestionView> {
-        let handle = self.handle.clone();
-        self.runtime
-            .block_on(async move { handle.pending_questions().await })
+        self.handle.published_questions()
+    }
+
+    /// The loop's published snapshot: status, questions, the planner call it
+    /// waits on. Never waits for the loop.
+    pub fn snapshot(&self) -> crate::run_intake::LoopSnapshot {
+        self.handle.snapshot()
     }
 
     /// Permission requests waiting for the user (decision 0094), oldest

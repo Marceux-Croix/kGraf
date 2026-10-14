@@ -3055,6 +3055,16 @@ impl ShellApp {
         settings_rows::toggle(
             ui,
             p,
+            "Keep work moving during planner calls",
+            "Off by default. On: while a handshake, a stub land, a consumer test or a \
+             re-grounding call runs for one contract, kGraf keeps verifying, merging and \
+             starting other contracts; the contract that needs the answer waits for it.",
+            &mut self.settings.concurrent_planner,
+        );
+        ui.add_space(8.0);
+        settings_rows::toggle(
+            ui,
+            p,
             "Lay out change requests for the prompt cache",
             "Off by default. On: a change to a finished run sends its plan in id order, and \
              marks it for the provider's prompt cache where the provider takes marks and a \

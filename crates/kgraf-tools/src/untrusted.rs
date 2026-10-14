@@ -64,6 +64,13 @@ impl UntrustedText {
         Self(kgraf_secrets::scrub_persist(&self.0).into_owned())
     }
 
+    /// A stored copy ([`UntrustedText::for_storage`]) as a plain string, for a
+    /// table that keeps input until a run takes it in (the run intake table,
+    /// decision 0100). Read back with [`UntrustedText::new`]; never a prompt.
+    pub fn into_stored_string(self) -> String {
+        self.0
+    }
+
     /// Drop this stored text's model copy (see `kgraf_secrets::forget_model_copy`).
     pub fn forget_model_copy(&self) {
         kgraf_secrets::forget_model_copy(&self.0);

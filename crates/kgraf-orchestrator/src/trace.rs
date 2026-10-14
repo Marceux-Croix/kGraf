@@ -339,6 +339,38 @@ pub enum TraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_queued_ms: Option<i64>,
     },
+    /// One intake row folded into the record (decision 0100, section 4).
+    /// `ack_us`: the reader's receipt of the line to its acknowledgment, the
+    /// row committed in between (B1); `fold_us`: the row's commit to the save
+    /// that folded it. Each is absent when this process did not measure it
+    /// (a row an earlier process appended).
+    IntakeFolded {
+        at_ms: i64,
+        row: i64,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack_us: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fold_us: Option<i64>,
+    },
+    /// One planner call run as a task off the loop (decision 0100, section 4),
+    /// taken in by the loop. `outcome`: `answered`, `failed`, `stale` (its key
+    /// moved on while it ran; the answer is dropped, its spend counted) or
+    /// `cancelled` (cut by the run's stop or as stale). `slot_wait_us`: from
+    /// the loop's spawn to the task's start; `call_us`: the task's own time;
+    /// `stop_us`: from the cut to the task's end, for a cut task.
+    PlannerTask {
+        at_ms: i64,
+        kind: String,
+        subject: String,
+        generation: u64,
+        outcome: String,
+        calls: usize,
+        slot_wait_us: i64,
+        call_us: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_us: Option<i64>,
+    },
     /// How a request was sized (decision 0100, section 6): the rule's
     /// decision (`small`, `large`, `ask`), and later how an `ask` settled.
     /// `step` names the moment: `decision` (the rule decided, `decided_us`
@@ -1210,6 +1242,8 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         | TraceEvent::Latency(_)
         | TraceEvent::DispatchLatency(_)
         | TraceEvent::DispatchGap { .. }
+        | TraceEvent::IntakeFolded { .. }
+        | TraceEvent::PlannerTask { .. }
         | TraceEvent::Spend { .. }) => other,
     }
 }

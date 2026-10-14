@@ -169,10 +169,11 @@ overwrites a node you changed.
 | `--early-start`, `--no-early-start` | off | With `--plan auto`, start the one worker beside the triage call when it can start at once. Also the run file key `early_start` and the `early_start` user setting. |
 | `--own-checks`, `--no-own-checks` | off | A plan's contract may carry a check command of its own, run only when `--verify` tests nothing for it. See [A contract's own check](#a-contracts-own-check). Also the run file key `own_checks` and the `own_checks` user setting. |
 | `--zero-test-plans`, `--no-zero-test-plans` | off | Apply the zero-test rule of [Small requests](#small-requests) to every contract. Also the run file key `zero_test_plans` and the `zero_test_plans` user setting. |
+| `--concurrent-planner`, `--no-concurrent-planner` | off | Run the planner calls a contract waits on before it starts (an interface's handshake, its stub land, its consumers' tests, a re-grounding) beside the run: other contracts keep verifying, merging and starting meanwhile, and the contract that needs the answer waits for it. Off, the run waits for each such call, as before. The first plan is made the same way either way. Also the run file key `concurrent_planner`, the `concurrent_planner` user setting (Settings > General > "Keep work moving during planner calls" in the app). |
 | `--cache-layout`, `--no-cache-layout` | off | A change to a finished run sends its plan block in contract id order and marks it for the provider's prompt cache where the route takes marks and a read can still come, with the run's cache key. See [Change a run](#change-a-run). Also the run file key `cache_layout` and the `cache_layout` user setting (Settings > General). |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
-| `--interactive` | off | Read notes and `?` status questions from stdin during the run, and answer a change's ask with y or n. |
+| `--interactive` | off | Read notes and `?` status questions from stdin during the run, and answer a change's ask with y or n. A note is acknowledged as soon as it is saved, and a status question answered, even while the run waits on a planner call. |
 | `--fetch-deps`, `--no-fetch-deps` | ask | Answer the dependency question for this run only. |
 | `--warn-rule-conflicts`, `--no-warn-rule-conflicts` | off | Warn when your verify or gate command runs a program your rules block for workers. The command still runs. |
 | `--retry-gate NAME`, `--waive-gate NAME` | | With `--resume` and `--gate-note TEXT`: run a held gate again, or waive it. |
@@ -499,7 +500,9 @@ code is 128 plus the signal number (130 for Ctrl-C, 143 for SIGTERM). Stopping c
 30 seconds. A second interrupt exits at once.
 
 Continue a stopped or killed run with `kgraf orchestrate --resume <run-id> --route ... --prices ...`.
-A resume does not repeat a paid call. A held or failed gate is run again, or waived, with
+A resume does not repeat a paid call. A note sent to a run that is not running (from the box or
+`--interactive`) is saved and acknowledged as waiting; the next resume, or a reopen of a completed
+run, takes it in first. A held or failed gate is run again, or waived, with
 `--resume`, `--retry-gate` or `--waive-gate`, and `--gate-note`. `--resume` alone refuses a
 completed run; reopen one with a change instead.
 

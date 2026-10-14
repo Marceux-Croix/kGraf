@@ -500,13 +500,39 @@ pub struct CallToken<'ledger> {
     /// time limit), so an abandoned call settles `Cancelled`, not
     /// `Unreconciled`. See [`Self::stop_on_purpose`].
     stopped: AtomicBool,
-    /// A caller-supplied check for the same thing, read when the call is
-    /// abandoned. See [`Self::stop_when`].
-    stop_probe: std::sync::OnceLock<StopProbe>,
+    /// Caller-supplied checks for the same thing, read when the call is
+    /// abandoned: any one true means stopped. See [`Self::stop_when`].
+    stop_probes: std::sync::Mutex<Vec<StopProbe>>,
 }
 
 /// Reports whether a caller has stopped a call on purpose.
 type StopProbe = Box<dyn Fn() -> bool + Send + Sync>;
+
+tokio::task_local! {
+    /// The stop of the caller whose future is running: see [`within_stop_scope`].
+    static STOP_SCOPE: Arc<dyn Fn() -> bool + Send + Sync>;
+}
+
+/// Run `fut` with `stopped` as the stop probe ([`CallToken::stop_when`]) of
+/// every call token minted while it runs on this task, however deep the call
+/// is made (a planner, a handshaker, a consumer-test writer): a caller that
+/// drops `fut` after `stopped` turned true leaves every abandoned call
+/// [`Settlement::Cancelled`], not [`Settlement::Unreconciled`].
+///
+/// A scope rather than a parameter: the token is minted inside adapters and
+/// callers that know nothing of why a call would be cut, and threading a stop
+/// through every trait between them would change each one for a fact only the
+/// outermost caller has. A call made on another task (a spawned helper) is
+/// outside the scope and keeps the plain rule: a scope covers the one task
+/// that runs `fut`, never a task it spawns. The innermost scope wins. A
+/// probe the call's own caller sets with [`CallToken::stop_when`] is read as
+/// well: either one stops the call.
+pub async fn within_stop_scope<F: std::future::Future>(
+    stopped: impl Fn() -> bool + Send + Sync + 'static,
+    fut: F,
+) -> F::Output {
+    STOP_SCOPE.scope(Arc::new(stopped), fut).await
+}
 
 impl<'ledger> CallToken<'ledger> {
     /// Record that the caller is stopping this call on purpose, before it
@@ -525,15 +551,22 @@ impl<'ledger> CallToken<'ledger> {
 
     /// Like [`Self::stop_on_purpose`], for a caller that cannot reach the
     /// token when it stops the call: `probe` is read when the call is
-    /// abandoned, and a `true` means the caller stopped it. Only the first
-    /// probe set is kept; a later one is ignored.
+    /// abandoned, and a `true` means the caller stopped it. Every probe set
+    /// is kept and read (a stop scope's and the caller's own): any one true
+    /// means stopped.
     pub fn stop_when(&self, probe: impl Fn() -> bool + Send + Sync + 'static) {
-        let _first_only = self.stop_probe.set(Box::new(probe));
+        if let Ok(mut probes) = self.stop_probes.lock() {
+            probes.push(Box::new(probe));
+        }
     }
 
     /// Whether the caller has stopped this call on purpose.
     pub fn stopped_on_purpose(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst) || self.stop_probe.get().is_some_and(|probe| probe())
+        self.stopped.load(Ordering::SeqCst)
+            || self
+                .stop_probes
+                .lock()
+                .is_ok_and(|probes| probes.iter().any(|probe| probe()))
     }
 
     /// The ledger id of this call.
@@ -1888,14 +1921,20 @@ impl Ledger {
     }
 
     fn token(&self, id: CallId, adapter: &'static str) -> CallToken<'_> {
-        CallToken {
+        let token = CallToken {
             ledger: self,
             id,
             settled: AtomicBool::new(false),
             adapter,
             stopped: AtomicBool::new(false),
-            stop_probe: std::sync::OnceLock::new(),
+            stop_probes: std::sync::Mutex::new(Vec::new()),
+        };
+        // A call minted inside a stop scope is stopped on purpose when its
+        // scope's caller says so (see `within_stop_scope`).
+        if let Ok(probe) = STOP_SCOPE.try_with(Arc::clone) {
+            token.stop_when(move || probe());
         }
+        token
     }
 
     /// Resolve an unreconciled call by supplying the usage it turned out to have.
@@ -4784,6 +4823,47 @@ mod tests {
         // usage, so their spend is unknown and needs the same reconcile.
         assert_eq!(ledger.unreconciled().expect("query").len(), 3);
         assert!(ledger.verify().expect("verify").ok);
+    }
+
+    /// A call minted inside a stop scope and abandoned once the scope's stop
+    /// is set settles cancelled; one abandoned while the stop is clear, or
+    /// minted outside any scope, stays unreconciled.
+    #[tokio::test]
+    async fn a_call_abandoned_inside_a_stopped_scope_is_cancelled() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let stop = Arc::new(AtomicBool::new(false));
+        let mint = || async {
+            let token = ledger
+                .begin_async("test", Protocol::Additive, "m", "a", "t")
+                .await
+                .expect("begin");
+            token.id().clone()
+        };
+        let s = stop.clone();
+        let clear = within_stop_scope(move || s.load(Ordering::SeqCst), mint()).await;
+        stop.store(true, Ordering::SeqCst);
+        let s = stop.clone();
+        let cut = within_stop_scope(move || s.load(Ordering::SeqCst), mint()).await;
+        let outside = mint().await;
+        // A caller's own probe is read beside the scope's (clear here).
+        let both = within_stop_scope(|| false, async {
+            let token = ledger
+                .begin_async("test", Protocol::Additive, "m", "a", "t")
+                .await
+                .expect("begin");
+            token.stop_when(|| true);
+            token.id().clone()
+        })
+        .await;
+        let read = |id: &CallId| ledger.call(id).expect("read").expect("present");
+        assert_eq!(read(&cut).settlement, Settlement::Cancelled);
+        assert_eq!(read(&clear).settlement, Settlement::Unreconciled);
+        assert_eq!(read(&outside).settlement, Settlement::Unreconciled);
+        assert_eq!(
+            read(&both).settlement,
+            Settlement::Cancelled,
+            "the caller's own probe counts beside the scope's"
+        );
     }
 
     #[test]

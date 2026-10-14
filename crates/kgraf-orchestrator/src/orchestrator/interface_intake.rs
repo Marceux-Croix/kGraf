@@ -346,13 +346,15 @@ impl RunLoop {
         // the loop ends as stopped. Nothing of the answer is used.
         let stop = self.stop_token.clone();
         let asked_at = self.now();
-        let out = tokio::select! {
-            out = self.s.decomposer.decompose(request) => Some(out),
-            () = stop.cancelled() => None,
-        };
+        let asked = std::time::Instant::now();
+        self.publish_planning(Some("decompose"));
+        let out =
+            super::planner_tasks::cut_by_stop(&stop, self.s.decomposer.decompose(request)).await;
+        self.publish_planning(None);
         self.planner_budget
             .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
         let Some(out) = out else {
+            self.trace_planning_cut("decompose", asked).await;
             self.stopping = true;
             self.settle_model_tool_calls()?;
             self.settle_call(reservation, None)?;
@@ -795,13 +797,15 @@ impl RunLoop {
         let reservation = self.reserve_rounds(&basis, input, 0);
         let stop = self.stop_token.clone();
         let asked_at = self.now();
-        let out = tokio::select! {
-            out = self.s.decomposer.interfaces(request) => Some(out),
-            () = stop.cancelled() => None,
-        };
+        let asked = std::time::Instant::now();
+        self.publish_planning(Some("interfaces"));
+        let out =
+            super::planner_tasks::cut_by_stop(&stop, self.s.decomposer.interfaces(request)).await;
+        self.publish_planning(None);
         self.planner_budget
             .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
         let Some(out) = out else {
+            self.trace_planning_cut("interfaces", asked).await;
             self.stopping = true;
             self.settle_call(reservation, None)?;
             self.notices.insert(

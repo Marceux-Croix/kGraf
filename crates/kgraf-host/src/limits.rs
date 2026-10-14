@@ -59,6 +59,9 @@ pub const KEY_OWN_CHECKS: &str = "own_checks";
 /// `settings.toml` key: whether the zero-test rule applies to every
 /// contract, not only a small request's (decision 0100). Unset is off.
 pub const KEY_ZERO_TEST_PLANS: &str = "zero_test_plans";
+/// `settings.toml` key: whether planner calls a dispatch waits on run as
+/// tasks beside the run loop (decision 0100). Unset is off.
+pub const KEY_CONCURRENT_PLANNER: &str = "concurrent_planner";
 /// `settings.toml` key: whether a change to a finished run sends its plan
 /// block in id order, marked for the provider's prompt cache (decision
 /// 0100). Unset is off.
@@ -120,6 +123,8 @@ pub struct UserLimits {
     pub own_checks: Option<bool>,
     /// Not a limit: the zero-test rule for every contract (decision 0100).
     pub zero_test_plans: Option<bool>,
+    /// Not a limit: planner calls as tasks beside the loop (decision 0100).
+    pub concurrent_planner: Option<bool>,
     /// Not a limit: the delta call's prompt-cache layout (decision 0100).
     pub cache_layout: Option<bool>,
 }
@@ -202,6 +207,7 @@ impl UserLimits {
             early_start: read_bool_key(&table, KEY_EARLY_START)?,
             own_checks: read_bool_key(&table, KEY_OWN_CHECKS)?,
             zero_test_plans: read_bool_key(&table, KEY_ZERO_TEST_PLANS)?,
+            concurrent_planner: read_bool_key(&table, KEY_CONCURRENT_PLANNER)?,
             cache_layout: read_bool_key(&table, KEY_CACHE_LAYOUT)?,
         })
     }
@@ -293,6 +299,7 @@ pub struct ResolvedLimits {
     /// Off by default.
     pub zero_test_plans: (bool, Source),
     /// Off by default.
+    pub concurrent_planner: (bool, Source),
     pub cache_layout: (bool, Source),
 }
 
@@ -334,6 +341,7 @@ impl ResolvedLimits {
             early_start: pick(flags.early_start, user.early_start, false),
             own_checks: pick(flags.own_checks, user.own_checks, false),
             zero_test_plans: pick(flags.zero_test_plans, user.zero_test_plans, false),
+            concurrent_planner: pick(flags.concurrent_planner, user.concurrent_planner, false),
             cache_layout: pick(flags.cache_layout, user.cache_layout, false),
         }
     }

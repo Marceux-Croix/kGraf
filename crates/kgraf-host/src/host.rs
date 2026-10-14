@@ -586,6 +586,7 @@ impl Host {
             small: config.small_requests(),
             own_checks: config.own_checks.unwrap_or(false),
             zero_test_plans: config.zero_test_plans.unwrap_or(false),
+            concurrent_planner: config.concurrent_planner.unwrap_or(false),
             cache_layout: config.cache_layout.unwrap_or(false),
             ..OrchestratorConfig::default()
         };

@@ -124,6 +124,7 @@ impl Orchestrator {
         run: RunId,
         change: ChangeInput,
     ) -> Result<RunReport, OrchestratorError> {
+        self.name_run(&run);
         let store = RunStore::new(self.services.graph.clone());
         let record = store
             .load(&run)?
@@ -196,6 +197,7 @@ impl Orchestrator {
         instruction: String,
         received: Received,
     ) -> Result<RunReport, OrchestratorError> {
+        self.name_run(&run);
         let store = RunStore::new(self.services.graph.clone());
         let old = store
             .load(&source)?
@@ -454,14 +456,17 @@ impl RunLoop {
         let reservation = self.reserve_call(&basis, estimate_tokens(&request.prompt.text()) + 600);
         let stop = self.stop_token.clone();
         let asked_at = self.now();
-        let out = tokio::select! {
-            out = self.s.decomposer.replan_delta(&request) => Some(out),
-            () = stop.cancelled() => None,
-        };
+        let asked = std::time::Instant::now();
+        self.publish_planning(Some("change"));
+        let out =
+            super::planner_tasks::cut_by_stop(&stop, self.s.decomposer.replan_delta(&request))
+                .await;
+        self.publish_planning(None);
         self.planner_budget
             .record(u64::try_from(self.now() - asked_at).unwrap_or(0));
         self.last_delta_ms = Some(self.now());
         let Some(out) = out else {
+            self.trace_planning_cut("replan_delta", asked).await;
             // The answer never reached the record: a resume asks again. The
             // cut call is counted with this change all the same.
             self.stopping = true;

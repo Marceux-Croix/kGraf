@@ -42,6 +42,17 @@ pub struct PlanFlags {
     /// setting says. Benchmark drivers pass it.
     #[arg(long)]
     pub no_zero_test_plans: bool,
+    /// Run the planner calls a contract's dispatch waits on (an interface's
+    /// handshake, its stub land, its consumers' tests, a re-grounding) beside
+    /// the run, so other contracts verify, merge and dispatch meanwhile; the
+    /// contract that needs the answer waits for it. Overrides the
+    /// `concurrent_planner` user setting; off by default.
+    #[arg(long, conflicts_with = "no_concurrent_planner")]
+    pub concurrent_planner: bool,
+    /// Wait for each such planner call before anything else runs, whatever
+    /// the user setting says. Benchmark drivers pass it.
+    #[arg(long)]
+    pub no_concurrent_planner: bool,
     /// A change to a finished run sends its plan block in id order, marked
     /// for the provider's prompt cache where the provider takes marks and a
     /// read can still come, with the run's cache key. Overrides the
@@ -75,6 +86,12 @@ impl PlanFlags {
     /// user setting.
     pub fn zero_test_plans(&self) -> Option<bool> {
         pair(self.zero_test_plans, self.no_zero_test_plans)
+    }
+
+    /// The concurrent-planner answer from its flag pair; `None` leaves it to
+    /// the user setting.
+    pub fn concurrent_planner(&self) -> Option<bool> {
+        pair(self.concurrent_planner, self.no_concurrent_planner)
     }
 
     /// The cache-layout answer from its flag pair; `None` leaves it to the
@@ -146,6 +163,16 @@ mod tests {
         );
         assert!(parse(&["--own-checks", "--no-own-checks"]).is_err());
         assert!(parse(&["--zero-test-plans", "--no-zero-test-plans"]).is_err());
+    }
+
+    #[test]
+    fn the_concurrent_planner_pair_parses() {
+        assert_eq!(parse(&[]).expect("none").concurrent_planner(), None);
+        let on = parse(&["--concurrent-planner"]).expect("on");
+        assert_eq!(on.concurrent_planner(), Some(true));
+        let off = parse(&["--no-concurrent-planner"]).expect("off");
+        assert_eq!(off.concurrent_planner(), Some(false));
+        assert!(parse(&["--concurrent-planner", "--no-concurrent-planner"]).is_err());
     }
 
     /// The cache-layout pair: unset by default, each side read, both refused.

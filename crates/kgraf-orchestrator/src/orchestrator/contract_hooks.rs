@@ -33,6 +33,7 @@
 //! against a superseded version is withdrawn and held under a different reason,
 //! which no revision releases: the user resolves each one (0027).
 
+use super::planner_tasks::{Answer, PartyStatement, Step, TaskKind};
 use super::{Control, LoopMsg, OrchestratorError, OrchestratorHandle, RunLoop};
 use crate::challenge::{
     Basis, Challenge, Challenger, Classification, ContractBook, ContractChecks, ContractControl,
@@ -59,6 +60,30 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 type Reply = oneshot::Sender<ContractReply>;
+
+/// The statements, the comparison's findings, and why the handshake was
+/// skipped (if it was).
+type Handshake = (
+    Vec<HandshakeStatement>,
+    Vec<HandshakeFinding>,
+    Option<String>,
+);
+
+/// What a handshake came to.
+enum HandshakeStep {
+    Done(Result<Handshake, String>),
+    /// Its calls run as a planner task, or a stop cut them: the parties wait.
+    Waiting,
+}
+
+/// What landing an interface's stub came to.
+enum Landing {
+    Landed,
+    /// Refused or failed: the interface failed and its parties are held.
+    Failed,
+    /// The land runs as a planner task: the parties wait.
+    Waiting,
+}
 
 /// Most characters the interface section adds to one brief (about 3,000
 /// tokens). A starting point, not a measured number: the section is part of the
@@ -252,6 +277,11 @@ impl CheckStarts {
 }
 
 impl Desk {
+    /// The current version of interface `id`, if the book has it.
+    pub(super) fn book_version(&self, id: &str) -> Option<u32> {
+        self.book.get(id).map(|ic| ic.version)
+    }
+
     pub(super) fn new(c: ContractChecks) -> Result<Self, String> {
         let seeded = c.interfaces.iter().map(|ic| ic.id.clone()).collect();
         Ok(Self {
@@ -561,7 +591,7 @@ impl RunLoop {
         })
     }
 
-    fn wake_soon(&mut self) {
+    pub(super) fn wake_soon(&mut self) {
         let at = self.now() + self.config.tick.as_millis() as i64;
         self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
     }
@@ -689,12 +719,30 @@ impl RunLoop {
                         .as_ref()
                         .is_some_and(|d| d.book.stub_landed(&ic.id))
                     {
+                        // With planner calls as tasks, a party can find the
+                        // stub landed while its consumers' tests are still
+                        // to write or in flight: it waits for them, as the
+                        // gate that landed the stub waited before.
+                        if self.config.concurrent_planner
+                            && !self.run_consumer_tests(&ic, true).await?
+                        {
+                            self.wake_soon();
+                            return Ok(false);
+                        }
                         continue;
                     }
-                    if !self.ensure_stub_landed(&ic).await? {
+                    match self.ensure_stub_landed(&ic).await? {
+                        Landing::Landed => {}
+                        Landing::Failed => return Ok(false),
+                        Landing::Waiting => {
+                            self.wake_soon();
+                            return Ok(false);
+                        }
+                    }
+                    if !self.run_consumer_tests(&ic, false).await? {
+                        self.wake_soon();
                         return Ok(false);
                     }
-                    self.run_consumer_tests(&ic).await?;
                     continue;
                 }
                 InterfaceState::Active => None,
@@ -742,8 +790,12 @@ impl RunLoop {
 
             // 3: the handshake, between the parties still to be built.
             let (statements, findings, skipped) = match self.handshake(&ic).await? {
-                Ok(t) => t,
-                Err(error) => {
+                HandshakeStep::Waiting => {
+                    self.wake_soon();
+                    return Ok(false);
+                }
+                HandshakeStep::Done(Ok(t)) => t,
+                HandshakeStep::Done(Err(error)) => {
                     let held = self.hold_parties(&ic, &format!("handshake could not run: {error}"));
                     let parties = self.party_models(&ic);
                     self.record_check_hold(&ic, "not_run".into(), &held, &parties);
@@ -794,8 +846,13 @@ impl RunLoop {
             // now, before any party of it is dispatched, so every party's
             // worktree (created after this gate returns) branches from a tip
             // that already compiles against the interface.
-            if !self.ensure_stub_landed(&ic).await? {
-                return Ok(false);
+            match self.ensure_stub_landed(&ic).await? {
+                Landing::Landed => {}
+                Landing::Failed => return Ok(false),
+                Landing::Waiting => {
+                    self.wake_soon();
+                    return Ok(false);
+                }
             }
             // 0076: each consumer of this interface writes and gates its own
             // test of what it expects from the producer, before the producer
@@ -803,7 +860,10 @@ impl RunLoop {
             // attempt is recorded and simply not added (rule 2), it never
             // holds the party the way a failed mechanical check or handshake
             // does above.
-            self.run_consumer_tests(&ic).await?;
+            if !self.run_consumer_tests(&ic, false).await? {
+                self.wake_soon();
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -830,31 +890,52 @@ impl RunLoop {
     async fn ensure_stub_landed(
         &mut self,
         ic: &InterfaceContract,
-    ) -> Result<bool, OrchestratorError> {
+    ) -> Result<Landing, OrchestratorError> {
         let Some(d) = self.contracts.as_ref() else {
-            return Ok(true);
+            return Ok(Landing::Landed);
         };
         // A compile-only interface's stub is the scaffold the repository
         // already holds: there is nothing to land.
         if d.book.stub_landed(&ic.id) || ic.is_compile_only() {
-            return Ok(true);
+            return Ok(Landing::Landed);
         }
-        let lander = d.stub_lander.clone();
-        let landed_before = d.book.landed_paths(&ic.id);
+        let key = self.task_key(TaskKind::StubLand, ic.label());
+        let answer = match self.planner_lookup(&key) {
+            Some(Step::Waiting) => return Ok(Landing::Waiting),
+            Some(Step::Done(answer)) => answer,
+            None => {
+                let Some(d) = self.contracts.as_ref() else {
+                    return Ok(Landing::Landed);
+                };
+                let lander = d.stub_lander.clone();
+                let landed_before = d.book.landed_paths(&ic.id);
+                let writes = self.party_writes(ic);
+                let producer = consumer_tests::producer_of(ic, &writes);
+                let producer_writes = producer
+                    .clone()
+                    .and_then(|p| writes.get(&p).cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.path)
+                    .collect();
+                let scope = StubScope {
+                    producer_writes,
+                    landed_before,
+                };
+                let ic2 = ic.clone();
+                let call = async move { Answer::StubLand(lander.land(&ic2, &scope).await) };
+                match self.planner_call(key, Vec::new(), call).await? {
+                    Step::Waiting => return Ok(Landing::Waiting),
+                    Step::Done(answer) => answer,
+                }
+            }
+        };
+        let Answer::StubLand(landed) = answer else {
+            return Ok(Landing::Waiting);
+        };
         let writes = self.party_writes(ic);
         let producer = consumer_tests::producer_of(ic, &writes);
-        let producer_writes = producer
-            .clone()
-            .and_then(|p| writes.get(&p).cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| t.path)
-            .collect();
-        let scope = StubScope {
-            producer_writes,
-            landed_before,
-        };
-        match lander.land(ic, &scope).await {
+        match landed {
             Ok(commit) => {
                 self.note_stub_landed(&ic.id, &commit, producer.as_deref());
                 self.contract_event(ContractEvent::StubLanded {
@@ -863,7 +944,7 @@ impl RunLoop {
                     commit,
                 })
                 .await?;
-                Ok(true)
+                Ok(Landing::Landed)
             }
             Err(error) => {
                 let failure = CheckFailure {
@@ -873,7 +954,66 @@ impl RunLoop {
                 };
                 self.check_failed(ic, failure, Vec::new(), Vec::new())
                     .await?;
-                Ok(false)
+                Ok(Landing::Failed)
+            }
+        }
+    }
+
+    /// A stub land's answer, taken in as it arrives (planner calls as tasks):
+    /// a landed commit is recorded at once, whatever the run does next, so a
+    /// stop or a kill never leaves a commit on the branch the record does not
+    /// name. A failed land waits for the party's gate, which holds its
+    /// parties. `label` is the land's key subject (`interface@vN`).
+    pub(super) async fn take_stub_land(
+        &mut self,
+        label: &str,
+        answer: Answer,
+    ) -> Result<(), OrchestratorError> {
+        let ic = self.contracts.as_ref().and_then(|d| {
+            let (id, _) = label.rsplit_once('@')?;
+            d.book.get(id).filter(|ic| ic.label() == label).cloned()
+        });
+        match (&answer, ic) {
+            (Answer::StubLand(Ok(commit)), Some(ic)) => {
+                if self
+                    .contracts
+                    .as_ref()
+                    .is_some_and(|d| d.book.stub_landed(&ic.id))
+                {
+                    return Ok(());
+                }
+                let writes = self.party_writes(&ic);
+                let producer = consumer_tests::producer_of(&ic, &writes);
+                self.note_stub_landed(&ic.id, commit, producer.as_deref());
+                self.contract_event(ContractEvent::StubLanded {
+                    interface: ic.id.clone(),
+                    version: ic.version,
+                    commit: commit.clone(),
+                })
+                .await?;
+                self.save()
+            }
+            (Answer::StubLand(Ok(commit)), None) => {
+                // The interface moved on while the land ran: the commit is on
+                // the branch all the same, and said.
+                let detail = format!(
+                    "the stub of `{label}` landed as {commit} after its interface was revised; the \
+                     newer version lands its own"
+                );
+                self.notices.insert(detail.clone());
+                let at_ms = self.now();
+                self.trace(TraceEvent::Notice {
+                    at_ms,
+                    contract: String::new(),
+                    worker: String::new(),
+                    detail,
+                })
+                .await
+            }
+            _ => {
+                let generation = self.plan_generation();
+                self.planner_keep(TaskKind::StubLand, label, generation, answer);
+                Ok(())
             }
         }
     }
@@ -887,33 +1027,51 @@ impl RunLoop {
     /// A reservation never refuses (decision 0080 removed every spend cap),
     /// and a model with no price is held at zero and reported as unpriced
     /// (decision 0075).
+    ///
+    /// Each writer call and its gate run as one planner task
+    /// (`planner_tasks.rs`). `Ok(false)`: a test is still being written (planner
+    /// calls as tasks), and the party waits. `only_unrecorded` skips every pair
+    /// with any outcome recorded, a `NotRun` too: a party that finds the stub
+    /// already landed takes up only the tests nobody started.
     async fn run_consumer_tests(
         &mut self,
         ic: &InterfaceContract,
-    ) -> Result<(), OrchestratorError> {
+        only_unrecorded: bool,
+    ) -> Result<bool, OrchestratorError> {
         // A compile-only interface has no reference to gate a consumer's test
         // against.
         if ic.is_compile_only() {
-            return Ok(());
+            return Ok(true);
         }
         let Some(writer) = self
             .contracts
             .as_ref()
             .and_then(|d| d.consumer_test_writer.clone())
         else {
-            return Ok(());
+            return Ok(true);
         };
         let writes = self.party_writes(ic);
         let Some(producer) = consumer_tests::producer_of(ic, &writes) else {
-            return Ok(());
+            return Ok(true);
         };
         let runner = self.contracts.as_ref().map(|d| d.runner.clone());
         let Some(runner) = runner else {
-            return Ok(());
+            return Ok(true);
         };
+        let mut waiting = false;
         for consumer in ic.parties.iter().filter(|p| **p != producer) {
             let key = ConsumerTestKey::new(&ic.id, ic.version, consumer, &producer);
-            if self.record.consumer_tests.attempted(&key) {
+            if self.record.consumer_tests.attempted(&key)
+                || (only_unrecorded && self.record.consumer_tests.outcome(&key).is_some())
+            {
+                continue;
+            }
+            let task = self.task_key(TaskKind::ConsumerTest, format!("{}/{consumer}", ic.label()));
+            if let Some(step) = self.planner_lookup(&task) {
+                match step {
+                    Step::Waiting => waiting = true,
+                    Step::Done(answer) => self.take_consumer_test(key, answer).await?,
+                }
                 continue;
             }
             let Some(route) = self.party_route(consumer) else {
@@ -947,59 +1105,77 @@ impl RunLoop {
             };
             let input = estimate_tokens(&request.brief) + 600;
             let reservation = self.reserve_call(&basis, input);
-            let (test, calls) = match writer.write(&request).await {
-                Ok((test, calls)) => {
-                    self.settle_call(reservation, Some(&calls))?;
-                    self.note_malformed_retries("consumer test", calls.len().saturating_sub(1));
-                    (test, calls)
-                }
-                Err(e) => {
-                    let calls = e.calls().map(|c| c.to_vec()).unwrap_or_default();
-                    self.settle_call(reservation, Some(&calls))?;
-                    self.note_consumer_test(
-                        key,
-                        ConsumerTestOutcome::WriterFailed {
-                            reason: e.to_string(),
-                            calls,
-                        },
-                    )
-                    .await?;
-                    continue;
+            let writer = writer.clone();
+            let runner = runner.clone();
+            let ic2 = ic.clone();
+            let consumer2 = consumer.clone();
+            let call = async move {
+                let (test, calls) = match writer.write(&request).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let calls = e.calls().map(|c| c.to_vec()).unwrap_or_default();
+                        return Answer::ConsumerTest {
+                            outcome: ConsumerTestOutcome::WriterFailed {
+                                reason: e.to_string(),
+                                calls: calls.clone(),
+                            },
+                            calls: Some(calls),
+                            retries: 0,
+                        };
+                    }
+                };
+                let retries = calls.len().saturating_sub(1);
+                let outcome = match consumer_tests::gate_consumer_test(
+                    &runner, &ic2, &consumer2, &test,
+                )
+                .await
+                {
+                    Ok(Ok(_runs)) => ConsumerTestOutcome::Accepted {
+                        test,
+                        calls: calls.clone(),
+                    },
+                    Ok(Err(rejection)) => ConsumerTestOutcome::Rejected {
+                        reason: rejection.to_string(),
+                        calls: calls.clone(),
+                    },
+                    // A check that could not run: not a verdict of the
+                    // test, but still made visible and still costs the
+                    // calls above, so it is recorded and traced like every
+                    // other outcome. `NotRun` is not terminal, so a later
+                    // gate call on this interface (another party's
+                    // dispatch) may attempt it again.
+                    Err(e) => ConsumerTestOutcome::NotRun {
+                        reason: format!("the gate could not run: {e}"),
+                    },
+                };
+                Answer::ConsumerTest {
+                    outcome,
+                    calls: Some(calls),
+                    retries,
                 }
             };
-            match consumer_tests::gate_consumer_test(&runner, ic, consumer, &test).await {
-                Ok(Ok(_runs)) => {
-                    self.note_consumer_test(key, ConsumerTestOutcome::Accepted { test, calls })
-                        .await?;
-                }
-                Ok(Err(rejection)) => {
-                    self.note_consumer_test(
-                        key,
-                        ConsumerTestOutcome::Rejected {
-                            reason: rejection.to_string(),
-                            calls,
-                        },
-                    )
-                    .await?;
-                }
-                // A check that could not run: not a verdict of the
-                // test, but still made visible and still costs the calls
-                // above, so it is recorded and traced like every other
-                // outcome. `NotRun` is not terminal, so a later gate call on
-                // this interface (another party's dispatch) may attempt it
-                // again.
-                Err(e) => {
-                    self.note_consumer_test(
-                        key,
-                        ConsumerTestOutcome::NotRun {
-                            reason: format!("the gate could not run: {e}"),
-                        },
-                    )
-                    .await?;
-                }
+            match self.planner_call(task, vec![reservation], call).await? {
+                Step::Waiting => waiting = true,
+                Step::Done(answer) => self.take_consumer_test(key, answer).await?,
             }
         }
-        Ok(())
+        Ok(!waiting)
+    }
+
+    /// A consumer test's answer, taken in: recorded and traced.
+    async fn take_consumer_test(
+        &mut self,
+        key: ConsumerTestKey,
+        answer: Answer,
+    ) -> Result<(), OrchestratorError> {
+        let Answer::ConsumerTest {
+            outcome, retries, ..
+        } = answer
+        else {
+            return Ok(());
+        };
+        self.note_malformed_retries("consumer test", retries);
+        self.note_consumer_test(key, outcome).await
     }
 
     /// Record one consumer test attempt's outcome in the persisted run record
@@ -1410,31 +1586,22 @@ impl RunLoop {
     }
 
     /// Ask each open party for its statement, independently, and compare.
-    /// `Ok(Err(_))`: a statement could not be obtained. Fewer than two open
-    /// parties means nothing to compare; that is recorded, and no call is made.
-    #[allow(clippy::type_complexity)]
+    /// `Done(Err(_))`: a statement could not be obtained. `Waiting`: the calls
+    /// run as a planner task and have not answered (or a stop cut them).
+    /// Fewer than two open parties means nothing to compare; that is
+    /// recorded, and no call is made.
     async fn handshake(
         &mut self,
         ic: &InterfaceContract,
-    ) -> Result<
-        Result<
-            (
-                Vec<HandshakeStatement>,
-                Vec<HandshakeFinding>,
-                Option<String>,
-            ),
-            String,
-        >,
-        OrchestratorError,
-    > {
+    ) -> Result<HandshakeStep, OrchestratorError> {
         // A compile-only interface is checked by compiling: no party is asked
         // for a statement, so it costs no model call.
         if ic.is_compile_only() {
-            return Ok(Ok((
+            return Ok(HandshakeStep::Done(Ok((
                 Vec::new(),
                 Vec::new(),
                 Some("compile-only interface: signatures are checked by compiling".to_owned()),
-            )));
+            ))));
         }
         let open: Vec<OpenContract> = ic
             .parties
@@ -1442,7 +1609,7 @@ impl RunLoop {
             .filter_map(|p| self.record.contract(p).cloned())
             .collect();
         if open.len() < 2 {
-            return Ok(Ok((
+            return Ok(HandshakeStep::Done(Ok((
                 Vec::new(),
                 Vec::new(),
                 Some(format!(
@@ -1450,10 +1617,10 @@ impl RunLoop {
                     open.len(),
                     ic.parties.len()
                 )),
-            )));
+            ))));
         }
         let Some(handshaker) = self.contracts.as_ref().map(|d| d.handshaker.clone()) else {
-            return Ok(Err("no handshaker".into()));
+            return Ok(HandshakeStep::Done(Err("no handshaker".into())));
         };
         // Three phases, so the calls overlap while everything that touches
         // the record or the budget stays on the loop, in party order:
@@ -1479,13 +1646,20 @@ impl RunLoop {
         // the same ones, one per open party. On a failure the calls after the
         // failing party are still made (they were already in flight), where
         // a serial loop would stop at the failure.
+        let key = self.task_key(TaskKind::Handshake, ic.label());
+        if let Some(step) = self.planner_lookup(&key) {
+            return Ok(match step {
+                Step::Waiting => HandshakeStep::Waiting,
+                Step::Done(answer) => self.finish_handshake(ic, &open, answer),
+            });
+        }
         let mut requests = Vec::with_capacity(open.len());
         for party in &open {
             let Some(route) = self.party_route(&party.contract) else {
-                return Ok(Err(format!(
+                return Ok(HandshakeStep::Done(Err(format!(
                     "party `{}` names a route that is not configured",
                     party.contract
-                )));
+                ))));
             };
             requests.push(HandshakeRequest {
                 interface: ic.label(),
@@ -1510,38 +1684,78 @@ impl RunLoop {
                 self.reserve_call(&basis, input)
             })
             .collect();
-        // `join_all` keeps the input order and waits for every call.
-        let results =
-            futures_util::future::join_all(requests.iter().map(|r| handshaker.state(r))).await;
-        let mut statements = Vec::with_capacity(requests.len());
+        // `join_all` keeps the input order and waits for every call. The calls
+        // run as one planner task (`planner_tasks.rs`); every reservation is
+        // settled when the loop takes the answer in, failed calls included.
+        let call = async move {
+            let results =
+                futures_util::future::join_all(requests.iter().map(|r| handshaker.state(r))).await;
+            Answer::Handshake(
+                requests
+                    .iter()
+                    .zip(results)
+                    .map(|(request, result)| match result {
+                        Ok((statement, calls)) => PartyStatement {
+                            party: request.party.clone(),
+                            route: request.route.clone(),
+                            statement: Ok(statement),
+                            calls: Some(calls),
+                        },
+                        Err(e) => PartyStatement {
+                            party: request.party.clone(),
+                            route: request.route.clone(),
+                            statement: Err(e.to_string()),
+                            calls: e.calls().map(<[CallId]>::to_vec),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+        Ok(match self.planner_call(key, reservations, call).await? {
+            Step::Waiting => HandshakeStep::Waiting,
+            Step::Done(answer) => self.finish_handshake(ic, &open, answer),
+        })
+    }
+
+    /// The handshake's statements, taken in (their reservations are settled):
+    /// each set to its party's route and model, then compared.
+    fn finish_handshake(
+        &mut self,
+        ic: &InterfaceContract,
+        open: &[OpenContract],
+        answer: Answer,
+    ) -> HandshakeStep {
+        let Answer::Handshake(parties) = answer else {
+            return HandshakeStep::Waiting;
+        };
+        let mut statements = Vec::with_capacity(parties.len());
         let mut first_failure: Option<String> = None;
-        for ((request, reservation), result) in requests.iter().zip(reservations).zip(results) {
-            match result {
-                Ok((mut statement, calls)) => {
-                    self.settle_call(reservation, Some(&calls))?;
-                    self.note_malformed_retries("handshake", calls.len().saturating_sub(1));
+        for p in parties {
+            match p.statement {
+                Ok(mut statement) => {
+                    let calls = p.calls.map_or(0, |c| c.len());
+                    self.note_malformed_retries("handshake", calls.saturating_sub(1));
                     // Set here, whatever the handshaker did: the route the
                     // party runs on, and the model that stated it (the
                     // route's model when the handshaker does not say), so a
                     // hold names the model pair (0078).
-                    statement.party = request.party.clone();
+                    statement.party = p.party.clone();
                     if statement.model.is_empty() {
                         statement.model = self
-                            .route(&request.route)
+                            .route(&p.route)
                             .map(|r| r.model().to_owned())
                             .unwrap_or_default();
                     }
-                    statement.route = request.route.clone();
+                    statement.route = p.route.clone();
                     statements.push(statement);
                 }
                 Err(e) => {
-                    self.settle_call(reservation, e.calls())?;
-                    first_failure.get_or_insert_with(|| format!("party `{}`: {e}", request.party));
+                    first_failure.get_or_insert_with(|| format!("party `{}`: {e}", p.party));
                 }
             }
         }
         if let Some(failure) = first_failure {
-            return Ok(Err(failure));
+            return HandshakeStep::Done(Err(failure));
         }
         let writes = self.party_writes(ic);
         let only_open = InterfaceContract {
@@ -1562,7 +1776,7 @@ impl RunLoop {
             &writes,
             &ordered_pairs(&depends_on),
         );
-        Ok(Ok((statements, findings, None)))
+        HandshakeStep::Done(Ok((statements, findings, None)))
     }
 
     /// A contract action from the handle. The reply is sent now, or by the loop

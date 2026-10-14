@@ -6753,6 +6753,549 @@ async fn a_partys_dispatch_split_names_its_sandbox_checks() {
     assert_eq!(free.checks_us, 0, "no interface binds it: {free:?}");
 }
 
+/// Which planner call a gate test holds.
+#[derive(Clone, Copy, Debug)]
+enum HeldCall {
+    Handshake,
+    StubLand,
+    ConsumerTest,
+}
+
+/// A consumer-test writer that holds each call until the test releases it,
+/// then writes no test: the outcome is recorded and the parties go on.
+struct HeldWriter {
+    began: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl ConsumerTestWriter for HeldWriter {
+    async fn write(
+        &self,
+        _: &ConsumerTestRequest,
+    ) -> Result<(FileOverlay, Vec<kgraf_core::CallId>), PlanError> {
+        self.began.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.release
+            .acquire()
+            .await
+            .map_err(|e| PlanError::Invalid(e.to_string()))?
+            .forget();
+        Err(PlanError::Invalid("the held writer wrote no test".into()))
+    }
+    fn cost_basis(&self) -> CostBasis {
+        CostBasis {
+            model: PLAN_MODEL.into(),
+            max_output_tokens: 100,
+        }
+    }
+}
+
+/// A run whose interface's `held` call is held while a contract no interface
+/// binds finishes its work. Returns whether that contract merged while the
+/// call was still held: with `concurrent` the loop keeps verifying and
+/// merging; without it the loop waits for the call, as it always has, and is
+/// given a fixed window to show it does not.
+async fn merges_while_held(held: HeldCall, concurrent: bool) -> bool {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan = parties_plan(false);
+    plan.push(c("free", "unrelated work", "free.py", &[]));
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&plan),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let free = rig.parts.hold_workers("unrelated work");
+    let handshake =
+        matches!(held, HeldCall::Handshake).then(|| rig.handshaker.hold("You are party"));
+    let open = |is: bool| if is { 0 } else { 1_000 };
+    let land = Arc::new(HeldLand {
+        began: Default::default(),
+        release: tokio::sync::Semaphore::new(open(matches!(held, HeldCall::StubLand))),
+        inner: rig.git_lander(),
+    });
+    let writer = Arc::new(HeldWriter {
+        began: Default::default(),
+        calls: Default::default(),
+        release: tokio::sync::Semaphore::new(open(matches!(held, HeldCall::ConsumerTest))),
+    });
+    let mut cfg = config();
+    cfg.concurrent_planner = concurrent;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks_with(vec![py_ic()], Some(writer.clone()), land.clone()))
+        .expect("contracts");
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    let seq = std::sync::atomic::Ordering::SeqCst;
+    until_or_run_ends(&run, "the held call began", || match held {
+        HeldCall::Handshake => rig.handshaker.calls() >= 1,
+        HeldCall::StubLand => land.began.load(seq),
+        HeldCall::ConsumerTest => writer.began.load(seq),
+    })
+    .await;
+    free.add_permits(1_000);
+    let window = if concurrent {
+        HANG_GUARD
+    } else {
+        Duration::from_secs(3)
+    };
+    let store = kgraf_orchestrator::RunStore::new(rig.parts.graph.clone());
+    let started = Instant::now();
+    let mut merged = false;
+    while started.elapsed() < window && !run.is_finished() {
+        if store
+            .load(&RunId::new("r1"))
+            .expect("load")
+            .is_some_and(|r| r.is_verified("free"))
+        {
+            merged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Still held here: nothing released it.
+    match held {
+        HeldCall::Handshake => {
+            if let Some(h) = &handshake {
+                h.add_permits(2);
+            }
+        }
+        HeldCall::StubLand => land.release.add_permits(1),
+        HeldCall::ConsumerTest => writer.release.add_permits(10),
+    }
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{held:?}: {report:?}");
+    merged
+}
+
+/// With `--concurrent-planner`, a contract no interface binds verifies and
+/// merges while its neighbor's handshake, stub land or consumer test is held
+/// (decision 0100, section 4). Without it the loop waits for each call, as
+/// before: the same contract does not merge until the call returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_concurrent_planner_another_contract_merges_while_a_gate_call_is_held() {
+    for held in [
+        HeldCall::Handshake,
+        HeldCall::StubLand,
+        HeldCall::ConsumerTest,
+    ] {
+        assert!(
+            merges_while_held(held, true).await,
+            "{held:?}: on, the contract merged meanwhile"
+        );
+        assert!(
+            !merges_while_held(held, false).await,
+            "{held:?}: off, the loop waited for the call"
+        );
+    }
+}
+
+/// Two consumers' tests answer back to back as planner tasks: the loop, the
+/// record's one writer, takes both in, one after the other, and records both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_planner_answers_back_to_back_are_both_recorded() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan = parties_plan(false);
+    plan.push(c("cons2", "also use the parser", "consumer2.py", &[]));
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&plan),
+        |prompt: &str| {
+            if prompt.contains("You are party `cons2`") {
+                serde_json::json!({"expect": [CONS_SAYS], "touch": ["consumer2.py"]}).to_string()
+            } else {
+                agreeing(prompt)
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let ic = InterfaceContract {
+        parties: s(&["prod", "cons", "cons2"]),
+        ..py_ic()
+    };
+    let writer = Arc::new(HeldWriter {
+        began: Default::default(),
+        calls: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut cfg = config();
+    cfg.concurrent_planner = true;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks_with(vec![ic], Some(writer.clone()), rig.git_lander()))
+        .expect("contracts");
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    until_or_run_ends(&run, "both consumers' tests are being written", || {
+        writer.calls.load(std::sync::atomic::Ordering::SeqCst) == 2
+    })
+    .await;
+    writer.release.add_permits(2);
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let record = kgraf_orchestrator::RunStore::new(rig.parts.graph.clone())
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    for consumer in ["cons", "cons2"] {
+        let key = kgraf_orchestrator::ConsumerTestKey::new("config", 1, consumer, "prod");
+        assert!(
+            matches!(
+                record.consumer_tests.outcome(&key),
+                Some(kgraf_orchestrator::ConsumerTestOutcome::WriterFailed { .. })
+            ),
+            "{consumer}: {:?}",
+            record.consumer_tests.outcome(&key)
+        );
+    }
+}
+
+/// A planner task that dies (a panic in the handshake model) does not leave
+/// the run waiting on it: it is reaped, said in a notice, and its parties take
+/// the handshake's failure path, with planner calls as tasks and without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_planner_task_that_dies_is_reaped_and_the_run_ends() {
+    for concurrent in [true, false] {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(
+            dir.path(),
+            plan_json(&parties_plan(false)),
+            |_| panic!("the handshake model panicked"),
+            |_| "{}".into(),
+            Duration::from_millis(20),
+        );
+        let mut cfg = config();
+        cfg.concurrent_planner = concurrent;
+        let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+            .expect("orchestrator")
+            .with_contract_checks(rig.checks(vec![py_ic()]))
+            .expect("contracts");
+        let report = tokio::time::timeout(
+            HANG_GUARD,
+            o.start(RunId::new("r1"), "parse the config".into()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("concurrent {concurrent}: the run waited on a dead task"))
+        .expect("run");
+        let trace = rig.trace().await;
+        assert!(
+            trace.iter().any(|e| matches!(
+                e,
+                TraceEvent::Notice { detail, .. } if detail.contains("ended without an answer")
+            )),
+            "concurrent {concurrent}: {report:?}"
+        );
+    }
+}
+
+/// A stub land is never cut: a stop while it runs waits for it, and the land
+/// it made is recorded, with planner calls as tasks and without. Its merge
+/// commits on a blocking thread whatever happens to the task, so a cut land
+/// would leave a commit on the branch the record does not name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_waits_for_a_stub_land_and_records_it() {
+    for concurrent in [true, false] {
+        let dir = tempfile::tempdir().expect("dir");
+        let rig = Rig::new(
+            dir.path(),
+            plan_json(&parties_plan(false)),
+            agreeing,
+            |_| "{}".into(),
+            Duration::from_millis(20),
+        );
+        let land = Arc::new(HeldLand {
+            began: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            inner: rig.git_lander(),
+        });
+        let mut cfg = config();
+        cfg.concurrent_planner = concurrent;
+        let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+            .expect("orchestrator")
+            .with_contract_checks(rig.checks_with(vec![py_ic()], None, land.clone()))
+            .expect("contracts");
+        let h = o.handle();
+        let run =
+            tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+        until_or_run_ends(&run, "the land began", || {
+            land.began.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        h.stop().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !run.is_finished(),
+            "concurrent {concurrent}: the run ended before its land did"
+        );
+        land.release.add_permits(1);
+        let report = tokio::time::timeout(HANG_GUARD, run)
+            .await
+            .expect("the run ends")
+            .expect("join")
+            .expect("run");
+        assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
+        let events = rig.contract_events().await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ContractEvent::StubLanded { version: 1, .. })),
+            "concurrent {concurrent}: the land is recorded: {events:?}"
+        );
+    }
+}
+
+/// With planner calls as tasks, an interface revised while its handshake is
+/// held makes that call stale: it is cut (or its answer dropped), said in a
+/// notice, and no handshake is recorded for the old version; the new version
+/// asks each party once, and no hold is left at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_for_a_revised_interface_is_dropped_as_stale() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let held = rig.handshaker.hold("You are party");
+    let mut cfg = config();
+    cfg.concurrent_planner = true;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks(vec![py_ic()]))
+        .expect("contracts");
+    let h = o.handle();
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    until_or_run_ends(&run, "both v1 statements are asked", || {
+        rig.handshaker.calls() >= 2
+    })
+    .await;
+    let mut v2 = py_ic();
+    v2.version = 2;
+    v2.symbols.push("DEFAULT_PORT".into());
+    v2.stub[0].content = format!("{PY_STUB}\nDEFAULT_PORT = 8080\n");
+    v2.reference[0].content = format!("{PY_REFERENCE}\nDEFAULT_PORT = 8080\n");
+    let reply = send(
+        &h,
+        ContractControl::Revise(Box::new(Revision {
+            revised: v2,
+            claimed: Some(RevisionClass::Amend),
+            proposer: None,
+        })),
+    )
+    .await;
+    assert!(matches!(reply, ContractReply::Classified(_)), "{reply:?}");
+    until_or_run_ends(&run, "the v2 statements are asked", || {
+        rig.handshaker
+            .prompts()
+            .iter()
+            .filter(|p| p.contains("config@v2"))
+            .count()
+            >= 2
+    })
+    .await;
+    // The v1 calls (cut) and the v2 calls answer from here.
+    held.add_permits(100);
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = rig.trace().await;
+    let v1: Vec<_> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::PlannerTask {
+                kind,
+                subject,
+                outcome,
+                ..
+            } if kind == "handshake" && subject == "config@v1" => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(v1.len(), 1, "{v1:?}");
+    assert!(v1[0] == "stale" || v1[0] == "cancelled", "{v1:?}");
+    assert!(
+        report.notices.iter().any(|n| n.contains("config@v1")),
+        "{:?}",
+        report.notices
+    );
+    let events = rig.contract_events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ContractEvent::ChecksPassed { version: 1, .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ContractEvent::ChecksPassed { version: 2, .. }))
+    );
+    for party in ["prod", "cons"] {
+        let asked = rig
+            .handshaker
+            .prompts()
+            .iter()
+            .filter(|p| p.contains("config@v2") && p.contains(&format!("You are party `{party}`")))
+            .count();
+        assert_eq!(asked, 1, "{party} asked once for v2");
+    }
+    assert_eq!(
+        rig.parts.admission.budget().held_run("r1"),
+        kgraf_core::Money::ZERO,
+        "no hold left"
+    );
+}
+
+/// With planner calls as tasks, both parties of an interface reach their
+/// gate while its handshake is held: one call per party is made, not one
+/// per party per gate, and no hold is left at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_parties_waiting_on_one_handshake_make_one_call_each() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let held = rig.handshaker.hold("You are party");
+    let mut cfg = config();
+    cfg.concurrent_planner = true;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks(vec![py_ic()]))
+        .expect("contracts");
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    until_or_run_ends(&run, "the handshake is held", || {
+        rig.handshaker.calls() >= 2
+    })
+    .await;
+    // Many loop steps pass with both parties waiting at their gate.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.handshaker.calls(), 2);
+    held.add_permits(100);
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(rig.handshaker.calls(), 2, "one call per party");
+    assert_eq!(
+        rig.parts.admission.budget().held_run("r1"),
+        kgraf_core::Money::ZERO,
+        "no hold left"
+    );
+}
+
+/// During a held `interfaces` call (it stays on the planning path), a note is
+/// acknowledged, a status question answered with the call named, the question
+/// cards read, and a stop ends the run with the call settled cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acknowledgment_status_questions_and_stop_are_served_during_the_interfaces_call() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&parties_plan(false)),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let _held = rig
+        .parts
+        .planner
+        .hold("Write one interface contract per producer");
+    let (port, mut client) = kgraf_orchestrator::channel_port("box", Arc::new(|| {}));
+    let o = rig.orchestrator(vec![py_ic()]);
+    o.attach_port(port);
+    let h = o.handle();
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    until_or_run_ends(&run, "the interfaces call is held", || {
+        rig.parts
+            .planner
+            .prompts()
+            .iter()
+            .any(|p| p.contains("Write one interface contract per producer"))
+    })
+    .await;
+    let reply_to = |client: &kgraf_orchestrator::PortClient, id: &str| {
+        let started = Instant::now();
+        loop {
+            if let Some(r) = client
+                .drain_replies()
+                .into_iter()
+                .find(|r| r.in_reply_to == id)
+            {
+                return r;
+            }
+            assert!(started.elapsed() < HANG_GUARD, "no reply to {id}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let n = client
+        .send(
+            kgraf_orchestrator::InboundKind::Note,
+            "keep the parser small",
+            1,
+        )
+        .expect("send");
+    let ack = tokio::task::block_in_place(|| reply_to(&client, &n));
+    assert_eq!(ack.text, kgraf_orchestrator::run_intake::NOTED);
+    let q = client
+        .send(kgraf_orchestrator::InboundKind::StatusQuestion, "status", 2)
+        .expect("send");
+    let status = tokio::task::block_in_place(|| reply_to(&client, &q));
+    assert!(
+        status
+            .text
+            .contains("planning: the interfaces call is running"),
+        "{}",
+        status.text
+    );
+    assert!(h.published_questions().is_empty());
+    assert!(!run.is_finished(), "all of it while the call was held");
+    h.stop().await;
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the stop ended the run")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
+    let calls = rig.parts.ledger.calls().expect("calls");
+    let interfaces: Vec<_> = calls
+        .iter()
+        .filter(|c| c.trace.kind.as_deref() == Some("interfaces"))
+        .collect();
+    assert!(!interfaces.is_empty());
+    assert!(
+        interfaces
+            .iter()
+            .all(|c| c.settlement != kgraf_provider::Settlement::Unreconciled),
+        "{interfaces:?}"
+    );
+}
+
 /// The plan mirror names the run's plan `run:<id>` and leaves `source_plan`
 /// alone: a run's own plan is not an approved one, so the held-plan re-plan and
 /// the dropping of held interface checks (which an approved plan switches off)

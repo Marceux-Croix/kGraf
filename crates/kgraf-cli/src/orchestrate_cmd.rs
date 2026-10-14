@@ -130,6 +130,9 @@ pub struct OrchestrateArgs {
     pub own_checks: bool,
     /// `--zero-test-plans` over the `zero_test_plans` user setting.
     pub zero_test_plans: bool,
+    /// `--concurrent-planner` over the `concurrent_planner` user setting
+    /// (decision 0100): planner calls a dispatch waits on run as tasks.
+    pub concurrent_planner: bool,
     /// `--cache-layout` over the `cache_layout` user setting (decision 0100).
     pub cache_layout: bool,
     /// `--change`, `--edit` and `--from-run` (decision 0100).
@@ -174,6 +177,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         early_start: args.small.early_start.then_some(true),
         own_checks: args.own_checks.then_some(true),
         zero_test_plans: args.zero_test_plans.then_some(true),
+        concurrent_planner: args.concurrent_planner.then_some(true),
         cache_layout: args.cache_layout.then_some(true),
         prompt_cache_key_routes: Vec::new(),
         worktrees: args.worktrees,
@@ -1986,6 +1990,7 @@ mod tests {
             small: Default::default(),
             own_checks: false,
             zero_test_plans: false,
+            concurrent_planner: false,
             cache_layout: false,
             edits: Default::default(),
         }

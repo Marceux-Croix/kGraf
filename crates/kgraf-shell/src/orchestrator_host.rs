@@ -1225,7 +1225,8 @@ impl BoxBackend for OrchestratorHost {
     }
 
     /// Real pending questions (design 0067, point 4) while a run is hosted;
-    /// empty otherwise, like `pending_asks`.
+    /// empty otherwise, like `pending_asks`. Read from the snapshot the run
+    /// loop publishes (decision 0100), so a frame never waits for the loop.
     fn pending_questions(&self) -> Vec<crate::orchestrator_box::PendingQuestion> {
         match &self.slot {
             Slot::Running(r) => r

@@ -741,6 +741,16 @@ pub struct RunStateRecord {
     /// save (a land, a decline) moves `updated_ms`, never this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_end_ms: Option<i64>,
+    /// The last row of the run's intake table folded into this record
+    /// (decision 0100): saved with what the fold changed, so a row is folded
+    /// once or not at all. `None`: no row was folded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_folded: Option<i64>,
+    /// Intake rows past `intake_folded` already taken in (notes, planner
+    /// answers used or dropped): the watermark stays below an answer not yet
+    /// used, and these are not folded again (decision 0100).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intake_above: Vec<i64>,
     /// The commit that verified each verified contract, by contract id: what
     /// the graph mirror records as `work:verified_commit`. A record from before
     /// the field has none for the contracts it had verified.
@@ -991,6 +1001,8 @@ impl RunStateRecord {
             replan_base: 0,
             plan_calls: Vec::new(),
             session_end_ms: None,
+            intake_folded: None,
+            intake_above: Vec::new(),
             verified_commits: BTreeMap::new(),
         }
     }

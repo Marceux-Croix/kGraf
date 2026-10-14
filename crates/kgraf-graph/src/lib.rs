@@ -65,7 +65,10 @@ pub use query::{EdgeDirection, NodePredicate, Pattern, QueryMatch};
 pub use rank::{RankRequest, RankedDefinition, RepoRank, rank_repository};
 pub use sessions::{SessionGraph, SharedSessions, read_session_graph};
 pub use slice::{ContextSlice, SliceMember, SliceReason};
-pub use store::{EdgeKind, FileRecord, GraphStore, NodeRecord, SourceRootRepair};
+pub use store::{
+    EdgeKind, FileRecord, GraphStore, IntakeRow, IntakeWriter, NewIntakeRow, NodeRecord,
+    SourceRootRepair,
+};
 pub use work::{WorkKind, WorkNode, WorkWrite};
 pub use work_schedule::{
     NewScheduleEvent, RunSpend, SCHEDULE_PLAN_ID, ScheduleEvent, WorkSchedule,

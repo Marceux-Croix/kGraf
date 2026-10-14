@@ -16,6 +16,6 @@ fn main() {
         settled: unimplemented!(),
         adapter: "sneaky",
         stopped: unimplemented!(),
-        stop_probe: unimplemented!(),
+        stop_probes: unimplemented!(),
     };
 }

@@ -447,6 +447,7 @@ impl RunLimitSliders {
             early_start: None,
             own_checks: None,
             zero_test_plans: None,
+            concurrent_planner: None,
             cache_layout: None,
         }
     }
@@ -637,6 +638,9 @@ pub struct Settings {
     /// unverified until the root gate passes over it, as a small request's
     /// does (decision 0100). Off by default.
     pub zero_test_plans: bool,
+    /// The planner calls a contract's dispatch waits on run beside the run,
+    /// so other work goes on meanwhile (decision 0100). Off by default.
+    pub concurrent_planner: bool,
     /// The delta call's prompt-cache layout (decision 0100): plan block in
     /// id order, marked for a provider that takes marks. Off by default.
     pub cache_layout: bool,
@@ -663,6 +667,7 @@ impl Settings {
             // Written only when on: off is the default everywhere.
             own_checks: self.own_checks.then_some(true),
             zero_test_plans: self.zero_test_plans.then_some(true),
+            concurrent_planner: self.concurrent_planner.then_some(true),
             cache_layout: self.cache_layout.then_some(true),
             ..self.limits.user_limits()
         }
@@ -694,6 +699,7 @@ impl Default for Settings {
             early_start: true,
             own_checks: false,
             zero_test_plans: false,
+            concurrent_planner: false,
             cache_layout: false,
         }
     }
@@ -790,6 +796,7 @@ struct SettingsFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     zero_test_plans: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    concurrent_planner: Option<bool>,
     cache_layout: Option<bool>,
 }
 
@@ -858,6 +865,7 @@ impl Settings {
         settings.early_start = user.early_start.unwrap_or(settings.early_start);
         settings.own_checks = user.own_checks.unwrap_or(false);
         settings.zero_test_plans = user.zero_test_plans.unwrap_or(false);
+        settings.concurrent_planner = user.concurrent_planner.unwrap_or(false);
         settings.cache_layout = user.cache_layout.unwrap_or(false);
         settings.limits = RunLimitSliders::from_user_limits(user);
         if let Some(a) = file.appearance {
@@ -949,6 +957,7 @@ impl Settings {
             early_start: (self.plan_auto || !self.early_start).then_some(self.early_start),
             own_checks: self.own_checks.then_some(true),
             zero_test_plans: self.zero_test_plans.then_some(true),
+            concurrent_planner: self.concurrent_planner.then_some(true),
             cache_layout: self.cache_layout.then_some(true),
         };
         toml::to_string(&file).map_err(|e| ShellError::Config(e.to_string()))
@@ -1537,6 +1546,32 @@ mod tests {
         assert_eq!(loaded.run_limits().cache_layout, Some(true));
         assert_eq!(user.cache_layout, Some(true));
         assert!(!Settings::default().cache_layout, "off by default");
+    }
+
+    /// The concurrent-planner toggle: off and absent from a saved file by
+    /// default; on, it round-trips through the file the command line reads
+    /// and reaches every run the app starts.
+    #[test]
+    fn the_concurrent_planner_toggle_round_trips_and_reaches_the_run_limits() {
+        let fresh = Settings::from_toml_str("").expect("valid");
+        assert!(!fresh.concurrent_planner);
+        assert_eq!(fresh.run_limits().concurrent_planner, None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("concurrent_planner"));
+        let chosen = Settings {
+            concurrent_planner: true,
+            ..Settings::default()
+        };
+        chosen.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let user = kgraf_host::limits::UserLimits::from_toml_str(&text).expect("host reads it");
+        assert_eq!(user.concurrent_planner, Some(true));
+        let loaded = Settings::load(&path).expect("load");
+        assert!(loaded.concurrent_planner);
+        assert_eq!(loaded.run_limits().concurrent_planner, Some(true));
     }
 
     #[test]

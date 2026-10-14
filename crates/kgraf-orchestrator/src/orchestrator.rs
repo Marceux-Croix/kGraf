@@ -66,7 +66,7 @@ use crate::plan::{
     ContractSpec, CostBasis, Decomposer, GroundRequest, Grounder, PlanError, PlanRequest,
     contract_from_spec, sanitize_interfaces, sanitize_plan, validate_plan_with,
 };
-use crate::port::{InboundKind, InboundMessage, MessagePort, OutboundReply};
+use crate::port::{InboundKind, InboundMessage, MessagePort};
 use crate::readiness::{ReadinessProbe, check_tools};
 use crate::reports::{ReportKind, ReportQueue, WorkerReport};
 use crate::routing;
@@ -153,6 +153,11 @@ use checkpoint_hooks::checkpoint_note;
 mod speculate;
 // The run's time limit applied to its workers (`run_deadline.rs`).
 mod time_limit;
+// Input taken in outside the loop and the snapshot the loop publishes
+// (decision 0100, section 4; `run_intake.rs`).
+mod intake_hooks;
+// Planner calls a dispatch waits on, run as tasks (decision 0100, section 4).
+mod planner_tasks;
 // Landing (decision 0100, section 5): records for a later land, the land
 // through a live loop, and the lease a land takes with none.
 mod land_hooks;
@@ -649,6 +654,16 @@ pub struct OrchestratorConfig {
     /// contract gets. A run with no interface checks has no such gate, and is
     /// scheduled the same either way.
     pub early_nonparty: bool,
+    /// Run the planner calls a contract's dispatch waits on (an interface's
+    /// handshake, its stub land, its consumers' tests, a re-grounding) as
+    /// tasks the loop takes in when they answer, so the loop verifies,
+    /// merges and dispatches other contracts meanwhile (decision 0100,
+    /// section 4; `--concurrent-planner`). Off by default: the loop then
+    /// waits for each such call as before, serving only acknowledgments,
+    /// status, questions and a stop during it, and dispatches in the same
+    /// order. The first plan (`decompose`, `interfaces`) stays on the
+    /// planning path either way.
+    pub concurrent_planner: bool,
     /// How long a route whose call failed at the transport stays out of
     /// rotation before it is probed again, doubled for each fault in a row up
     /// to `route_health::MAX_COOLDOWN_MS` (`route_health.rs`). Thirty seconds
@@ -706,6 +721,7 @@ impl Default for OrchestratorConfig {
             approve_plan: false,
             collapse_chains: true,
             early_nonparty: false,
+            concurrent_planner: false,
             route_fault_cooldown: Duration::from_secs(30),
             time_limit: None,
             small: crate::triage::SmallRequestConfig::default(),
@@ -1267,7 +1283,14 @@ enum LoopMsg {
         generation: i64,
     },
     Control(Control),
-    Inbound(InboundMessage, Arc<dyn MessagePort>),
+    /// A row was appended to the run's intake table (decision 0100): the loop
+    /// folds the rows past the last one it folded.
+    Intake,
+    /// A planner call run as a task ended (decision 0100): its answer is
+    /// taken in.
+    Planner(Box<planner_tasks::TaskDone>),
+    /// A port's reader could not take a message in or reply to one: traced as
+    /// it says.
     PortError(String),
     GateFinished(Box<coord::GateDone>),
     /// A contract check, recompute or classification finished off the loop.
@@ -1299,6 +1322,9 @@ pub struct OrchestratorHandle {
     /// tool call the planner is making is not a worker the loop can notify,
     /// and the loop does not read messages while it awaits the planner.
     stop_token: kgraf_tools::CancellationToken,
+    /// The loop's published snapshot (decision 0100): read without asking
+    /// the loop.
+    intake: Arc<crate::run_intake::Intake>,
 }
 
 #[cfg(test)]
@@ -1319,16 +1345,46 @@ impl OrchestratorHandle {
                 }
             }
         });
+        let graph = kgraf_graph::GraphStore::open_in_memory(std::path::Path::new("."))
+            .expect("in-memory graph");
         Self {
             tx,
             stop_token: kgraf_tools::CancellationToken::new(),
+            intake: crate::run_intake::Intake::new(Arc::new(Mutex::new(graph))),
         }
     }
 }
 
 impl OrchestratorHandle {
+    /// What the loop last published (decision 0100): status, the questions
+    /// waiting for the user, the planner call it waits on. Never waits for
+    /// the loop.
+    pub fn snapshot(&self) -> crate::run_intake::LoopSnapshot {
+        self.intake.snapshot()
+    }
+
+    /// Questions waiting for the user as the loop last published them. Never
+    /// waits for the loop, so a UI may call it while drawing.
+    pub fn published_questions(&self) -> Vec<crate::asks::PendingQuestionView> {
+        self.intake.snapshot().questions
+    }
+
+    /// Waits until the loop publishes a snapshot `f` accepts. For callers
+    /// that must see a published change (tests, a CLI waiting on a state).
+    pub async fn published(
+        &self,
+        f: impl FnMut(&crate::run_intake::LoopSnapshot) -> bool,
+    ) -> crate::run_intake::LoopSnapshot {
+        let mut rx = self.intake.subscribe();
+        match rx.wait_for(f).await {
+            Ok(s) => s.clone(),
+            Err(_) => self.intake.snapshot(),
+        }
+    }
+
     /// Stop the run: cancel every worker; the record stays resumable.
     pub async fn stop(&self) {
+        self.intake.note_stop();
         self.stop_token.cancel();
         let _ = self.tx.send(LoopMsg::Control(Control::Stop)).await;
     }
@@ -2308,6 +2364,9 @@ pub struct Orchestrator {
     pub(crate) perms: permission_hooks::PermissionParts,
     /// Landing (decision 0100): the repository side and the start branch.
     land: Box<land_hooks::LandParts>,
+    /// The run's intake table and the loop's published snapshot (decision
+    /// 0100): shared with the handle, the port readers and the loop.
+    intake: Arc<crate::run_intake::Intake>,
 }
 
 impl Orchestrator {
@@ -2323,7 +2382,9 @@ impl Orchestrator {
             }
         }
         let (tx, rx) = mpsc::channel(1_024);
+        let intake = crate::run_intake::Intake::new(services.graph.clone());
         Ok(Self {
+            intake,
             config,
             services,
             contracts: None,
@@ -2525,34 +2586,37 @@ impl Orchestrator {
         Ok(self)
     }
 
+    /// Name the run a port's reader appends to, as the run is asked for: a
+    /// line that comes before the loop opens, or for a run that fails to
+    /// open, is kept for that run and said to wait (decision 0100).
+    fn name_run(&self, run: &RunId) {
+        self.intake.publish(|s| {
+            s.run = Some(run.clone());
+            s.live = false;
+        });
+    }
+
     /// A handle for stop, steer and status.
     pub fn handle(&self) -> OrchestratorHandle {
         OrchestratorHandle {
             tx: self.tx.clone(),
             stop_token: self.stop_token.clone(),
+            intake: self.intake.clone(),
         }
     }
 
-    /// Serve a message port: its notes and status questions reach the loop as
-    /// data, and replies go back through it.
+    /// Serve a message port (decision 0100, section 4): a note is appended to
+    /// the run's intake table and acknowledged once the row is committed, and
+    /// the loop folds it at its next step; a status question is answered from
+    /// the loop's published snapshot. Neither waits for the loop. The reader
+    /// keeps serving after the run ends, so a line for an ended run is kept
+    /// for its next resume and says so.
     pub fn attach_port(&self, port: Arc<dyn MessagePort>) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match port.receive().await {
-                    Ok(Some(m)) => {
-                        if tx.send(LoopMsg::Inbound(m, port.clone())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tx.send(LoopMsg::PortError(e.to_string())).await;
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(intake_hooks::serve_port(
+            self.intake.clone(),
+            port,
+            self.tx.clone(),
+        ));
     }
 
     /// Plan and run a new instruction to its end.
@@ -2561,6 +2625,7 @@ impl Orchestrator {
         run: RunId,
         instruction: String,
     ) -> Result<RunReport, OrchestratorError> {
+        self.name_run(&run);
         self.check_plan_review()?;
         let now = self.services.clock.now_ms();
         let record = RunStateRecord::new(run, instruction, now);
@@ -2581,6 +2646,7 @@ impl Orchestrator {
         run: RunId,
         plan: kgraf_interpret::ApprovedPlan,
     ) -> Result<RunReport, OrchestratorError> {
+        self.name_run(&run);
         self.check_plan_review()?;
         let record = crate::intake::seeded_record(&self, run, &plan)?;
         // Each on the heap: the run loop's futures are hundreds of
@@ -2592,6 +2658,7 @@ impl Orchestrator {
 
     /// Resume a run from its record.
     pub async fn resume(self, run: RunId) -> Result<RunReport, OrchestratorError> {
+        self.name_run(&run);
         let store = RunStore::new(self.services.graph.clone());
         let record = store
             .load(&run)?
@@ -2780,6 +2847,10 @@ struct RunLoop {
     delta_rt: delta_hooks::DeltaRuntime,
     /// Landing (decision 0100).
     land: Box<land_hooks::LandParts>,
+    /// The intake table and the published snapshot (decision 0100).
+    intake: Arc<crate::run_intake::Intake>,
+    /// Planner calls run as tasks (decision 0100).
+    planner: planner_tasks::PlannerTasks,
 }
 
 fn run_lease_key(run: &RunId) -> String {
@@ -2903,6 +2974,8 @@ fn acquire_run_lease(
 /// through their own `Drop`.
 impl Drop for RunLoop {
     fn drop(&mut self) {
+        self.publish_live(false);
+        self.planner.abort_all();
         self.land.stop();
         for (_, _, task) in &self.delta_rt.stale_tasks {
             task.abort();
@@ -2953,7 +3026,14 @@ impl RunLoop {
             check_network_notice,
             perms,
             land,
+            intake,
         } = o;
+        // A port's reader names its rows with this run from here on; until
+        // the loop is running, it says the run is not running.
+        intake.publish(|s| {
+            s.run = Some(record.run.clone());
+            s.live = false;
+        });
         // The check setting is the run's: kept in the record, and a resume with
         // another one is refused before anything is written.
         let checks = contracts
@@ -3131,6 +3211,8 @@ impl RunLoop {
             perms: permission_hooks::PermissionRuntime::new(perms),
             delta_rt: delta_hooks::DeltaRuntime::default(),
             land,
+            intake,
+            planner: planner_tasks::PlannerTasks::default(),
         };
         if let Some(torn) = torn_trace {
             let at = me.now();
@@ -3180,6 +3262,11 @@ impl RunLoop {
             me.load_report_fates();
             me.on_resume().await?;
         }
+        // Input a box or stdin line left while no loop ran (decision 0100):
+        // folded before anything else reads the record.
+        me.fold_intake().await?;
+        me.publish_live(true);
+        me.publish_snapshot();
         Ok(me)
     }
 
@@ -3482,6 +3569,7 @@ impl RunLoop {
             });
         let report = self.store.save_mirrored(&self.record)?;
         self.note_mirror(report);
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -4707,6 +4795,10 @@ impl RunLoop {
         // whatever the status (decision 0067, amendment of 2026-10-06).
         self.report_undelivered_at_run_end();
         self.shutdown()?;
+        // No loop reads input from here: a reader says so, and what arrived
+        // until now is folded into the record this session ends with.
+        self.publish_live(false);
+        on_heap(|| self.fold_intake()).await?;
         self.record.session_end_ms = Some(self.now());
         self.queue_rate_limit_waits();
         self.flush_coord().await?;
@@ -4804,7 +4896,14 @@ impl RunLoop {
             if !self.stopping {
                 self.start_due_stale_rechecks()?;
             }
-            if self.in_flight.is_empty() && (self.stopping || !self.gates_busy()) {
+            // A planner task cut by a stop, or gone stale, ends at once; the
+            // loop takes its end in before it ends itself.
+            self.cut_stale_planner_tasks();
+            on_heap(|| self.reap_dead_planner_tasks()).await?;
+            if self.in_flight.is_empty()
+                && !self.planner.busy()
+                && (self.stopping || !self.gates_busy())
+            {
                 if self.stopping {
                     on_heap(|| self.stop_triage()).await?;
                     if !matches!(self.record.status, RunStatus::Blocked { .. }) {
@@ -4885,7 +4984,8 @@ impl RunLoop {
                 }) => on_heap(|| self.on_lease_lost(holder, path, generation)).await?,
                 Some(LoopMsg::Control(c)) => on_heap(|| self.on_control(c)).await?,
                 Some(LoopMsg::ContractWork(w)) => on_heap(|| self.on_contract_work(*w)).await?,
-                Some(LoopMsg::Inbound(m, port)) => on_heap(|| self.on_inbound(m, port)).await?,
+                Some(LoopMsg::Intake) => on_heap(|| self.fold_intake()).await?,
+                Some(LoopMsg::Planner(done)) => on_heap(|| self.on_planner_done(*done)).await?,
                 Some(LoopMsg::GateFinished(done)) => {
                     on_heap(|| self.on_gate_finished(*done)).await?
                 }
@@ -4909,18 +5009,24 @@ impl RunLoop {
                     })
                     .await?;
                 }
-                Some(LoopMsg::PortError(e)) => {
+                Some(LoopMsg::PortError(detail)) => {
                     let at = self.now();
                     self.trace(TraceEvent::Deferred {
                         at_ms: at,
                         contract: String::new(),
                         reason: DeferReason::Readiness,
-                        detail: format!("message port failed: {e}"),
+                        detail,
                     })
                     .await?;
                 }
                 None => {}
             }
+            // A row acknowledged whose wake did not arrive (a full channel)
+            // is folded at this step all the same.
+            if self.intake_waiting() {
+                on_heap(|| self.fold_intake()).await?;
+            }
+            self.publish_snapshot();
             let now = self.now();
             self.s.admission.budget().renew_due(now);
             on_heap(|| self.subagent_tick()).await?;
@@ -5891,8 +5997,34 @@ impl RunLoop {
 
     /// Re-grounding before a dispatch (0057). Returns whether the dispatch may
     /// proceed.
+    ///
+    /// The call runs as a planner task (`planner_tasks.rs`): `false` too while
+    /// it has not answered, and the contract waits. Notes another re-grounding
+    /// in flight carries are not counted as waiting, so they are not sent
+    /// twice.
     async fn reground(&mut self, contract: &OpenContract) -> Result<bool, OrchestratorError> {
-        let steered = self.record.notes.iter().any(|n| !n.delivered);
+        let key = self.task_key(planner_tasks::TaskKind::Reground, contract.contract.clone());
+        if let Some(step) = self.planner_lookup(&key) {
+            return match step {
+                planner_tasks::Step::Waiting => {
+                    self.wake_soon();
+                    Ok(false)
+                }
+                planner_tasks::Step::Done(answer) => self.take_reground(contract, answer).await,
+            };
+        }
+        let carried: BTreeSet<String> = self
+            .planner
+            .carried_notes
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let steered = self
+            .record
+            .notes
+            .iter()
+            .any(|n| !n.delivered && !carried.contains(&n.id));
         let due = self.reground_on_resume
             || steered
             || (self.config.reground_every > 0
@@ -5908,7 +6040,14 @@ impl RunLoop {
             GroundingTrigger::Cadence
         };
         let id = contract.contract.clone();
-        let (notes, note_ids) = self.pending_notes();
+        let (notes, note_ids): (Vec<String>, Vec<String>) = {
+            let (blocks, ids) = self.pending_notes();
+            blocks
+                .into_iter()
+                .zip(ids)
+                .filter(|(_, id)| !carried.contains(id))
+                .unzip()
+        };
         // The original instruction and every applied change, verbatim
         // (decision 0057 as amended by 0100).
         let log = crate::delta::instruction_text(&self.record);
@@ -5929,26 +6068,85 @@ impl RunLoop {
             + 500;
         let basis = self.s.grounder.cost_basis();
         let reservation = self.reserve_call(&basis, input);
-        let (serves, reason, call) = match self.s.grounder.ground(&request).await {
-            Ok(v) => {
-                let calls: Vec<CallId> = v.retried_calls.iter().chain(&v.call).cloned().collect();
-                self.settle_call(reservation, Some(&calls))?;
-                self.note_malformed_retries("re-grounding", v.retried_calls.len());
-                // Only an answered call has received the notes.
-                self.mark_delivered(&note_ids);
-                (v.serves, v.reason, v.call)
-            }
-            Err(e) => {
-                self.settle_call(reservation, e.calls())?;
+        // Taken as asked: a second contract's dispatch meanwhile does not
+        // ask again for the same cause. Given back if the call ends with no
+        // answer (`planner_tasks.rs`).
+        self.planner.reground_prior.insert(
+            contract.contract.clone(),
+            planner_tasks::RegroundPrior {
+                trigger,
+                on_resume: self.reground_on_resume,
+                since: self.since_reground,
+            },
+        );
+        self.reground_on_resume = false;
+        self.since_reground = 0;
+        self.planner
+            .carried_notes
+            .insert(contract.contract.clone(), note_ids.clone());
+        let grounder = self.s.grounder.clone();
+        let call = async move {
+            match grounder.ground(&request).await {
+                Ok(v) => {
+                    let calls: Vec<CallId> =
+                        v.retried_calls.iter().chain(&v.call).cloned().collect();
+                    planner_tasks::Answer::Reground {
+                        verdict: Ok((v.serves, v.reason, v.call, v.retried_calls)),
+                        calls: Some(calls),
+                        note_ids,
+                        trigger,
+                    }
+                }
                 // A re-grounding that cannot answer is not a pass. The record
                 // names the last call made, so the failed answer can be found
                 // in the ledger.
-                let last = e.calls().and_then(|c| c.last()).cloned();
-                (false, format!("re-grounding failed: {e}"), last)
+                Err(e) => planner_tasks::Answer::Reground {
+                    verdict: Err((
+                        format!("re-grounding failed: {e}"),
+                        e.calls().and_then(|c| c.last()).cloned(),
+                    )),
+                    calls: e.calls().map(<[CallId]>::to_vec),
+                    note_ids,
+                    trigger,
+                },
             }
         };
-        self.reground_on_resume = false;
-        self.since_reground = 0;
+        match self.planner_call(key, vec![reservation], call).await? {
+            planner_tasks::Step::Waiting => {
+                self.wake_soon();
+                Ok(false)
+            }
+            planner_tasks::Step::Done(answer) => self.take_reground(contract, answer).await,
+        }
+    }
+
+    /// A re-grounding's answer, taken in (its reservation is settled):
+    /// recorded, traced, and the contract held when the verdict says its
+    /// dispatch does not serve the instruction.
+    async fn take_reground(
+        &mut self,
+        contract: &OpenContract,
+        answer: planner_tasks::Answer,
+    ) -> Result<bool, OrchestratorError> {
+        let planner_tasks::Answer::Reground {
+            verdict,
+            note_ids,
+            trigger,
+            ..
+        } = answer
+        else {
+            return Ok(false);
+        };
+        let id = contract.contract.clone();
+        let (serves, reason, call) = match verdict {
+            Ok((serves, reason, call, retried)) => {
+                self.note_malformed_retries("re-grounding", retried.len());
+                // Only an answered call has received the notes.
+                self.mark_delivered(&note_ids);
+                (serves, reason, call)
+            }
+            Err((reason, last)) => (false, reason, last),
+        };
         let at = self.now();
         self.record.groundings.push(GroundingRecord {
             at_ms: at,
@@ -9964,60 +10162,6 @@ impl RunLoop {
         });
         self.save()
             .map_err(|e| SteerError::NotPersisted(e.to_string()))
-    }
-
-    /// Inbound text is data: a note is persisted for the next orchestrator call;
-    /// a status question is answered from state. Neither changes the plan.
-    async fn on_inbound(
-        &mut self,
-        m: InboundMessage,
-        port: Arc<dyn MessagePort>,
-    ) -> Result<(), OrchestratorError> {
-        let started = std::time::Instant::now();
-        let is_note = m.kind == InboundKind::Note;
-        let text = match m.kind {
-            InboundKind::StatusQuestion => self.status().text,
-            InboundKind::Note => {
-                let n = self.record.notes.len();
-                self.record.notes.push(RecordedNote {
-                    id: if m.id.is_empty() {
-                        format!("note-{n}")
-                    } else {
-                        m.id.clone()
-                    },
-                    channel: m.channel.clone(),
-                    received_ms: m.received_ms,
-                    kind: m.kind,
-                    // Scrubbed at intake.
-                    text: m.text.for_storage(),
-                    delivered: false,
-                });
-                self.save()?;
-                "noted, as information for the run".to_owned()
-            }
-        };
-        if let Err(e) = port
-            .reply(OutboundReply {
-                in_reply_to: m.id.clone(),
-                text,
-            })
-            .await
-        {
-            // A reply that did not go out is recorded, not assumed.
-            let at = self.now();
-            self.trace(TraceEvent::Deferred {
-                at_ms: at,
-                contract: String::new(),
-                reason: DeferReason::Readiness,
-                detail: format!("reply to {} not delivered: {e}", m.id),
-            })
-            .await?;
-        }
-        if is_note {
-            self.emit_overhead_only(crate::latency::LatencyKind::NoteAck, started)
-                .await?;
-        }
-        Ok(())
     }
 
     fn status(&self) -> StatusReport {
