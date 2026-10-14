@@ -32,6 +32,11 @@ what is planned.
 
 ## In progress
 
+- Working with the orchestrator as a live session (decision 0100): a run stays open and takes
+  changes, re-planning only the difference; small requests skip planning; an earlier instruction
+  can be edited and run again as a change; you can talk to the worker on a work node directly;
+  kGraf suggests landing and lands one merge commit on your branch when you say yes; and every
+  interaction reports how much of its time was kGraf and how much was the model.
 - Routing a question that does not fit the current plan: assigning it to an existing
   roadmap item, spinning up a new project from it, or parking it on a dedicated node, at
   the orchestrator's judgment.

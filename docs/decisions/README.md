@@ -134,3 +134,4 @@ Active means no later record changed it. Where a record changes an earlier one, 
 | [0097](0097-windows-commands-run-as-a-dedicated-sandbox-user.md) | On Windows, sandboxed commands run as a dedicated local sandbox user | Active; supersedes part of 0011 |
 | [0098](0098-one-reasoning-level-setting-covers-every-model-call.md) | One reasoning-level setting covers every model call | Active |
 | [0099](0099-replace-in-file-is-an-edit-tool-that-needs-no-patch-format.md) | `replace_in_file` is an edit tool that needs no patch format | Active |
+| [0100](0100-the-plan-is-a-living-work-graph.md) | The plan is a living work graph, and a run is a working session | Proposed |
