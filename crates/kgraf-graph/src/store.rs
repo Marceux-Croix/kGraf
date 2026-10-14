@@ -1999,8 +1999,8 @@ CREATE INDEX IF NOT EXISTS node_lease_history_agent_task
 -- Bi-temporal facts (decision 0056), ported from Graphiti's edge model
 -- (see `facts.rs`). Not derived data: absent from DROP_DERIVED_ON_SCHEMA_CHANGE,
 -- so a schema bump keeps it. A fact that stops being true is closed (invalid_at,
--- expired_at set), never deleted (decision 0028). No change-log trigger yet: no
--- view draws facts.
+-- expired_at set), never deleted (decision 0028). A change-log trigger covers the
+-- `work:` predicates only (`facts_work_ai`, `facts_work_au`, below the log).
 CREATE TABLE IF NOT EXISTS facts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     subject    TEXT NOT NULL,
@@ -2036,6 +2036,25 @@ CREATE TABLE IF NOT EXISTS change_log (
 -- never pruned). A read-only viewer uses it once a writer opened the store and
 -- created it. Created on every open, like the tables above.
 CREATE INDEX IF NOT EXISTS change_log_table_op ON change_log(table_name, op, seq);
+
+-- Change-log rows for the plan's own facts only (`plan_mirror.rs`): the `work:`
+-- predicates. A fact of any other predicate writes no row. A new fact is logged;
+-- a close is logged as an update, and only when the end of validity changed, so
+-- re-asserting an open fact (a source added to it) is never logged.
+CREATE TRIGGER IF NOT EXISTS facts_work_ai AFTER INSERT ON facts
+WHEN substr(NEW.predicate, 1, 5) = 'work:' BEGIN
+    INSERT INTO change_log(table_name, op, row_id, payload)
+    VALUES ('facts', 'insert', NEW.id,
+            json_object('subject', NEW.subject, 'predicate', NEW.predicate,
+                        'object', NEW.object));
+END;
+CREATE TRIGGER IF NOT EXISTS facts_work_au AFTER UPDATE ON facts
+WHEN substr(NEW.predicate, 1, 5) = 'work:' AND OLD.invalid_at IS NOT NEW.invalid_at BEGIN
+    INSERT INTO change_log(table_name, op, row_id, payload)
+    VALUES ('facts', 'update', NEW.id,
+            json_object('subject', NEW.subject, 'predicate', NEW.predicate,
+                        'object', NEW.object, 'invalid_at', NEW.invalid_at));
+END;
 
 CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
     INSERT INTO change_log(table_name, op, row_id, payload)

@@ -2596,6 +2596,18 @@ impl Orchestrator {
         let record = store
             .load(&run)?
             .ok_or_else(|| OrchestratorError::NoRecord(run.to_string()))?;
+        // The plan mirror is derived from the record, which wins: whatever the
+        // graph holds that differs (a kill before its write, an older build's
+        // shape, an edit) is written again, and one that matches is not written.
+        // Before everything else, so a run with nothing left to do (a completed
+        // one, refused below) is repaired too.
+        if let Err(e) = store.rebuild_mirror(&run) {
+            kgraf_diag::record(kgraf_diag::DiagEvent::error(
+                "KG-0499",
+                "kgraf-orchestrator",
+                format!("the plan mirror of run {run} could not be checked on resume: {e}"),
+            ));
+        }
         // A completed run has nothing to resume. Re-running its loop would
         // rewrite its records from state it no longer keeps.
         if record.status == RunStatus::Completed {
@@ -3468,13 +3480,47 @@ impl RunLoop {
                     .map(|d| format!("{}/{d}", self.record.run.as_str()).as_str().into())
                     .collect(),
             });
-        self.store.save(&self.record)?;
+        let report = self.store.save_mirrored(&self.record)?;
+        self.note_mirror(report);
         Ok(())
+    }
+
+    /// What the plan mirror's write says: a failure is a notice (the record was
+    /// saved, and the run goes on); a write that changed rows is one timing
+    /// event, written the next time the trace is (`trace`).
+    fn note_mirror(&mut self, report: crate::store::MirrorReport) {
+        if let Some(e) = report.error {
+            let detail = kgraf_secrets::scrub_persist_owned(format!(
+                "the plan mirror in the graph was not written: {e}. The run record is saved \
+                 and the run goes on; `kgraf mirror rebuild {}` writes the mirror again",
+                self.record.run
+            ));
+            self.notices.insert(detail);
+            return;
+        }
+        // Every save is measured, the ones that changed nothing in the plan too.
+        self.latency.mirror_us.push((report.micros, report.rows));
     }
 
     async fn trace(&mut self, event: TraceEvent) -> Result<(), OrchestratorError> {
         if self.run_lease_lost {
             return Ok(());
+        }
+        // The plan mirror's writes since the last event: kGraf's own time.
+        for (us, rows) in std::mem::take(&mut self.latency.mirror_us) {
+            if !self.latency.enabled {
+                break;
+            }
+            let split = crate::latency::attribute(us, &[], &[]);
+            let event = crate::latency::LatencyEvent::new(
+                crate::latency::LatencyKind::PlanMirror,
+                self.now(),
+                split,
+                None,
+            )
+            .with_rows(rows);
+            self.latency.book.record(&event);
+            self.write_latency_event(TraceEvent::Latency(event)).await;
         }
         // Records queued by synchronous code go first, so the file keeps the
         // order in which things happened.
@@ -8899,6 +8945,15 @@ impl RunLoop {
             }
             self.record.open_contracts.retain(|c| c.contract != id);
             self.record.verified_contracts.push(id.clone());
+            if let Some(Verdict::Pass {
+                commit: Some(commit),
+                ..
+            }) = &flight.attempts[winner].verdict
+            {
+                self.record
+                    .verified_commits
+                    .insert(id.clone(), commit.clone());
+            }
             self.release_leases_if_unused(&holder)?;
             return self.save();
         }

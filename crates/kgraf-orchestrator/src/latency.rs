@@ -24,7 +24,7 @@
 //! the interaction's timeline by its offset from the wall anchor. Every
 //! function here takes its times as arguments, so tests inject them.
 //!
-//! The eighteen interaction kinds are listed in [`LatencyKind`] with their
+//! The nineteen interaction kinds are listed in [`LatencyKind`] with their
 //! budget ids. A kind is measured only where [`LatencyKind::is_emitted`] says
 //! so; the others are defined so their events have one schema when they are
 //! added.
@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-/// The interactions with a budget (decision 0100, section 1, B1 to B15).
+/// The interactions with a budget (decision 0100, section 1, B1 to B15, and B16
+/// for the plan mirror).
 ///
 /// Each variant names the interval it measures:
 ///
@@ -57,6 +58,7 @@ use std::time::Instant;
 /// | B13 | `land_suggestion` | the trigger fires | the suggestion is raised |
 /// | B14 | `node_note_ack` | a message to a work node arrives | it is acknowledged |
 /// | B15 | `node_note_delivered` | that message is acknowledged | the worker holding the node sees it |
+/// | B16 | `plan_mirror` | the record is saved with a plan change | the mirror's changed items are written in the record's transaction; all kGraf time |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LatencyKind {
@@ -78,11 +80,12 @@ pub enum LatencyKind {
     LandSuggestion,
     NodeNoteAck,
     NodeNoteDelivered,
+    PlanMirror,
 }
 
 impl LatencyKind {
     /// Every kind, in budget order.
-    pub const ALL: [LatencyKind; 18] = [
+    pub const ALL: [LatencyKind; 19] = [
         Self::NoteAck,
         Self::SmallRequestDispatch,
         Self::TriageDispatch,
@@ -101,6 +104,7 @@ impl LatencyKind {
         Self::LandSuggestion,
         Self::NodeNoteAck,
         Self::NodeNoteDelivered,
+        Self::PlanMirror,
     ];
 
     /// The budget id in decision 0100's table.
@@ -124,6 +128,7 @@ impl LatencyKind {
             Self::LandSuggestion => "B13",
             Self::NodeNoteAck => "B14",
             Self::NodeNoteDelivered => "B15",
+            Self::PlanMirror => "B16",
         }
     }
 
@@ -141,6 +146,7 @@ impl LatencyKind {
                 | Self::ContractMerged
                 | Self::RootGate
                 | Self::EditApplied
+                | Self::PlanMirror
         )
     }
 }
@@ -392,6 +398,10 @@ pub struct LatencyEvent {
     /// The contract, when the interaction is one contract's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<String>,
+    /// Rows the interaction wrote, for a kind that writes rows (`plan_mirror`:
+    /// 0 for a save that changed nothing in the plan).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rows: i64,
 }
 
 impl LatencyEvent {
@@ -407,7 +417,14 @@ impl LatencyEvent {
             capacity_wait_us: split.capacity_wait_us,
             checks_us: split.checks_us,
             contract,
+            rows: 0,
         }
+    }
+
+    /// The same event, saying how many rows it wrote.
+    pub fn with_rows(mut self, rows: u64) -> Self {
+        self.rows = rows.min(i64::MAX as u64) as i64;
+        self
     }
 
     /// Whether the parts add up to the wall time.
@@ -631,6 +648,10 @@ pub struct LatencyState {
     /// Wall milliseconds when the newest plan was accepted: a root contract is
     /// eligible from then.
     pub plan_accepted_ms: Option<i64>,
+    /// Microseconds and rows of each save's plan mirror work since the trace was
+    /// last written, those that changed nothing included: one `plan_mirror`
+    /// event each.
+    pub mirror_us: Vec<(i64, u64)>,
     /// Wall milliseconds when each contract merged: a contract that depends
     /// on it is eligible from the last of them. Kept for the run.
     pub merged_ms: BTreeMap<String, i64>,
@@ -656,6 +677,7 @@ impl LatencyState {
             gates: BTreeMap::new(),
             gap_written: Default::default(),
             last_written: BTreeMap::new(),
+            mirror_us: Vec::new(),
             plan_accepted_ms: None,
             merged_ms: BTreeMap::new(),
             first_deferred_ms: BTreeMap::new(),
@@ -1030,7 +1052,9 @@ mod tests {
             .collect();
         assert_eq!(
             emitted,
-            ["B1", "B2", "B3", "B4", "B7", "B9", "B10", "B10a", "B11"]
+            [
+                "B1", "B2", "B3", "B4", "B7", "B9", "B10", "B10a", "B11", "B16"
+            ]
         );
     }
 

@@ -720,6 +720,11 @@ impl OrchestratorHost {
         })
     }
 
+    /// The run a land from this window applies to, if there is one.
+    pub fn land_run(&self) -> Option<RunId> {
+        self.land_target().ok().map(|(_, run)| run)
+    }
+
     /// The project and run a land with no live loop applies to: this
     /// window's run, else the last run it hosted.
     fn land_target(&self) -> Result<(std::path::PathBuf, RunId), String> {

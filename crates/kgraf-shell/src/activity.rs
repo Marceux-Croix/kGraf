@@ -61,6 +61,67 @@ pub struct ActivityRow {
     pub target: Target,
 }
 
+/// The run a plan-mirror row belongs to (decision 0100, section 2): the rows the
+/// orchestrator writes for each run's contracts, ids `run:<run>` and
+/// `run:<run>/item/<contract>`. They are data, not events a person follows: the
+/// card shows one summary row for a run of them.
+fn mirror_run(c: &Change) -> Option<String> {
+    let id = match c.table.as_str() {
+        "work_nodes" => c.row_id.as_str(),
+        "work_deps" => field(c, "src")?,
+        _ => return None,
+    };
+    let rest = id.strip_prefix("run:")?;
+    Some(
+        rest.split_once("/item/")
+            .map_or(rest, |(run, _)| run)
+            .to_owned(),
+    )
+}
+
+fn summary(run: &str, rows: usize) -> String {
+    format!(
+        "the plan of run {run} changed: {rows} row{}",
+        if rows == 1 { "" } else { "s" }
+    )
+}
+
+/// The card's rows for a page of changes, newest first: a plan-mirror row never
+/// stands alone. The consecutive mirror rows of one run (one save of its record)
+/// are one row, "the plan of run R changed: N rows", routed to the run's root
+/// node; every other change is its own row ([`describe`]).
+pub fn rows_of(changes: &[Change]) -> Vec<ActivityRow> {
+    let mut out: Vec<ActivityRow> = Vec::new();
+    let mut open: Option<(String, usize)> = None;
+    for c in changes {
+        match mirror_run(c) {
+            Some(run) => match &mut open {
+                Some((r, n)) if *r == run => {
+                    *n += 1;
+                    if let Some(last) = out.last_mut() {
+                        last.text = summary(&run, *n);
+                    }
+                }
+                _ => {
+                    open = Some((run.clone(), 1));
+                    out.push(ActivityRow {
+                        seq: c.seq,
+                        ts_ms: c.ts,
+                        who: "plan".to_owned(),
+                        text: summary(&run, 1),
+                        target: Target::Work(format!("run:{run}")),
+                    });
+                }
+            },
+            None => {
+                open = None;
+                out.push(describe(c));
+            }
+        }
+    }
+    out
+}
+
 fn field<'a>(c: &'a Change, key: &str) -> Option<&'a str> {
     c.payload.as_ref()?.get(key)?.as_str()
 }
@@ -393,7 +454,7 @@ fn read(
                 .first()
                 .map_or(0, |c| c.seq)
                 .max(all.first().map_or(0, |f| f.seq));
-            let mut lines: Vec<ActivityRow> = page.changes.iter().map(describe).collect();
+            let mut lines: Vec<ActivityRow> = rows_of(&page.changes);
             // A row that could not be read whole is shown, not dropped quietly.
             lines.extend(all.into_iter().map(fault_row));
             lines.sort_by_key(|r| std::cmp::Reverse(r.seq));
@@ -460,6 +521,61 @@ mod tests {
         assert_eq!(r.target, Target::Agent("run/w1@1".into()));
     }
 
+    /// A run's mirror rows are never rows of their own: the consecutive ones of one
+    /// run are one summary row routed to the run's root node, and other changes
+    /// keep their rows.
+    #[test]
+    fn a_runs_mirror_rows_are_one_summary_row() {
+        let item = |id: &str, seq: i64| {
+            let mut c = change(
+                "work_nodes",
+                ChangeOp::Insert,
+                id,
+                serde_json::json!({"kind": "item", "title": "do it"}),
+            );
+            c.seq = seq;
+            c
+        };
+        let dep = {
+            let mut c = change(
+                "work_deps",
+                ChangeOp::Insert,
+                "run:r1/item/b->run:r1/item/a",
+                serde_json::json!({"src": "run:r1/item/b", "dst": "run:r1/item/a"}),
+            );
+            c.seq = 7;
+            c
+        };
+        let scheduled = {
+            let mut c = change(
+                "work_nodes",
+                ChangeOp::Insert,
+                "plan-1/item/x",
+                serde_json::json!({"kind": "item", "title": "x"}),
+            );
+            c.seq = 6;
+            c
+        };
+        let changes = vec![
+            item("run:r1/item/b", 9),
+            item("run:r1/item/a", 8),
+            dep,
+            scheduled,
+            item("run:r1", 5),
+            item("run:r2/item/z", 4),
+        ];
+        let rows = rows_of(&changes);
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(rows.len(), 4, "{texts:?}");
+        assert_eq!(texts[0], "the plan of run r1 changed: 3 rows");
+        assert_eq!(rows[0].target, Target::Work("run:r1".into()));
+        assert_eq!(rows[0].seq, 9, "the newest row's place");
+        assert!(texts[1].contains("planned item x"), "{texts:?}");
+        assert_eq!(rows[1].target, Target::Work("plan-1/item/x".into()));
+        assert_eq!(texts[2], "the plan of run r1 changed: 1 row");
+        assert_eq!(texts[3], "the plan of run r2 changed: 1 row");
+    }
+
     #[test]
     fn a_removed_node_has_no_route() {
         let r = describe(&change(
@@ -519,5 +635,47 @@ mod tests {
             .expect("rows");
         assert!(key > first_key);
         assert_eq!(unreadable(&rows).len(), 3, "{rows:?}");
+    }
+
+    /// A real mirror write reaches the card through the watch's own read as one
+    /// summary row, not a row for each node and edge.
+    #[test]
+    fn a_mirror_write_is_one_row_on_the_card() {
+        use kgraf_graph::{PlanMirror, WorkKind, WorkNode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = kgraf_graph::snapshot::graph_db_path(dir.path());
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("mkdir");
+        let store = kgraf_graph::GraphStore::open(&db, dir.path()).expect("graph");
+        let node = |id: &str, kind, parent: Option<&str>| WorkNode {
+            id: id.into(),
+            plan_id: "run:r1".into(),
+            kind,
+            parent_id: parent.map(str::to_owned),
+            title: id.into(),
+            body: "{}".into(),
+            created_ms: 1,
+        };
+        store
+            .put_plan_mirror(&PlanMirror {
+                plan_id: "run:r1".into(),
+                nodes: vec![
+                    node("run:r1", WorkKind::Plan, None),
+                    node("run:r1/item/a", WorkKind::Item, Some("run:r1")),
+                    node("run:r1/item/b", WorkKind::Item, Some("run:r1")),
+                ],
+                deps: vec![("run:r1/item/b".into(), "run:r1/item/a".into())],
+                facts: Vec::new(),
+                recorded_ms: 1,
+                full: true,
+            })
+            .expect("mirror");
+        let (mut open, mut watermark, mut faults) = (None, None, Vec::new());
+        let (_, rows) = read(dir.path(), &mut open, &mut watermark, &mut faults)
+            .expect("read")
+            .expect("rows");
+        let plan: Vec<&ActivityRow> = rows.iter().filter(|r| r.who == "plan").collect();
+        assert_eq!(plan.len(), 1, "{rows:?}");
+        assert_eq!(plan[0].text, "the plan of run r1 changed: 4 rows");
+        assert_eq!(plan[0].target, Target::Work("run:r1".into()));
     }
 }

@@ -167,6 +167,60 @@ pub fn gate_key(run: &str, gate: &str) -> String {
     format!("{run}/gate/{gate}")
 }
 
+/// The run root node's key: the id of the run's plan in the graph (`run:<id>`),
+/// so the square drawn for the root and the plan row the graph holds for it are
+/// one thing. A contract's key is `<run>/<contract>`; the two never collide.
+pub fn root_key(run: &str) -> String {
+    kgraf_orchestrator::work_mirror::plan_id(run)
+}
+
+/// The run a root node's key names.
+pub fn root_run(key: &str) -> Option<&str> {
+    kgraf_orchestrator::work_mirror::run_of_plan(key)
+}
+
+/// A run's root node: what the run has done toward landing, from the land
+/// record. It is the run's one place to land from (`land_card::root_node_land`).
+fn root_node(r: &RunStateRecord, asks: usize) -> kgraf_galaxy::PlanNode {
+    use kgraf_galaxy::{PlanNode, WorkState};
+    let run = r.run.as_str();
+    let verified = r.verified_contracts.len();
+    let total = verified + r.open_contracts.len();
+    let (state, detail) = if let Some(entry) = &r.land.landing {
+        (
+            WorkState::InFlight,
+            format!("landing into {}", entry.target),
+        )
+    } else if let Some(entry) = r.land.landed.last() {
+        (
+            WorkState::Done,
+            format!(
+                "landed into {} as {}",
+                entry.target,
+                short_sha(&entry.merge_commit)
+            ),
+        )
+    } else {
+        (
+            WorkState::Planned,
+            format!("not landed; {verified} of {total} contracts verified"),
+        )
+    };
+    let intent = intent_of(&r.original_instruction);
+    PlanNode {
+        key: root_key(run),
+        state,
+        label: format!("run {run}: {} ({detail}) | {intent}", state.word()),
+        blocked_by: Vec::new(),
+        asks,
+        parent: None,
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 /// Runs the graph draws: every run marked for resume, and the newest run, so a
 /// finished run stays visible until another starts.
 pub fn shown_runs(runs: &[StoredRun]) -> Vec<&RunStateRecord> {
@@ -356,6 +410,8 @@ pub fn plan_nodes(
                 blocked_by: Vec::new(),
             });
         }
+        // The run root, last: the plan's own node, with the land state.
+        out.push(root_node(r, pending_for(&root_key(run))));
     }
     out
 }
@@ -1067,6 +1123,121 @@ pub(crate) mod tests {
         assert_eq!(
             transcript_path(Path::new("/p/.kgraf"), "r1", "w"),
             Path::new("/p/.kgraf/runs/r1/workers/w.jsonl")
+        );
+    }
+
+    fn landed_entry() -> kgraf_orchestrator::land_record::LandingEntry {
+        kgraf_orchestrator::land_record::LandingEntry {
+            run_branch: "kgraf/r1".into(),
+            candidate: "a".repeat(40),
+            merge_commit: "b".repeat(40),
+            target: "main".into(),
+            target_old: "c".repeat(40),
+            gate: kgraf_orchestrator::land_record::LandGate::Passed {
+                candidate: "a".repeat(40),
+                tree: "d".repeat(40),
+            },
+            started_ms: 1,
+            target_moved: true,
+            checkout_interrupted: false,
+            include_changes: Vec::new(),
+            programs_digest: None,
+            fold: None,
+            finished_ms: Some(2),
+        }
+    }
+
+    /// Every shown run has a root node keyed by its plan id in the graph, with
+    /// its land state from the land record: not landed, landing, landed.
+    #[test]
+    fn a_run_has_a_root_node_with_its_land_state() {
+        use kgraf_galaxy::WorkState;
+        let mut r = RunStateRecord::new(RunId::new("r1"), "make the thing\nfast", 1);
+        r.verified_contracts = vec!["v".into()];
+        r.open_contracts = vec![contract("a", ContractStatus::Planned, &[])];
+        let root_of = |r: &RunStateRecord| {
+            let nodes = plan_nodes(&[stored(r.clone())], &[], None);
+            let root: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.key == "run:r1")
+                .cloned()
+                .collect();
+            assert_eq!(root.len(), 1, "one root: {nodes:#?}");
+            assert_eq!(nodes.len(), 3, "the run's two contracts and its root");
+            root[0].clone()
+        };
+        let root = root_of(&r);
+        assert_eq!(root.state, WorkState::Planned);
+        assert!(
+            root.label.contains("not landed; 1 of 2 contracts verified"),
+            "{}",
+            root.label
+        );
+        assert!(root.label.contains("make the thing"), "{}", root.label);
+        assert_eq!(root_run(&root.key), Some("r1"));
+
+        r.land.landing = Some(landed_entry());
+        let root = root_of(&r);
+        assert_eq!(root.state, WorkState::InFlight);
+        assert!(root.label.contains("landing into main"), "{}", root.label);
+
+        r.land.landing = None;
+        r.land.landed = vec![landed_entry()];
+        let root = root_of(&r);
+        assert_eq!(root.state, WorkState::Done);
+        assert!(
+            root.label
+                .contains(&format!("landed into main as {}", "b".repeat(12))),
+            "{}",
+            root.label
+        );
+    }
+
+    /// A run and its mirror in the graph draw each square once: the contracts
+    /// on `<run>/<contract>` and the root on `run:<run>`, and no key of the
+    /// mirror's item rows (`run:<run>/item/<contract>`). The mirror rows are
+    /// queryable data, not drawn again.
+    #[test]
+    fn a_run_and_its_mirror_draw_no_duplicate_squares() {
+        let dir = tempfile::tempdir().expect("dir");
+        let graph = std::sync::Arc::new(std::sync::Mutex::new(
+            kgraf_graph::GraphStore::open(&dir.path().join("graph.db"), dir.path()).expect("graph"),
+        ));
+        let mut r = RunStateRecord::new(RunId::new("r1"), "go", 1);
+        r.verified_contracts = vec!["v".into()];
+        r.plan_specs.insert(
+            "v".into(),
+            serde_json::from_str::<kgraf_orchestrator::ContractSpec>(
+                r#"{"id":"v","instruction":"do v","acceptance":"ok"}"#,
+            )
+            .expect("spec"),
+        );
+        let mut b = contract("b", ContractStatus::Planned, &[]);
+        b.depends_on = vec!["a".into()];
+        r.open_contracts = vec![contract("a", ContractStatus::Dispatched, &["w1"]), b];
+        kgraf_orchestrator::RunStore::new(graph.clone())
+            .save(&r)
+            .expect("save");
+        // The mirror is there, as rows.
+        let g = graph.lock().expect("lock");
+        let mirrored = g.work_nodes("run:r1").expect("nodes");
+        assert_eq!(mirrored.len(), 4, "the root and three items: {mirrored:#?}");
+        // The same read the window makes.
+        let runs = kgraf_orchestrator::read_runs(&g).expect("runs");
+        let presumed = kgraf_interpret::presumed::views(&g).expect("presumed");
+        let schedules = crate::schedule_store::views(&g).expect("schedules");
+        drop(g);
+        let mut plan = plan_nodes(&runs, &[], None);
+        plan.extend(crate::schedule_store::plan_nodes(&schedules, &|_: &str| {
+            None
+        }));
+        fold_presumed(&mut plan, &runs, &presumed);
+        let mut keys: Vec<&str> = plan.iter().map(|n| n.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["r1/a", "r1/b", "r1/v", "run:r1"], "{plan:#?}");
+        assert!(
+            plan.iter().all(|n| !n.key.contains("/item/")),
+            "no mirror row is drawn: {plan:#?}"
         );
     }
 }

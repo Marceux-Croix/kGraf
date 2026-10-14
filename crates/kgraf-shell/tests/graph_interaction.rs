@@ -126,7 +126,8 @@ fn the_run_record_is_drawn_as_work_status_on_the_graph() {
     let ctx = egui::Context::default();
     let (mut panel, mut interaction) = open(dir.path(), &ctx);
     settle(&ctx, &rs, &mut panel, &mut interaction, |p| {
-        p.model().is_some_and(|m| m.plan_nodes().count() == 3)
+        // Three contracts and the run's root node.
+        p.model().is_some_and(|m| m.plan_nodes().count() == 4)
     });
     let model = panel.model().expect("live");
     let state = |key: &str| {
@@ -136,6 +137,8 @@ fn the_run_record_is_drawn_as_work_status_on_the_graph() {
     assert_eq!(state("r1/a"), WorkState::InFlight);
     assert_eq!(state("r1/b"), WorkState::HeldByCap);
     assert_eq!(state("r1/c"), WorkState::Blocked);
+    // The run's root is drawn once beside its three contracts, with its land state.
+    assert_eq!(state("run:r1"), WorkState::Planned);
     // The block is an edge from c to a, in the scene the renderer draws.
     let scene = panel.view().expect("view").galaxy().scene();
     let (a, c) = (
@@ -177,7 +180,7 @@ fn a_search_is_a_selection_on_the_graph_with_the_camera_on_it() {
     // A work-state query lights the work node, through the same selection.
     interaction.search.query = "status:cap".into();
     settle(&ctx, &rs, &mut panel, &mut interaction, |p| {
-        p.model().is_some_and(|m| m.plan_nodes().count() == 3)
+        p.model().is_some_and(|m| m.plan_nodes().count() == 4)
     });
     interaction.search_now(Some(&mut panel));
     let model = panel.model().expect("model");
@@ -279,7 +282,7 @@ fn status_labels_are_painted_on_the_work_nodes_and_agents() {
     }
     settle(&ctx, &rs, &mut panel, &mut interaction, |p| {
         p.model()
-            .is_some_and(|m| m.plan_nodes().count() == 3 && m.agent_slot(HOLDER).is_some())
+            .is_some_and(|m| m.plan_nodes().count() == 4 && m.agent_slot(HOLDER).is_some())
     });
     let texts = painted_texts(&ctx, &rs, &mut panel);
     let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
@@ -415,7 +418,7 @@ fn a_snippet_routes_back_to_its_node_and_expands_in_place() {
     let ctx = egui::Context::default();
     let (mut panel, mut interaction) = open(dir.path(), &ctx);
     settle(&ctx, &rs, &mut panel, &mut interaction, |p| {
-        p.model().is_some_and(|m| m.plan_nodes().count() == 3)
+        p.model().is_some_and(|m| m.plan_nodes().count() == 4)
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     while interaction.corpus.get("r1", WORKER).is_none() {

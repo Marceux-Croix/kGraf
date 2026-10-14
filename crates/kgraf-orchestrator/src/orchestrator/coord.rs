@@ -775,6 +775,16 @@ impl RunLoop {
                 {
                     self.record.verified_contracts.push(original.clone());
                 }
+                // The commit that verified it is the resolver's winning attempt's.
+                if let Some(Verdict::Pass {
+                    commit: Some(commit),
+                    ..
+                }) = winner.and_then(|w| flight.attempts[w].verdict.as_ref())
+                {
+                    self.record
+                        .verified_commits
+                        .insert(original.clone(), commit.clone());
+                }
                 self.queue(TraceEvent::Integration {
                     at_ms: at,
                     duration_ms: None,

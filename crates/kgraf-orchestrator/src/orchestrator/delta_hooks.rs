@@ -1398,6 +1398,14 @@ impl RunLoop {
                 .insert(id.clone(), Integration::Empty);
         }
         self.record.verified_contracts = done.clone();
+        // The commits that verified the work carried over keep their record.
+        for id in &done {
+            if let Some(commit) = old.verified_commits.get(id) {
+                self.record
+                    .verified_commits
+                    .insert(id.clone(), commit.clone());
+            }
+        }
         for mut s in remaining {
             // A dependency on work done in the base is met; one on a
             // contract that is neither remaining nor done (a split's parent)

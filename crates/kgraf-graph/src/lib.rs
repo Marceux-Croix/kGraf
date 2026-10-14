@@ -35,6 +35,7 @@ pub mod lang;
 pub mod layout;
 pub mod leases;
 pub mod permission_events;
+pub mod plan_mirror;
 pub mod presumed;
 pub mod query;
 pub mod rank;
@@ -58,6 +59,7 @@ pub use leases::{
     NodeAcquisition, NodeConflict, NodeLease, NodeLeaseRecord, WriteLease,
 };
 pub use permission_events::PermissionEventRow;
+pub use plan_mirror::{MirrorFact, MirrorWrite, PlanMirror};
 pub use presumed::{PresumedNode, PresumedOrigin, PresumedSync, StoredPresumed};
 pub use query::{EdgeDirection, NodePredicate, Pattern, QueryMatch};
 pub use rank::{RankRequest, RankedDefinition, RepoRank, rank_repository};

@@ -340,6 +340,9 @@ pub fn prepare(store: &GraphStore, request: InterpretRequest) -> Result<Prepared
         // The plan `kgraf schedule add` creates to hold scheduled work is not
         // an interpretation (decision 0052 section 3), so it is not a prior plan.
         .filter(|n| n.plan_id != kgraf_graph::SCHEDULE_PLAN_ID)
+        // A run's plan mirror (`run:<id>`, written for every run) is not an
+        // interpretation either (decision 0100, section 2).
+        .filter(|n| !n.plan_id.starts_with("run:"))
         .map(|n| n.plan_id)
         .collect();
     Ok(Prepared {

@@ -101,6 +101,30 @@ pub fn root_node_land(model: &mut BoxModel, backend: &mut dyn BoxBackend) {
     submit(model, backend, None);
 }
 
+/// A click on a run root node's land action. The land applies to the run this
+/// window lands (`lands_run`), so a root node of another run is refused with
+/// that said, never landed as the wrong run.
+pub fn land_from_root(
+    model: &mut BoxModel,
+    backend: &mut dyn BoxBackend,
+    node_key: &str,
+    lands_run: Option<&str>,
+) {
+    let Some(run) = crate::run_view::root_run(node_key) else {
+        model.say(Line::Error(format!("`{node_key}` is not a run root")));
+        return;
+    };
+    match lands_run {
+        Some(mine) if mine == run => root_node_land(model, backend),
+        Some(mine) => model.say(Line::Error(format!(
+            "not landed: that is run {run}; this window lands run {mine}"
+        ))),
+        None => model.say(Line::Error(
+            "not landed: there is no run in this window to land".to_owned(),
+        )),
+    }
+}
+
 fn send(model: &mut BoxModel, backend: &mut dyn BoxBackend, request: LandRequest) {
     model.land.suggester.withdraw();
     match backend.land(request.clone()) {
@@ -586,6 +610,37 @@ mod tests {
         assert_eq!(
             crate::orchestrator_box::parse("/land now"),
             BoxCommand::Unknown("/land now".into())
+        );
+    }
+
+    /// The run root node's land action reaches `BoxBackend::land`, attended, once,
+    /// for the run this window lands; a root of another run lands nothing.
+    #[test]
+    fn a_root_nodes_land_action_reaches_the_backend() {
+        let mut model = BoxModel::default();
+        let mut backend = Fake::default();
+        land_from_root(&mut model, &mut backend, "run:r1", Some("r1"));
+        assert_eq!(backend.landed.len(), 1);
+        assert!(backend.landed[0].attended && !backend.landed[0].untested_confirmed);
+        assert_eq!(
+            backend.landed[0],
+            {
+                let mut slash = Fake::default();
+                let mut m = BoxModel::default();
+                m.input = "/land".into();
+                m.submit(&mut slash, None);
+                slash.landed[0].clone()
+            },
+            "the same request as /land"
+        );
+
+        let mut other = Fake::default();
+        land_from_root(&mut model, &mut other, "run:r2", Some("r1"));
+        land_from_root(&mut model, &mut other, "r1/a", Some("r1"));
+        land_from_root(&mut model, &mut other, "run:r1", None);
+        assert!(
+            other.landed.is_empty(),
+            "no land for another run, a contract or no run"
         );
     }
 

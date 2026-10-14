@@ -20,6 +20,7 @@ use kgraf_galaxy::PlanNode;
 use kgraf_orchestrator::{Admission, StoredRun};
 
 use crate::chrome;
+use crate::land_card;
 use crate::orchestrator_box::{self, BackendState, BoxBackend, BoxModel, Line};
 use crate::orchestrator_host::{HostParts, NO_HOST, OrchestratorHost};
 use crate::run_view;
@@ -466,6 +467,9 @@ pub struct Interaction {
     order_previous: Option<Vec<String>>,
     /// The plan overlay changed since the galaxy last took it.
     plan_dirty: bool,
+    /// A run root node was just selected: the box takes keyboard focus on the
+    /// next frame, since the root is where the user talks to the orchestrator.
+    focus_box: bool,
     /// Pending asks as last counted into the plan.
     asks_seen: Vec<u64>,
     /// Scheduled work nodes from the scheduler thread, added to the plan.
@@ -572,6 +576,7 @@ impl Interaction {
             order_run: None,
             order_previous: None,
             plan_dirty: true,
+            focus_box: false,
             asks_seen: Vec::new(),
             schedule_nodes: Vec::new(),
             search,
@@ -802,6 +807,13 @@ impl Interaction {
             return;
         }
         self.routed = selected.clone();
+        if selected
+            .work
+            .as_deref()
+            .is_some_and(|k| run_view::root_run(k).is_some())
+        {
+            self.focus_box = true;
+        }
         let from_search = self.search.lit
             && selected.slot.is_some()
             && self.search.results.hits.first().map(|h| h.slot) == selected.slot;
@@ -1014,6 +1026,13 @@ impl Interaction {
     /// Append the selected work node to the user's order (0014): it is dispatched
     /// after the nodes already ordered and before the ones the user did not order.
     pub fn pin(&mut self, key: &str) -> Result<(), String> {
+        if run_view::root_run(key).is_some() {
+            return Err(
+                "that is a run's root: it takes no place in the order; talk to the orchestrator \
+                 in the box, or land the run from it"
+                    .to_owned(),
+            );
+        }
         // A graph work node (presumed, 0064, or scheduled, 0052) is in no run: it
         // has no place in a run's order. Said, rather than mistaken for a run id.
         if key.starts_with("work:") {
@@ -1122,7 +1141,27 @@ impl Interaction {
             {
                 self.play();
             }
-            if let Some(key) = &selected.work {
+            if let Some(key) = &selected.work
+                && run_view::root_run(key).is_some()
+            {
+                // The run root: land from here (the same land as `/land`).
+                let key = key.clone();
+                if ui
+                    .button("Land")
+                    .on_hover_text(
+                        "land this run onto your branch as one merge commit; the same as /land",
+                    )
+                    .clicked()
+                {
+                    let lands = self.host.land_run();
+                    land_card::land_from_root(
+                        &mut self.box_model,
+                        &mut self.host,
+                        &key,
+                        lands.as_ref().map(|r| r.as_str()),
+                    );
+                }
+            } else if let Some(key) = &selected.work {
                 let key = key.clone();
                 if ui
                     .button("Add to my order")
@@ -1171,7 +1210,17 @@ impl Interaction {
             .agent
             .as_deref()
             .and_then(|a| run_view::worker_for_holder(&self.runs.runs, a));
-        orchestrator_box::show(ui, &mut self.box_model, &mut self.host, worker.as_deref());
+        let opts = orchestrator_box::BoxOptions {
+            focus_input: std::mem::take(&mut self.focus_box),
+            ..orchestrator_box::BoxOptions::default()
+        };
+        orchestrator_box::show_styled(
+            ui,
+            &mut self.box_model,
+            &mut self.host,
+            worker.as_deref(),
+            &opts,
+        );
     }
 }
 
@@ -1555,6 +1604,25 @@ mod tests {
             .pin("work:presumed/roadmap/ROADMAP.md/item/phases/1")
             .expect_err("not a run's");
         assert!(err.contains("not in a run"), "{err}");
+        // A run's root is no contract: it takes no place in the order.
+        let err = i.pin("run:r1").expect_err("a root");
+        assert!(err.contains("root"), "{err}");
+    }
+
+    /// A click on a run root node takes the user to the orchestrator box (the
+    /// composer gets focus on the next frame); a contract's square does not.
+    #[test]
+    fn selecting_a_run_root_focuses_the_orchestrator_box() {
+        let ctx = egui::Context::default();
+        let mut i = Interaction::new(&ctx, None, None);
+        let pick = |key: &str| Selected {
+            work: Some(key.to_owned()),
+            ..Selected::default()
+        };
+        i.on_selection(&pick("r1/a"));
+        assert!(!i.focus_box, "a contract does not take the box");
+        i.on_selection(&pick("run:r1"));
+        assert!(i.focus_box, "the run root does");
     }
 
     /// Scheduled work nodes join the plan overlay the galaxy takes, and a

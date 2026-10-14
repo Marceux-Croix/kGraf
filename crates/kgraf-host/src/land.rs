@@ -1614,6 +1614,20 @@ pub fn record_land_decline(root: &Path, run: &RunId, now_ms: i64) -> Result<(), 
         .map_err(|e| LandError::Persist(e.to_string()))
 }
 
+/// `kgraf mirror rebuild RUN`: write the run's plan mirror in the graph again from
+/// its record, the record winning (decision 0100, section 2). `None`: the
+/// project has no record of the run. Touches only the mirror's rows; the record
+/// is read, never written.
+pub fn rebuild_run_mirror(
+    root: &Path,
+    run: &RunId,
+) -> Result<Option<kgraf_orchestrator::MirrorRepair>, LandError> {
+    let (_, graph) = open_graph(root)?;
+    RunStore::new(graph)
+        .rebuild_mirror(run)
+        .map_err(|e| LandError::Run(e.to_string()))
+}
+
 /// The branch checked out at `root` and its commit; `None` on a detached
 /// or unborn HEAD.
 pub(crate) fn checked_out_branch(root: &Path) -> Option<(String, String)> {

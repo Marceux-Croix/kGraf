@@ -130,6 +130,7 @@ mod trace;
 pub mod triage;
 mod verify;
 mod waits;
+pub mod work_mirror;
 
 pub use admission::{
     Admission, AdmissionError, AdmissionGate, Admitted, BudgetBook, BudgetStats,
@@ -262,7 +263,9 @@ pub use speculation::{
     ValidationCache, speculate,
 };
 pub use starter::{Finished, OrchestratorFactory, ScheduledRuns};
-pub use store::{RunFiles, RunStore, SharedGraph, StoreError, StoredRun, read_runs};
+pub use store::{
+    MirrorRepair, MirrorReport, RunFiles, RunStore, SharedGraph, StoreError, StoredRun, read_runs,
+};
 pub use stub_land::{
     GitStubLander, StubLander, StubScope, is_placeholder_source, placeholder_left_in_place_reason,
     placeholder_writes_left_in_place, stub_left_in_place, stub_left_in_place_failure,

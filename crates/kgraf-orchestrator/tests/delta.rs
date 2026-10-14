@@ -884,6 +884,14 @@ async fn a_copy_keeps_work_in_its_base_and_makes_one_delta_call() {
             .push(ClosedContract::of(&open, Closure::Verified));
         old.coordination.integration.insert(id.into(), integration);
         old.verified_contracts.push(id.into());
+        old.verified_commits.insert(
+            id.into(),
+            kgraf_orchestrator::VerifiedCommit {
+                sha: id.repeat(40),
+                verified_by: "t".into(),
+                verified_ms: 1,
+            },
+        );
         old.plan_specs.insert(id.into(), spec);
     }
     let mut f = kgraf_orchestrator::OpenContract::planned(
@@ -923,6 +931,15 @@ async fn a_copy_keeps_work_in_its_base_and_makes_one_delta_call() {
     let r = record_of(&p, "r2");
     assert_eq!(r.copied_from, Some(RunId::new("r0")));
     assert_eq!(r.plan_root, Some(RunId::new("r0")));
+    // The commits that verified the work kept in the base are carried over.
+    for id in ["a", "c"] {
+        assert_eq!(
+            r.verified_commits.get(id).map(|c| c.sha.clone()),
+            Some(id.repeat(40)),
+            "{id}: {:?}",
+            r.verified_commits
+        );
+    }
     let mut verified = r.verified_contracts.clone();
     verified.sort();
     assert_eq!(verified, vec!["a", "b", "c", "d", "d1.e", "f"]);

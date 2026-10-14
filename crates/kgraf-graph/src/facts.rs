@@ -126,15 +126,87 @@ fn immediate(conn: &rusqlite::Connection) -> rusqlite::Result<rusqlite::Transact
 impl GraphStore {
     /// Assert a fact, closing the facts it contradicts (module doc, rules 1 to 4).
     pub fn assert_fact(&self, new: &NewFact<'_>, now_ms: i64) -> Result<Assertion> {
-        if let Some(end) = new.invalid_at
-            && end < new.valid_at
-        {
-            return Err(GraphError::Fact {
-                id: 0,
-                reason: format!("invalid_at {end} is before valid_at {}", new.valid_at),
-            });
-        }
         let tx = immediate(self.conn())?;
+        let assertion = assert_in(&tx, new, now_ms)?;
+        tx.commit()?;
+        Ok(assertion)
+    }
+
+    /// Whether a fact with exactly this subject, predicate, object and start of
+    /// validity is stored, open or closed. A writer that re-asserts a whole
+    /// history (the plan mirror) skips what is already there: re-asserting an
+    /// older fact beside a newer open one would otherwise store it again, closed.
+    pub(crate) fn has_fact_at(
+        conn: &rusqlite::Connection,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_at: i64,
+    ) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM facts
+                 WHERE subject = ?1 AND predicate = ?2 AND object = ?3 AND valid_at = ?4",
+                params![subject, predicate, object, valid_at],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// One fact by id.
+    pub fn fact(&self, id: i64) -> Result<Option<Fact>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM facts WHERE id = ?1"),
+                params![id],
+                row_fact,
+            )
+            .optional()?)
+    }
+
+    /// Every fact about a subject and predicate, closed ones included, oldest
+    /// first: the full history.
+    pub fn fact_history(&self, subject: &str, predicate: &str) -> Result<Vec<Fact>> {
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {COLUMNS} FROM facts WHERE subject = ?1 AND predicate = ?2
+             ORDER BY valid_at, id"
+        ))?;
+        Ok(stmt
+            .query_map(params![subject, predicate], row_fact)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Open facts with this predicate whose subject starts with `subject_prefix`.
+    pub fn open_facts(&self, predicate: &str, subject_prefix: &str) -> Result<Vec<Fact>> {
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT {COLUMNS} FROM facts
+             WHERE predicate = ?1 AND invalid_at IS NULL AND expired_at IS NULL
+               AND substr(subject, 1, length(?2)) = ?2
+             ORDER BY subject, id"
+        ))?;
+        Ok(stmt
+            .query_map(params![predicate, subject_prefix], row_fact)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// [`GraphStore::assert_fact`] inside a transaction the caller owns and commits.
+pub(crate) fn assert_in(
+    tx: &rusqlite::Connection,
+    new: &NewFact<'_>,
+    now_ms: i64,
+) -> Result<Assertion> {
+    if let Some(end) = new.invalid_at
+        && end < new.valid_at
+    {
+        return Err(GraphError::Fact {
+            id: 0,
+            reason: format!("invalid_at {end} is before valid_at {}", new.valid_at),
+        });
+    }
+    {
         // Only open facts are candidates: a closed one already has its end.
         let open: Vec<Fact> = {
             let mut stmt = tx.prepare(&format!(
@@ -166,7 +238,6 @@ impl GraphStore {
                     fact.episode_count as i64
                 ],
             )?;
-            tx.commit()?;
             return Ok(Assertion {
                 fact,
                 invalidated: Vec::new(),
@@ -223,7 +294,6 @@ impl GraphStore {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        tx.commit()?;
         Ok(Assertion {
             fact: Fact {
                 id,
@@ -240,43 +310,6 @@ impl GraphStore {
             invalidated,
             duplicate: false,
         })
-    }
-
-    /// One fact by id.
-    pub fn fact(&self, id: i64) -> Result<Option<Fact>> {
-        Ok(self
-            .conn()
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM facts WHERE id = ?1"),
-                params![id],
-                row_fact,
-            )
-            .optional()?)
-    }
-
-    /// Every fact about a subject and predicate, closed ones included, oldest
-    /// first: the full history.
-    pub fn fact_history(&self, subject: &str, predicate: &str) -> Result<Vec<Fact>> {
-        let mut stmt = self.conn().prepare(&format!(
-            "SELECT {COLUMNS} FROM facts WHERE subject = ?1 AND predicate = ?2
-             ORDER BY valid_at, id"
-        ))?;
-        Ok(stmt
-            .query_map(params![subject, predicate], row_fact)?
-            .collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Open facts with this predicate whose subject starts with `subject_prefix`.
-    pub fn open_facts(&self, predicate: &str, subject_prefix: &str) -> Result<Vec<Fact>> {
-        let mut stmt = self.conn().prepare(&format!(
-            "SELECT {COLUMNS} FROM facts
-             WHERE predicate = ?1 AND invalid_at IS NULL AND expired_at IS NULL
-               AND substr(subject, 1, length(?2)) = ?2
-             ORDER BY subject, id"
-        ))?;
-        Ok(stmt
-            .query_map(params![predicate, subject_prefix], row_fact)?
-            .collect::<rusqlite::Result<_>>()?)
     }
 }
 

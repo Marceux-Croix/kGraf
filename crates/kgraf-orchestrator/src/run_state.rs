@@ -741,6 +741,11 @@ pub struct RunStateRecord {
     /// save (a land, a decline) moves `updated_ms`, never this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_end_ms: Option<i64>,
+    /// The commit that verified each verified contract, by contract id: what
+    /// the graph mirror records as `work:verified_commit`. A record from before
+    /// the field has none for the contracts it had verified.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub verified_commits: BTreeMap<String, VerifiedCommit>,
 }
 
 /// A hold a pre-dispatch interface check placed, with the route and model of
@@ -986,6 +991,7 @@ impl RunStateRecord {
             replan_base: 0,
             plan_calls: Vec::new(),
             session_end_ms: None,
+            verified_commits: BTreeMap::new(),
         }
     }
 

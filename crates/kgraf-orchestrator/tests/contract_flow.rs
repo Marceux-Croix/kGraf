@@ -6752,3 +6752,94 @@ async fn a_partys_dispatch_split_names_its_sandbox_checks() {
     assert!(free.sums(), "{free:?}");
     assert_eq!(free.checks_us, 0, "no interface binds it: {free:?}");
 }
+
+/// The plan mirror names the run's plan `run:<id>` and leaves `source_plan`
+/// alone: a run's own plan is not an approved one, so the held-plan re-plan and
+/// the dropping of held interface checks (which an approved plan switches off)
+/// stay on. The record has a `plan_root` and the graph has the run's mirror, and
+/// neither switches them off.
+fn assert_mirrored_but_not_approved(rig: &Rig) {
+    let store = kgraf_orchestrator::RunStore::new(rig.parts.graph.clone());
+    let record = store
+        .load(&RunId::new("r1"))
+        .expect("load")
+        .expect("record");
+    assert_eq!(
+        record.plan_root,
+        Some(RunId::new("r1")),
+        "a plan_root is set"
+    );
+    assert_eq!(
+        record.source_plan, None,
+        "the mirror is not an approved plan"
+    );
+    assert!(
+        !rig.parts
+            .graph
+            .lock()
+            .expect("lock")
+            .work_nodes("run:r1")
+            .expect("nodes")
+            .is_empty(),
+        "the run's mirror is in the graph"
+    );
+}
+
+/// `RunLoop::replan` reads `source_plan` only: with a mirror and a `plan_root`
+/// present, the held plan is still sent back to the planner once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mirrored_run_still_re_plans_a_held_plan() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::with_planner(
+        dir.path(),
+        held_then_replanned(plan_with(&py_ic()), plan_with(&replacing_ic())),
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        4,
+        "one plan, one re-plan"
+    );
+    assert_mirrored_but_not_approved(&rig);
+}
+
+/// `RunLoop::drop_failed_checks` reads `source_plan` only: with a mirror and a
+/// `plan_root` present, a check that still fails after the re-plan is dropped
+/// and the contracts dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mirrored_run_still_drops_a_failed_check_it_cannot_re_plan() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        plan_with(&py_ic()),
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.contracts.stub_land_failures, 2, "{report:?}");
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "re1.config",
+        STUB_LAND_REFUSAL,
+        "the re-plan is spent",
+    )
+    .await;
+    assert_mirrored_but_not_approved(&rig);
+}

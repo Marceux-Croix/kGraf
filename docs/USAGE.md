@@ -122,6 +122,7 @@ overwrites a node you changed.
 |---|---|
 | `kgraf orchestrate` | Run the orchestrator on an instruction, or resume a run. Flags below. |
 | `kgraf land --run RUN [--into BRANCH] [--commit SHA] [--untested] [--recover]` | Land a run onto your branch as one merge commit. See [Landing](#landing). |
+| `kgraf mirror rebuild RUN` | Write the run's plan mirror in the graph again from its run record. See [The plan in the graph](#the-plan-in-the-graph). |
 | `kgraf worker` | Run one worker in its own worktree under `.kgraf/workspaces/`. It commits to an attempt ref and never merges. |
 | `kgraf clean <worktree> [--force]` | Remove a kept or stranded worktree. Refused while its owner or any process started in it runs. `--force` is needed when a run record still names it. |
 | `kgraf allow mcp__<server>__<tool> [--note ...] [--revoke]` | Always allow an MCP tool in this project. |
@@ -714,6 +715,28 @@ dependencies on disk before it starts.
 
 Workers cannot merge changes to `.cargo`, `rust-toolchain`, and other build-tool or
 version-manager configuration. Make those by hand.
+
+### The plan in the graph
+
+Every run writes its plan into the project's graph as work nodes: a plan root `run:<run id>`,
+one item for each contract (`run:<run id>/item/<contract>`), the dependencies between items, and
+a record of each contract's history (the change that revised or removed it, the commit that
+verified it). The run record stays the truth; the nodes are rows kGraf derives from it, written
+in the same step as the record, so they cannot disagree after a stop or a crash. A contract keeps
+its item for its whole life; a change that replaces a contract gives the replacement a new id.
+The graph draws each contract once, from the record. The nodes are data you can query, not a
+second drawing. A run's root node is drawn too, with its land state; selecting it takes you to
+the orchestrator box, and its Land button is the same land as `/land`.
+
+If a notice says the mirror was not written, the run went on and its record is saved. Run
+`kgraf mirror rebuild RUN` to write the nodes again from the record. The command says whether
+the mirror already matched (and writes nothing) or what it rewrote, with the time it took. The
+record wins when the two differ: a node or fact the record does not give is marked removed or
+closed (never deleted), so a second `rebuild` always says the mirror matched. When you resume a
+run, kGraf compares the mirror with the record first and rewrites it only if they differ, also
+for a run with nothing left to do. A dependency a revision drops stays as an edge of the old
+state; an item's body holds its current dependencies. The live activity card shows one line for
+a save's plan rows, not one for each.
 
 ### Worker worktrees
 

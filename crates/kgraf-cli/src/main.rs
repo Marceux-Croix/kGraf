@@ -128,6 +128,11 @@ enum Command {
     },
     /// Land a run onto your branch as one merge commit (decision 0100).
     Land(land_cmd::LandArgs),
+    /// The plan mirror: each run's contracts as work nodes in the graph.
+    Mirror {
+        #[command(subcommand)]
+        action: MirrorAction,
+    },
     /// Report recorded provider spend.
     Spend {
         /// A JSON price table: {"model-name": {"uncached_input": 3000000, ...}},
@@ -909,6 +914,18 @@ enum DepsAction {
 }
 
 #[derive(Subcommand)]
+enum MirrorAction {
+    /// Write a run's mirror in the graph again from its run record. The record
+    /// is the truth and wins over the graph; nothing in the record changes. Use
+    /// it after a notice said the mirror was not written, or to check one:
+    /// the command says whether the mirror already matched.
+    Rebuild {
+        /// The run id, as the run's own report prints it.
+        run: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum UnreconciledAction {
     /// Close one open call with the usage the provider's own invoice or console
     /// shows for it. Counts in the call's own protocol: for an inclusive route
@@ -991,6 +1008,7 @@ fn feature_name(command: &Command) -> &'static str {
         Command::Cochange { .. } => "cochange",
         Command::Partners { .. } => "partners",
         Command::Land(_) => "land",
+        Command::Mirror { .. } => "mirror",
         Command::Spend { .. } => "spend",
         Command::Unreconciled { .. } => "unreconciled",
         Command::Demand => "demand",
@@ -1239,6 +1257,9 @@ fn run_cli() -> Result<()> {
             limit,
         } => partners(&root, &path, min_count, max_commit_size, limit),
         Command::Land(args) => land_cmd::run(&root, args),
+        Command::Mirror {
+            action: MirrorAction::Rebuild { run },
+        } => mirror_rebuild(&root, &run),
         Command::Spend { prices } => spend(&root, prices.as_deref()),
         Command::Unreconciled { action: None } => unreconciled(&root),
         Command::Unreconciled {
@@ -2614,6 +2635,26 @@ fn resolve_unreconciled(ledger: &Ledger, call_id: &str, given: ResolvedUsage) ->
         usage.text_output,
         usage.reasoning_output
     ))
+}
+
+/// `kgraf mirror rebuild RUN`.
+fn mirror_rebuild(root: &Path, run: &str) -> Result<()> {
+    match kgraf_host::land::rebuild_run_mirror(root, &kgraf_core::RunId::new(run))? {
+        None => bail!("there is no run {run} in this project"),
+        Some(r) if r.matched => println!(
+            "run {run}: the mirror already matched the record ({} items); nothing written, {:.1} ms",
+            r.items,
+            r.micros as f64 / 1000.0
+        ),
+        Some(r) => println!(
+            "run {run}: the mirror was rewritten from the record ({} items, {} rows written, \
+             {:.1} ms)",
+            r.items,
+            r.rows,
+            r.micros as f64 / 1000.0
+        ),
+    }
+    Ok(())
 }
 
 fn ledger_command(root: &Path, action: LedgerAction) -> Result<()> {

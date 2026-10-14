@@ -127,7 +127,7 @@ impl GraphStore {
 /// [`GraphStore::put_work`] inside a caller's transaction, so a write that must be
 /// atomic with other rows (the presumed-node bookkeeping, `presumed.rs`) is.
 pub(crate) fn put_work_in(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     nodes: &[WorkNode],
     deps: &[(String, String)],
 ) -> Result<WorkWrite> {

@@ -101,6 +101,14 @@ async fn a_merge_conflict_dispatches_a_resolver_worker_not_a_rerun() {
         record.verified_contracts
     );
     assert!(
+        record
+            .verified_commits
+            .get("a")
+            .is_some_and(|c| c.sha.len() == 40),
+        "the commit that verified the original is recorded: {:?}",
+        record.verified_commits
+    );
+    assert!(
         !record
             .verified_contracts
             .iter()

@@ -15,11 +15,16 @@
 //! - The **trace** (the six open-question measurements, `trace.rs`) is JSON lines
 //!   in the same run directory.
 //!
-//! Known limit: `GraphStore` rebuilds its whole schema, `meta` included, when its
-//! schema version changes, because the index is derived data. A run record is not
-//! derived. A graph schema bump therefore loses in-flight run records; until the
-//! graph crate keeps non-derived tables across a rebuild, finish or stop runs
-//! before upgrading.
+//! A graph schema bump keeps run records. `GraphStore` rebuilds only derived
+//! data (the code index and the change log) when its schema version changes;
+//! `meta`, where the records live, the work tables and the facts are not in
+//! `DROP_DERIVED_ON_SCHEMA_CHANGE`, and a test reopens a store at another
+//! version to show the record and the plan mirror survive.
+//!
+//! The **plan mirror** (`work_mirror.rs`) is written in the same transaction as
+//! the record: one `GraphStore::put_record_with_mirror`. It is rows derived from
+//! the record; the record wins on any disagreement, and [`RunStore::rebuild_mirror`]
+//! writes it again from the record.
 
 use crate::run_state::{RunStateError, RunStateRecord};
 use kgraf_core::RunId;
@@ -27,6 +32,7 @@ use kgraf_graph::GraphStore;
 use kgraf_runtime::blocking;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 fn record_key(run: &RunId) -> String {
     format!("orchestrator/run/{}", run.as_str())
@@ -60,15 +66,50 @@ pub enum StoreError {
 /// [`blocking`] so SQLite never stalls an executor thread.
 pub type SharedGraph = Arc<Mutex<GraphStore>>;
 
+/// What writing a record's mirror cost and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorReport {
+    /// Microseconds kGraf spent on the mirror: building it, diffing it against
+    /// what this process wrote, and the rows written.
+    pub micros: i64,
+    /// Rows added or changed. 0: every item was already written as it is.
+    pub rows: u64,
+    /// The record's plan-relevant parts were as at the last write, so no row was
+    /// built or compared.
+    pub skipped: bool,
+    /// Why the mirror was not written. The record was.
+    pub error: Option<String>,
+}
+
+/// What [`RunStore::rebuild_mirror`] found and did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorRepair {
+    /// The mirror already held exactly what the record gives.
+    pub matched: bool,
+    /// Items the record gives (the plan root excluded).
+    pub items: usize,
+    /// Rows added or changed to make it so.
+    pub rows: u64,
+    /// Microseconds the repair took: reading the record, building the mirror,
+    /// comparing it and writing what differed.
+    pub micros: i64,
+}
+
 /// Run records in the graph store.
 #[derive(Clone)]
 pub struct RunStore {
     graph: SharedGraph,
+    /// What this store wrote of each run's mirror, so an unchanged item is not
+    /// written again.
+    mirrored: Arc<Mutex<crate::work_mirror::MirrorCache>>,
 }
 
 impl RunStore {
     pub fn new(graph: SharedGraph) -> Self {
-        Self { graph }
+        Self {
+            graph,
+            mirrored: Arc::default(),
+        }
     }
 
     pub fn graph(&self) -> &SharedGraph {
@@ -98,9 +139,122 @@ impl RunStore {
     /// brief and its acceptance), a note, a posted message body, a gate
     /// decision's note, a wait's detail and a grounding verdict's reason.
     pub fn save(&self, record: &RunStateRecord) -> Result<(), StoreError> {
+        let report = self.save_mirrored(record)?;
+        if let Some(e) = report.error {
+            // Loud, and never a reason to lose the record. The loop reads the
+            // report of `save_mirrored` and says it in a notice.
+            kgraf_diag::record(kgraf_diag::DiagEvent::error(
+                "KG-0499",
+                "kgraf-orchestrator",
+                format!("the plan mirror of run {} was not written: {e}", record.run),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::save`], with the report of the mirror write. The record and the
+    /// mirror's changed items are written in one transaction; a mirror that
+    /// cannot be written is in the report and the record is still saved.
+    pub fn save_mirrored(&self, record: &RunStateRecord) -> Result<MirrorReport, StoreError> {
         let text = record.to_json()?;
         let key = record_key(&record.run);
-        self.with(|g| Ok(g.set_meta(&key, &text)?))
+        // The mirror is built and diffed before the graph lock is taken. A record
+        // whose plan-relevant parts hash as they did at the last write builds
+        // nothing at all: that is nearly every save.
+        let started = Instant::now();
+        let plan = crate::work_mirror::plan_id(record.run.as_str());
+        let fingerprint = crate::work_mirror::fingerprint(record);
+        let prepared = {
+            let cache = self
+                .mirrored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.fingerprint_is(&plan, fingerprint) {
+                None
+            } else {
+                let (part, hashes) = cache.diff(&crate::work_mirror::mirror(record));
+                Some((part, hashes))
+            }
+        };
+        let built = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+        let skipped = prepared.is_none();
+        let (part, hashes) = match prepared {
+            Some((part, hashes)) => (Some(part), Some(hashes)),
+            None => (None, None),
+        };
+        let part = part.as_ref().filter(|p| !p.nodes.is_empty());
+        self.with(|g| {
+            let write = g.put_record_with_mirror(&key, &text, part)?;
+            if write.error.is_none() {
+                let mut cache = self
+                    .mirrored
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(hashes) = hashes {
+                    cache.remember(&plan, hashes);
+                }
+                cache.remember_fingerprint(&plan, fingerprint);
+            }
+            Ok(MirrorReport {
+                micros: built.saturating_add(write.micros.min(i64::MAX as u64) as i64),
+                rows: write.changed(),
+                skipped,
+                error: write.error,
+            })
+        })
+    }
+
+    /// How many times this store built and diffed a mirror (a save whose record
+    /// did not touch the plan builds none).
+    pub fn mirror_builds(&self) -> usize {
+        self.mirrored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .builds()
+    }
+
+    /// Write a run's mirror again from its record, the record winning: the
+    /// repair command and the resume path. `None`: the run has no record.
+    pub fn rebuild_mirror(&self, run: &RunId) -> Result<Option<MirrorRepair>, StoreError> {
+        let started = Instant::now();
+        let Some(record) = self.load(run)? else {
+            return Ok(None);
+        };
+        let full = crate::work_mirror::mirror(&record);
+        self.with(|g| {
+            let matched = g.plan_mirror_matches(&full)?;
+            // A mirror that already matches is not written: a resume of every run
+            // checks, and a check writes nothing.
+            let write = if matched {
+                kgraf_graph::MirrorWrite::default()
+            } else {
+                g.put_plan_mirror(&full)?
+            };
+            let mut cache = self
+                .mirrored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.forget(&full.plan_id);
+            let (_, hashes) = cache.diff(&full);
+            cache.remember(&full.plan_id, hashes);
+            cache.remember_fingerprint(&full.plan_id, crate::work_mirror::fingerprint(&record));
+            Ok(Some(MirrorRepair {
+                matched,
+                items: full.nodes.len().saturating_sub(1),
+                rows: write.changed(),
+                micros: started.elapsed().as_micros().min(i64::MAX as u128) as i64,
+            }))
+        })
+    }
+
+    /// Whether the graph's mirror of `run` is exactly what its record gives.
+    /// `None`: no record.
+    pub fn mirror_matches(&self, run: &RunId) -> Result<Option<bool>, StoreError> {
+        let Some(record) = self.load(run)? else {
+            return Ok(None);
+        };
+        let full = crate::work_mirror::mirror(&record);
+        self.with(|g| Ok(Some(g.plan_mirror_matches(&full)?)))
     }
 
     /// Every run's record, validated. A record that does not validate is an
