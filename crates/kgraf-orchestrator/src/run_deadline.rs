@@ -129,6 +129,13 @@ impl RunDeadline {
         self.deadline_ms().saturating_sub(self.elapsed_ms(now_ms))
     }
 
+    /// Time left before the run's limit at `now_ms` (0 past it): what the
+    /// reserve after the worker deadline holds for verification, merge and
+    /// the gate.
+    pub(crate) fn limit_left_ms(&self, now_ms: i64) -> u64 {
+        self.limit_ms.saturating_sub(self.elapsed_ms(now_ms))
+    }
+
     /// A worker on `route` ended with its round measure.
     pub(crate) fn record_round(&mut self, route: &str, ms: u64) {
         self.rounds.insert(route.to_owned(), ms);

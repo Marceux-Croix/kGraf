@@ -150,7 +150,7 @@ overwrites a node you changed.
 | `--gate-command CMD` | discovered | A quality gate. Repeatable. Without one, kGraf finds the project's test commands. |
 | `--gate-timeout SECS` | 1800 | Longest one gate or one `--verify` run. |
 | `--shell-timeout SECS` | 600 | Longest one worker shell command. |
-| `--time-limit SECS` | none | The run's wall-clock budget, from when the run opens. The planner skips optional asks that would pass 30 percent of it. The last tenth (at most 120 s) is kept for verification, merge and the gate; every worker gets the rest as its deadline and stops at a round boundary before it, when its next round (the longest of its last three) would not end in time. A round still running at the deadline is cut, and its call is recorded as cancelled. The tree a stopped worker leaves is verified as it stands. No new attempt starts when the time left is shorter than one round (the fastest route's last measured round, else 15 s or 5 percent of the limit); a notice says so and the run ends with what it has. Trace records: `time_limit`. |
+| `--time-limit SECS` | none | The run's wall-clock budget, from when the run opens. The planner skips optional asks that would pass 30 percent of it. The last tenth (at most 120 s) is kept for verification, merge and the gate; every worker gets the rest as its deadline and stops at a round boundary before it, when its next round (the longest of its last three) would not end in time. A round still running at the deadline is cut, and its call is recorded as cancelled. The tree a stopped worker leaves is verified as it stands. When no further attempt can start, that tree is the contract's only delivery: a check that checks nothing accepts it too, with a notice, and the verification is stopped at the limit if it would run past it (the verdict names that). No new attempt starts when the time left is shorter than one round (the fastest route's last measured round, else 15 s or 5 percent of the limit); a notice says so and the run ends with what it has. Trace records: `time_limit` (actions `worker_stopped`, `tree_verified`, `attempt_refused`). |
 | `--rate-limit ROUTE=RPM[/BURST][@MAX_WAIT_MS]` | none | Limit one route's call rate. A call that would wait longer than MAX_WAIT_MS (default 60000) fails. Repeatable. |
 | `--routing rotation\|fitness` | `rotation` | `rotation` rotates workers across routes. `fitness` sends coupled contracts to one vendor and picks each worker's model by measured cost per satisfied task. |
 | `--sessions true\|false` | true | Give every agent the session tools `ask_user_question`, `spawn_subagent`, `send_message` and `request_connection`. |
@@ -158,6 +158,7 @@ overwrites a node you changed.
 | `--planner-reasoning LEVEL` | unset | The same as `--reasoning planner=LEVEL`. |
 | `--contract-checks` | off | Experimental. Check interface contracts in the sandbox before the first worker starts. |
 | `--interface-review` | off | Before a producer attempt counts as verified, one model on a different vendor's route reviews it. The finding is advisory. |
+| `--no-collapse-chains` | off | Keep a plan's straight chains of contracts as the planner wrote them. By default a chain (each contract waiting on the one before) becomes one contract when its steps run on one route and one worker can carry it. Plan review and an order you chose always keep the plan as written. Also the run file key `collapse_chains` (`false`). |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
 | `--interactive` | off | Read notes and `?` status questions from stdin during the run. |
@@ -383,7 +384,12 @@ refused. A typed answer is not a verified answer.
 1. **Setup.** The run indexes the working tree, checks the dependencies (see below) and
    checks that each local route answers.
 2. **Plan.** The orchestrator splits the instruction into contracts. A malformed answer is
-   asked for again, at most twice.
+   asked for again, at most twice. A straight chain of contracts, each waiting on the one
+   before, becomes one contract when its steps run on one route and one worker can carry it
+   (a chain gains no parallelism, and each split costs an interface and a handshake). The run
+   notices say so, and the trace holds a `chain_collapsed` record. A plan under `--plan-review`
+   stays as written, as does a plan with an order you chose; with several routes and steps
+   that are not pinned to one route, chains stay split.
 3. **Dispatch.** Workers run in parallel, each in its own worktree and sandbox, each fed
    from graph slices.
 4. **Verify.** Each attempt runs the `--verify` command. An attempt that changed none of

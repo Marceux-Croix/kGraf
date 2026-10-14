@@ -45,6 +45,7 @@ Checked against the code on 2026-10-12. Where the history below disagrees, this 
 - [Amendment (2026-10-11, third): a missing check program skips an interface's checks; it no longer holds its parties](#amendment-2026-10-11-third-a-missing-check-program-skips-an-interfaces-checks-it-no-longer-holds-its-parties)
 - [Amendment (2026-10-12): an interface refused again for a reason it was told is not asked for again; a repeated missing tests file becomes compile-only](#amendment-2026-10-12-an-interface-refused-again-for-a-reason-it-was-told-is-not-asked-for-again-a-repeated-missing-tests-file-becomes-compile-only)
 - [Amendment (2026-10-12): the optional planner asks have a budget when the run has a time limit](#amendment-2026-10-12-the-optional-planner-asks-have-a-budget-when-the-run-has-a-time-limit)
+- [Amendment (2026-10-13): an interface is asked only where a stub can work, and the interface call has two asks](#amendment-2026-10-13-an-interface-is-asked-only-where-a-stub-can-work-and-the-interface-call-has-two-asks)
 
 ---
 
@@ -1303,3 +1304,72 @@ gate disabled), `with_no_time_limit_the_interface_asks_are_not_held_back`,
 `the_contracts_ask_is_never_skipped_by_the_budget`, `a_replan_is_skipped_when_the_budget_is_spent`, the unit
 tests in `planner_budget.rs`, and the internal scenario tests `test_a_budget_stop_is_an_honest_end_of_the_interface_call_and_a_fact`
 and `test_only_the_counted_skip_record_ends_the_interface_call`.
+
+## Amendment (2026-10-13): an interface is asked only where a stub can work, and the interface call has two asks
+
+An earlier record of a run (the pypi-server task, qwen3.6:35b): the plan held contracts whose work is system
+state, not files. `c2` builds the package into `dist/` and `c3` starts a server on port 8080, and both declare
+`writes: []`; `c4` depends on `c3`. The interface step asked for one interface per producer edge. A stub is
+landed on the producer's declared writes only, so the planner had no file to stub and invented marker files
+(`dist/.gitkeep`, `dist/.built`, `dist/.serving`). Each was refused with "the stub file ... is not a declared
+write of any of its parties", all three asks were spent (434 s, 23,000 output tokens), and the edges ended
+unchecked anyway. Two of the asks repeated the first ask's reason.
+
+Measured over 22 recorded runs of one terminal benchmark task: planner time was 51 to 93 percent of the task
+window (typically 7 to 19 minutes), each run made 1 to 6 interface asks costing 25,000 to 45,000 output
+tokens, most asks were refused, and most edges still ended unchecked.
+
+The rules:
+- **An edge is asked about only when its producer writes a source file.** A producer is never asked about when
+  it declares no file writes, when it writes only binary build outputs (`derive_interface::binary_outputs_only`),
+  or when none of its declared writes is a source file in a language the checks support
+  (`derive_interface::has_compile_language`: Rust, Python, TypeScript, Go, Java, C#). Data, markers, notes,
+  configuration and shell scripts cannot be compiled or tested against a stub, so the planner could only invent
+  a check that is refused. The rule is deterministic over the plan: `derive_interface::unaskable_writes`, no model
+  call. Such a producer is a `BehaviorPlan::Skip`, decided before the first ask, also when no edge was derived.
+- **Its edges leave the ask.** The prompt's `Consumer <- producers` list and the refusal `no interface binds ...`
+  never name them, and a plan in which every edge is like this makes no interface call. Each edge is recorded as
+  an `unchecked` contract event at once, counted as not run, with a reason that begins `behavior check not run:`
+  and says either `the producer declares no file writes, so no stub can stand in for it; its result is judged by
+  its acceptance check and the run's gates` or `the producer declares no source file kGraf can compile or test
+  (<files>), so no stub can stand in for it; its result is judged by its acceptance check and the run's gates`.
+  The compile-check note follows it, as for any skipped edge. An interface the planner still writes for such a
+  producer is refused as before and, as for any skipped producer, that refusal is a notice and does not buy
+  another ask (the 2026-10-12 amendment). Edges with a producer that writes source files are unchanged.
+  The prompt says a producer or edge not listed needs no interface.
+- **The interface call has two asks, not three** (`MAX_INTERFACE_ASKS`): the first, and one re-ask with the
+  previous answer and its refusal. After the last ask the edges no behavior interface binds are recorded
+  unchecked, and the run dispatches at once, as it did after the third ask. The third ask had almost never
+  bought an accepted interface in the recorded runs, and each ask cost minutes on a local model. The earlier
+  amendments' "three asks" describe the allowance at the time they were written.
+  The test harness reads the allowance from each `interfaces_refused` event's `of` field, so its judges follow it.
+
+Tests: `a_producer_that_declares_no_writes_gets_no_ask_and_an_unchecked_edge`,
+`a_plan_whose_producers_all_declare_no_writes_makes_no_interface_ask`,
+`a_mixed_plan_asks_only_for_the_edge_of_the_writing_producer`,
+`a_producer_that_writes_only_non_code_files_gets_no_ask` and, for the allowance,
+`after_two_asks_a_failing_interface_is_counted_unchecked_and_the_run_goes_on` (each fails with its change
+reverted); the unit tests `a_producer_with_no_file_writes_is_not_asked_about` and
+`a_producer_that_writes_only_non_code_files_is_not_asked_about` in `derive_interface.rs`.
+
+## Amendment (2026-10-14): a tree stopped at the time limit is verified when no attempt can run
+
+A measured run of a terminal task (a 3600 s limit) ended with nothing delivered though the worker had
+written the contract's files in its first block. The worker was stopped at its deadline, the tree went to
+verification, and the contract's check was `true`. The rule that a check that checks nothing cannot
+accept a tree its worker never claimed was done refused it, and no attempt could start, so nothing
+replaced it. A failure path recovers or continues with less, loudly.
+
+- When the time limit stops an attempt and no further attempt can start (the time left to the worker
+  deadline is below one round), its tree is the contract's only delivery. It is verified as it stands, as
+  a completed attempt's is, and merged and gated when it passes. A check that checks nothing (`true`,
+  with no gate command) accepts it too, with a notice that says so; for a stalled worker or one out of
+  rounds that check still refuses the tree, because another attempt can replace it. A trace record
+  (`time_limit`, action `tree_verified`) and a notice say the attempt was stopped at the time limit and
+  its tree was verified because no further attempt could run.
+- The verification runs inside the time left to the run's limit: the reserve after the worker deadline.
+  A check still running at the limit is stopped, and the verdict names it ("the verification did not
+  finish in the N s left before the run's time limit"). No check duration is measured per contract, so
+  the bound is the clock, not a forecast.
+- If the verification fails, or an attempt changed no file, the run ends as before (held, with the
+  verification's reason named, or blocked with no attempt started).

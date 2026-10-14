@@ -297,3 +297,35 @@ Tests: `contract_flow.rs` `a_replan_the_budget_refuses_drops_the_failing_check_a
 `a_resume_after_a_drop_traced_but_not_saved_releases_the_parties`; each failed on the code before
 this change (the run ended Blocked). The flow tests also assert that the root verify gate passed
 after the drop.
+
+## Amendment (2026-10-13): a failed handshake drops its interface's checks and keeps the plan
+
+Recorded runs of the pypi-server task show a handshake failure making kGraf discard the plan and plan again
+from scratch: one run made 5 decompose calls and wrote 2 plans in 554 s after interface `i_src_init@v1` failed
+with "7 mismatch(es) between the parties' statements; the first: symbol_unprovided dotproduct_fn". Two more
+runs re-planned the same way. A handshake compares what each party assumed of the other. A mismatch is the
+planner's wording of the interface, and planning the whole run again costs minutes of planner time without any
+reason to expect the new plan to agree.
+
+The rule: when every interface whose failed check holds a party failed at the handshake stage
+(`RunLoop::only_handshake_failures`), the plan is not planned again (`replan` returns `NotPlanned("a failed
+handshake is dropped, not planned again")`). The existing drop applies at once
+(`drop_failed_checks`, the 2026-10-13 amendments above): `ChecksDropped`, one `Unchecked` per edge between
+the interface's parties with the failure and its first mismatch, a notice naming the interface, the held
+parties released, and the contracts dispatched; the root verify gate still judges the work. Counters are the
+same (`interface_checks_dropped`, `checks_not_run`).
+
+Kept: a failure of any other stage (artifact, stub-compile, vacuity, stub land) still goes back to the planner
+once as before; when a handshake failure and another failure hold parties together, the re-plan covers both.
+A handshake that could not run is not a failure and was already dropped without a re-plan. A run from an
+approved plan, or with interfaces given before planning, keeps its holds.
+
+Supersedes the lines above that send a handshake failure back to the planner once. The planner time budget
+is no longer consulted for it.
+
+Tests: `contract_flow.rs` `a_failed_handshake_drops_its_checks_keeps_the_plan_and_dispatches` (one accepted
+plan, no second planner call, the edge unchecked, the contracts dispatched; it fails with the rule reverted),
+`a_failed_handshake_never_reaches_the_replan_budget`, `a_handshake_that_cannot_run_drops_its_checks_and_dispatches`.
+The tests that reached the re-plan by a handshake failure (the re-plan's briefs, its not-JSON re-ask, the
+handshake that fails twice) were removed: no handshake failure reaches the re-plan now, and no other
+pre-dispatch failure stage can be produced at the gate by the test rig.

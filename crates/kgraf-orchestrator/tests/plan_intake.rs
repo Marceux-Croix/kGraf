@@ -58,6 +58,10 @@ impl kgraf_tools::Tool for NamedTool {
 /// An orchestrator whose routes offer the recorded plans' tools, the first
 /// route named as the long-run answer pins it.
 fn orchestrator(p: &Parts) -> Orchestrator {
+    orchestrator_with(p, config())
+}
+
+fn orchestrator_with(p: &Parts, cfg: kgraf_orchestrator::OrchestratorConfig) -> Orchestrator {
     let tools: Vec<Arc<dyn kgraf_tools::Tool>> =
         ["apply_patch", "graph_slice", "shell", "send_message"]
             .into_iter()
@@ -65,7 +69,7 @@ fn orchestrator(p: &Parts) -> Orchestrator {
             .collect();
     let mut services = p.services_with(WINDOW, &tools);
     services.routes[0].name = PINNED_ROUTE.into();
-    Orchestrator::new(config(), services).expect("orchestrator")
+    Orchestrator::new(cfg, services).expect("orchestrator")
 }
 
 /// Plan, then stop. Returns the report.
@@ -198,7 +202,12 @@ async fn contracts_sharing_a_file_under_a_whole_check_are_left_alone() {
         |_| SERVES.into(),
         Duration::from_millis(20),
     );
-    plan_then_stop(orchestrator(&p)).await;
+    // The recorded answer is a straight chain of eight contracts on one route,
+    // which kGraf now makes one contract (`chain_collapse.rs`); this test is
+    // about the shared-file rule, so the plan is kept as written.
+    let mut cfg = config();
+    cfg.collapse_chains = false;
+    plan_then_stop(orchestrator_with(&p, cfg)).await;
     let events = trace(dir.path()).await;
     assert!(refusals(&events).is_empty());
     assert_eq!(accepted_ids(&events).len(), 8);

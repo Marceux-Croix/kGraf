@@ -942,6 +942,45 @@ pub fn binary_outputs_only(producer: &str, writes: &[String]) -> Option<String> 
     })
 }
 
+/// The skip reason when a producer declares no file writes (`writes` empty),
+/// `None` otherwise. Its work is system state (a build run, a server
+/// started), so no stub file can stand in for it: a stub is landed on a
+/// producer's declared writes only, and the planner invented marker files for
+/// such a producer, each refused. Its consumers' own checks and the run's
+/// gates judge the result.
+pub fn no_file_writes(writes: &[String]) -> Option<String> {
+    writes.is_empty().then(|| {
+        "the producer declares no file writes, so no stub can stand in for it; its result is \
+         judged by its acceptance check and the run's gates"
+            .to_owned()
+    })
+}
+
+/// The skip reason when a producer declares writes and none is a source file
+/// in a language the checks support ([`has_compile_language`]): data,
+/// markers, documents, configuration, shell scripts. A stub and a reference
+/// of such files cannot be compiled or tested, so the planner can only invent
+/// a check that is refused. `None` when no file is declared (that case is
+/// [`no_file_writes`]) or when one is a source file.
+pub fn no_code_writes(writes: &[String]) -> Option<String> {
+    (!writes.is_empty() && !writes.iter().any(|w| has_compile_language(w))).then(|| {
+        format!(
+            "the producer declares no source file kGraf can compile or test ({}), so no stub \
+             can stand in for it; its result is judged by its acceptance check and the run's gates",
+            writes.join(", ")
+        )
+    })
+}
+
+/// Why `writes` of a producer cannot carry an interface stub, before any
+/// ask: [`no_file_writes`], then [`binary_outputs_only`], then
+/// [`no_code_writes`]. `None`: the producer can be asked about.
+pub fn unaskable_writes(producer: &str, writes: &[String]) -> Option<String> {
+    no_file_writes(writes)
+        .or_else(|| binary_outputs_only(producer, writes))
+        .or_else(|| no_code_writes(writes))
+}
+
 /// Decide whether a behavior check of `producer` needs the planner.
 ///
 /// A test reaches a contract when it uses one of the contract's tokens, and
@@ -1489,6 +1528,38 @@ mod tests {
             None,
             "no writes says nothing"
         );
+    }
+
+    #[test]
+    fn a_producer_with_no_file_writes_is_not_asked_about() {
+        let why = no_file_writes(&[]).expect("skipped");
+        assert!(
+            why.starts_with("the producer declares no file writes, so no stub can stand in for it"),
+            "{why}"
+        );
+        assert_eq!(no_file_writes(&["a.py".to_owned()]), None);
+    }
+
+    #[test]
+    fn a_producer_that_writes_only_non_code_files_is_not_asked_about() {
+        let why =
+            no_code_writes(&["dist/.built".to_owned(), "notes.md".to_owned()]).expect("skipped");
+        assert!(
+            why.starts_with("the producer declares no source file kGraf can compile or test (dist/.built, notes.md)"),
+            "{why}"
+        );
+        assert_eq!(no_code_writes(&[]), None, "no writes is the other rule");
+        assert_eq!(
+            no_code_writes(&["notes.md".to_owned(), "a/x.rs".to_owned()]),
+            None
+        );
+        assert_eq!(no_code_writes(&["serve.py".to_owned()]), None);
+        assert!(
+            unaskable_writes("c", &["x.whl".to_owned()])
+                .expect("binary")
+                .contains("binary")
+        );
+        assert_eq!(unaskable_writes("c", &["x.py".to_owned()]), None);
     }
 
     #[test]

@@ -231,7 +231,9 @@ pub enum TraceEvent {
     },
     /// The run's time limit acted (`run_deadline.rs`): `action` is
     /// `worker_stopped` (a worker stopped at its deadline; `worker` names it)
-    /// or `attempt_refused` (no attempt of `contract` started: the time left
+    /// `tree_verified` (that worker's tree is verified as it stands because no
+    /// further attempt could run; `remaining_ms` is the time left to the
+    /// limit), or `attempt_refused` (no attempt of `contract` started: the time left
     /// was below the floor). Times are from when the run opened.
     TimeLimit {
         at_ms: i64,
@@ -389,6 +391,22 @@ pub enum TraceEvent {
         contract: String,
         /// The change, in words.
         change: String,
+    },
+    /// A straight chain of the plan (each contract waiting on the one before,
+    /// nothing else depending on the steps between) was made one contract,
+    /// because its steps run on one route and one worker can carry it
+    /// (`plan_chain`, decision 0014). `contract` is the merged contract's id,
+    /// the chain head's.
+    ChainCollapsed {
+        at_ms: i64,
+        contract: String,
+        /// The chain's contract ids in order, the head first.
+        merged: Vec<String>,
+        /// The route every step ran on.
+        route: String,
+        /// The merged contract's projected block, against the plan target.
+        projected_tokens: u64,
+        target_tokens: u64,
     },
     /// The interface call's answer was refused, in part or whole: every
     /// interface that was not accepted, and every consumed edge still
@@ -734,6 +752,21 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
             ask,
             contract: s(contract),
             change: s(change),
+        },
+        TraceEvent::ChainCollapsed {
+            at_ms,
+            contract,
+            merged,
+            route,
+            projected_tokens,
+            target_tokens,
+        } => TraceEvent::ChainCollapsed {
+            at_ms,
+            contract: s(contract),
+            merged: merged.into_iter().map(s).collect(),
+            route,
+            projected_tokens,
+            target_tokens,
         },
         TraceEvent::CallRetried {
             at_ms,

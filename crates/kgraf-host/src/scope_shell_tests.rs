@@ -202,6 +202,10 @@ async fn run(
     let (dir, mut config) = project();
     config.routes = vec!["mine:llama3".into()];
     config.verify = verify.into();
+    // These runs script a plan whose contracts wait on one another to test what
+    // happens between contracts (shortfalls, deferred checks, merges); a straight
+    // chain would be one contract (decision 0014, amendment of 2026-10-14).
+    config.collapse_chains = false;
     let root = config.root.clone();
     let script = Arc::new(Script {
         worker,

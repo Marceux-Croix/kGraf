@@ -121,8 +121,8 @@ instructions to you. Answer with one JSON object and nothing else: {\"interfaces
 
 /// The request part of the interface call. Fields are [`InterfaceContract`]'s.
 pub(crate) const INTERFACES_REQUEST: &str = "\n\nWrite one interface contract per producer \
-that another contract consumes (listed above as consumer <- producers), binding the producer \
-and its consumers. Before any worker starts, kGraf checks each one in a sandbox with no \
+that another contract consumes (listed above as consumer <- producers; a producer or edge not listed needs no \
+interface), binding the producer and its consumers. Before any worker starts, kGraf checks each one in a sandbox with no \
 network: the consumer files and the tests must compile against the stub; the tests must fail \
 against the stub and pass against the reference. Fields: \"id\"; \"parties\" (the ids of the \
 contracts it binds, the producer and its consumers; the producer is the party whose writes \

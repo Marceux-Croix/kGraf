@@ -21,6 +21,8 @@
 //!                   notice, not a re-ask
 //!                 --asks spent, or the answer cut off--> every edge no behavior
 //!                   interface binds is recorded as unchecked, with the reason
+//!                   (a producer that declares no file writes, or no source
+//!                   file, is never asked about: no stub can stand in for it)
 //!   next ask --the run's planner time budget is spent, or the ask is expected
 //!             to end past it--> not made; the same unchecked record, with the
 //!             budget as the reason, a notice, and a counted event
@@ -45,9 +47,12 @@ use crate::interface_plan::{
 };
 use crate::run_state::UncheckedEdge;
 
-/// Asks of the interface call: the first, and two more with the previous
-/// answer and its refusal.
-pub(crate) const MAX_INTERFACE_ASKS: u32 = 3;
+/// Asks of the interface call: the first, and one more with the previous
+/// answer and its refusal. Measured over 22 recorded runs of one benchmark
+/// task, a third ask almost never bought an accepted interface and each ask
+/// cost minutes on a local model; after the last ask the edges are recorded
+/// unchecked and the run goes on at once.
+pub(crate) const MAX_INTERFACE_ASKS: u32 = 2;
 
 /// The guidance added to a mechanical check failure, so the refusal says what
 /// a passing interface needs and not only what failed.
@@ -203,6 +208,9 @@ impl RunLoop {
             ));
         };
         self.note_shape_changes(&specs).await?;
+        // A straight chain is one contract before any interface is derived
+        // (`chain_collapse.rs`).
+        let specs = self.collapse_chains(specs, outer).await?;
         // One contract binds nothing, unless it is a split's, whose interface
         // may bind the plan's other contracts.
         if !request.interfaces || (specs.len() < 2 && outer.is_empty()) {
@@ -424,13 +432,22 @@ impl RunLoop {
             .await?;
         let mut accepted: Vec<InterfaceContract> =
             derived.iter().filter_map(|d| d.interface.clone()).collect();
-        let skipped: BTreeMap<String, String> = derived
+        let mut skipped: BTreeMap<String, String> = derived
             .iter()
             .filter_map(|d| match &d.behavior {
                 BehaviorPlan::Skip(why) => Some((d.producer.clone(), why.clone())),
                 BehaviorPlan::Ask => None,
             })
             .collect();
+        // A producer whose writes cannot carry a stub (none, or no source
+        // file) is never asked about, whether or not edges were derived (with
+        // no sandbox runner none are).
+        for spec in specs {
+            let writes: Vec<String> = spec.writes.iter().map(|w| w.path.clone()).collect();
+            if let Some(why) = derive_interface::unaskable_writes(&spec.id, &writes) {
+                skipped.entry(spec.id.clone()).or_insert(why);
+            }
+        }
         // The edges the planner is asked a behavior check of.
         let asked: Vec<(String, Vec<String>)> = consumers
             .iter()
@@ -1378,7 +1395,7 @@ impl RunLoop {
                 .await?;
             let (interface, base, compile_note) = derive_one(&runner, &facts).await;
             let writes: Vec<String> = spec.writes.iter().map(|w| w.path.clone()).collect();
-            let behavior = match derive_interface::binary_outputs_only(&producer, &writes) {
+            let behavior = match derive_interface::unaskable_writes(&producer, &writes) {
                 Some(why) => BehaviorPlan::Skip(why),
                 None => derive_interface::behavior_plan(&producer, &tests, &contract_facts),
             };

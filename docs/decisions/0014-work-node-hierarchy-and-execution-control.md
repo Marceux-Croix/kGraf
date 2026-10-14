@@ -136,3 +136,44 @@ declare.
 user request a collision, and the resulting conflict would be
 indistinguishable from a partition failure, corrupting the measurement of
 how well the design partitions work.
+
+## Amendment (2026-10-14): a straight chain is one contract
+
+Plans that were straight chains (each contract waiting on the one before) spent most of the run
+in interface asks, handshakes and re-plans on edges that gained no parallelism: the planner's
+time was 51 to 93 percent of the run window across 22 local runs. A split still costs an
+interface to negotiate, a handshake, a merge, and a fresh worker that loses the previous step's
+working state.
+
+**The rule** (`plan_chain.rs`, applied in `orchestrator/chain_collapse.rs` before interfaces
+are derived, for every plan revision including re-plans):
+
+- A link `A -> B` is: `B` depends on `A` alone, and `A` has `B` as its only dependent. A chain
+  is a maximal run of links, two contracts or more. The head may depend on contracts outside
+  the chain, and the tail may have any dependents. This cannot make a cycle.
+- The merged contract keeps the head's id. Instruction: one line saying it is one contract of N
+  steps, then each step's instruction under `Step k of N (`id`):`. Acceptance: each step's
+  acceptance under the same heading. Writes, slices and tools: the union. Dependencies: the
+  head's; whatever depended on the tail depends on the merged contract. Attempts: the most any
+  step asked for. Route: the first pin. Task kind: the steps' shared kind, else
+  `implementation`.
+- **One route, known before dispatch.** A chain merges only when every step runs on one route
+  that is known now: the roster has one route (every routing policy), or every step pins the
+  same route. With several routes and unpinned steps, rotation moves a cursor per dispatch and
+  `fitness` picks by measured figures, so the steps could get different models; those chains
+  stay split, so a mixed-model arm still measures mixing. The route must offer the union of the
+  steps' tools.
+- **One worker's size.** The merged contract is sized by the plan loop's own estimate (0057)
+  against the route's plan target. A chain whose merged block is over the target is kept whole
+  as the planner wrote it when a split could bring a step under the target; when the worker
+  prefix and the projected growth alone are over the target, no split could make a step fit and
+  the chain is merged. The children of a split are never merged back.
+- **A plan as written stays.** Plan review (0094), an order the user chose (Scheduling above)
+  and `OrchestratorConfig::collapse_chains = false` keep the plan as the planner wrote it. A
+  plan the user approved up front is seeded, not decomposed, so it is never merged.
+- **Loud.** One `chain_collapsed` trace record per merge (contract, merged ids, route,
+  projected tokens, plan target) and a notice in the plan's notices. A chain kept as planned is
+  a `notice` trace record with the reason.
+
+The interface and handshake asks of the collapsed edges are not made. The cost is one worker
+carrying more steps in one context, which the size rule bounds.

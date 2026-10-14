@@ -1242,6 +1242,32 @@ impl RunLoop {
         edges
     }
 
+    /// Whether every interface whose failed check holds a party failed at the
+    /// handshake stage, and at least one did. A handshake compares what the
+    /// parties assumed of one another: a mismatch is the planner's wording,
+    /// not a flaw the plan's contracts would lose by being kept, and a re-plan
+    /// from scratch cost minutes of planner time in recorded runs. Such a
+    /// plan is not re-planned; the interface's checks are dropped
+    /// ([`RunLoop::drop_failed_checks`]) and the contracts run. Failures of
+    /// any other stage keep the re-plan.
+    pub(super) fn only_handshake_failures(&self) -> bool {
+        let Some(desk) = self.contracts.as_ref() else {
+            return false;
+        };
+        let mut seen = false;
+        for c in &self.record.open_contracts {
+            for id in desk.book.interfaces_of(&c.contract) {
+                if let Some(InterfaceState::Failed { failure }) = desk.book.state(&id) {
+                    if failure.stage != crate::checks::CheckStage::Handshake {
+                        return false;
+                    }
+                    seen = true;
+                }
+            }
+        }
+        seen
+    }
+
     /// The failures a re-plan sends back to the planner, or why the run's
     /// holds are not the planner's to correct by planning again (said in the
     /// notice of a check dropped instead, [`RunLoop::drop_failed_checks`]).

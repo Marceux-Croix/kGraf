@@ -60,6 +60,9 @@ pub struct OrchestrateArgs {
     /// `RunConfig` into `kgraf-host`, which installs a `RoutedInterfaceReviewer`
     /// on the orchestrator next to `Host::contract_checks` (`host.rs`).
     pub interface_review: bool,
+    /// `--no-collapse-chains` turns this off (decision 0014, amendment of
+    /// 2026-10-14): a straight chain of contracts is made one contract.
+    pub collapse_chains: bool,
     /// `--keep-worktrees` (decision 0088): whether a worker's worktree and its
     /// build output are deleted after use. The flag is this command's only
     /// source for it: the command does not read `.kgraf/run.json`.
@@ -147,6 +150,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         rate_limits: args.rate_limits.clone(),
         contract_checks: args.contract_checks,
         interface_review: args.interface_review,
+        collapse_chains: args.collapse_chains,
         worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
@@ -1382,6 +1386,7 @@ mod tests {
             gate_timeout: Duration::from_secs(60),
             contract_checks: true,
             interface_review: false,
+            collapse_chains: true,
             worktrees: kgraf_host::WorktreeRetention::default(),
             sessions: true,
             check_timeout: Duration::from_secs(600),

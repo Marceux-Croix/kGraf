@@ -375,6 +375,13 @@ enum Command {
         /// and reported, never a silent pass or block. Off by default.
         #[arg(long)]
         interface_review: bool,
+        /// Keep a plan's straight chains of contracts as the planner wrote
+        /// them. By default a chain, each contract waiting on the one before,
+        /// is one contract when its steps run on one route and one worker can
+        /// carry it. Plan review and an order you chose already keep a plan
+        /// as written.
+        #[arg(long)]
+        no_collapse_chains: bool,
         /// Keep every worker's worktree, with the build output in it, after
         /// its attempt is merged or discarded, so builds can be inspected or
         /// reused. Without it, a worktree nothing needs any more is deleted
@@ -1305,6 +1312,7 @@ fn run_cli() -> Result<()> {
             gate_timeout,
             contract_checks,
             interface_review,
+            no_collapse_chains,
             keep_worktrees,
             sessions,
             check_timeout,
@@ -1380,6 +1388,7 @@ fn run_cli() -> Result<()> {
                     gate_timeout: std::time::Duration::from_secs(gate_timeout),
                     contract_checks,
                     interface_review,
+                    collapse_chains: !no_collapse_chains,
                     worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
                     sessions,
                     check_timeout: std::time::Duration::from_secs(check_timeout),

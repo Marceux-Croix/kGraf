@@ -16,7 +16,7 @@
 mod contract_support;
 mod support;
 
-use contract_support::{commit_all, py, runner_with, state_dir};
+use contract_support::{commit_all, git, py, runner_with, state_dir};
 use kgraf_core::{AgentId, RunId};
 use kgraf_orchestrator::{
     Basis, Challenge, Challenger, CheckStage, ConsumerTestRequest, ConsumerTestWriter,
@@ -446,7 +446,7 @@ async fn until_or_run_ends<T>(
 }
 
 fn gated_plan() -> String {
-    let mut all = vec![c("gate", "prepare the ground", "gate.txt", &[])];
+    let mut all = vec![c("gate", "prepare the ground", "gate.py", &[])];
     all.extend(parties_plan(true));
     plan_json(&all)
 }
@@ -1630,10 +1630,11 @@ async fn an_interface_the_decomposition_writes_is_registered_checked_and_replaye
         claim: "wrong".into(),
         evidence: Evidence::None,
     };
-    assert!(matches!(
-        send(&h, ContractControl::Challenge(first.clone())).await,
-        ContractReply::Resolved(Resolution::Rejected { .. })
-    ));
+    let reply = send(&h, ContractControl::Challenge(first.clone())).await;
+    assert!(
+        matches!(&reply, ContractReply::Resolved(Resolution::Rejected { .. })),
+        "{reply:?}"
+    );
     h.stop().await;
     let report = run.await.expect("join").expect("run");
     assert_eq!(report.status, RunStatus::Stopped, "{report:?}");
@@ -1642,8 +1643,8 @@ async fn an_interface_the_decomposition_writes_is_registered_checked_and_replaye
     let prompts = rig.parts.planner.prompts();
     assert_eq!(
         prompts.len(),
-        4,
-        "the contracts call, then three interface asks"
+        3,
+        "the contracts call, then two interface asks"
     );
     assert!(
         prompts[0].contains("Contract checks are on") && !prompts[0].contains("Accepted contracts"),
@@ -1926,12 +1927,12 @@ async fn a_plan_missing_an_interface_field_is_asked_again() {
 }
 
 /// A planner that keeps answering a failing interface is asked on the
-/// interface call's budget (three asks), and the interface is then dropped,
+/// interface call's budget (two asks), and the interface is then dropped,
 /// not held: the edge it declared is recorded as unchecked with the failure,
 /// counted as not run, and the run goes on. A malformed interface ends the
 /// same way an omitted one does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn after_three_asks_a_failing_interface_is_counted_unchecked_and_the_run_goes_on() {
+async fn after_two_asks_a_failing_interface_is_counted_unchecked_and_the_run_goes_on() {
     let dir = tempfile::tempdir().expect("dir");
     let rig = Rig::new(
         dir.path(),
@@ -1947,7 +1948,7 @@ async fn after_three_asks_a_failing_interface_is_counted_unchecked_and_the_run_g
         .expect("run");
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     let prompts = rig.parts.planner.prompts();
-    assert_eq!(prompts.len(), 4, "one contracts ask, three interface asks");
+    assert_eq!(prompts.len(), 3, "one contracts ask, two interface asks");
     assert_eq!(report.contracts.stub_compile_failures, 0, "nothing held");
     assert_eq!(report.contracts.interfaces_registered, 0, "{report:?}");
     assert_eq!(report.contracts.unchecked_edges, 1, "{report:?}");
@@ -2078,20 +2079,16 @@ async fn the_same_other_reason_twice_ends_unchecked_with_no_third_ask() {
     );
 }
 
-/// Two asks refused for different reasons are the planner making progress:
-/// the third ask is made, and its good answer is registered.
+/// An ask refused for one reason is asked again once (the last ask), and its
+/// good answer is registered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn different_reasons_in_two_asks_still_get_the_third_ask() {
+async fn a_refused_answer_is_asked_again_once_and_the_good_answer_registers() {
     let dir = tempfile::tempdir().expect("dir");
     let mut no_symbols = py_ic();
     no_symbols.symbols.clear();
     let rig = Rig::with_planner(
         dir.path(),
-        answers_in_turn(vec![
-            plan_with(&no_tests_ic()),
-            plan_with(&no_symbols),
-            plan_with(&py_ic()),
-        ]),
+        answers_in_turn(vec![plan_with(&no_tests_ic()), plan_with(&py_ic())]),
         agreeing,
         |_| "{}".into(),
         Duration::from_millis(20),
@@ -2104,8 +2101,8 @@ async fn different_reasons_in_two_asks_still_get_the_third_ask() {
     assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     assert_eq!(
         rig.parts.planner.prompts().len(),
-        4,
-        "the contracts ask and three interface asks"
+        3,
+        "the contracts ask and two interface asks"
     );
     let c = &report.contracts;
     assert_eq!(
@@ -2287,12 +2284,11 @@ async fn the_contracts_ask_is_never_skipped_by_the_budget() {
     );
 }
 
-/// A re-plan is optional: with the budget spent, a plan the gate holds is not
-/// planned again. The run does not end on the hold: as when the re-plan is
-/// spent, the failing check is dropped with a notice that names the budget,
-/// and the contracts dispatch.
+/// A failed handshake is dropped without a re-plan, so the planner time
+/// budget is not consulted for one: no skip is counted, and the notice names
+/// the handshake rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replan_the_budget_refuses_drops_the_failing_check_and_dispatches() {
+async fn a_failed_handshake_never_reaches_the_replan_budget() {
     let dir = tempfile::tempdir().expect("dir");
     let clock = Arc::new(ManualClock::new(1_000_000));
     let rig = Rig::with_planner(
@@ -2318,29 +2314,13 @@ async fn a_replan_the_budget_refuses_drops_the_failing_check_and_dispatches() {
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
-    assert!(
-        rig.parts
-            .planner
-            .prompts()
-            .iter()
-            .all(|p| !p.contains("before any work started")),
-        "no re-plan ask was made"
-    );
-    assert_eq!(report.contracts.planner_budget_skips, 1, "{report:?}");
-    assert!(
-        report
-            .notices
-            .iter()
-            .any(|n| n.contains("planner time budget") && n.contains("replan")),
-        "{:?}",
-        report.notices
-    );
+    assert_eq!(report.contracts.planner_budget_skips, 0, "{report:?}");
     assert_checks_dropped(
         &rig,
         &report,
         "config",
         "Optional[Config]",
-        "the planner time budget refused it",
+        "a failed handshake is dropped, not planned again",
     )
     .await;
 }
@@ -2401,138 +2381,13 @@ async fn a_check_failing_after_work_started_is_dropped_and_the_run_continues() {
     .await;
 }
 
-/// A plan the gate holds before any work started (a handshake mismatch) is
-/// re-planned once. The held plan's failure is quoted, as data, only in the
-/// briefs of the re-planned contracts it concerns (the contracts its
-/// interface bound, or a file of it); an unrelated contract's brief does not
-/// carry it.
+/// A handshake runs only at the gate, after planning. The parties of the plan
+/// disagree; the plan is kept, not planned again: the interface's checks are
+/// dropped loudly with the first mismatch, its edge is unchecked, and the
+/// contracts dispatch. One plan is accepted and no further planner call is
+/// made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_held_plans_failure_reaches_only_the_contracts_it_concerns() {
-    let dir = tempfile::tempdir().expect("dir");
-    let mut plan: serde_json::Value = serde_json::from_str(&plan_json(&[
-        c("prod", "implement the parser", "config.py", &[]),
-        c("cons", "use the parser", "consumer.py", &[]),
-        // Waits on `cons`, so nothing is dispatched before the gate holds
-        // the plan.
-        c("other", "write the readme", "README.md", &["cons"]),
-    ]))
-    .expect("the plan is JSON");
-    plan["interfaces"] = serde_json::json!([serde_json::to_value(py_ic()).expect("json")]);
-    let rig = Rig::new(
-        dir.path(),
-        plan.to_string(),
-        |prompt| {
-            // The held plan's consumer disagrees; the re-plan's agrees.
-            if prompt.contains("You are party `cons`") {
-                serde_json::json!({
-                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
-                    "touch": ["consumer.py"]
-                })
-                .to_string()
-            } else {
-                agreeing(&prompt.replace("`re1.", "`"))
-            }
-        },
-        |_| "{}".into(),
-        Duration::from_millis(20),
-    );
-    let report = rig
-        .orchestrator(vec![])
-        .start(RunId::new("r1"), "parse the config".into())
-        .await
-        .expect("run");
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
-    let briefs = worker_requests(&rig.parts);
-    let of =
-        |marker: &str| -> Vec<&String> { briefs.iter().filter(|b| b.contains(marker)).collect() };
-    for marker in ["implement the parser", "use the parser"] {
-        let mine = of(marker);
-        assert!(!mine.is_empty(), "{marker}");
-        assert!(
-            mine.iter()
-                .all(|b| b.contains("<held_plan_failures>") && b.contains("Optional[Config]")),
-            "{marker}: {mine:?}"
-        );
-    }
-    let other = of("write the readme");
-    assert!(!other.is_empty());
-    assert!(
-        other.iter().all(|b| !b.contains("<held_plan_failures>")),
-        "an unrelated contract gets no failure: {other:?}"
-    );
-}
-
-/// A re-plan's contracts answer gets the same bounded re-ask as the first
-/// plan's: an answer that is not JSON is asked again, not taken as a refusal
-/// that ends the re-plan.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_re_plan_answer_that_is_not_json_is_asked_again() {
-    let dir = tempfile::tempdir().expect("dir");
-    let good = plan_with(&py_ic());
-    let broke = std::sync::atomic::AtomicBool::new(false);
-    let rig = Rig::with_planner(
-        dir.path(),
-        move |prompt: &str| {
-            // The re-plan's first contracts ask is answered with broken JSON.
-            if prompt.contains("before any work started")
-                && !prompt.contains("Accepted contracts")
-                && !broke.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                recorded("d6-replan-unclosed-string.txt")
-            } else {
-                good.clone()
-            }
-        },
-        |prompt| {
-            if prompt.contains("You are party `cons`") {
-                serde_json::json!({
-                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
-                    "touch": ["consumer.py"]
-                })
-                .to_string()
-            } else {
-                agreeing(&prompt.replace("`re1.", "`"))
-            }
-        },
-        |_| "{}".into(),
-        Duration::from_millis(20),
-    );
-    let report = rig
-        .orchestrator(vec![])
-        .start(RunId::new("r1"), "parse the config".into())
-        .await
-        .expect("run");
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
-    for party in ["re1.prod", "re1.cons"] {
-        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
-    }
-    let refused: Vec<String> = rig
-        .trace()
-        .await
-        .into_iter()
-        .filter_map(|e| match e {
-            TraceEvent::PlanRefused { reason, .. } => Some(reason),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    // The refusal points at the place and says what probably happened: the
-    // live answer left a string unclosed, so a line break fell inside it.
-    assert!(
-        refused[0].contains("[ERROR HERE]")
-            && refused[0].contains("line 107")
-            && refused[0].contains("probably not closed"),
-        "{}",
-        refused[0]
-    );
-}
-
-/// A handshake runs only at the gate, after planning, so no re-ask ever sent
-/// its failure back. The parties of the first plan disagree; nothing has
-/// started, so the plan goes back to the planner with the finding, and the
-/// re-planned parties agree and dispatch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_handshake_failure_before_any_work_is_sent_back_to_the_planner_once() {
+async fn a_failed_handshake_drops_its_checks_keeps_the_plan_and_dispatches() {
     let dir = tempfile::tempdir().expect("dir");
     let rig = Rig::new(
         dir.path(),
@@ -2545,58 +2400,7 @@ async fn a_handshake_failure_before_any_work_is_sent_back_to_the_planner_once() 
                 })
                 .to_string()
             } else {
-                agreeing(&prompt.replace("`re1.", "`"))
-            }
-        },
-        |_| "{}".into(),
-        Duration::from_millis(20),
-    );
-    let report = rig
-        .orchestrator(vec![])
-        .start(RunId::new("r1"), "parse the config".into())
-        .await
-        .expect("run");
-    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
-    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
-    for party in ["re1.prod", "re1.cons"] {
-        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
-    }
-    let prompts = rig.parts.planner.prompts();
-    assert_eq!(
-        prompts.len(),
-        4,
-        "the plan (contracts, interfaces), then one re-plan (contracts, interfaces)"
-    );
-    for replan in &prompts[2..] {
-        assert!(
-            replan.contains("Handshake check failed") && replan.contains("Optional[Config]"),
-            "the re-plan carries the finding: {replan}"
-        );
-    }
-}
-
-/// Parties that keep disagreeing: the plan is re-planned once, and the
-/// re-plan's interface fails its handshake too. No third plan is asked for;
-/// the re-plan's interface checks are dropped with a notice naming the
-/// interface and its finding, its edge is counted as not run, and the
-/// contracts are dispatched.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_dispatches() {
-    let dir = tempfile::tempdir().expect("dir");
-    let rig = Rig::new(
-        dir.path(),
-        plan_with(&py_ic()),
-        |prompt| {
-            if prompt.contains("You are party `cons`")
-                || prompt.contains("You are party `re1.cons`")
-            {
-                serde_json::json!({
-                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
-                    "touch": ["consumer.py"]
-                })
-                .to_string()
-            } else {
-                agreeing(&prompt.replace("`re1.", "`"))
+                agreeing(prompt)
             }
         },
         |_| "{}".into(),
@@ -2608,43 +2412,46 @@ async fn a_handshake_that_keeps_failing_after_one_re_plan_drops_its_checks_and_d
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
+    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
     assert_eq!(
         rig.parts.planner.prompts().len(),
-        4,
-        "one plan, one re-plan, each a contracts and an interface call"
+        2,
+        "the contracts and interface calls of the one plan; no re-plan"
     );
-    assert_eq!(report.contracts.handshake_failures, 2, "{report:?}");
+    let accepted = rig
+        .trace()
+        .await
+        .into_iter()
+        .filter(|e| matches!(e, TraceEvent::PlanAccepted { .. }))
+        .count();
+    assert_eq!(accepted, 1, "no second plan was accepted");
+    for party in ["prod", "cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
     assert_checks_dropped(
         &rig,
         &report,
-        "re1.config",
+        "config",
         "Optional[Config]",
-        "the re-plan is spent",
+        "a failed handshake is dropped, not planned again",
     )
     .await;
 }
 
-/// A re-planned interface whose handshake cannot run at all (a party's
-/// answer is never a statement) degrades the same way after the one
-/// re-plan: its checks are dropped, counted as not run, and the contracts
-/// are dispatched.
+/// An interface whose handshake cannot run at all (a party's answer is never
+/// a statement) has its checks dropped, counted as not run, and the contracts
+/// are dispatched. No check failed, so there is nothing to plan again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_dispatches() {
+async fn a_handshake_that_cannot_run_drops_its_checks_and_dispatches() {
     let dir = tempfile::tempdir().expect("dir");
     let rig = Rig::new(
         dir.path(),
         plan_with(&py_ic()),
         |prompt| {
-            if prompt.contains("You are party `re1.cons`") {
+            if prompt.contains("You are party `cons`") {
                 "no statement here".to_owned()
-            } else if prompt.contains("You are party `cons`") {
-                serde_json::json!({
-                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
-                    "touch": ["consumer.py"]
-                })
-                .to_string()
             } else {
-                agreeing(&prompt.replace("`re1.", "`"))
+                agreeing(prompt)
             }
         },
         |_| "{}".into(),
@@ -2656,14 +2463,13 @@ async fn a_handshake_that_cannot_run_after_one_re_plan_drops_its_checks_and_disp
         .start(RunId::new("r1"), "parse the config".into())
         .await
         .expect("run");
-    assert_eq!(rig.parts.planner.prompts().len(), 4, "one re-plan");
-    assert_eq!(report.contracts.handshake_failures, 1, "{report:?}");
+    assert_eq!(rig.parts.planner.prompts().len(), 2, "no re-plan");
     assert_checks_dropped(
         &rig,
         &report,
-        "re1.config",
+        "config",
         "could not run",
-        "the re-plan is spent",
+        "no check failed, so a re-plan has nothing to correct",
     )
     .await;
 }
@@ -2743,6 +2549,355 @@ async fn assert_checks_dropped(
         events.iter().any(|e| matches!(e,
             ContractEvent::Unchecked { reason, .. } if reason.contains(interface))),
         "{events:?}"
+    );
+}
+
+// The re-plan path, reached by a failure that is not a handshake.
+//
+// The plan-time checks (artifact, stub compile, vacuity) run on every
+// interface answer and drop a failing interface after two asks, so a plan
+// reaches the gate with an interface that fails one of them only when the
+// repository changed in between. The stub land runs at the gate, after the
+// handshake, and fails for a reason the plan-time checks cannot see: the
+// integration branch holds a file at a stub path the interface does not list
+// in `replaces`. Here the branch is moved before the run starts, in the
+// run's real repository, and the real `GitStubLander` refuses the stub, so
+// the hold has its real cause and its stage is `CheckStage::StubLand`.
+
+/// `py_ic` declaring the `replaces` entry that the integration tip's own
+/// `config.py` makes necessary: the re-planned interface lands.
+fn replacing_ic() -> InterfaceContract {
+    let mut ic = py_ic();
+    ic.replaces = s(&["config.py"]);
+    ic
+}
+
+/// What the stub land says when the tip holds a file at a stub path the
+/// interface does not declare.
+const STUB_LAND_REFUSAL: &str = "already exist at the integration tip";
+
+impl Rig {
+    /// Commit `files` onto the integration branch `kgraf/r1`, which the run's
+    /// stub lander merges onto, leaving the checked-out branch (the check
+    /// base) as it was. The plan-time checks run at the base, so they do not
+    /// see these files; the stub land does.
+    fn advance_integration_branch(&self, files: &[&str]) {
+        git(&self.repo, &["checkout", "-q", "kgraf/r1"]);
+        for f in files {
+            std::fs::write(self.repo.join(f), "# held by the integration branch\n").expect("write");
+        }
+        git(&self.repo, &["add", "-A"]);
+        git(&self.repo, &["commit", "-q", "-m", "integration moved"]);
+        git(&self.repo, &["checkout", "-q", "main"]);
+    }
+}
+
+/// A planner that answers `held` until it is asked to plan again (its prompt
+/// then carries the re-plan's marker), and `then` after.
+fn held_then_replanned(
+    held: String,
+    then: String,
+) -> impl Fn(&str) -> String + Send + Sync + 'static {
+    move |prompt: &str| {
+        if prompt.contains("before any work started") {
+            then.clone()
+        } else {
+            held.clone()
+        }
+    }
+}
+
+/// Handshake answers that agree for the original parties and the re-planned
+/// ones (`re1.` ids).
+fn agreeing_after_replan(prompt: &str) -> String {
+    agreeing(&prompt.replace("`re1.", "`"))
+}
+
+/// A plan the gate holds before any work started on a failure that is not a
+/// handshake is re-planned once. The held plan's failure is quoted, as data,
+/// only in the briefs of the re-planned contracts it concerns (the contracts
+/// its interface bound, or a file of it); an unrelated contract's brief does
+/// not carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_plans_failure_reaches_only_the_contracts_it_concerns() {
+    let dir = tempfile::tempdir().expect("dir");
+    let with_other = |ic: &InterfaceContract| {
+        let mut plan: serde_json::Value = serde_json::from_str(&plan_json(&[
+            c("prod", "implement the parser", "config.py", &[]),
+            c("cons", "use the parser", "consumer.py", &[]),
+            // Waits on `cons`, so nothing is dispatched before the gate holds
+            // the plan.
+            c("other", "write the readme", "README.md", &["cons"]),
+        ]))
+        .expect("the plan is JSON");
+        plan["interfaces"] = serde_json::json!([serde_json::to_value(ic).expect("json")]);
+        plan.to_string()
+    };
+    let rig = Rig::with_planner(
+        dir.path(),
+        held_then_replanned(with_other(&py_ic()), with_other(&replacing_ic())),
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.stub_land_failures, 1, "{report:?}");
+    let briefs = worker_requests(&rig.parts);
+    let of =
+        |marker: &str| -> Vec<&String> { briefs.iter().filter(|b| b.contains(marker)).collect() };
+    for marker in ["implement the parser", "use the parser"] {
+        let mine = of(marker);
+        assert!(!mine.is_empty(), "{marker}");
+        assert!(
+            mine.iter()
+                .all(|b| b.contains("<held_plan_failures>") && b.contains(STUB_LAND_REFUSAL)),
+            "{marker}: {mine:?}"
+        );
+    }
+    let other = of("write the readme");
+    assert!(!other.is_empty());
+    assert!(
+        other.iter().all(|b| !b.contains("<held_plan_failures>")),
+        "an unrelated contract gets no failure: {other:?}"
+    );
+}
+
+/// A re-plan's contracts answer gets the same bounded re-ask as the first
+/// plan's: an answer that is not JSON is asked again, not taken as a refusal
+/// that ends the re-plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_plan_answer_that_is_not_json_is_asked_again() {
+    let dir = tempfile::tempdir().expect("dir");
+    let held = plan_with(&py_ic());
+    let good = plan_with(&replacing_ic());
+    let broke = std::sync::atomic::AtomicBool::new(false);
+    let rig = Rig::with_planner(
+        dir.path(),
+        move |prompt: &str| {
+            if !prompt.contains("before any work started") {
+                held.clone()
+            } else if !prompt.contains("Accepted contracts")
+                && !broke.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // The re-plan's first contracts ask is answered with broken
+                // JSON.
+                recorded("d6-replan-unclosed-string.txt")
+            } else {
+                good.clone()
+            }
+        },
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    for party in ["re1.prod", "re1.cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let refused: Vec<String> = rig
+        .trace()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            TraceEvent::PlanRefused { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    // The refusal points at the place and says what probably happened: the
+    // live answer left a string unclosed, so a line break fell inside it.
+    assert!(
+        refused[0].contains("[ERROR HERE]")
+            && refused[0].contains("line 107")
+            && refused[0].contains("probably not closed"),
+        "{}",
+        refused[0]
+    );
+}
+
+/// The plan is held at the gate by a stub land the integration branch
+/// refuses; nothing has started, so the plan goes back to the planner once
+/// with the finding, and the re-planned interface declares the file it
+/// replaces and lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stub_land_failure_before_any_work_is_sent_back_to_the_planner_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::with_planner(
+        dir.path(),
+        held_then_replanned(plan_with(&py_ic()), plan_with(&replacing_ic())),
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    assert_eq!(report.contracts.stub_land_failures, 1, "{report:?}");
+    assert_eq!(report.contracts.handshake_failures, 0, "{report:?}");
+    for party in ["re1.prod", "re1.cons"] {
+        assert!(report.verified.iter().any(|v| v == party), "{report:?}");
+    }
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(
+        prompts.len(),
+        4,
+        "the plan (contracts, interfaces), then one re-plan (contracts, interfaces)"
+    );
+    for replan in &prompts[2..] {
+        assert!(
+            replan.contains("StubLand check failed") && replan.contains(STUB_LAND_REFUSAL),
+            "the re-plan carries the finding: {replan}"
+        );
+    }
+}
+
+/// A stub land that keeps failing: the plan is re-planned once, and the
+/// re-plan's interface is refused at the land too. No third plan is asked
+/// for; the interface's checks are dropped with a notice naming the interface
+/// and its finding, its edge is counted as not run, and the contracts are
+/// dispatched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_failing_after_one_re_plan_is_dropped_and_the_contracts_dispatch() {
+    let dir = tempfile::tempdir().expect("dir");
+    let rig = Rig::new(
+        dir.path(),
+        // The re-plan repeats the interface that fails.
+        plan_with(&py_ic()),
+        agreeing_after_replan,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["config.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(
+        rig.parts.planner.prompts().len(),
+        4,
+        "one plan, one re-plan, each a contracts and an interface call"
+    );
+    assert_eq!(report.contracts.stub_land_failures, 2, "{report:?}");
+    assert_checks_dropped(
+        &rig,
+        &report,
+        "re1.config",
+        STUB_LAND_REFUSAL,
+        "the re-plan is spent",
+    )
+    .await;
+}
+
+/// The handshake exemption is exact: a plan held by a handshake failure alone
+/// is not re-planned, but a plan held by a handshake failure and a failure of
+/// another stage together is, because not every failure is a handshake. One
+/// interface's parties disagree; another's stub is refused at the land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_failure_beside_another_stage_still_re_plans() {
+    let dir = tempfile::tempdir().expect("dir");
+    // The second interface: `py_ic` over other names, so nothing collides.
+    let second: InterfaceContract = serde_json::from_str(
+        &serde_json::to_string(&py_ic())
+            .expect("json")
+            .replace("config", "settings")
+            .replace("consumer.py", "consumer2.py")
+            .replace("import consumer,", "import consumer2,")
+            .replace("test_contract", "test_contract2")
+            .replace("\"prod\"", "\"prod2\"")
+            .replace("\"cons\"", "\"cons2\""),
+    )
+    .expect("the second interface");
+    let held = {
+        let mut plan: serde_json::Value = serde_json::from_str(&plan_json(&[
+            c("prod", "implement the parser", "config.py", &[]),
+            c("cons", "use the parser", "consumer.py", &[]),
+            c("prod2", "implement the settings", "settings.py", &[]),
+            c("cons2", "use the settings", "consumer2.py", &[]),
+        ]))
+        .expect("the plan is JSON");
+        plan["interfaces"] = serde_json::json!([
+            serde_json::to_value(py_ic()).expect("json"),
+            serde_json::to_value(&second).expect("json"),
+        ]);
+        plan.to_string()
+    };
+    let rig = Rig::with_planner(
+        dir.path(),
+        held_then_replanned(held, plan_with(&py_ic())),
+        |prompt| {
+            if prompt.contains("You are party `prod2`") {
+                serde_json::json!({
+                    "provide": [
+                        "I will provide `parse_settings` taking `str` and returning `Config`",
+                        PROD_SAYS_2
+                    ],
+                    "touch": ["settings.py"]
+                })
+                .to_string()
+            } else if prompt.contains("You are party `cons2`") {
+                serde_json::json!({
+                    "expect": [
+                        "I assume you provide `parse_settings` taking `str` and returning `Config`"
+                    ],
+                    "touch": ["consumer2.py"]
+                })
+                .to_string()
+            } else if prompt.contains("You are party `cons`") {
+                // The first interface's consumer disagrees.
+                serde_json::json!({
+                    "expect": ["I assume `parse_config` returns `Optional[Config]`"],
+                    "touch": ["consumer.py"]
+                })
+                .to_string()
+            } else {
+                agreeing_after_replan(prompt)
+            }
+        },
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    rig.advance_integration_branch(&["settings.py"]);
+    let report = rig
+        .orchestrator(vec![])
+        .with_gate_runner(Arc::new(PassGate))
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert!(
+        rig.parts
+            .planner
+            .prompts()
+            .iter()
+            .any(|p| p.contains("before any work started")),
+        "the plan was asked for again"
+    );
+    assert!(report.contracts.handshake_failures >= 1, "{report:?}");
+    assert!(report.contracts.stub_land_failures >= 1, "{report:?}");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|n| n.contains("planning again (1 of")),
+        "{:?}",
+        report.notices
     );
 }
 
@@ -4025,8 +4180,8 @@ async fn a_plan_still_without_interfaces_after_the_budget_runs_counted_and_notic
     let prompts = rig.parts.planner.prompts();
     assert_eq!(
         prompts.len(),
-        4,
-        "one contracts ask, three interface asks: an omitted interface is retried like a \
+        3,
+        "one contracts ask, two interface asks: an omitted interface is retried like a \
          malformed one"
     );
     for reask in &prompts[2..] {
@@ -4094,7 +4249,7 @@ async fn a_recorded_answer_with_contract_ids_in_consumer_is_refused_naming_the_f
     );
     let report = plan_then_stop(rig.orchestrator_for_recorded_plans()).await;
     let prompts = rig.parts.planner.prompts();
-    assert_eq!(prompts.len(), 4, "one contracts ask, three interface asks");
+    assert_eq!(prompts.len(), 3, "one contracts ask, two interface asks");
     assert!(
         !prompts[1..].iter().any(|p| p.contains("<plan_refused>")),
         "the contracts were never asked for again"
@@ -5192,6 +5347,201 @@ async fn a_producer_of_binary_build_outputs_is_not_asked_about() {
     );
 }
 
+/// `contracts` as a plan whose contracts in `writeless` declare no writes (a
+/// build run, a server started: system state, not files), and `interfaces`
+/// as its interface list.
+fn plan_writeless(
+    contracts: &[C<'_>],
+    writeless: &[&str],
+    interfaces: &[InterfaceContract],
+) -> String {
+    let mut plan: serde_json::Value =
+        serde_json::from_str(&plan_json(contracts)).expect("the plan is JSON");
+    for c in plan["contracts"].as_array_mut().expect("contracts") {
+        if writeless.contains(&c["id"].as_str().expect("id")) {
+            c["writes"] = serde_json::json!([]);
+        }
+    }
+    plan["interfaces"] = serde_json::to_value(interfaces).expect("json");
+    plan.to_string()
+}
+
+const NO_WRITES_REASON: &str = "behavior check not run: the producer declares no file writes, \
+     so no stub can stand in for it; its result is judged by its acceptance check and the \
+     run's gates";
+
+async fn unchecked_reasons(rig: &Rig) -> Vec<(String, Vec<String>, String)> {
+    rig.contract_events()
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ContractEvent::Unchecked {
+                consumer,
+                producers,
+                reason,
+            } => Some((consumer, producers, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A producer that declares no file writes (the Terminal-Bench pypi-server
+/// plan: build a package, start a server) cannot carry a stub file, and the
+/// planner's marker files were refused on every ask. The edge is recorded
+/// unchecked at once with that reason and no ask is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_that_declares_no_writes_gets_no_ask_and_an_unchecked_edge() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_writeless(
+        &[
+            c("build", "build the package", "dist/.built", &[]),
+            c("serve", "serve the package", "serve.py", &["build"]),
+        ],
+        &["build"],
+        &[],
+    );
+    let rig = Rig::new(
+        dir.path(),
+        plan,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 1, "no interface call");
+    assert_eq!(report.contracts.interface_asks, 0, "{report:?}");
+    let unchecked = unchecked_reasons(&rig).await;
+    assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+    assert_eq!(unchecked[0].0, "serve");
+    assert!(
+        unchecked[0].2.contains(NO_WRITES_REASON),
+        "{}",
+        unchecked[0].2
+    );
+}
+
+/// Every edge has a write-less producer: no ask at all, one unchecked record
+/// per edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plan_whose_producers_all_declare_no_writes_makes_no_interface_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_writeless(
+        &[
+            c("c2", "build the package", "dist/.built", &[]),
+            c("c3", "start the server", "dist/.serving", &["c2"]),
+            c("c4", "check the server", "check.py", &["c3"]),
+        ],
+        &["c2", "c3"],
+        &[],
+    );
+    let rig = Rig::new(
+        dir.path(),
+        plan,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 1, "no interface call");
+    assert_eq!(report.contracts.interface_asks, 0, "{report:?}");
+    let mut edges: Vec<(String, Vec<String>)> = unchecked_reasons(&rig)
+        .await
+        .into_iter()
+        .map(|(c, p, why)| {
+            assert!(why.contains(NO_WRITES_REASON), "{why}");
+            (c, p)
+        })
+        .collect();
+    edges.sort();
+    assert_eq!(
+        edges,
+        vec![
+            ("c3".to_owned(), vec!["c2".to_owned()]),
+            ("c4".to_owned(), vec!["c3".to_owned()])
+        ]
+    );
+}
+
+/// A plan with a writing producer and a write-less one: the ask names only
+/// the writing producer's edge, and it is bound; the other edge is recorded
+/// unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mixed_plan_asks_only_for_the_edge_of_the_writing_producer() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_writeless(
+        &[
+            c("prod", "implement the parser", "config.py", &[]),
+            c("cons", "use the parser", "consumer.py", &["prod"]),
+            c("srv", "start the server", "dist/.serving", &[]),
+            c("cli", "query the server", "cli.py", &["srv"]),
+        ],
+        &["srv"],
+        &[py_ic()],
+    );
+    let rig = Rig::new(
+        dir.path(),
+        plan,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    let prompts = rig.parts.planner.prompts();
+    assert_eq!(prompts.len(), 2, "the contracts ask and one interface ask");
+    assert!(
+        prompts[1].contains("Consumer <- producers: cons <- prod\n"),
+        "{}",
+        prompts[1]
+    );
+    assert!(!prompts[1].contains("cli <- srv"), "{}", prompts[1]);
+    assert_eq!(report.contracts.interface_asks, 1, "{report:?}");
+    assert_eq!(report.contracts.interfaces_registered, 1, "{report:?}");
+    let unchecked = unchecked_reasons(&rig).await;
+    assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+    assert_eq!(unchecked[0].0, "cli");
+    assert!(
+        unchecked[0].2.contains(NO_WRITES_REASON),
+        "{}",
+        unchecked[0].2
+    );
+}
+
+/// A producer that declares writes, none of them a source file in a language
+/// the checks support (a marker, a notes file), gets no ask: nothing can be
+/// compiled or tested against a stub of it. Its edge is unchecked at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_that_writes_only_non_code_files_gets_no_ask() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_writeless(
+        &[
+            c("notes", "write the notes", "docs/notes.md", &[]),
+            c("serve", "serve from the notes", "serve.py", &["notes"]),
+        ],
+        &[],
+        &[],
+    );
+    let rig = Rig::new(
+        dir.path(),
+        plan,
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = plan_then_stop(rig.orchestrator(vec![])).await;
+    assert_eq!(rig.parts.planner.prompts().len(), 1, "no interface call");
+    assert_eq!(report.contracts.interface_asks, 0, "{report:?}");
+    let unchecked = unchecked_reasons(&rig).await;
+    assert_eq!(unchecked.len(), 1, "{unchecked:?}");
+    assert!(
+        unchecked[0].2.contains(
+            "behavior check not run: the producer declares no source file kGraf can compile \
+             or test (docs/notes.md), so no stub can stand in for it"
+        ),
+        "{}",
+        unchecked[0].2
+    );
+}
+
 /// `py_ic` with its test as a script of pytest-style functions that the file
 /// never calls, run as `python test_script.py`: the shape a local planner
 /// wrote on every ask of the interface call.
@@ -5811,10 +6161,10 @@ fn script_planner(
 /// ids), so no ask is withheld: each carries a reason the planner had not
 /// been told for that interface. The first re-ask tells the planner what to do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_recorded_script_answers_spend_three_asks_for_three_different_reasons() {
+async fn the_recorded_script_answers_spend_the_two_asks() {
     let dir = tempfile::tempdir().expect("dir");
     let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let answers = ["ask1", "ask2", "ask3"]
+    let answers = ["ask1", "ask2"]
         .iter()
         .map(|n| recorded(&format!("tb-pypi-script-{n}.txt")))
         .collect();
@@ -5829,10 +6179,10 @@ async fn the_recorded_script_answers_spend_three_asks_for_three_different_reason
     let prompts = rig.parts.planner.prompts();
     assert_eq!(
         asks.load(std::sync::atomic::Ordering::SeqCst),
-        3,
+        2,
         "{report:?}"
     );
-    assert_eq!(report.contracts.interface_asks, 3, "{report:?}");
+    assert_eq!(report.contracts.interface_asks, 2, "{report:?}");
     let reask = &prompts[2];
     for told in [
         "the repository has no file at that path",
@@ -5883,10 +6233,19 @@ async fn an_answer_refused_again_for_the_same_reason_is_not_asked_a_third_time()
         })
         .collect();
     assert!(!unchecked.is_empty(), "{report:?}");
+    // `c2` writes only a shell script, so it is never asked about and its edge
+    // says so; the edge of the producer that was asked says the planner repeated.
     assert!(
         unchecked.iter().all(|r| r.contains(
             "behavior check not run: the planner repeated an answer refused for the same reason"
-        )),
+        ) || r
+            .contains("behavior check not run: the producer declares no source file")),
+        "{unchecked:?}"
+    );
+    assert!(
+        unchecked
+            .iter()
+            .any(|r| r.contains("the planner repeated an answer refused for the same reason")),
         "{unchecked:?}"
     );
     // No call is added elsewhere: the contracts ask and two interface asks.

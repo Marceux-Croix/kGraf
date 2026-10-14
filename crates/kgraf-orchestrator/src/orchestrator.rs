@@ -115,6 +115,9 @@ mod connections;
 // Subagents (decision 0067, point 5).
 mod subagents;
 // Speculative merge across in-flight branches (decision 0074).
+/// A straight chain of a fresh plan made one contract before interfaces are
+/// derived (decision 0014)
+mod chain_collapse;
 /// Plan intake: the contracts call, the interface call, and what is left
 /// unchecked.
 mod interface_intake;
@@ -608,6 +611,12 @@ pub struct OrchestratorConfig {
     /// 0094, `--approve-plan`): the one way a run nobody attends may start
     /// with plan review on. The approval is recorded and traced.
     pub approve_plan: bool,
+    /// Make each straight chain of a fresh plan one contract when its steps run
+    /// on one route and one worker can carry it (decision 0014, amendment of
+    /// 2026-10-14; `plan_chain.rs`). On by default. Off keeps every plan as the
+    /// planner wrote it. Plan review and a user-chosen order keep a plan as
+    /// written whatever this says.
+    pub collapse_chains: bool,
     /// How long a route whose call failed at the transport stays out of
     /// rotation before it is probed again, doubled for each fault in a row up
     /// to `route_health::MAX_COOLDOWN_MS` (`route_health.rs`). Thirty seconds
@@ -644,6 +653,7 @@ impl Default for OrchestratorConfig {
             routing: crate::routing::RoutingPolicy::default(),
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
             approve_plan: false,
+            collapse_chains: true,
             route_fault_cooldown: Duration::from_secs(30),
             time_limit: None,
         }
@@ -1604,6 +1614,11 @@ struct InFlight {
     /// stopped it: a pass accepts the tree with a notice, a failure fails the
     /// attempt as the stop alone did.
     unfinished_verify: BTreeMap<AgentId, String>,
+    /// Workers of `unfinished_verify` that the run's time limit stopped while
+    /// no further attempt could start: nothing else will deliver the
+    /// contract, so a check that checks nothing accepts the tree too, with a
+    /// notice, and the verification is bounded by the time left to the limit.
+    limit_verify: BTreeSet<AgentId>,
     /// Workers whose attempt handed its work back with changes in its tree
     /// while no continuation will run for it (its re-split would be refused,
     /// or another attempt is the one continued): verified as it stands, as
@@ -4685,6 +4700,13 @@ impl RunLoop {
             Ok(parts) => parts,
             Err(why) => return Ok(Replan::NotPlanned(why)),
         };
+        // A handshake mismatch is dropped, not planned again: the contracts
+        // run with that interface's edges unchecked.
+        if self.only_handshake_failures() {
+            return Ok(Replan::NotPlanned(
+                "a failed handshake is dropped, not planned again".to_owned(),
+            ));
+        }
         // A re-plan is optional: with the planner time budget spent the held
         // plan is not planned again, as when no re-plan is left, and its
         // failing checks are dropped instead.
@@ -6005,6 +6027,7 @@ impl RunLoop {
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
             unfinished_verify: BTreeMap::new(),
+            limit_verify: BTreeSet::new(),
             handback_verify: BTreeSet::new(),
             handback_failed: None,
             repeated_scope: None,
@@ -7092,6 +7115,13 @@ impl RunLoop {
             let stop = stop_note_of(f.worker.as_str(), &f.result)
                 .unwrap_or_else(|| outcome_name(&f.result.outcome).to_owned());
             flight.unfinished_verify.insert(f.worker.clone(), stop);
+            // Stopped at the run's time limit with no attempt able to start:
+            // this tree is the contract's only delivery, verified inside the
+            // reserve (the run's last tenth).
+            if f.result.out_of_time.is_some() && self.no_time_for_continuation().is_some() {
+                flight.limit_verify.insert(f.worker.clone());
+                self.note_limit_verify(&f.contract, &f.worker, now).await?;
+            }
         }
         // A worker that handed its work back is continued by a re-split of
         // its remainder. When no continuation will run (the re-split would be
@@ -7249,7 +7279,17 @@ impl RunLoop {
                 // attempt spawn above: a panic anywhere in verification must
                 // still reach the loop as a `Verified` message, or the
                 // contract's slot in `in_flight` never clears.
-                let verify_task = tokio::spawn(on_heap(|| async move {
+                // A tree verified because the time limit stopped its worker
+                // is checked inside what is left of the limit: a check that
+                // would run past it is stopped and named, not waited on.
+                let verify_budget = if flight.limit_verify.contains(&f.worker) {
+                    self.run_deadline
+                        .as_ref()
+                        .map(|d| Duration::from_millis(d.limit_left_ms(self.now())))
+                } else {
+                    None
+                };
+                let mut verify_task = tokio::spawn(on_heap(|| async move {
                     let mut infrastructure = false;
                     let mut verdict = match verifier
                         .verify_among(&c, &workspace, &result, &unmerged)
@@ -7425,7 +7465,35 @@ impl RunLoop {
                 }));
                 tokio::spawn(async move {
                     let (verdict, infrastructure, review, producer_challenge) =
-                        match verify_task.await {
+                        match match verify_budget {
+                            None => verify_task.await,
+                            Some(budget) => {
+                                match tokio::time::timeout(budget, &mut verify_task).await {
+                                    Ok(done) => done,
+                                    Err(_) => {
+                                        verify_task.abort();
+                                        let _ = tx
+                                            .send(LoopMsg::Verified {
+                                                contract: cid,
+                                                worker,
+                                                verdict: Verdict::Fail {
+                                                    reason: format!(
+                                                        "the verification did not finish in the \
+                                                         {} s left before the run's time limit, \
+                                                         and was stopped",
+                                                        budget.as_secs()
+                                                    ),
+                                                },
+                                                infrastructure: false,
+                                                review: None,
+                                                producer_challenge: None,
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        } {
                             Ok(v) => v,
                             Err(e) => {
                                 let reason = if e.is_panic() {
@@ -7829,9 +7897,34 @@ impl RunLoop {
         stop: &str,
         flight: &mut InFlight,
     ) -> Verdict {
+        let limit_stop = flight.limit_verify.remove(worker);
         // The first line names the stop; the rest lists refusals.
         let what = stop.lines().next().unwrap_or(stop).trim();
         let verdict = match verdict {
+            // Stopped at the run's time limit with no attempt able to start:
+            // no better delivery will come, so the tree is accepted on the
+            // check the contract has, and the notice says it checks nothing.
+            Verdict::Pass {
+                by,
+                commit,
+                mut notices,
+            } if limit_stop
+                && contract.gate_commands.is_empty()
+                && crate::shortfall::vacuous_check(&by) =>
+            {
+                notices.push(kgraf_secrets::scrub_persist_owned(format!(
+                    "contract {}: the worker was stopped at the run's time limit ({what}) and no \
+                     further attempt could run; the check `{}` checks nothing, so the tree it \
+                     left is accepted unjudged",
+                    contract.contract,
+                    by.trim()
+                )));
+                Verdict::Pass {
+                    by,
+                    commit,
+                    notices,
+                }
+            }
             Verdict::Pass { by, .. }
                 if contract.gate_commands.is_empty() && crate::shortfall::vacuous_check(&by) =>
             {
@@ -10457,6 +10550,7 @@ mod tests {
             premerged: BTreeSet::new(),
             held_verify: BTreeSet::new(),
             unfinished_verify: BTreeMap::new(),
+            limit_verify: BTreeSet::new(),
             handback_verify: BTreeSet::new(),
             handback_failed: None,
             repeated_scope: None,

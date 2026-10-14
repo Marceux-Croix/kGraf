@@ -113,6 +113,9 @@ impl RunLoop {
         } else {
             "; its tree is verified as it stands"
         });
+        if !result.changed_paths.is_empty() && d.may_start(now).is_err() {
+            text.push_str(", because no further attempt could run");
+        }
         self.notices
             .insert(kgraf_secrets::scrub_persist_owned(text));
         self.trace(TraceEvent::TimeLimit {
@@ -127,6 +130,47 @@ impl RunLoop {
             last_round_ms: stop.last_round_ms,
             expected_round_ms: stop.expected_round_ms,
             cut: stop.cut,
+        })
+        .await
+    }
+
+    /// A stopped worker's tree is verified because no further attempt can
+    /// run: a notice and a trace record (`tree_verified`) say so, with the
+    /// time left to the limit for the check, the merge and the gate.
+    pub(super) async fn note_limit_verify(
+        &mut self,
+        contract: &str,
+        worker: &AgentId,
+        now: i64,
+    ) -> Result<(), OrchestratorError> {
+        let Some(d) = self.run_deadline.as_ref() else {
+            return Ok(());
+        };
+        let (limit_ms, deadline_ms, elapsed_ms, left_ms) = (
+            d.limit_ms(),
+            d.deadline_ms(),
+            d.elapsed_ms(now),
+            d.limit_left_ms(now),
+        );
+        self.notices
+            .insert(kgraf_secrets::scrub_persist_owned(format!(
+                "contract {contract}: worker {worker} was stopped at the run's time limit and no \
+                 further attempt could run, so its tree is verified as it stands, inside the {} s \
+                 left before the limit",
+                secs(left_ms)
+            )));
+        self.trace(TraceEvent::TimeLimit {
+            at_ms: now,
+            contract: contract.to_owned(),
+            worker: worker.to_string(),
+            action: "tree_verified".to_owned(),
+            limit_ms,
+            deadline_ms,
+            elapsed_ms,
+            remaining_ms: left_ms,
+            last_round_ms: None,
+            expected_round_ms: None,
+            cut: false,
         })
         .await
     }

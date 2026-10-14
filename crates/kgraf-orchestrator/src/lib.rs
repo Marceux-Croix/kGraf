@@ -93,6 +93,7 @@ pub mod pairing;
 mod partition;
 mod placeholder;
 mod plan;
+mod plan_chain;
 mod plan_repo;
 mod plan_shapes;
 mod planner_budget;

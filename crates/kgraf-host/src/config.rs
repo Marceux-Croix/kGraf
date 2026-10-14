@@ -179,6 +179,11 @@ pub struct RunConfig {
     /// run's own routes.
     #[serde(default = "defaults::interface_review")]
     pub interface_review: bool,
+    /// Make each straight chain of a plan one contract when its steps run on
+    /// one route and one worker can carry it (decision 0014, amendment of
+    /// 2026-10-14; `--no-collapse-chains` turns it off). **On by default.**
+    #[serde(default = "defaults::collapse_chains")]
+    pub collapse_chains: bool,
     /// Vendor/model routing policy (`--routing`, decision 0075). **Rotation by
     /// default**: a three-arm experiment elsewhere in this project depends on
     /// rotation's behavior being unchanged. `fitness` is opt-in
@@ -314,6 +319,10 @@ pub mod defaults {
     pub fn interface_review() -> bool {
         false
     }
+    /// On: a chain gains no parallelism (decision 0014).
+    pub fn collapse_chains() -> bool {
+        true
+    }
     /// The orchestrator's `SandboxRunner` default for test runs.
     pub fn check_timeout() -> Duration {
         Duration::from_secs(600)
@@ -408,6 +417,7 @@ impl RunConfig {
             planner_reasoning: None,
             reasoning: kgraf_provider::ReasoningLevels::new(),
             interface_review: defaults::interface_review(),
+            collapse_chains: defaults::collapse_chains(),
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,

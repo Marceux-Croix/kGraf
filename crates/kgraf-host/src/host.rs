@@ -571,6 +571,7 @@ impl Host {
             routing: config.routing,
             // Decision 0094: `--approve-plan`, the command line's only.
             approve_plan: config.approve_plan,
+            collapse_chains: config.collapse_chains,
             time_limit: config.time_limit,
             ..OrchestratorConfig::default()
         };

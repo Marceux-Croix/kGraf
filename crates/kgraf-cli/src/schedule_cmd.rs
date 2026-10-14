@@ -667,6 +667,7 @@ fn run_now_with(
             // Contract checks as a run has them by default: off.
             contract_checks: kgraf_host::config::defaults::contract_checks(),
             interface_review: kgraf_host::config::defaults::interface_review(),
+            collapse_chains: kgraf_host::config::defaults::collapse_chains(),
             worktrees: args.worktrees,
             // Sessions as a run has them by default: on (decision 0067).
             sessions: kgraf_host::config::defaults::sessions(),
