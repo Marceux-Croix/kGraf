@@ -177,3 +177,37 @@ are derived, for every plan revision including re-plans):
 
 The interface and handshake asks of the collapsed edges are not made. The cost is one worker
 carrying more steps in one context, which the size rule bounds.
+
+### Note (2026-10-14): a large code link stays split
+
+A merged chain gives up the parallel start of decision 0081: the producer's interface stub
+lands on the integration branch before any party is dispatched, so producer and consumer run
+at the same time. A link `A -> B` of a chain is therefore kept split when both hold:
+
+- **`A` can carry an interface.** `A`'s declared writes pass the interface-ask rule's own test
+  (`derive_interface::unaskable_writes` is `None`: it declares a file, not only binary build
+  outputs, and at least one source file in a language the checks compile or test). The same
+  predicate decides which producers are asked for an interface. `B`'s writes do not matter.
+- **`A` and `B` are each large.** Each step's own part of the work block is at least one
+  quarter of the route's plan target (`PARALLEL_LINK_SHARE = 4`): the plan loop's base estimate
+  (0057) of that step alone minus the worker prefix, that is its instruction and its slices or
+  declared files' symbols. The prefix and the projected growth are the same for every block on
+  the route, so they cannot tell a large step from a small one.
+
+The chain is cut at every such link, and each run of two or more contracts on either side is
+judged as any chain; a run of one stays as written. `a -> b -> c` with only `a -> b` qualifying
+becomes `a` and a merged `b` that waits on `a`. A link whose route is not known before dispatch,
+or whose size cannot be estimated, is left to the chain rules above.
+
+**Why a quarter.** A parallel start saves at most the shorter step's worker time, and costs an
+interface ask and a handshake first. Recorded interface asks took 75 to 186 s each on a local
+model (fewer seconds on a hosted one), and the handshakes 81 to 178 s, while workers of small
+steps in the same runs took 26 to 130 s. No per-route seconds-per-token figure exists to turn
+a step's size into time, so the rule is in the sizer's units, set against the local cost; on a
+hosted route it errs toward merging. Not measured: the saving of a parallel start on a large
+code link.
+
+**Loud.** A kept link is a `notice` trace record naming the link, the producer's checkable
+files, both steps' own sizes and the plan target: `link A -> B kept split: A writes
+interface-checkable code (...) and both steps are large enough to run in parallel against its
+stub (...)`.

@@ -8,7 +8,10 @@
 //!        v
 //!   plan review on, or user order set? --yes--> kept as written, noticed
 //!        |no
-//!        v   per chain
+//!        v   per link A -> B
+//!   one route known, A writes checkable code, A and B both large? --yes--> link kept split, noticed
+//!        |no                                          (chain cut there)
+//!        v   per run of two or more links left
 //!   one route known before dispatch? --no--> kept, noticed
 //!   tools offered by that route?     --no--> kept, noticed
 //!   merged block over the plan target, and a split could fit one? --yes--> kept, noticed
@@ -31,9 +34,49 @@
 //! and the projected growth alone are over the target, no step fits and no split
 //! could make one fit, so the chain is merged: splitting would only add
 //! interfaces and handshakes.
+//!
+//! A link `A -> B` is kept split when a merge would give up a parallel start
+//! worth more than it costs (0014 note of 2026-10-14; the parallel start is
+//! 0081: `A`'s interface stub lands before either party is dispatched, so `A`
+//! and `B` run at once):
+//!
+//! - `A` can carry an interface: its writes pass the interface-ask rule's own
+//!   test ([`derive_interface::unaskable_writes`] is `None`: it declares a
+//!   source file the checks can compile or test). One predicate, so "can carry
+//!   an interface" means the same here and at the ask.
+//! - `A` and `B` are each large: its own part of the work block (the plan
+//!   loop's base estimate, without the worker prefix every block carries: its
+//!   instruction and its slices or declared files' symbols) is at least
+//!   1/[`PARALLEL_LINK_SHARE`] of the route's plan target. See the constant
+//!   for the reason.
+//!
+//! The chain is cut at each such link and each side is judged on its own.
+//!
+//! [`derive_interface::unaskable_writes`]: crate::derive_interface::unaskable_writes
 
 use super::*;
 use crate::plan_chain::{self, Outcome, Verdict};
+
+/// The share of the route's plan target each step of a link must reach, in
+/// its own part of the work block, for the link to be kept split: one
+/// quarter (the divisor is 4).
+///
+/// A parallel start saves at most the shorter step's worker time, and it
+/// costs an interface ask and a handshake first. The recorded asks took 75 to
+/// 186 s each on a local model (0030 and 0014 evidence; fewer seconds on a
+/// hosted model), and the handshakes after them 81 to 178 s, while the
+/// workers of the small steps in the same runs (a few hundred tokens of their
+/// own) took 26 to 130 s each: a merge was faster. The work a split divides
+/// is a step's own part; the worker prefix and the projected growth are the
+/// same for every block on the route, so they cannot tell a large step from
+/// a small one. No per-route figure of seconds per token exists to convert a
+/// step's size into time, so the rule is stated in the sizer's own units: a
+/// step whose own part is a quarter of one worker's plan target or more is
+/// large (two such steps fill half the target before any transcript), far
+/// above the steps that lost to the ask. Set against the local cost, the only
+/// one recorded; on a hosted route, where asks are cheaper, it errs toward
+/// merging.
+pub(crate) const PARALLEL_LINK_SHARE: u64 = 4;
 
 impl RunLoop {
     /// `specs` with each collapsible chain merged. Only a whole plan is
@@ -66,9 +109,11 @@ impl RunLoop {
             .await?;
             return Ok(specs);
         }
-        let (collapsed, outcomes) = plan_chain::collapse(specs.clone(), |links, merged| {
-            self.chain_verdict(links, merged)
-        });
+        let (collapsed, outcomes) = plan_chain::collapse(
+            specs.clone(),
+            |a, b| self.parallel_start_link(a, b),
+            |links, merged| self.chain_verdict(links, merged),
+        );
         // A merged plan breaks a plan rule only if a rule this module does not
         // know of does; the planner's own plan then stands, and the refusal is
         // traced.
@@ -119,6 +164,23 @@ impl RunLoop {
                     })
                     .await?;
                 }
+                Outcome::LinkKept {
+                    chain,
+                    from,
+                    to,
+                    reason,
+                } => {
+                    self.trace(TraceEvent::Notice {
+                        at_ms: at,
+                        contract: from.clone(),
+                        worker: String::new(),
+                        detail: kgraf_secrets::scrub_persist_owned(format!(
+                            "straight chain {}: link {from} -> {to} {reason}",
+                            chain.join(" -> ")
+                        )),
+                    })
+                    .await?;
+                }
                 Outcome::Kept { ids, reason } => {
                     self.trace(TraceEvent::Notice {
                         at_ms: at,
@@ -149,9 +211,10 @@ impl RunLoop {
         }
     }
 
-    /// One chain's ruling: the route every step runs on must be known now,
-    /// offer the merged tools, and carry the merged block.
-    fn chain_verdict(&self, links: &[&ContractSpec], merged: &ContractSpec) -> Verdict {
+    /// The one route every step of `links` runs on, when it is known before
+    /// dispatch: the roster has one route, or every step pins the same one.
+    /// `Err`: why it is not known.
+    fn known_route(&self, links: &[&ContractSpec]) -> Result<String, String> {
         let roster = self.roster();
         let pins: BTreeSet<&str> = links.iter().filter_map(|l| l.route.as_deref()).collect();
         let pinned_by_all = links.iter().all(|l| l.route.is_some());
@@ -162,19 +225,79 @@ impl RunLoop {
             _ if pinned_by_all && pins.len() == 1 => pins.iter().next().map(|p| (*p).to_owned()),
             _ => None,
         };
-        let route = match known {
-            Some(route) => route,
-            None => {
-                return Verdict::Keep(format!(
-                    "its steps may run on different routes ({} routes, {} routing, {} distinct \
-                     pin(s) among {} steps); one route is known before dispatch only when the \
-                     roster has one or every step pins the same",
-                    roster.len(),
-                    self.config.routing,
-                    pins.len(),
-                    links.len()
-                ));
-            }
+        known.ok_or_else(|| {
+            format!(
+                "its steps may run on different routes ({} routes, {} routing, {} distinct \
+                 pin(s) among {} steps); one route is known before dispatch only when the \
+                 roster has one or every step pins the same",
+                roster.len(),
+                self.config.routing,
+                pins.len(),
+                links.len()
+            )
+        })
+    }
+
+    /// The plan loop's slice estimate of `spec`, without its traces: the named
+    /// slices, else the declared files' symbols.
+    fn spec_slice_tokens(&self, spec: &ContractSpec) -> Result<u64, String> {
+        let from = spec.writes.first().map(|w| w.path.clone());
+        match self.lookup_slices(&spec.slices, from) {
+            Ok(found) if !found.nodes.is_empty() => Ok(found.tokens),
+            Ok(_) => match self.write_file_slices(&spec.writes) {
+                Ok((_, tokens, _)) => Ok(tokens),
+                Err(e) => Err(format!("its size could not be projected ({e})")),
+            },
+            Err(e) => Err(format!("its size could not be projected ({e})")),
+        }
+    }
+
+    /// Why the link `a -> b` is kept split, or `None` (see the module notes
+    /// and [`PARALLEL_LINK_SHARE`]). A link whose route is not known, or
+    /// whose size cannot be estimated, is left to [`Self::chain_verdict`],
+    /// which keeps a chain it cannot place or size.
+    fn parallel_start_link(&self, a: &ContractSpec, b: &ContractSpec) -> Option<String> {
+        let writes: Vec<String> = a.writes.iter().map(|w| w.path.clone()).collect();
+        if crate::derive_interface::unaskable_writes(&a.id, &writes).is_some() {
+            return None;
+        }
+        let route = self.known_route(&[a, b]).ok()?;
+        let r = self.route(&route)?;
+        let fixed = self.base_tokens(r, "", 0);
+        let own = |s: &ContractSpec| -> Option<u64> {
+            let slices = self.spec_slice_tokens(s).ok()?;
+            Some(
+                self.base_tokens(r, &s.instruction, slices)
+                    .saturating_sub(fixed),
+            )
+        };
+        let (own_a, own_b) = (own(a)?, own(b)?);
+        let target = r.context.worker_plan_target_tokens();
+        let large = target.div_ceil(PARALLEL_LINK_SHARE);
+        if own_a < large || own_b < large {
+            return None;
+        }
+        let checkable: Vec<&str> = writes
+            .iter()
+            .filter(|w| crate::derive_interface::has_compile_language(w))
+            .map(String::as_str)
+            .collect();
+        Some(format!(
+            "kept split: {} writes interface-checkable code ({}) and both steps are large \
+             enough to run in parallel against its stub (own work {own_a} and {own_b} tokens, \
+             each at least 1/{PARALLEL_LINK_SHARE} of the plan target of {target} on route \
+             `{route}`)",
+            a.id,
+            checkable.join(", ")
+        ))
+    }
+
+    /// One chain's ruling: the route every step runs on must be known now,
+    /// offer the merged tools, and carry the merged block.
+    fn chain_verdict(&self, links: &[&ContractSpec], merged: &ContractSpec) -> Verdict {
+        let route = match self.known_route(links) {
+            Ok(route) => route,
+            Err(why) => return Verdict::Keep(why),
         };
         if !self.route_offers(&route, &merged.tools) {
             return Verdict::Keep(format!(
@@ -184,16 +307,9 @@ impl RunLoop {
         let Some(r) = self.route(&route) else {
             return Verdict::Keep(format!("route `{route}` is not configured"));
         };
-        // The plan loop's sizing, without its traces: the named slices, else
-        // the declared files' symbols.
-        let from = merged.writes.first().map(|w| w.path.clone());
-        let slice_tokens = match self.lookup_slices(&merged.slices, from) {
-            Ok(found) if !found.nodes.is_empty() => found.tokens,
-            Ok(_) => match self.write_file_slices(&merged.writes) {
-                Ok((_, tokens, _)) => tokens,
-                Err(e) => return Verdict::Keep(format!("its size could not be projected ({e})")),
-            },
-            Err(e) => return Verdict::Keep(format!("its size could not be projected ({e})")),
+        let slice_tokens = match self.spec_slice_tokens(merged) {
+            Ok(tokens) => tokens,
+            Err(why) => return Verdict::Keep(why),
         };
         let base = self.base_tokens(r, &merged.instruction, slice_tokens);
         let projection = self

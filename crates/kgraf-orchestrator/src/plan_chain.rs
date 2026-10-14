@@ -21,8 +21,15 @@
 //! made: a path through the merged contract enters through the head and leaves
 //! through the tail, as it did before.
 //!
-//! This module is the shape of the rule. Whether a chain may merge (one route,
-//! one worker's size) is the caller's [`Verdict`].
+//! A link may be kept split (amendment note of 2026-10-14 to 0014): when its
+//! producer writes code an interface can check and both steps are large, the
+//! interface stub lets both start at once (decision 0081), which a merge would
+//! give up. The chain is then cut at that link, and each run of two or more
+//! links on either side is a chain of its own, judged as any other.
+//!
+//! This module is the shape of the rule. Whether a link is kept split, and
+//! whether a chain may merge (one route, one worker's size), are the caller's
+//! rulings ([`collapse`]'s `keep_link` and [`Verdict`]).
 
 use crate::plan::ContractSpec;
 use kgraf_core::model_profile::TaskKind;
@@ -53,6 +60,14 @@ pub enum Outcome {
     },
     Kept {
         ids: Vec<String>,
+        reason: String,
+    },
+    /// The link `from -> to` of the straight chain `chain` was kept split
+    /// (`keep_link`'s reason), and the chain cut there.
+    LinkKept {
+        chain: Vec<String>,
+        from: String,
+        to: String,
         reason: String,
     },
 }
@@ -171,18 +186,60 @@ pub fn merge_chain(links: &[&ContractSpec]) -> ContractSpec {
     merged
 }
 
+/// `chain` cut after every position `k` where `keep(k)` holds (the link from
+/// `chain[k]` to `chain[k + 1]` is kept split): the runs between the cuts, in
+/// order, a run of one included.
+pub fn cut_chain(chain: &[usize], mut keep: impl FnMut(usize) -> bool) -> Vec<Vec<usize>> {
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    for (k, &i) in chain.iter().enumerate() {
+        run.push(i);
+        if k + 1 < chain.len() && keep(k) {
+            runs.push(std::mem::take(&mut run));
+        }
+    }
+    runs.push(run);
+    runs
+}
+
 /// `specs` with every chain the verdict accepts replaced by its merged
 /// contract, at the head's place, and with every dependency on a merged link
-/// naming the head. One outcome per chain, in plan order.
+/// naming the head.
+///
+/// `keep_link(a, b)` rules on each link `a -> b` of a chain first: a reason
+/// keeps that link split ([`Outcome::LinkKept`]), and the chain
+/// is cut there ([`cut_chain`]). Each run of two or more contracts left is
+/// then given to `decide`. One outcome per kept link, then one per run, each
+/// in plan order.
 pub fn collapse(
     specs: Vec<ContractSpec>,
+    mut keep_link: impl FnMut(&ContractSpec, &ContractSpec) -> Option<String>,
     mut decide: impl FnMut(&[&ContractSpec], &ContractSpec) -> Verdict,
 ) -> (Vec<ContractSpec>, Vec<Outcome>) {
     let mut outcomes = Vec::new();
     let mut replace: BTreeMap<usize, ContractSpec> = BTreeMap::new();
     let mut dropped: BTreeSet<usize> = BTreeSet::new();
     let mut rename: BTreeMap<String, String> = BTreeMap::new();
-    for chain in straight_chains(&specs) {
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for whole in straight_chains(&specs) {
+        let runs_of = cut_chain(&whole, |k| {
+            let (a, b) = (&specs[whole[k]], &specs[whole[k + 1]]);
+            match keep_link(a, b) {
+                Some(reason) => {
+                    outcomes.push(Outcome::LinkKept {
+                        chain: whole.iter().map(|&i| specs[i].id.clone()).collect(),
+                        from: a.id.clone(),
+                        to: b.id.clone(),
+                        reason,
+                    });
+                    true
+                }
+                None => false,
+            }
+        });
+        runs.extend(runs_of.into_iter().filter(|r| r.len() >= 2));
+    }
+    for chain in runs {
         let links: Vec<&ContractSpec> = chain.iter().map(|&i| &specs[i]).collect();
         let ids: Vec<String> = links.iter().map(|l| l.id.clone()).collect();
         let merged = merge_chain(&links);
@@ -327,7 +384,7 @@ mod tests {
             spec("after", &["b"]),
             spec("also", &["b"]),
         ];
-        let (out, outcomes) = collapse(s, always);
+        let (out, outcomes) = collapse(s, |_, _| None, always);
         let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["root", "side", "a", "after", "also"]);
         assert_eq!(out[2].depends_on, ["root"]);
@@ -393,9 +450,76 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_is_cut_after_each_kept_link() {
+        let chain = [10, 11, 12, 13];
+        assert_eq!(cut_chain(&chain, |_| false), vec![vec![10, 11, 12, 13]]);
+        assert_eq!(
+            cut_chain(&chain, |k| k == 0),
+            vec![vec![10], vec![11, 12, 13]]
+        );
+        assert_eq!(
+            cut_chain(&chain, |k| k == 1),
+            vec![vec![10, 11], vec![12, 13]]
+        );
+        assert_eq!(
+            cut_chain(&chain, |_| true),
+            vec![vec![10], vec![11], vec![12], vec![13]]
+        );
+    }
+
+    #[test]
+    fn a_kept_link_splits_the_chain_and_the_rest_merges_on_each_side() {
+        // a -> b -> c -> d -> e with b -> c kept: a+b merge, c+d+e merge, and
+        // the merged c waits on the merged a.
+        let s = vec![
+            spec("a", &[]),
+            spec("b", &["a"]),
+            spec("c", &["b"]),
+            spec("d", &["c"]),
+            spec("e", &["d"]),
+        ];
+        let (out, outcomes) = collapse(
+            s,
+            |a, b| (a.id == "b" && b.id == "c").then(|| "big".to_owned()),
+            always,
+        );
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+        assert!(out[0].depends_on.is_empty());
+        assert_eq!(out[1].depends_on, ["a"]);
+        assert_eq!(
+            outcomes[0],
+            Outcome::LinkKept {
+                chain: ["a", "b", "c", "d", "e"].map(String::from).to_vec(),
+                from: "b".into(),
+                to: "c".into(),
+                reason: "big".into()
+            }
+        );
+        let merged: Vec<Vec<String>> = outcomes[1..]
+            .iter()
+            .map(|o| match o {
+                Outcome::Collapsed { ids, .. } => ids.clone(),
+                _ => panic!("{o:?}"),
+            })
+            .collect();
+        assert_eq!(merged, [vec!["a", "b"], vec!["c", "d", "e"]]);
+    }
+
+    #[test]
+    fn a_kept_link_at_each_end_leaves_one_contract_on_that_side() {
+        // a -> b -> c with a -> b kept: a stays, b+c merge.
+        let s = vec![spec("a", &[]), spec("b", &["a"]), spec("c", &["b"])];
+        let (out, _) = collapse(s, |a, _| (a.id == "a").then(String::new), always);
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(out[1].depends_on, ["a"]);
+    }
+
+    #[test]
     fn a_kept_chain_leaves_the_plan_as_it_was() {
         let s = vec![spec("a", &[]), spec("b", &["a"])];
-        let (out, outcomes) = collapse(s.clone(), |_, _| Verdict::Keep("why".into()));
+        let (out, outcomes) = collapse(s.clone(), |_, _| None, |_, _| Verdict::Keep("why".into()));
         assert_eq!(out, s);
         assert_eq!(
             outcomes,

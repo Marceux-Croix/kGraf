@@ -303,6 +303,16 @@ async fn a_tree_stopped_at_the_limit_that_fails_its_check_ends_blocked_with_the_
     let v = verdicts(&trace);
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(!v[0].0 && v[0].1.contains("missing or wrong"), "{v:?}");
+    // The blocked reason keeps the time-limit part and names the contract and
+    // the verification's own failure.
+    let RunStatus::Blocked { reason } = &report.status else {
+        unreachable!()
+    };
+    assert!(
+        reason.contains("the tree stopped at the time limit was verified and refused: long: ")
+            && reason.contains("missing or wrong"),
+        "{reason}"
+    );
 }
 
 /// The verification of a limit-stopped tree runs inside the time left to the

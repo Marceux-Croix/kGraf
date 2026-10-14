@@ -253,11 +253,13 @@ async fn steps_pinned_to_one_route_collapse_and_to_two_routes_do_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_chain_too_big_for_one_worker_is_kept_as_planned() {
     // Each step fits under the plan target (40k of a 100k window) alone; the three together are over it.
+    // The steps write documents: steps this large writing code would keep each
+    // link split for a parallel start before the size rule is reached.
     let step = "pad ".repeat(6_000);
     let big = plan_json(&[
-        c("a", &step, "src/a.rs", &[]),
-        c("b", &step, "src/b.rs", &["a"]),
-        c("c", &step, "src/c.rs", &["b"]),
+        c("a", &step, "docs/a.md", &[]),
+        c("b", &step, "docs/b.md", &["a"]),
+        c("c", &step, "docs/c.md", &["b"]),
     ]);
     let out = run_plan(big, 1, 100_000, config()).await;
     assert!(
@@ -527,5 +529,114 @@ async fn an_order_the_user_chose_keeps_a_later_plan_as_written() {
             .any(|n| n.contains("the user chose an order")),
         "{:?}",
         notices(&events)
+    );
+}
+
+/// An instruction whose own part of the work block (`bound_tokens`: half its
+/// length) is about `tokens`.
+fn sized(tokens: usize) -> String {
+    "pad ".repeat(tokens / 2)
+}
+
+/// Own work per large step: over a quarter of the plan target (40k under the
+/// 200k window, so 10k), and two of them with the projected growth still under
+/// the target, so the size rule alone would merge them.
+const LARGE: usize = 10_500;
+
+fn kept_split(events: &[TraceEvent]) -> Vec<String> {
+    notices(events)
+        .into_iter()
+        .filter(|n| n.contains("kept split:"))
+        .collect()
+}
+
+/// A chain of code where both steps are large keeps its link: producer and
+/// consumer can run at once against the producer's interface stub (0081),
+/// which a merge would give up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_chain_of_two_large_steps_stays_split_and_says_why() {
+    let plan = plan_json(&[
+        c("a", &sized(LARGE), "src/a.rs", &[]),
+        c("b", &sized(LARGE), "src/b.rs", &["a"]),
+    ]);
+    let out = run_plan(plan, 1, WINDOW, config()).await;
+    assert_eq!(out.report.status, RunStatus::Completed, "{:?}", out.report);
+    assert!(
+        collapsed(&out.events).is_empty(),
+        "{:?}",
+        notices(&out.events)
+    );
+    assert_eq!(ids(&out.events), ["a", "b"]);
+    let kept = kept_split(&out.events);
+    assert_eq!(kept.len(), 1, "{:?}", notices(&out.events));
+    assert!(
+        kept[0].contains(
+            "link a -> b kept split: a writes interface-checkable code (src/a.rs) and both steps \
+             are large enough to run in parallel against its stub"
+        ),
+        "{kept:?}"
+    );
+    assert!(kept[0].contains("of the plan target of 40000"), "{kept:?}");
+}
+
+/// One small step is enough to merge: the parallel start saves at most the
+/// shorter step's time, which a small step does not repay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_chain_with_a_small_step_is_one_contract() {
+    for (first, second) in [(LARGE, 100), (100, LARGE)] {
+        let plan = plan_json(&[
+            c("a", &sized(first), "src/a.rs", &[]),
+            c("b", &sized(second), "src/b.rs", &["a"]),
+        ]);
+        let out = run_plan(plan, 1, WINDOW, config()).await;
+        assert_eq!(out.report.status, RunStatus::Completed, "{:?}", out.report);
+        assert!(kept_split(&out.events).is_empty(), "{first} {second}");
+        assert_eq!(ids(&out.events), ["a"], "{first} {second}");
+        assert_eq!(
+            collapsed(&out.events),
+            [("a".into(), vec!["a".into(), "b".into()], "alpha".into())]
+        );
+    }
+}
+
+/// A producer that writes no file an interface can check has no stub to start
+/// its consumer against, so its link merges however large the steps are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_without_checkable_code_is_one_contract_whatever_its_size() {
+    // The consumer writes code; only the producer's writes decide.
+    let plan = plan_json(&[
+        c("a", &sized(LARGE), "docs/a.md", &[]),
+        c("b", &sized(LARGE), "src/b.rs", &["a"]),
+    ]);
+    let out = run_plan(plan, 1, WINDOW, config()).await;
+    assert_eq!(out.report.status, RunStatus::Completed, "{:?}", out.report);
+    assert!(kept_split(&out.events).is_empty());
+    assert_eq!(ids(&out.events), ["a"]);
+    assert_eq!(collapsed(&out.events)[0].1, ["a", "b"]);
+}
+
+/// A chain is cut only at the link that qualifies; the rest of it merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mixed_chain_splits_only_at_the_qualifying_link() {
+    // a -> b: both large, a writes code: kept. b -> c: c is small: merged.
+    let plan = plan_json(&[
+        c("a", &sized(LARGE), "src/a.rs", &[]),
+        c("b", &sized(LARGE), "src/b.rs", &["a"]),
+        c("c", &sized(100), "src/c.rs", &["b"]),
+    ]);
+    let out = run_plan(plan, 1, WINDOW, config()).await;
+    assert_eq!(out.report.status, RunStatus::Completed, "{:?}", out.report);
+    assert_eq!(ids(&out.events), ["a", "b"]);
+    assert_eq!(
+        collapsed(&out.events),
+        [("b".into(), vec!["b".into(), "c".into()], "alpha".into())]
+    );
+    let (contracts, _) = accepted(&out.events);
+    assert_eq!(contracts[1].depends_on, ["a"]);
+    let kept = kept_split(&out.events);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(
+        kept[0].starts_with("straight chain a -> b -> c: link a -> b kept split"),
+        "{kept:?}"
     );
 }

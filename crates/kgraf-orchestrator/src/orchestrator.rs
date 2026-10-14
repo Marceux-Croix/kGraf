@@ -2574,6 +2574,11 @@ struct RunLoop {
     /// Why no attempt could start for lack of time, once one could not: the
     /// reason a run that ends blocked on it states.
     out_of_time: Option<String>,
+    /// Trees stopped at the run's time limit, verified because no attempt could
+    /// run, and refused: the contract and the first line of the refusal. A run
+    /// that ends blocked says them, so the verification is not lost behind
+    /// the time-limit reason.
+    limit_refused: Vec<(String, String)>,
     /// Contracts whose attempt the time limit refused: one notice and one
     /// trace record each, though the dispatch round asks every tick.
     time_refused: BTreeSet<String>,
@@ -2914,6 +2919,7 @@ impl RunLoop {
             planner_budget: crate::planner_budget::PlannerBudget::new(time_limit),
             run_deadline,
             out_of_time: None,
+            limit_refused: Vec::new(),
             time_refused: BTreeSet::new(),
             workspace_problems: Vec::new(),
             subagents: subagents::Subagents::default(),
@@ -5009,6 +5015,17 @@ impl RunLoop {
         // The run's time limit refused the next attempt (`run_deadline.rs`).
         if let Some(why) = &self.out_of_time {
             reason = format!("{reason}; {why}");
+        }
+        if !self.limit_refused.is_empty() {
+            let refused: Vec<String> = self
+                .limit_refused
+                .iter()
+                .map(|(c, r)| format!("{c}: {r}"))
+                .collect();
+            reason = format!(
+                "{reason}; the tree stopped at the time limit was verified and refused: {}",
+                refused.join("; ")
+            );
         }
         Some(RunStatus::Blocked {
             reason: kgraf_secrets::scrub_persist_owned(reason),
@@ -7956,6 +7973,11 @@ impl RunLoop {
             fail => fail,
         };
         if !verdict.passed() {
+            if limit_stop && let Verdict::Fail { reason } = &verdict {
+                let first = reason.lines().next().unwrap_or(reason).trim();
+                let first: String = first.chars().take(300).collect();
+                self.limit_refused.push((contract.contract.clone(), first));
+            }
             if let Some(a) = flight.attempts.iter_mut().find(|a| a.worker == *worker) {
                 a.status = AttemptStatus::Error;
             }

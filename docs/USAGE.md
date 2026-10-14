@@ -156,9 +156,9 @@ overwrites a node you changed.
 | `--sessions true\|false` | true | Give every agent the session tools `ask_user_question`, `spawn_subagent`, `send_message` and `request_connection`. |
 | `--reasoning [SCOPE=]LEVEL` | unset | Reasoning level. Repeatable. See [Reasoning level](#reasoning-level). |
 | `--planner-reasoning LEVEL` | unset | The same as `--reasoning planner=LEVEL`. |
-| `--contract-checks` | off | Experimental. Check interface contracts in the sandbox before the first worker starts. |
+| `--contract-checks` | off | Experimental. Check interface contracts in the sandbox before the first worker starts. The planner is asked for an interface only where the producer writes a source file, at most twice. A check that still fails after the plan's one re-plan is dropped with a notice, and the contracts run. |
 | `--interface-review` | off | Before a producer attempt counts as verified, one model on a different vendor's route reviews it. The finding is advisory. |
-| `--no-collapse-chains` | off | Keep a plan's straight chains of contracts as the planner wrote them. By default a chain (each contract waiting on the one before) becomes one contract when its steps run on one route and one worker can carry it. Plan review and an order you chose always keep the plan as written. Also the run file key `collapse_chains` (`false`). |
+| `--no-collapse-chains` | off | Keep a plan's straight chains of contracts as the planner wrote them. By default a chain (each contract waiting on the one before) becomes one contract when its steps run on one route and one worker can carry it; a link stays split when its first step writes source code an interface can check and both steps are large (each at least a quarter of the route's plan target), so both can start at once against the first step's stub. Plan review and an order you chose always keep the plan as written. Also the run file key `collapse_chains` (`false`). |
 | `--check-timeout SECS`, `--check-compile-timeout SECS` | 600, 600 | Limits for one contract-check test run and compile. |
 | `--keep-worktrees` | off | Keep every worker's worktree and build output. |
 | `--interactive` | off | Read notes and `?` status questions from stdin during the run. |
@@ -387,7 +387,11 @@ refused. A typed answer is not a verified answer.
    asked for again, at most twice. A straight chain of contracts, each waiting on the one
    before, becomes one contract when its steps run on one route and one worker can carry it
    (a chain gains no parallelism, and each split costs an interface and a handshake). The run
-   notices say so, and the trace holds a `chain_collapsed` record. A plan under `--plan-review`
+   notices say so, and the trace holds a `chain_collapsed` record. A link stays split when its
+   first step writes source code an interface can check and both steps are large (each step's
+   own instruction and code at least a quarter of the route's plan target): the first step's
+   interface stub lets both start at once. A trace notice names the link and the reason, and
+   the rest of the chain on either side is merged as usual. A plan under `--plan-review`
    stays as written, as does a plan with an order you chose; with several routes and steps
    that are not pinned to one route, chains stay split.
 3. **Dispatch.** Workers run in parallel, each in its own worktree and sandbox, each fed
