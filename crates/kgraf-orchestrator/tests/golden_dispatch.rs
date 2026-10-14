@@ -43,6 +43,13 @@ fn config() -> OrchestratorConfig {
 }
 
 async fn scenario(timing_off: bool) -> (Vec<String>, BTreeMap<String, usize>) {
+    scenario_with(timing_off, config()).await
+}
+
+async fn scenario_with(
+    timing_off: bool,
+    cfg: OrchestratorConfig,
+) -> (Vec<String>, BTreeMap<String, usize>) {
     let dir = tempfile::tempdir().expect("dir");
     let plan = plan_json(&[
         c("a", "make a", "src/a.rs", &[]),
@@ -58,7 +65,7 @@ async fn scenario(timing_off: bool) -> (Vec<String>, BTreeMap<String, usize>) {
         |_| SERVES.into(),
         Duration::from_millis(60),
     );
-    let mut o = Orchestrator::new(config(), p.services(WINDOW)).expect("orchestrator");
+    let mut o = Orchestrator::new(cfg, p.services(WINDOW)).expect("orchestrator");
     if timing_off {
         o = o.without_latency_events();
     }
@@ -140,5 +147,17 @@ async fn a_run_with_timing_matches_the_run_before_timing_existed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_with_timing_off_matches_it_too() {
     let (order, calls) = scenario(true).await;
+    check(&order, &calls);
+}
+
+/// `--early-nonparty` with no interface checks has no party to move: the
+/// order, and the ledger's calls, are the baseline's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_nonparty_with_no_interface_checks_matches_the_baseline() {
+    let cfg = OrchestratorConfig {
+        early_nonparty: true,
+        ..config()
+    };
+    let (order, calls) = scenario_with(false, cfg).await;
     check(&order, &calls);
 }

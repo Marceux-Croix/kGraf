@@ -1385,7 +1385,10 @@ impl RunLoop {
         }
         let tests = repo_tests(&runner, known_files).await;
         let contract_facts = contract_facts(&runner, specs).await;
-        let mut out = Vec::new();
+        // The facts are read one producer at a time (they need the graph
+        // through the loop's own state); the compile checks that follow are
+        // independent of each other and run together.
+        let mut found = Vec::new();
         for (producer, consumers) in by_producer {
             let Some(spec) = specs.iter().find(|s| s.id == producer) else {
                 continue;
@@ -1393,8 +1396,23 @@ impl RunLoop {
             let facts = self
                 .producer_facts(&runner, spec, &consumers, specs)
                 .await?;
-            let (interface, base, compile_note) = derive_one(&runner, &facts).await;
             let writes: Vec<String> = spec.writes.iter().map(|w| w.path.clone()).collect();
+            found.push((producer, consumers, writes, facts));
+        }
+        let started = self.now();
+        let checked = in_order_together(found.iter().map(|f| &f.3), |facts| {
+            derive_one(&runner, facts)
+        })
+        .await;
+        // The sandbox time of plan intake, for the latency split.
+        if !found.is_empty() {
+            let ended = self.now();
+            self.latency.plan_checks.push((started, ended));
+        }
+        let mut out = Vec::new();
+        for ((producer, consumers, writes, _), (interface, base, compile_note)) in
+            found.into_iter().zip(checked)
+        {
             let behavior = match derive_interface::unaskable_writes(&producer, &writes) {
                 Some(why) => BehaviorPlan::Skip(why),
                 None => derive_interface::behavior_plan(&producer, &tests, &contract_facts),
@@ -2091,6 +2109,67 @@ async fn contract_facts(
         });
     }
     out
+}
+
+/// `f` of every item, all in flight together, the results in the order of
+/// the items. The derived compile checks of a plan are independent: each
+/// compiles its own copy of the check base in the sandbox, which bounds how
+/// many run at once (`check_runner::max_concurrent_checks`), so a plan of N
+/// producers waits for the slowest rather than the sum.
+async fn in_order_together<'a, T: 'a, R, Fut>(
+    items: impl IntoIterator<Item = &'a T>,
+    f: impl Fn(&'a T) -> Fut,
+) -> Vec<R>
+where
+    Fut: std::future::Future<Output = R>,
+{
+    futures_util::future::join_all(items.into_iter().map(f)).await
+}
+
+#[cfg(test)]
+mod together_tests {
+    use super::in_order_together;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Every call is in flight before any finishes, and the results come back in
+    /// the order of the items whichever finishes first. Each call waits (up to a
+    /// guard that is not part of the assertion) until all of them are in flight,
+    /// so overlap is shown by a count, not by a clock. A loop that awaits one
+    /// call at a time never gets past one in flight and fails the count.
+    #[tokio::test]
+    async fn every_check_is_in_flight_together_and_results_keep_their_order() {
+        let items = [3u64, 1, 2];
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let out = in_order_together(items.iter(), |n| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let waited = Instant::now();
+                while peak.load(Ordering::SeqCst) < items.len()
+                    && waited.elapsed() < Duration::from_secs(3)
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                // The call that was given the largest number finishes last.
+                tokio::time::sleep(Duration::from_millis(*n)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                *n * 10
+            }
+        })
+        .await;
+        assert_eq!(peak.load(Ordering::SeqCst), 3, "all three overlapped");
+        assert_eq!(out, [30, 10, 20], "results follow the items");
+    }
+
+    #[tokio::test]
+    async fn no_item_is_no_call() {
+        let none: [u8; 0] = [];
+        let out = in_order_together(none.iter(), |_| async { 1 }).await;
+        assert!(out.is_empty());
+    }
 }
 
 #[cfg(test)]

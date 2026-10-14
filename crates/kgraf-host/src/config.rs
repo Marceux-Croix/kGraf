@@ -184,6 +184,12 @@ pub struct RunConfig {
     /// 2026-10-14; `--no-collapse-chains` turns it off). **On by default.**
     #[serde(default = "defaults::collapse_chains")]
     pub collapse_chains: bool,
+    /// Start the contracts whose gate has nothing to do on the loop before a
+    /// contract whose gate still has a stub to land or a handshake to make,
+    /// within one dispatch round (`--early-nonparty`). **Off by default**: it
+    /// changes the order rotation hands out routes in.
+    #[serde(default = "defaults::early_nonparty")]
+    pub early_nonparty: bool,
     /// Vendor/model routing policy (`--routing`, decision 0075). **Rotation by
     /// default**: a three-arm experiment elsewhere in this project depends on
     /// rotation's behavior being unchanged. `fitness` is opt-in
@@ -323,6 +329,10 @@ pub mod defaults {
     pub fn collapse_chains() -> bool {
         true
     }
+    /// Off: it changes which route a contract gets under rotation.
+    pub fn early_nonparty() -> bool {
+        false
+    }
     /// The orchestrator's `SandboxRunner` default for test runs.
     pub fn check_timeout() -> Duration {
         Duration::from_secs(600)
@@ -418,6 +428,7 @@ impl RunConfig {
             reasoning: kgraf_provider::ReasoningLevels::new(),
             interface_review: defaults::interface_review(),
             collapse_chains: defaults::collapse_chains(),
+            early_nonparty: defaults::early_nonparty(),
             routing: kgraf_orchestrator::RoutingPolicy::default(),
             tbench_bridge_socket: None,
             dependency_fetch: crate::deps::RunFetch::Stored,

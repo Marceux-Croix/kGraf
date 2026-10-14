@@ -2216,6 +2216,31 @@ impl Ledger {
         })
     }
 
+    /// The spans, `(started_ms, finished_ms)`, of the calls of an agent whose
+    /// id starts with `planner_prefix` that overlap `[from_ms, to_ms]`, oldest
+    /// first; a call still open counts to `to_ms`. One range on the agent
+    /// index. The model time of a contract's wait from eligibility.
+    pub fn planner_spans_between(
+        &self,
+        planner_prefix: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<(i64, i64)>, LedgerError> {
+        let upper = format!("{planner_prefix}\u{10FFFF}");
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT started_ms, COALESCE(finished_ms, ?4) FROM calls
+                 WHERE agent_id >= ?1 AND agent_id < ?2
+                   AND started_ms < ?4 AND COALESCE(finished_ms, ?4) > ?3
+                 ORDER BY started_ms",
+            )?;
+            let rows = stmt.query_map(params![planner_prefix, upper, from_ms, to_ms], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
     /// The newest `limit` finished calls that carry a route (`route` filters to
     /// one), newest first: the settled, counted generative calls, and any
     /// call that ended on a 429 (a throttled attempt has no usage but counts
@@ -7188,6 +7213,14 @@ mod tests {
             f.planner_spans,
             vec![(2_300, 2_400)],
             "the call inside the gap"
+        );
+        // The calls over a window of the caller's choosing: this run's planner
+        // only, the plan's call cut off at the window's start.
+        assert_eq!(
+            ledger
+                .planner_spans_between("orchestrator:r1", 1_950, 2_350)
+                .expect("read"),
+            vec![(2_000, 2_100), (2_300, 2_400)]
         );
         // No dispatch instant known: anchored on the worker's own start.
         let late = ledger

@@ -63,6 +63,9 @@ pub struct OrchestrateArgs {
     /// `--no-collapse-chains` turns this off (decision 0014, amendment of
     /// 2026-10-14): a straight chain of contracts is made one contract.
     pub collapse_chains: bool,
+    /// `--early-nonparty`: contracts no interface binds are dispatched first
+    /// within one round.
+    pub early_nonparty: bool,
     /// `--keep-worktrees` (decision 0088): whether a worker's worktree and its
     /// build output are deleted after use. The flag is this command's only
     /// source for it: the command does not read `.kgraf/run.json`.
@@ -151,6 +154,7 @@ fn run_config(root: &Path, args: &OrchestrateArgs) -> RunConfig {
         contract_checks: args.contract_checks,
         interface_review: args.interface_review,
         collapse_chains: args.collapse_chains,
+        early_nonparty: args.early_nonparty,
         worktrees: args.worktrees,
         check_timeout: args.check_timeout,
         check_compile_timeout: args.check_compile_timeout,
@@ -1428,6 +1432,7 @@ mod tests {
             contract_checks: true,
             interface_review: false,
             collapse_chains: true,
+            early_nonparty: false,
             worktrees: kgraf_host::WorktreeRetention::default(),
             sessions: true,
             check_timeout: Duration::from_secs(600),

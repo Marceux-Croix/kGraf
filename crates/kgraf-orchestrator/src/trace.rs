@@ -319,6 +319,20 @@ pub enum TraceEvent {
         /// Wall-clock milliseconds when the worker's first call started.
         worker_started_ms: i64,
         gap_us: i64,
+        /// Wall milliseconds when the contract became eligible: its plan was
+        /// accepted, or its last dependency merged. Absent when unknown (a
+        /// run resumed after the dispatch).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eligible_ms: Option<i64>,
+        /// Of the time from eligibility to the worker's first call: the wait
+        /// for a slot after the contract was deferred, and the sandbox checks
+        /// on its path, both measured. Model time is the planner's calls in
+        /// the span; kGraf's own time is the rest (`latency` event,
+        /// `small_request_dispatch`).
+        #[serde(default)]
+        capacity_wait_us: i64,
+        #[serde(default)]
+        checks_us: i64,
         /// How long the worker's first call then waited for a rate-limit
         /// slot. That wait begins after the call starts, so it is not part of
         /// `gap_us`; it is named here so it is never read as kGraf time.
@@ -1311,6 +1325,9 @@ mod tests {
             planner_ended_ms: 1_000,
             worker_started_ms: 1_450,
             gap_us: 450_000,
+            eligible_ms: Some(1_100),
+            capacity_wait_us: 200_000,
+            checks_us: 100_000,
             worker_queued_ms: None,
         };
         let line = |e: &TraceEvent| serde_json::to_string(e).expect("serialize");
@@ -1323,7 +1340,7 @@ mod tests {
         ));
         assert_eq!(
             line(&gap),
-            r#"{"event":"dispatch_gap","at_ms":5,"contract":"c1","planner_ended_ms":1000,"worker_started_ms":1450,"gap_us":450000}"#
+            r#"{"event":"dispatch_gap","at_ms":5,"contract":"c1","planner_ended_ms":1000,"worker_started_ms":1450,"gap_us":450000,"eligible_ms":1100,"capacity_wait_us":200000,"checks_us":100000}"#
         );
         for e in [&latency, &dispatch, &gap] {
             let back: TraceEvent = serde_json::from_str(&line(e)).expect("round trip");

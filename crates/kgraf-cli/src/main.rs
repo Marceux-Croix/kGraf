@@ -382,6 +382,16 @@ enum Command {
         /// as written.
         #[arg(long)]
         no_collapse_chains: bool,
+        /// Within one dispatch round, start the contracts whose gate has
+        /// nothing to do on the loop before a contract whose gate still has
+        /// a stub to land or a handshake to make. Those steps run on the
+        /// loop and the run starts one contract at a time, so a ready
+        /// contract otherwise waits behind them. Rotation hands out routes
+        /// in the order of dispatch, so a contract may get another route
+        /// than without the flag. Off by default. Give it again with
+        /// `--resume`: the run record does not keep it.
+        #[arg(long)]
+        early_nonparty: bool,
         /// Keep every worker's worktree, with the build output in it, after
         /// its attempt is merged or discarded, so builds can be inspected or
         /// reused. Without it, a worktree nothing needs any more is deleted
@@ -1313,6 +1323,7 @@ fn run_cli() -> Result<()> {
             contract_checks,
             interface_review,
             no_collapse_chains,
+            early_nonparty,
             keep_worktrees,
             sessions,
             check_timeout,
@@ -1389,6 +1400,7 @@ fn run_cli() -> Result<()> {
                     contract_checks,
                     interface_review,
                     collapse_chains: !no_collapse_chains,
+                    early_nonparty,
                     worktrees: kgraf_host::WorktreeRetention::from_delete(!keep_worktrees),
                     sessions,
                     check_timeout: std::time::Duration::from_secs(check_timeout),

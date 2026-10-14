@@ -11,7 +11,7 @@ mod support;
 use kgraf_core::RunId;
 use kgraf_orchestrator::latency::LatencyKind;
 use kgraf_orchestrator::{
-    Orchestrator, OrchestratorConfig, RunReport, RunStatus, TraceEvent, TraceLog,
+    Limits, Orchestrator, OrchestratorConfig, RunReport, RunStatus, TraceEvent, TraceLog,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -291,4 +291,80 @@ async fn measuring_changes_neither_dispatch_order_nor_ledger_calls() {
     )));
     assert!(off.report.latency.is_empty());
     assert!(!off.status_text.contains("latency"));
+}
+
+/// A contract that waited for a slot says so: with room for one agent, `x` is
+/// deferred while `a` works, and its dispatch split names that wait as
+/// `capacity_wait_us`, apart from kGraf's own time. `a` waited for nothing.
+/// The parts sum, and the `dispatch_gap` event carries the same figures and
+/// the moment the contract became eligible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_for_a_slot_is_named_apart_from_kgrafs_own_time() {
+    let dir = tempfile::tempdir().expect("dir");
+    let plan = plan_json(&[
+        c("a", "make a", "src/a.rs", &[]),
+        c("x", "make x", "src/x.rs", &[]),
+    ]);
+    let mut p = Parts::open(
+        dir.path(),
+        move |_| plan.clone(),
+        |_| SERVES.into(),
+        Duration::from_millis(120),
+    );
+    p.admission = admission(Limits::new(1, 1).expect("limits"));
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        Orchestrator::new(config(), p.services(WINDOW))
+            .expect("orchestrator")
+            .start(RunId::new("r1"), "make a and x".into()),
+    )
+    .await
+    .expect("the run ended")
+    .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = TraceLog::open(&dir.path().join("runs").join("r1").join("trace.jsonl"))
+        .await
+        .expect("trace")
+        .load()
+        .await
+        .expect("load");
+    let events = latency_events(&trace);
+    let b2 = |contract: &str| {
+        events
+            .iter()
+            .find(|e| {
+                e.kind == LatencyKind::SmallRequestDispatch
+                    && e.contract.as_deref() == Some(contract)
+            })
+            .copied()
+            .unwrap_or_else(|| panic!("no dispatch split for {contract}"))
+    };
+    let (a, x) = (b2("a"), b2("x"));
+    assert!(a.sums() && x.sums(), "{a:?} {x:?}");
+    assert_eq!(a.capacity_wait_us, 0, "{a:?}");
+    assert!(x.capacity_wait_us > 0, "x waited for a slot: {x:?}");
+    assert!(
+        x.kgraf_us + x.capacity_wait_us <= x.wall_us && x.kgraf_us >= 0,
+        "{x:?}"
+    );
+    let gap = trace
+        .iter()
+        .find_map(|e| match e {
+            TraceEvent::DispatchGap {
+                contract,
+                eligible_ms,
+                capacity_wait_us,
+                checks_us,
+                ..
+            } if contract == "x" => Some((*eligible_ms, *capacity_wait_us, *checks_us)),
+            _ => None,
+        })
+        .expect("the gap of x");
+    assert!(gap.0.is_some(), "a root contract is eligible from the plan");
+    assert_eq!((gap.1, gap.2), (x.capacity_wait_us, x.checks_us));
+    assert!(
+        x.line().contains("slot wait"),
+        "the line names the wait: {}",
+        x.line()
+    );
 }

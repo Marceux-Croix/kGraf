@@ -40,7 +40,7 @@ use std::time::Instant;
 /// | Budget | Kind | Starts | Ends |
 /// |---|---|---|---|
 /// | B1 | `note_ack` | the loop takes a note or box line | the note is persisted and its reply sent |
-/// | B2 | `small_request_dispatch` | the last planner call ends | the worker's first ledger row starts |
+/// | B2 | `small_request_dispatch` | the contract is eligible (its plan was accepted, or its last dependency merged; the last planner call ends when that is unknown) | the worker's first ledger row starts. Its `kgraf_us` is the part the 1.5 s / 3 s target applies to: the wait for a slot (`capacity_wait_us`) and the sandbox checks (`checks_us`) are measured and named apart |
 /// | B3 | `triage_dispatch` | the request is received | the worker's first ledger row starts |
 /// | B4 | `delta_applied` | a change is received | it is applied to the plan and written |
 /// | B4a | `streamed_delta_dispatch` | an added contract's object parses | it is dispatched |
@@ -226,6 +226,13 @@ pub struct Split {
     pub kgraf_us: i64,
     pub model_us: i64,
     pub tools_us: i64,
+    /// Time the contract waited for a slot after it was deferred (the agent
+    /// ceiling, the cluster cap, a lease): queue time, not kGraf's work. Zero
+    /// for an interaction that has no such wait.
+    pub capacity_wait_us: i64,
+    /// Sandbox checks that ran on the interaction's path (the plan's derived
+    /// compile checks, an interface's mechanical checks), measured.
+    pub checks_us: i64,
     /// Attributed model calls that ran at the same time as another attributed
     /// call: where more than one model call was in flight, their time counts
     /// once in `model_us`.
@@ -247,6 +254,37 @@ pub fn attribute(wall_us: i64, model: &[Interval], tools: &[Interval]) -> Split 
         kgraf_us: wall_us - model_us - tools_us,
         model_us,
         tools_us,
+        capacity_wait_us: 0,
+        checks_us: 0,
+        model_calls_overlapped: overlapped_count(model, wall_us),
+    }
+}
+
+/// Split a contract's wait from eligibility to its worker's first call. Model
+/// time wins where spans overlap, then the measured sandbox checks, then the
+/// wait for a slot; what is left is kGraf's own time (`kgraf_us`), and the
+/// five parts always sum to `wall_us`. All spans are on the interaction's
+/// timeline.
+pub fn attribute_dispatch(
+    wall_us: i64,
+    model: &[Interval],
+    checks: &[Interval],
+    capacity: &[Interval],
+) -> Split {
+    let wall_us = wall_us.max(0);
+    let m = union_clipped(model, wall_us);
+    let c = subtract(&union_clipped(checks, wall_us), &m);
+    // `subtract` needs its cut sorted: the two disjoint sets are merged back.
+    let taken = union_clipped(&m.iter().chain(&c).copied().collect::<Vec<_>>(), wall_us);
+    let q = subtract(&union_clipped(capacity, wall_us), &taken);
+    let (model_us, checks_us, capacity_wait_us) = (total(&m), total(&c), total(&q));
+    Split {
+        wall_us,
+        kgraf_us: wall_us - model_us - checks_us - capacity_wait_us,
+        model_us,
+        tools_us: 0,
+        capacity_wait_us,
+        checks_us,
         model_calls_overlapped: overlapped_count(model, wall_us),
     }
 }
@@ -325,6 +363,10 @@ pub fn call_intervals(
         .collect()
 }
 
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
 /// One interaction's measurement, as written to the trace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyEvent {
@@ -337,6 +379,12 @@ pub struct LatencyEvent {
     pub model_us: i64,
     pub tools_us: i64,
     pub model_calls_overlapped: u32,
+    /// The wait for a slot and the sandbox checks on the path, measured;
+    /// absent (zero) for a kind that has neither.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub capacity_wait_us: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub checks_us: i64,
     /// The contract, when the interaction is one contract's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<String>,
@@ -352,19 +400,22 @@ impl LatencyEvent {
             model_us: split.model_us,
             tools_us: split.tools_us,
             model_calls_overlapped: split.model_calls_overlapped,
+            capacity_wait_us: split.capacity_wait_us,
+            checks_us: split.checks_us,
             contract,
         }
     }
 
-    /// Whether the three parts add up to the wall time.
+    /// Whether the parts add up to the wall time.
     pub fn sums(&self) -> bool {
-        self.kgraf_us + self.model_us + self.tools_us == self.wall_us
+        self.kgraf_us + self.model_us + self.tools_us + self.capacity_wait_us + self.checks_us
+            == self.wall_us
     }
 
     /// One short line: the kind, its budget id, the wall time and the split.
     pub fn line(&self) -> String {
         let ms = |us: i64| format!("{:.1}", us as f64 / 1_000.0);
-        format!(
+        let mut line = format!(
             "latency {} ({}): {} ms = kgraf {} + model {} + tools {}",
             self.kind_name(),
             self.kind.budget(),
@@ -372,7 +423,15 @@ impl LatencyEvent {
             ms(self.kgraf_us),
             ms(self.model_us),
             ms(self.tools_us)
-        )
+        );
+        if self.capacity_wait_us != 0 || self.checks_us != 0 {
+            line.push_str(&format!(
+                " + slot wait {} + checks {}",
+                ms(self.capacity_wait_us),
+                ms(self.checks_us)
+            ));
+        }
+        line
     }
 
     fn kind_name(&self) -> String {
@@ -565,6 +624,21 @@ pub struct LatencyState {
     /// contract that did not dispatch: a deferral is written again only when
     /// its outcome changes, not on every pass.
     pub last_written: BTreeMap<String, String>,
+    /// Wall milliseconds when the newest plan was accepted: a root contract is
+    /// eligible from then.
+    pub plan_accepted_ms: Option<i64>,
+    /// Wall milliseconds when each contract merged: a contract that depends
+    /// on it is eligible from the last of them. Kept for the run.
+    pub merged_ms: BTreeMap<String, i64>,
+    /// Wall milliseconds of each open contract's first deferral.
+    pub first_deferred_ms: BTreeMap<String, i64>,
+    /// Sandbox checks that ran for the whole plan (the derived compile checks
+    /// of plan intake), as wall-millisecond spans.
+    pub plan_checks: Vec<(i64, i64)>,
+    /// When each interface's mechanical checks started, until they report.
+    pub check_started_ms: BTreeMap<String, i64>,
+    /// Each interface's finished mechanical checks, as wall-millisecond spans.
+    pub interface_checks: BTreeMap<String, Vec<(i64, i64)>>,
 }
 
 impl LatencyState {
@@ -578,6 +652,12 @@ impl LatencyState {
             gates: BTreeMap::new(),
             gap_written: Default::default(),
             last_written: BTreeMap::new(),
+            plan_accepted_ms: None,
+            merged_ms: BTreeMap::new(),
+            first_deferred_ms: BTreeMap::new(),
+            plan_checks: Vec::new(),
+            check_started_ms: BTreeMap::new(),
+            interface_checks: BTreeMap::new(),
         }
     }
 
@@ -608,6 +688,7 @@ impl LatencyState {
         self.contracts.retain(|c, _| open(c));
         self.gap_written.retain(|c| open(c));
         self.last_written.retain(|c, _| open(c));
+        self.first_deferred_ms.retain(|c, _| open(c));
         self.gates.retain(|g, _| gate_running(g));
     }
 
@@ -726,6 +807,68 @@ mod tests {
             let s = attribute(wall, &m, &t);
             assert!(sums(&s), "{wall} {m:?} {t:?} {s:?}");
             assert!(s.kgraf_us >= 0 && s.model_us >= 0 && s.tools_us >= 0);
+        }
+    }
+
+    /// A contract's wait is split into five parts that sum: model first, then
+    /// the measured checks, then the wait for a slot; what is left is kGraf's.
+    #[test]
+    fn a_dispatch_wait_names_checks_and_slot_wait_and_leaves_kgraf_the_rest() {
+        let s = attribute_dispatch(1_000, &[iv(100, 200)], &[iv(150, 400)], &[iv(300, 700)]);
+        assert_eq!(s.model_us, 100);
+        assert_eq!(s.checks_us, 200, "150..400 less the model's 150..200");
+        assert_eq!(
+            s.capacity_wait_us, 300,
+            "300..700 less the checks' 300..400"
+        );
+        assert_eq!(s.kgraf_us, 400);
+        assert_eq!(s.tools_us, 0);
+        let e = LatencyEvent::new(LatencyKind::SmallRequestDispatch, 9, s, Some("c".into()));
+        assert!(e.sums());
+        assert!(
+            e.line().ends_with("+ slot wait 0.3 + checks 0.2"),
+            "{}",
+            e.line()
+        );
+        // A kind with neither part writes neither field and reads as before.
+        let plain = LatencyEvent::new(LatencyKind::NoteAck, 9, attribute(10, &[], &[]), None);
+        let json = serde_json::to_string(&plain).expect("json");
+        assert!(
+            !json.contains("capacity_wait_us") && !json.contains("checks_us"),
+            "{json}"
+        );
+        let back: LatencyEvent = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, plain);
+    }
+
+    #[test]
+    fn the_five_parts_sum_to_the_wall_for_scattered_spans() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |m: i64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m as u64) as i64
+        };
+        for _ in 0..300 {
+            let wall = next(5_000);
+            let mut spans = |n: usize| -> Vec<Interval> {
+                (0..n)
+                    .map(|_| {
+                        let a = next(7_000) - 1_000;
+                        iv(a, a + next(1_500) - 200)
+                    })
+                    .collect()
+            };
+            let (m, c, q) = (spans(3), spans(3), spans(3));
+            let s = attribute_dispatch(wall, &m, &c, &q);
+            let e = LatencyEvent::new(LatencyKind::SmallRequestDispatch, 0, s, None);
+            assert!(e.sums(), "{wall} {m:?} {c:?} {q:?} {s:?}");
+            assert!(
+                [s.kgraf_us, s.model_us, s.checks_us, s.capacity_wait_us]
+                    .iter()
+                    .all(|v| *v >= 0)
+            );
         }
     }
 

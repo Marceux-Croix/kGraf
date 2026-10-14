@@ -6348,3 +6348,407 @@ async fn a_check_that_cannot_run_for_another_cause_still_holds_its_parties() {
             .any(|e| matches!(e, ContractEvent::ChecksSkipped { .. })),
     );
 }
+
+/// A handshake model that holds every call until the test releases it, and
+/// says which parties it was asked about and on which route. It records the
+/// route the way [`RouteRecorder`] does.
+struct HeldHandshake {
+    asked: std::sync::Mutex<Vec<(String, String)>>,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl kgraf_orchestrator::Handshaker for HeldHandshake {
+    async fn state(
+        &self,
+        request: &kgraf_orchestrator::HandshakeRequest,
+    ) -> Result<
+        (
+            kgraf_orchestrator::HandshakeStatement,
+            Vec<kgraf_core::CallId>,
+        ),
+        kgraf_orchestrator::PlanError,
+    > {
+        self.asked
+            .lock()
+            .expect("lock")
+            .push((request.party.clone(), request.route.clone()));
+        self.release
+            .acquire()
+            .await
+            .expect("the semaphore is open")
+            .forget();
+        let mut s = kgraf_orchestrator::parse_handshake(&agreeing(&format!(
+            "You are party `{}`",
+            request.party
+        )))?;
+        s.party = request.party.clone();
+        Ok((s, Vec::new()))
+    }
+
+    fn cost_basis(&self) -> kgraf_orchestrator::CostBasis {
+        kgraf_orchestrator::CostBasis {
+            model: PLAN_MODEL.into(),
+            max_output_tokens: 100,
+        }
+    }
+}
+
+/// What one run of `held_gate_run` left: the handshake route of each party,
+/// the route each contract's first attempt ran on, and the trace position of
+/// each dispatch and of the checks passing.
+struct HeldGate {
+    handshake_routes: std::collections::BTreeMap<String, String>,
+    first_routes: std::collections::BTreeMap<String, String>,
+    dispatch_at: std::collections::BTreeMap<String, usize>,
+    checks_passed_at: usize,
+}
+
+/// Two parties of one interface and one contract no interface binds, with the
+/// parties' handshake held by the test until the non-party has started and no
+/// party has. `early` is `--early-nonparty`.
+async fn held_gate_run(early: bool) -> HeldGate {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan = parties_plan(false);
+    plan.push(c("free", "unrelated work", "free.py", &[]));
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&plan),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let held = Arc::new(HeldHandshake {
+        asked: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut checks = rig.checks(vec![py_ic()]);
+    checks.handshaker = held.clone();
+    let mut cfg = config();
+    cfg.early_nonparty = early;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(checks)
+        .expect("contracts");
+    let run =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    // Both parties' calls are in flight: the gate is open and holding.
+    let started = Instant::now();
+    while held.asked.lock().expect("lock").len() < 2 {
+        assert!(
+            started.elapsed() < HANG_GUARD,
+            "the parties' handshake never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The contract no interface binds starts while the parties wait, and no
+    // party has a worker.
+    let started = Instant::now();
+    while !worker_requests(&rig.parts)
+        .iter()
+        .any(|r| r.contains("unrelated work"))
+    {
+        assert!(
+            started.elapsed() < HANG_GUARD,
+            "the contract no interface binds waited for the parties' handshake"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !worker_requests(&rig.parts)
+            .iter()
+            .any(|r| r.contains("implement the parser") || r.contains("use the parser")),
+        "a party started before its handshake ended"
+    );
+    held.release.add_permits(2);
+    let report = tokio::time::timeout(HANG_GUARD, run)
+        .await
+        .expect("the run ends")
+        .expect("join")
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = rig.trace().await;
+    let mut out = HeldGate {
+        handshake_routes: held.asked.lock().expect("lock").iter().cloned().collect(),
+        first_routes: Default::default(),
+        dispatch_at: Default::default(),
+        checks_passed_at: trace
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    TraceEvent::Contract { record, .. }
+                        if matches!(**record, ContractEvent::ChecksPassed { .. })
+                )
+            })
+            .expect("the checks passed"),
+    };
+    for (i, e) in trace.iter().enumerate() {
+        match e {
+            TraceEvent::Dispatch { contract, .. } => {
+                out.dispatch_at.entry(contract.clone()).or_insert(i);
+            }
+            TraceEvent::WorkerFinished {
+                contract, route, ..
+            } => {
+                out.first_routes
+                    .entry(contract.clone())
+                    .or_insert_with(|| route.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A party still waits for its checks and its handshake whole, on or off, and
+/// is dispatched on the route its handshake was stated on. With the flag on, a
+/// contract no interface binds starts while the handshake is still held, and
+/// the route of every contract, party or not, is what it is without the flag
+/// (this plan lists the contract that no interface binds last, and rotation
+/// hands it its route after the parties' pins either way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_nonparty_keeps_the_parties_gate_and_route_pins_and_starts_the_rest() {
+    let off = held_gate_run(false).await;
+    let on = held_gate_run(true).await;
+    for (name, run) in [("off", &off), ("on", &on)] {
+        for party in ["prod", "cons"] {
+            assert!(
+                run.dispatch_at[party] > run.checks_passed_at,
+                "{name}: {party} dispatched before its checks passed: {:?} / {}",
+                run.dispatch_at,
+                run.checks_passed_at
+            );
+            assert_eq!(
+                run.first_routes.get(party),
+                run.handshake_routes.get(party),
+                "{name}: {party} runs on the route of its handshake"
+            );
+        }
+        assert!(
+            run.dispatch_at["free"] < run.dispatch_at["prod"].min(run.dispatch_at["cons"]),
+            "{name}: the contract no interface binds started first: {:?}",
+            run.dispatch_at
+        );
+    }
+    assert_eq!(
+        on.handshake_routes, off.handshake_routes,
+        "handshake routes"
+    );
+    assert_eq!(
+        on.first_routes, off.first_routes,
+        "first routes of every contract"
+    );
+}
+
+/// A lander that holds the land until the test releases it, then lands for
+/// real. It records that a land began.
+struct HeldLand {
+    began: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Semaphore,
+    inner: Arc<dyn StubLander>,
+}
+
+#[async_trait::async_trait]
+impl StubLander for HeldLand {
+    async fn land(&self, ic: &InterfaceContract, scope: &StubScope) -> Result<String, String> {
+        self.began.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?
+            .forget();
+        self.inner.land(ic, scope).await
+    }
+}
+
+/// A run killed with its interface checked and its stub not landed, resumed
+/// with the land held: the round the resume starts in has two parties with a
+/// land pending on the loop and a contract no interface binds. Returns the
+/// contracts in the order the resume dispatched them, and whether the
+/// contract no interface binds had started while the land was still held.
+async fn resumed_round_with_a_pending_land(early: bool) -> (Vec<String>, bool) {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan = parties_plan(false);
+    plan.push(c("free", "unrelated work", "free.py", &[]));
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&plan),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    // Another holder has the lease of the contract no interface binds, so the
+    // first run cannot start it before the process dies.
+    {
+        let g = rig.parts.graph.lock().expect("lock");
+        let reg = kgraf_graph::LeaseRegistry::new(&g).with_ttl_ms(600_000);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+        let got = reg
+            .acquire_all("blocker", "blocker", &["free.py".to_owned()], &[], now)
+            .expect("acquire");
+        assert!(matches!(got, kgraf_graph::Acquisition::Granted(_)));
+    }
+    let began = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let o = rig.orchestrator_with(vec![py_ic()], Arc::new(DiesInsideTheLand(began.clone())));
+    let first =
+        tokio::spawn(async move { o.start(RunId::new("r1"), "parse the config".into()).await });
+    until_or_run_ends(&first, "the land began", || {
+        began.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    first.abort();
+    let _ = first.await;
+    {
+        let g = rig.parts.graph.lock().expect("lock");
+        let reg = kgraf_graph::LeaseRegistry::new(&g);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+        let holder = reg
+            .holder_of("run:r1", now)
+            .expect("registry")
+            .expect("the killed run still holds its lease")
+            .agent_id;
+        reg.release_all(&holder).expect("release");
+        reg.release_all("blocker").expect("release the blocker");
+    }
+    assert!(
+        !worker_requests(&rig.parts)
+            .iter()
+            .any(|r| r.contains("unrelated work")),
+        "the first run did not start the contract no interface binds"
+    );
+    let held = Arc::new(HeldLand {
+        began: Default::default(),
+        release: tokio::sync::Semaphore::new(0),
+        inner: rig.git_lander(),
+    });
+    let mut cfg = config();
+    cfg.early_nonparty = early;
+    let o = Orchestrator::new(cfg, rig.parts.services(WINDOW))
+        .expect("orchestrator")
+        .with_contract_checks(rig.checks_with(vec![py_ic()], None, held.clone()))
+        .expect("contracts");
+    let second = tokio::spawn(async move { o.resume(RunId::new("r1")).await });
+    until_or_run_ends(&second, "the held land began", || {
+        held.began.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Flag on: the contract no interface binds was started before the land was
+    // reached, so its worker has made its first request. Flag off: the loop is
+    // inside the land and it has not.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started_meanwhile = worker_requests(&rig.parts)
+        .iter()
+        .any(|r| r.contains("unrelated work"));
+    held.release.add_permits(1);
+    let report = tokio::time::timeout(HANG_GUARD, second)
+        .await
+        .expect("the resume ends")
+        .expect("join")
+        .expect("resume");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = rig.trace().await;
+    let order: Vec<String> = trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::Dispatch { contract, .. } => Some(contract.clone()),
+            _ => None,
+        })
+        .collect();
+    (order, started_meanwhile)
+}
+
+/// The round a resume starts in holds a party whose stub land is pending on
+/// the loop and a contract no interface binds. Without the flag the loop goes
+/// into the land first and the contract waits behind it. With the flag the
+/// contract starts first, and the parties still land, still wait for their
+/// gate and still run after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_nonparty_starts_a_ready_contract_before_a_party_with_a_land_pending() {
+    let (off_order, off_meanwhile) = resumed_round_with_a_pending_land(false).await;
+    assert!(
+        !off_meanwhile,
+        "without the flag the contract waited behind the land: {off_order:?}"
+    );
+    assert_eq!(
+        off_order.first().map(String::as_str),
+        Some("prod"),
+        "{off_order:?}"
+    );
+    let (on_order, on_meanwhile) = resumed_round_with_a_pending_land(true).await;
+    assert!(
+        on_meanwhile,
+        "with the flag the contract started while the land was held: {on_order:?}"
+    );
+    assert_eq!(
+        on_order.first().map(String::as_str),
+        Some("free"),
+        "{on_order:?}"
+    );
+    for order in [&off_order, &on_order] {
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            ["cons", "free", "prod"],
+            "every contract dispatched once: {order:?}"
+        );
+    }
+}
+
+/// The sandbox checks on a party's path are named in its dispatch split
+/// (`checks_us`, measured from the start of its interface's mechanical checks
+/// to their result), apart from kGraf's own time; a contract no interface
+/// binds has none. The parts sum for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partys_dispatch_split_names_its_sandbox_checks() {
+    let dir = tempfile::tempdir().expect("dir");
+    let mut plan = parties_plan(false);
+    plan.push(c("free", "unrelated work", "free.py", &[]));
+    let rig = Rig::new(
+        dir.path(),
+        plan_json(&plan),
+        agreeing,
+        |_| "{}".into(),
+        Duration::from_millis(20),
+    );
+    let report = rig
+        .orchestrator(vec![py_ic()])
+        .start(RunId::new("r1"), "parse the config".into())
+        .await
+        .expect("run");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
+    let trace = rig.trace().await;
+    let b2 = |contract: &str| {
+        trace
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::Latency(l)
+                    if l.kind == kgraf_orchestrator::latency::LatencyKind::SmallRequestDispatch
+                        && l.contract.as_deref() == Some(contract) =>
+                {
+                    Some(l.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no dispatch split for {contract}"))
+    };
+    for party in ["prod", "cons"] {
+        let l = b2(party);
+        assert!(l.sums(), "{l:?}");
+        assert!(l.checks_us > 0, "{party}: the checks are named: {l:?}");
+        assert!(
+            l.kgraf_us >= 0 && l.kgraf_us + l.checks_us <= l.wall_us,
+            "{l:?}"
+        );
+    }
+    let free = b2("free");
+    assert!(free.sums(), "{free:?}");
+    assert_eq!(free.checks_us, 0, "no interface binds it: {free:?}");
+}

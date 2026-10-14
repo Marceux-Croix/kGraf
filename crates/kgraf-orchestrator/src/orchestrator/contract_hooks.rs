@@ -561,6 +561,63 @@ impl RunLoop {
         self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
     }
 
+    /// The sandbox checks on a contract's path, as wall-millisecond spans: the
+    /// plan's derived compile checks, and the mechanical checks of each
+    /// interface that binds it (one still running counts to `until_ms`).
+    pub(super) fn check_spans_of(&self, contract: &str, until_ms: i64) -> Vec<(i64, i64)> {
+        let mut out = self.latency.plan_checks.clone();
+        let interfaces = self
+            .contracts
+            .as_ref()
+            .map(|d| d.book.interfaces_of(contract))
+            .unwrap_or_default();
+        for id in interfaces {
+            if let Some(done) = self.latency.interface_checks.get(&id) {
+                out.extend(done.iter().copied());
+            }
+            if let Some(start) = self.latency.check_started_ms.get(&id) {
+                out.push((*start, until_ms));
+            }
+        }
+        out
+    }
+
+    /// `ids` with the contracts whose gate has work pending on the loop
+    /// last (`--early-nonparty`).
+    ///
+    /// A party's gate can make calls on the loop (the handshake, the stub
+    /// land and the consumer tests), and a dispatch round starts one contract
+    /// at a time, so a contract ready in the same round waits behind them.
+    /// This moves the contracts with such work after the others. A party with
+    /// none (its checks still run off the loop, it is held, or its checks
+    /// passed and its stub landed) keeps its place. The contracts the user put
+    /// in order keep theirs at the front. Nothing else changes: every party
+    /// still goes through [`Self::contract_gate`] whole, so it still waits for
+    /// its checks and records its handshake route before route selection reads
+    /// it; only the order in which rotation hands out routes moves with the
+    /// order of dispatch.
+    pub(super) async fn nonparty_first(
+        &mut self,
+        ids: Vec<String>,
+    ) -> Result<Vec<String>, OrchestratorError> {
+        if !self.config.early_nonparty || self.contracts.is_none() || ids.len() < 2 {
+            return Ok(ids);
+        }
+        // A resumed run's book holds nothing until its trace is replayed.
+        self.replay_contracts().await?;
+        let user_order = &self.record.coordination.user_order;
+        let keep = ids.iter().take_while(|id| user_order.contains(id)).count();
+        let desk = self.contracts.as_ref();
+        Ok(nonparty_first_order(ids, keep, |id| {
+            desk.is_some_and(|d| {
+                d.book
+                    .interfaces_of(id)
+                    .iter()
+                    .any(|i| loop_work_pending(d, i))
+            })
+        }))
+    }
+
     /// The pre-dispatch gate: stub-compile, vacuity, handshake, for every
     /// interface binding `contract`, before its first worker exists. Returns
     /// whether dispatch may proceed. A `false` either held the contract with the
@@ -970,6 +1027,8 @@ impl RunLoop {
                 .await;
         });
         desk.checks.track(&ic.id, seq, task);
+        let started = self.s.clock.now_ms();
+        self.latency.check_started_ms.insert(ic.id.clone(), started);
     }
 
     async fn check_failed(
@@ -1603,6 +1662,14 @@ impl RunLoop {
                     .is_some_and(|d| d.checks.answer(&interface, seq))
                 {
                     return Ok(());
+                }
+                if let Some(started) = self.latency.check_started_ms.remove(&interface) {
+                    let ended = self.now();
+                    self.latency
+                        .interface_checks
+                        .entry(interface.clone())
+                        .or_default()
+                        .push((started, ended));
                 }
                 let Some((ic, _)) = self.interface(&interface) else {
                     return Ok(());
@@ -2472,10 +2539,83 @@ fn rationale_block(dep: &str, closed: &crate::coordination::ClosedContract) -> O
     ))
 }
 
+/// Whether the gate of interface `id` has a call to make on the loop the next
+/// time a party's gate runs: its checks passed and its stub is not landed yet
+/// (the land, then the consumer tests), or its mechanical checks passed and
+/// the handshake is due. A compile-only interface makes neither call, and a
+/// check still running, a skipped one and a failed or held one return at once.
+fn loop_work_pending(desk: &Desk, id: &str) -> bool {
+    let (Some(ic), Some(state)) = (desk.book.get(id), desk.book.state(id)) else {
+        return false;
+    };
+    if ic.is_compile_only() || !matches!(state, InterfaceState::Active) {
+        return false;
+    }
+    if desk.book.checks_skipped(id).is_some() {
+        return false;
+    }
+    if desk.book.checked(id) {
+        return !desk.book.stub_landed(id);
+    }
+    desk.mechanical.contains_key(&(ic.id.clone(), ic.version))
+}
+
+/// `ids` with the ones `is_pending` accepts last, each kind in its own order;
+/// the first `keep` ids (the user's order) stay where they are.
+pub(super) fn nonparty_first_order(
+    ids: Vec<String>,
+    keep: usize,
+    is_pending: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let keep = keep.min(ids.len());
+    let mut out = ids;
+    let tail = out.split_off(keep);
+    let (parties, others): (Vec<String>, Vec<String>) =
+        tail.into_iter().partition(|id| is_pending(id));
+    out.extend(others);
+    out.extend(parties);
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CheckStarts, held_under, rationale_block};
+    use super::{CheckStarts, held_under, nonparty_first_order, rationale_block};
     use crate::coordination::{ClosedContract, Closure, ProducerRationale};
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The contracts no interface binds go first, each kind in plan order:
+    /// stable, so rotation hands routes out in a reproducible order.
+    #[test]
+    fn non_parties_go_first_and_each_kind_keeps_its_order() {
+        let parties = ["p1", "p2", "p3"];
+        let out = nonparty_first_order(ids(&["p1", "a", "p2", "b", "p3", "c"]), 0, |id| {
+            parties.contains(&id)
+        });
+        assert_eq!(out, ids(&["a", "b", "c", "p1", "p2", "p3"]));
+    }
+
+    /// The user's chosen order is the first `keep` ids and is never moved,
+    /// whether those ids are parties or not.
+    #[test]
+    fn the_users_order_stays_in_front() {
+        let out = nonparty_first_order(ids(&["p1", "a", "p2", "b"]), 2, |id| id.starts_with('p'));
+        assert_eq!(out, ids(&["p1", "a", "b", "p2"]));
+        // `keep` past the end is the whole list.
+        let all = nonparty_first_order(ids(&["p1", "a"]), 9, |id| id.starts_with('p'));
+        assert_eq!(all, ids(&["p1", "a"]));
+    }
+
+    /// With no party, or only parties, the order is the one it was given.
+    #[test]
+    fn with_one_kind_only_the_order_is_unchanged() {
+        let given = ids(&["x", "y", "z"]);
+        assert_eq!(nonparty_first_order(given.clone(), 0, |_| false), given);
+        assert_eq!(nonparty_first_order(given.clone(), 0, |_| true), given);
+        assert!(nonparty_first_order(Vec::new(), 0, |_| true).is_empty());
+    }
 
     /// A task that has finished and reported: its handle, once finished.
     async fn finished(task: tokio::task::JoinHandle<()>) -> tokio::task::JoinHandle<()> {

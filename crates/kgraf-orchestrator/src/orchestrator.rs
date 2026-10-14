@@ -617,6 +617,16 @@ pub struct OrchestratorConfig {
     /// planner wrote it. Plan review and a user-chosen order keep a plan as
     /// written whatever this says.
     pub collapse_chains: bool,
+    /// Start the contracts whose gate has nothing to do on the loop before a
+    /// contract whose gate still has a stub to land or a handshake to make,
+    /// within one dispatch round (`--early-nonparty`). Those steps run on the
+    /// loop and the loop starts one contract at a time, so a contract ready in
+    /// the same round waits behind them. The order among the contracts of
+    /// each kind, and the order the user chose, are kept. Off by default: it
+    /// changes the order rotation hands out routes in, and so which route a
+    /// contract gets. A run with no interface checks has no such gate, and is
+    /// scheduled the same either way.
+    pub early_nonparty: bool,
     /// How long a route whose call failed at the transport stays out of
     /// rotation before it is probed again, doubled for each fault in a row up
     /// to `route_health::MAX_COOLDOWN_MS` (`route_health.rs`). Thirty seconds
@@ -654,6 +664,7 @@ impl Default for OrchestratorConfig {
             max_in_flight_per_cluster: crate::cluster_cap::DEFAULT_MAX_IN_FLIGHT_PER_CLUSTER,
             approve_plan: false,
             collapse_chains: true,
+            early_nonparty: false,
             route_fault_cooldown: Duration::from_secs(30),
             time_limit: None,
         }
@@ -4280,6 +4291,7 @@ impl RunLoop {
                 task_kind: c.task_kind,
             })
             .collect();
+        self.latency.plan_accepted_ms = Some(self.now());
         let event = TraceEvent::PlanAccepted {
             at_ms: self.now(),
             revision: self.record.replans + 1,
@@ -5099,6 +5111,7 @@ impl RunLoop {
         };
         ids.sort_by_key(|id| rank(id));
         let ids = self.cross_feature_order(ids);
+        let ids = self.nonparty_first(ids).await?;
         for id in ids.clone() {
             if self.stopping {
                 break;
@@ -5541,6 +5554,13 @@ impl RunLoop {
             .to_owned(),
         );
         self.note_wait(id, Self::wait_of_defer(reason, &detail));
+        if !id.is_empty() {
+            let now = self.now();
+            self.latency
+                .first_deferred_ms
+                .entry(id.to_owned())
+                .or_insert(now);
+        }
         let cluster_hold = cluster_cap::is_hold_detail(&detail);
         if !id.is_empty()
             && !self
@@ -8272,16 +8292,45 @@ impl RunLoop {
                 };
                 self.latency.gap_written.insert(contract.to_owned());
                 let gap_us = (facts.worker_started_ms - planner_ended_ms).max(0) * 1_000;
-                let model: Vec<crate::latency::Interval> = facts
-                    .planner_spans
+                let eligible_ms = self.eligible_since(contract, facts.worker_started_ms);
+                // The split runs from eligibility when it is known (a
+                // contract that waited on a dependency does not count that
+                // run), else from the planner's last call as before.
+                let from_ms = eligible_ms.unwrap_or(planner_ended_ms);
+                let wall_us = (facts.worker_started_ms - from_ms).max(0) * 1_000;
+                let at = |ms: i64| (ms - from_ms) * 1_000;
+                let spans = if from_ms == planner_ended_ms {
+                    facts.planner_spans.clone()
+                } else {
+                    self.s
+                        .ledger
+                        .planner_spans_between(&planner, from_ms, facts.worker_started_ms)
+                        .unwrap_or_else(|_| facts.planner_spans.clone())
+                };
+                let model: Vec<crate::latency::Interval> = spans
                     .iter()
-                    .map(|(s, f)| {
+                    .map(|(s, f)| crate::latency::Interval::new(at(*s), at(*f)))
+                    .collect();
+                let checks = self.check_spans_of(contract, facts.worker_started_ms);
+                let checks: Vec<crate::latency::Interval> = checks
+                    .iter()
+                    .map(|(s, f)| crate::latency::Interval::new(at(*s), at(*f)))
+                    .collect();
+                // Waiting for a slot: from the first deferral to the attempt
+                // that dispatched the contract.
+                let capacity: Vec<crate::latency::Interval> = self
+                    .latency
+                    .first_deferred_ms
+                    .get(contract)
+                    .map(|first| {
                         crate::latency::Interval::new(
-                            (s - planner_ended_ms) * 1_000,
-                            (f - planner_ended_ms) * 1_000,
+                            at(*first),
+                            at(anchor.min(facts.worker_started_ms)),
                         )
                     })
+                    .into_iter()
                     .collect();
+                let split = crate::latency::attribute_dispatch(wall_us, &model, &checks, &capacity);
                 let at_ms = self.now();
                 self.write_latency_event(TraceEvent::DispatchGap {
                     at_ms,
@@ -8289,12 +8338,15 @@ impl RunLoop {
                     planner_ended_ms,
                     worker_started_ms: facts.worker_started_ms,
                     gap_us,
+                    eligible_ms,
+                    capacity_wait_us: split.capacity_wait_us,
+                    checks_us: split.checks_us,
                     worker_queued_ms: facts.worker_queued_ms,
                 })
                 .await;
                 self.emit_latency(
                     crate::latency::LatencyKind::SmallRequestDispatch,
-                    crate::latency::attribute(gap_us, &model, &[]),
+                    split,
                     Some(contract.to_owned()),
                 )
                 .await
@@ -8309,6 +8361,19 @@ impl RunLoop {
         }
     }
 
+    /// The wall millisecond a contract became eligible: its plan was accepted,
+    /// or its last dependency merged, whichever is later. `None` when that is
+    /// not known (a run resumed after the plan was accepted, a dependency that
+    /// merged in an earlier process) or lies after `worker_started_ms`.
+    fn eligible_since(&self, contract: &str, worker_started_ms: i64) -> Option<i64> {
+        let planned = self.latency.plan_accepted_ms?;
+        let mut at = planned;
+        for dep in &self.record.contract(contract)?.depends_on {
+            at = at.max(*self.latency.merged_ms.get(dep)?);
+        }
+        (at <= worker_started_ms).then_some(at)
+    }
+
     /// The interaction from a contract's dispatch to its verified work
     /// landing on the integration branch, split by the attribution rule: the
     /// contract's ledger calls are model time, its verification is tool
@@ -8318,6 +8383,10 @@ impl RunLoop {
         &mut self,
         contract: &OpenContract,
     ) -> Result<(), OrchestratorError> {
+        let merged_at = self.now();
+        self.latency
+            .merged_ms
+            .insert(contract.contract.clone(), merged_at);
         let Some(clock) = self.latency.contracts.get(&contract.contract).copied() else {
             return Ok(());
         };
