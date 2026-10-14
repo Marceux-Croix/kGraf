@@ -600,8 +600,19 @@ impl Interaction {
             }
             RunsUpdate::Unavailable(e) => self.runs.error = Some(e),
         }
-        self.host
-            .set_record_status(run_view::newest_status(&self.runs.runs));
+        // The watch's own poll time is said beside the run's status.
+        let status = run_view::newest_status(&self.runs.runs).map(|s| {
+            match self
+                .watch
+                .as_ref()
+                .and_then(RunWatch::latest_split)
+                .map(|e| e.line())
+            {
+                Some(line) => format!("{s}\n{line}"),
+                None => s,
+            }
+        });
+        self.host.set_record_status(status);
         self.plan_dirty = true;
         self.runs_generation += 1;
         true

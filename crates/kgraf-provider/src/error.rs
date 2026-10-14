@@ -71,6 +71,9 @@ pub enum ProviderError {
         adapter: &'static str,
         status: u16,
         body: String,
+        /// The wait the server asked for (`retry-after-ms`, or `retry-after`
+        /// in seconds), in milliseconds. `None` when the response named none.
+        retry_after_ms: Option<u64>,
     },
 
     /// The server could not parse the **model's own** output (a malformed tool
@@ -280,6 +283,14 @@ impl ProviderError {
         }
     }
 
+    /// The wait the server asked for with its status answer, in milliseconds.
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            ProviderError::Http { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        }
+    }
+
     /// Whether the server failed to parse the model's own output, so a fresh
     /// sample of the same request is worth sending (see
     /// [`Self::ModelOutputMalformed`]). No other error kind is retried on this
@@ -332,6 +343,7 @@ mod tests {
             adapter: "t",
             status,
             body: String::new(),
+            retry_after_ms: None,
         }
     }
 

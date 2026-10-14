@@ -54,6 +54,87 @@ pub struct LatencyHistory {
     /// Every generative call on the model; read only when `answer_calls` is
     /// too short to decide.
     pub model_calls: Vec<u64>,
+    /// Finished calls read by route, newest first, for [`crate::route_speed`].
+    /// Empty unless the reader asked for them: the answer wait does not use
+    /// them.
+    pub route_calls: Vec<RouteCall>,
+}
+
+/// Output below this many tokens is a small call (a triage, a re-grounding, a
+/// short answer); at or above it, a large one (a plan, a delta, a worker
+/// round that writes).
+pub const SMALL_OUTPUT_TOKENS: u64 = 400;
+
+/// How much a call produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SizeClass {
+    Small,
+    Large,
+}
+
+/// One finished call on a route: what [`crate::route_speed::RouteSpeed`] is
+/// computed from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteCall {
+    pub route: String,
+    /// Wall time from the call's start to its end, milliseconds. For a
+    /// throttled attempt, the time until the 429 came back.
+    pub latency_ms: u64,
+    pub output_tokens: u64,
+    /// Time to first token. `None` when the call did not stream; never zero.
+    pub ttft_ms: Option<u64>,
+    /// Rate-limit wait inside `latency_ms`. `None` when no limiter admitted
+    /// the call.
+    pub queued_ms: Option<u64>,
+    /// The call ended on a 429, with the wait the server asked for if it
+    /// named one.
+    pub throttled: Option<Throttle>,
+    /// Another call on the route ran during this one (otherwise lone).
+    pub overlapped: bool,
+}
+
+/// A 429 answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Throttle {
+    pub retry_after_ms: Option<u64>,
+}
+
+impl RouteCall {
+    pub fn size_class(&self) -> SizeClass {
+        if self.output_tokens < SMALL_OUTPUT_TOKENS {
+            SizeClass::Small
+        } else {
+            SizeClass::Large
+        }
+    }
+
+    /// Time spent generating: the call's wall time less its rate-limit wait.
+    pub fn generation_ms(&self) -> u64 {
+        self.latency_ms.saturating_sub(self.queued_ms.unwrap_or(0))
+    }
+
+    /// Output tokens per second of generation. `None` for a call with no
+    /// output or no generation time.
+    pub fn tokens_per_s(&self) -> Option<f64> {
+        let ms = self.generation_ms();
+        (self.output_tokens > 0 && ms > 0).then(|| self.output_tokens as f64 * 1_000.0 / ms as f64)
+    }
+
+    /// From a ledger row. A row with a negative span is clamped to zero.
+    pub fn from_row(row: &kgraf_provider::RouteCallRow) -> Self {
+        let ms = |v: i64| v.max(0) as u64;
+        Self {
+            route: row.route.clone(),
+            latency_ms: ms(row.finished_ms - row.started_ms),
+            output_tokens: row.output_tokens,
+            ttft_ms: row.ttft_ms.map(ms),
+            queued_ms: row.queued_ms.map(ms),
+            throttled: (row.http_status == Some(429)).then_some(Throttle {
+                retry_after_ms: row.retry_after_ms.map(ms),
+            }),
+            overlapped: row.overlapped,
+        }
+    }
 }
 
 /// Which calls a measured wait was taken from.
@@ -195,6 +276,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: calls.clone(),
                 model_calls: Vec::new(),
+                ..Default::default()
             }),
         );
         assert!(
@@ -223,6 +305,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: secs(&[2; 10]),
                 model_calls: Vec::new(),
+                ..Default::default()
             }),
         );
         assert_eq!(fast.wait, FLOOR);
@@ -231,6 +314,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: secs(&[3_000; 10]),
                 model_calls: Vec::new(),
+                ..Default::default()
             }),
         );
         assert_eq!(stalled.wait, CEILING);
@@ -244,6 +328,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: secs(&[10; 3]),
                 model_calls: secs(&[200; 12]),
+                ..Default::default()
             }),
         );
         assert_eq!(w.wait, Duration::from_secs(400));
@@ -264,6 +349,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: secs(&[200; 20]),
                 model_calls: Vec::new(),
+                ..Default::default()
             }),
         );
         assert_eq!(w.wait, Duration::from_secs(45));
@@ -288,6 +374,7 @@ mod tests {
             Ok(LatencyHistory {
                 answer_calls: secs(&[500; 7]),
                 model_calls: secs(&[500; 7]),
+                ..Default::default()
             }),
         );
         assert_eq!(short.wait, DEFAULT, "seven calls do not decide");

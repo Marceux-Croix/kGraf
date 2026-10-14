@@ -263,6 +263,7 @@ impl Provider for WorkerFake {
                 adapter: "fake-worker",
                 status: 400,
                 body: REFUSAL_BODY.into(),
+                retry_after_ms: None,
             });
         }
         if round == 0 {
@@ -308,6 +309,7 @@ impl Provider for WorkerFake {
                 adapter: "fake-worker",
                 status: 400,
                 body: "the test failed this parked call".into(),
+                retry_after_ms: None,
             });
         }
         let held = self.hold.lock().expect("lock").clone();

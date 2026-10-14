@@ -647,14 +647,35 @@ impl RouteLimiter {
         // which are not rounds). A failure to record it
         // is logged, never fatal: a route this crate cannot yet resolve is
         // reported as "unmeasured" downstream, not as a broken call.
+        // Armed from the first poll: a cancel at any await below closes the
+        // row as failed, since the request has not left.
+        let mut guard = FailIfDropped { token, armed: true };
         if let Err(e) = token.record_route_async(self.route()).await {
             eprintln!(
                 "kgraf: could not record the route on call {}: {e}",
                 token.id()
             );
         }
-        let mut guard = FailIfDropped { token, armed: true };
         let acquired = self.acquire(adapter).await;
+        // The wait for a slot is recorded on the row, so a throttled route's
+        // queue time is told apart from generation time. The guard stays armed
+        // across this write: a cancel here still closes the row as failed,
+        // since the request has not left. A failed write goes to the
+        // diagnostics file and is never fatal, like the route above.
+        if let Ok(waited) = &acquired
+            && let Err(e) = token
+                .record_queued_async(waited.as_millis().min(i64::MAX as u128) as i64)
+                .await
+        {
+            kgraf_diag::record(kgraf_diag::DiagEvent::error(
+                kgraf_diag::catch_all_for("kgraf-provider").code,
+                "kgraf-provider",
+                format!(
+                    "could not record the rate-limit wait on call {}: {e}",
+                    token.id()
+                ),
+            ));
+        }
         guard.armed = false;
         if let Err(mut e) = acquired {
             if let Err(ledger) = token.close_on_async(&e, None).await {
@@ -936,6 +957,14 @@ mod tests {
         assert!(waited >= Duration::from_millis(30), "waited {waited:?}");
         let stats = p.limiter().stats();
         assert_eq!((stats.admitted, stats.waited, stats.refused), (2, 1, 0));
+        // The wait is on the row: zero for the call admitted at once, the
+        // slept time for the second.
+        let calls = ledger.calls().expect("calls");
+        assert_eq!(calls[0].queued_ms, Some(0));
+        let queued = calls[1]
+            .queued_ms
+            .expect("the waiting call records its wait");
+        assert!((30..2_000).contains(&queued), "queued {queued} ms");
     }
 
     /// A provider that streams, to check the stream path is limited too.
@@ -1017,6 +1046,56 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].settlement, Settlement::Failed);
         assert!(ledger.unreconciled().expect("unreconciled").is_empty());
+    }
+
+    /// A call cancelled at any await of admission, once its route is recorded,
+    /// is closed as failed: the write of the rate-limit wait is not an
+    /// unguarded cancel point. The ledger is on disk so each write is
+    /// pending for a moment; the admission future is polled by hand and
+    /// dropped after `k` polls, for many `k`.
+    #[test]
+    fn a_call_cancelled_during_admission_is_failed_wherever_it_stops() {
+        use std::task::{Context, Poll, Waker};
+        let dir = tempfile::tempdir().expect("dir");
+        let ledger = Ledger::open(&dir.path().join("ledger.db")).expect("ledger");
+        let limiter =
+            RouteLimiter::new("r", RateLimit::parse("600000/1000@1000").expect("spec")).expect("l");
+        let mut cx = Context::from_waker(Waker::noop());
+        let (mut cancelled, mut completed) = (0, 0);
+        for k in 1..400 {
+            let token = ledger
+                .begin("instant", Protocol::Additive, "m", "agent", "task")
+                .expect("begin");
+            let mut fut = Box::pin(limiter.admit("instant", &token));
+            let mut done = false;
+            // Spacing the polls lets the writer thread commit between them, so
+            // the cancel lands at each of the awaits in turn across the runs.
+            let pause = Duration::from_micros((k % 9) as u64 * 250);
+            for _ in 0..(k % 6 + 1) {
+                if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                    r.expect("admitted");
+                    done = true;
+                    break;
+                }
+                std::thread::sleep(pause);
+            }
+            if done {
+                completed += 1;
+                drop(fut);
+                token.fail().expect("close");
+                continue;
+            }
+            drop(fut);
+            let row = ledger.call(token.id()).expect("read").expect("row");
+            cancelled += 1;
+            assert_eq!(
+                row.settlement,
+                Settlement::Failed,
+                "cancelled after {k} poll(s)"
+            );
+        }
+        assert!(cancelled > 20, "cancelled {cancelled} times");
+        assert!(completed > 5, "some runs finished: {completed}");
     }
 
     #[tokio::test]

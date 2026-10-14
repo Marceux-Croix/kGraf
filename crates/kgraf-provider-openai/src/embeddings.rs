@@ -294,11 +294,13 @@ impl Poster {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
         if !status.is_success() {
+            let retry_after_ms = crate::retry_after_of(&http);
             let text = crate::bounded_error_body(self.config.timeout, http).await;
             let error = ProviderError::Http {
                 adapter,
                 status: status.as_u16(),
                 body: text,
+                retry_after_ms,
             };
             token.close_on_async(&error, request_id.as_deref()).await?;
             return Err(error);

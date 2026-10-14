@@ -811,6 +811,8 @@ pub(crate) fn test_report(status: kgraf_orchestrator::RunStatus) -> kgraf_orches
         notices: Vec::new(),
         unverified: Vec::new(),
         unfinished: Vec::new(),
+        latency: Vec::new(),
+        latency_clocks_held: 0,
     }
 }
 
@@ -839,6 +841,13 @@ fn report_lines(report: &kgraf_orchestrator::RunReport) -> Vec<String> {
         "dispatched {} (serialized {}, fraction {:.3})",
         report.counters.dispatches, report.counters.serialized, report.serialized_fraction
     ));
+    // The newest split of each measured interaction, one line per kind.
+    for line in &report.latency {
+        out.push(format!(
+            "latency    {}",
+            line.trim_start_matches("latency ")
+        ));
+    }
     let leases = &report.lease_measurements;
     out.push(format!(
         "leases     {} path(s) held by more than one agent, needless waits {}",
@@ -1227,6 +1236,36 @@ mod tests {
         );
     }
 
+    /// The report prints the newest split of each interaction kind, one
+    /// `latency` line per kind, and none when nothing was measured.
+    #[test]
+    fn the_printed_report_carries_one_latency_line_per_measured_kind() {
+        let mut report = test_report(kgraf_orchestrator::RunStatus::Completed);
+        assert!(
+            !report_lines(&report)
+                .iter()
+                .any(|l| l.starts_with("latency")),
+            "nothing measured, nothing printed"
+        );
+        report.latency = vec![
+            "latency small_request_dispatch (B2): 120.0 ms = kgraf 120.0 + model 0.0 + tools 0.0"
+                .into(),
+            "latency contract_merged (B10): 900.0 ms = kgraf 300.0 + model 600.0 + tools 0.0"
+                .into(),
+        ];
+        let lines: Vec<String> = report_lines(&report)
+            .into_iter()
+            .filter(|l| l.starts_with("latency"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "latency    small_request_dispatch (B2): 120.0 ms = kgraf 120.0 + model 0.0 + tools 0.0",
+                "latency    contract_merged (B10): 900.0 ms = kgraf 300.0 + model 600.0 + tools 0.0",
+            ]
+        );
+    }
+
     /// The CLI report carries an analytics failure.
     #[test]
     fn the_printed_report_carries_an_analytics_failure() {
@@ -1247,6 +1286,8 @@ mod tests {
             notices: vec!["the check generated Cargo.lock".into()],
             unverified: Vec::new(),
             unfinished: Vec::new(),
+            latency: Vec::new(),
+            latency_clocks_held: 0,
         };
         assert!(
             !report_lines(&report)

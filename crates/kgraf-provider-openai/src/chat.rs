@@ -1118,8 +1118,9 @@ impl kgraf_provider::Provider for ChatCompletionsAdapter {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         if !status.is_success() {
+            let retry_after = crate::retry_after_of(&http);
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text, retry_after);
             // A 4xx rejection billed nothing; a 5xx or 408 may have. `close_on`
             // keeps the second kind open for reconciliation.
             token.close_on_async(&error, request_id.as_deref()).await?;
@@ -1377,8 +1378,9 @@ impl Streaming for ChatCompletionsAdapter {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         if !status.is_success() {
+            let retry_after = crate::retry_after_of(&http);
             let text = crate::bounded_error_body(self.config.timeout, http).await;
-            let error = crate::http_error(self.adapter_name(), status.as_u16(), text);
+            let error = crate::http_error(self.adapter_name(), status.as_u16(), text, retry_after);
             token.close_on_async(&error, request_id.as_deref()).await?;
             return Err(error);
         }

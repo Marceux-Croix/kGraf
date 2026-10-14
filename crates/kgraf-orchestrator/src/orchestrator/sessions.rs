@@ -1687,6 +1687,7 @@ mod unit_tests {
                 Some(h) => Ok(crate::answer_wait::LatencyHistory {
                     answer_calls: h.iter().map(|s| s * 1_000).collect(),
                     model_calls: Vec::new(),
+                    ..Default::default()
                 }),
                 None => Err("the ledger is locked".into()),
             }

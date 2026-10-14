@@ -78,6 +78,13 @@ Notes on single rows:
 
 - `openai` embedding: one call of one text. Request batching, the vector-width check and
   per-model rate-limit header recording were added after it. Recorded replies test those.
+- Rate-limit answers (hosted wires with an HTTP status): an adapter reads `retry-after-ms`, or
+  `retry-after` in seconds, from a failed response (capped at 24 hours; an HTTP-date, a negative
+  or a non-numeric value is not read), and the failed call keeps it with the HTTP status on its
+  ledger row (`http_status`, `retry_after_ms`), beside the time the call waited for a rate-limit
+  slot (`queued_ms`). The per-route limits the OpenAI-style and Anthropic-style header readers
+  record are unchanged by it. Tested against recorded headers and a stub vendor; no route's
+  status above changed, since none was re-verified live for this.
 - `anthropic`: plain call, streamed call, tool round trip, prompt caching (cold write, then
   warm read), rate-limit headers, and a note injected after tool results all passed.
 - `ollama`: the first exchange used `qwen2.5-coder:7b`, which returned its tool call as plain

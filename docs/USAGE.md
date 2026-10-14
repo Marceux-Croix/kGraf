@@ -645,7 +645,11 @@ Runs in a project keep going while you view another.
 
 **The orchestrator box.** Plain text is a note for the running run. In a window with no run,
 use `/run <instruction>` to start a paid run through the same path as `kgraf orchestrate`. It
-needs `.kgraf/run.json`. `/status` asks where the run stands. `/compact` compacts the
+needs `.kgraf/run.json`. `/status` asks where the run stands. Once kGraf has measured an
+interaction, `/status` adds one short line per kind of interaction, in budget order, each the
+newest split of its kind, that splits its time into kGraf overhead, model time and tool time (for example
+`latency contract_merged (B10): 900.0 ms = kgraf 300.0 + model 600.0 + tools 0.0`). The run
+report prints the same lines. `/compact` compacts the
 orchestrator, and `/compact selected` or `/compact <worker>` targets a worker. `/help` lists
 them. Tool approvals are answered in place: allow once, allow always, deny.
 

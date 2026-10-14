@@ -1788,6 +1788,9 @@ impl ModelCaller {
         };
         let call = token.id().clone();
         // The adapter settles the token on success and closes it on error.
+        // This call is not streamed, so the row has no time to first token:
+        // `ttft_ms` stays absent (NULL), and `RouteSpeed` reports it absent,
+        // never as zero.
         match provider.complete(request, &token).await {
             Ok(response) if response.stop_reason == kgraf_provider::StopReason::MaxTokens => (
                 Err(PlanError::attributed(
@@ -2272,6 +2275,7 @@ impl crate::QuestionAnswerer for ModelAnswerer {
         Ok(LatencyHistory {
             answer_calls,
             model_calls,
+            ..Default::default()
         })
     }
 
@@ -3363,6 +3367,7 @@ mod tests {
             adapter: "a",
             status: 500,
             body: "boom".into(),
+            retry_after_ms: None,
         });
         assert!(!http.reaskable() && !http.is_malformed_answer());
         let spent = PlanError::MalformedAfterRetries {

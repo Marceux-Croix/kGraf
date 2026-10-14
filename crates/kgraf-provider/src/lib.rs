@@ -33,9 +33,9 @@ pub mod reasoning;
 pub mod streaming;
 
 pub use accounting::{
-    CallRecord, CallToken, CallTrace, GroupBy, GroupKey, Ledger, LedgerAck, LedgerError, McpCall,
-    McpCallRecord, ROUTE_STATS_MIN_ROUNDS, RouteRoundStats, Settlement, SpendGroup, SpendOf,
-    TaskUsage,
+    CallRecord, CallToken, CallTrace, DispatchGapFacts, GroupBy, GroupKey, Ledger, LedgerAck,
+    LedgerError, McpCall, McpCallRecord, ROUTE_STATS_MIN_ROUNDS, RouteCallRow, RouteRoundStats,
+    Settlement, SpendGroup, SpendOf, TaskUsage,
 };
 pub use call_errors::{
     AgentLog, AnswerRecovery, AnswerRecoveryAction, CallError, CallErrorLog,
@@ -50,7 +50,7 @@ pub use kinds::{
 };
 pub use limits::{
     HeaderGet, ObservedLimits, last_429, parse_anthropic_style, parse_openai_style, record_429,
-    record_429_now,
+    record_429_now, retry_after_ms,
 };
 pub use message::{
     Content, Message, ReasoningEffort, Request, Response, Role, Signature, StopReason, ToolChoice,

@@ -301,6 +301,30 @@ pub enum TraceEvent {
         waited_ms: u64,
         waits: u64,
     },
+    /// One interaction's wall time split into kGraf overhead, model time and
+    /// tool time (decision 0100, section 1). The three parts sum to the wall
+    /// time. See [`crate::latency`].
+    Latency(crate::latency::LatencyEvent),
+    /// One `try_dispatch` attempt, step by step: written for every attempt,
+    /// whether it dispatched, deferred or held the contract. The steps and
+    /// `residual_us` sum to `total_us`.
+    DispatchLatency(crate::latency::DispatchLatency),
+    /// The gap between the end of the last planner call and the start of a
+    /// contract's first worker call in the ledger, written once per contract.
+    DispatchGap {
+        at_ms: i64,
+        contract: String,
+        /// Wall-clock milliseconds when the last planner call ended.
+        planner_ended_ms: i64,
+        /// Wall-clock milliseconds when the worker's first call started.
+        worker_started_ms: i64,
+        gap_us: i64,
+        /// How long the worker's first call then waited for a rate-limit
+        /// slot. That wait begins after the call starts, so it is not part of
+        /// `gap_us`; it is named here so it is never read as kGraf time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_queued_ms: Option<i64>,
+    },
     /// Question 6. Accounting only (decision 0080 removed every spend cap).
     Spend {
         at_ms: i64,
@@ -1100,6 +1124,9 @@ fn scrub_trace_fields(event: TraceEvent) -> TraceEvent {
         | TraceEvent::Compaction { .. }
         | TraceEvent::ExtractorChanged { .. }
         | TraceEvent::RateLimitWaits { .. }
+        | TraceEvent::Latency(_)
+        | TraceEvent::DispatchLatency(_)
+        | TraceEvent::DispatchGap { .. }
         | TraceEvent::Spend { .. }) => other,
     }
 }
@@ -1250,6 +1277,62 @@ mod tests {
         for e in [&gate, &integration, &waits] {
             let back: TraceEvent = serde_json::from_str(&line(e)).expect("round trip");
             assert_eq!(&back, e);
+        }
+    }
+
+    /// The latency events keep the names the canary and benchmark readers
+    /// look for, and survive a round trip and the redaction pass unchanged.
+    #[test]
+    fn the_latency_events_serialize_round_trip_and_pass_redaction_unchanged() {
+        use crate::latency::{
+            DispatchLatency, DispatchStep, Interval, LatencyEvent, LatencyKind, attribute,
+        };
+        let latency = TraceEvent::Latency(LatencyEvent::new(
+            LatencyKind::NoteAck,
+            9,
+            attribute(2_000, &[Interval::new(0, 500)], &[]),
+            None,
+        ));
+        let dispatch = TraceEvent::DispatchLatency(DispatchLatency {
+            at_ms: 1,
+            contract: "c1".into(),
+            outcome: "deferred:lease".into(),
+            total_us: 30,
+            steps: vec![DispatchStep {
+                step: "contract_gate".into(),
+                offset_us: 10,
+                us: 10,
+            }],
+            residual_us: 20,
+        });
+        let gap = TraceEvent::DispatchGap {
+            at_ms: 5,
+            contract: "c1".into(),
+            planner_ended_ms: 1_000,
+            worker_started_ms: 1_450,
+            gap_us: 450_000,
+            worker_queued_ms: None,
+        };
+        let line = |e: &TraceEvent| serde_json::to_string(e).expect("serialize");
+        assert_eq!(
+            line(&latency),
+            r#"{"event":"latency","kind":"note_ack","at_ms":9,"wall_us":2000,"kgraf_us":1500,"model_us":500,"tools_us":0,"model_calls_overlapped":0}"#
+        );
+        assert!(line(&dispatch).starts_with(
+            r#"{"event":"dispatch_latency","at_ms":1,"contract":"c1","outcome":"deferred:lease""#
+        ));
+        assert_eq!(
+            line(&gap),
+            r#"{"event":"dispatch_gap","at_ms":5,"contract":"c1","planner_ended_ms":1000,"worker_started_ms":1450,"gap_us":450000}"#
+        );
+        for e in [&latency, &dispatch, &gap] {
+            let back: TraceEvent = serde_json::from_str(&line(e)).expect("round trip");
+            assert_eq!(&back, e);
+            assert_eq!(
+                &scrub_trace_event(e.clone()),
+                e,
+                "numbers and fixed names only"
+            );
         }
     }
 

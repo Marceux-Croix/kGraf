@@ -259,6 +259,45 @@ fn median_u64(values: &mut [u64]) -> u64 {
     values[values.len() / 2]
 }
 
+/// What [`Ledger::dispatch_gap_facts`] reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchGapFacts {
+    /// When the worker's first call began, wall-clock milliseconds.
+    pub worker_started_ms: i64,
+    /// How long that call then waited for a rate-limit slot (after it began,
+    /// so not inside the gap). `None` when no limiter admitted it.
+    pub worker_queued_ms: Option<i64>,
+    /// The end of the latest planner call that finished before the dispatch
+    /// began. `None` when there was none.
+    pub planner_ended_ms: Option<i64>,
+    /// The planner's calls that overlap the gap, `(started_ms, finished_ms)`:
+    /// a re-grounding or handshake call made while the dispatch was being
+    /// prepared. Model time inside the gap.
+    pub planner_spans: Vec<(i64, i64)>,
+}
+
+/// One finished call on a route, as [`Ledger::recent_route_calls`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteCallRow {
+    pub route: String,
+    pub call_kind: Option<String>,
+    pub started_ms: i64,
+    pub finished_ms: i64,
+    /// Text plus reasoning output tokens.
+    pub output_tokens: u64,
+    /// Time to first token; `None` for a call that did not stream. Never
+    /// read as zero.
+    pub ttft_ms: Option<i64>,
+    /// Wait for a rate-limit slot; `None` when no limiter admitted the call.
+    pub queued_ms: Option<i64>,
+    pub http_status: Option<u16>,
+    pub retry_after_ms: Option<i64>,
+    /// Settled `counted`. A row that ended on a 429 is not.
+    pub counted: bool,
+    /// Another call on the route ran during this one.
+    pub overlapped: bool,
+}
+
 /// One accounted call, as stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallRecord {
@@ -291,6 +330,17 @@ pub struct CallRecord {
     /// several different routes can share). `None` for a call made without
     /// going through either wrapper (most test fixtures).
     pub route: Option<String>,
+    /// Milliseconds the call waited for a rate-limit slot before it was sent.
+    /// `None` when no limiter admitted the call (an unlimited route, a row
+    /// from before the column existed); `Some(0)` is a call admitted at once.
+    pub queued_ms: Option<i64>,
+    /// The HTTP status the call ended on, when it ended on a non-success
+    /// status answer (a 429, a 5xx). `None` for a call that succeeded, one
+    /// that never got an answer, and rows from before the column existed.
+    pub http_status: Option<u16>,
+    /// The wait the server asked for on that answer (`retry-after-ms` or
+    /// `retry-after`), in milliseconds. `None` when it named none.
+    pub retry_after_ms: Option<i64>,
 }
 
 impl CallRecord {
@@ -541,6 +591,21 @@ impl<'ledger> CallToken<'ledger> {
         )
     }
 
+    /// Record how long the call waited for a rate-limit slot, in milliseconds
+    /// (zero for a call admitted at once). Written by the admission path
+    /// ([`crate::ratelimit::RouteLimiter::admit`]) once a slot is taken.
+    pub fn record_queued_async(&self, queued_ms: i64) -> LedgerAck<()> {
+        self.ledger.submit(
+            Op::Wire {
+                id: self.id.clone(),
+                queued_ms: Some(queued_ms),
+                http_status: None,
+                retry_after_ms: None,
+            },
+            Done::unit,
+        )
+    }
+
     /// Append one round's ordered tool list. Called once per round, in order, so
     /// the stored `tool_rounds` array is the round sequence itself, not a set.
     /// Refused once the row has settled, for the same reason as
@@ -584,6 +649,26 @@ impl<'ledger> CallToken<'ledger> {
         error: &crate::ProviderError,
         request_id: Option<&str>,
     ) -> LedgerAck<()> {
+        // A status answer is recorded on the row before it closes, so a
+        // throttled call (429 with a retry-after) can be counted per call.
+        // Operations from one token reach the writer in order, and a write
+        // that fails here fails the close that follows it for the same
+        // reason, so its own ack is not held.
+        if let Some(status) = error.http_status()
+            && !self.settled.load(Ordering::SeqCst)
+        {
+            drop(self.ledger.submit(
+                Op::Wire {
+                    id: self.id.clone(),
+                    queued_ms: None,
+                    http_status: Some(i64::from(status)),
+                    retry_after_ms: error.retry_after_ms().map(|ms| {
+                        i64::try_from(ms.min(crate::limits::MAX_RETRY_AFTER_MS)).unwrap_or(i64::MAX)
+                    }),
+                },
+                Done::unit,
+            ));
+        }
         match error.billing() {
             crate::error::Billing::NotBilled => self.fail_async(),
             crate::error::Billing::MayHaveBilled => self.leave_unreconciled_async(request_id),
@@ -1101,6 +1186,15 @@ enum Op {
     Route {
         id: CallId,
         route: String,
+    },
+    /// Wire facts written after `begin`: the rate-limit wait, and the status
+    /// answer a failed call ended on. Each field is written only when set;
+    /// none is part of the row's content digest (same rule as `route`).
+    Wire {
+        id: CallId,
+        queued_ms: Option<i64>,
+        http_status: Option<i64>,
+        retry_after_ms: Option<i64>,
     },
     ToolRound {
         id: CallId,
@@ -2062,6 +2156,129 @@ impl Ledger {
         })
     }
 
+    /// The facts of one contract's dispatch gap, in one read: the start of
+    /// `worker`'s first call and its wait for a rate-limit slot, the end of the
+    /// latest call of an agent whose id starts with `planner_prefix` that
+    /// finished at or before `anchor_ms` (the instant the contract's dispatch
+    /// began), and the spans of the planner's calls inside the gap (after that
+    /// end and before the worker's first call began). `None` when the worker
+    /// made no call. Every lookup is a range on the agent index or the
+    /// worker's own rows.
+    pub fn dispatch_gap_facts(
+        &self,
+        worker: &str,
+        planner_prefix: &str,
+        anchor_ms: i64,
+    ) -> Result<Option<DispatchGapFacts>, LedgerError> {
+        let upper = format!("{planner_prefix}\u{10FFFF}");
+        self.read(|conn| {
+            let first: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT started_ms, queued_ms FROM calls WHERE agent_id = ?1
+                     ORDER BY started_ms LIMIT 1",
+                    params![worker],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((worker_started_ms, worker_queued_ms)) = first else {
+                return Ok(None);
+            };
+            let before = anchor_ms.min(worker_started_ms);
+            let planner_ended_ms: Option<i64> = conn.query_row(
+                "SELECT MAX(finished_ms) FROM calls
+                 WHERE agent_id >= ?1 AND agent_id < ?2
+                   AND finished_ms IS NOT NULL AND finished_ms <= ?3",
+                params![planner_prefix, upper, before],
+                |row| row.get(0),
+            )?;
+            let mut planner_spans = Vec::new();
+            if let Some(from) = planner_ended_ms {
+                let mut stmt = conn.prepare(
+                    "SELECT started_ms, COALESCE(finished_ms, ?4) FROM calls
+                     WHERE agent_id >= ?1 AND agent_id < ?2
+                       AND started_ms < ?4 AND COALESCE(finished_ms, ?4) > ?3
+                     ORDER BY started_ms",
+                )?;
+                let rows = stmt.query_map(
+                    params![planner_prefix, upper, from, worker_started_ms],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?;
+                for r in rows {
+                    planner_spans.push(r?);
+                }
+            }
+            Ok(Some(DispatchGapFacts {
+                worker_started_ms,
+                worker_queued_ms,
+                planner_ended_ms,
+                planner_spans,
+            }))
+        })
+    }
+
+    /// The newest `limit` finished calls that carry a route (`route` filters to
+    /// one), newest first: the settled, counted generative calls, and any
+    /// call that ended on a 429 (a throttled attempt has no usage but counts
+    /// toward the route's throttling). One query, keyed by route, for
+    /// [`RouteCallRow`]'s timing, wait and overlap facts.
+    ///
+    /// A counted call is `overlapped` when another call on the same route
+    /// (settled or still open) ran at any moment of its span; otherwise it
+    /// was lone. Rows are bounded by `limit`; the overlap probe reads the
+    /// `started_ms` index within [`CALL_SPAN_SLACK_MS`] before each row.
+    pub fn recent_route_calls(
+        &self,
+        route: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RouteCallRow>, LedgerError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.route, c.call_kind, c.started_ms, c.finished_ms,
+                        c.text_output + c.reasoning_output, c.ttft_ms, c.queued_ms,
+                        c.http_status, c.retry_after_ms, c.settlement,
+                        EXISTS (SELECT 1 FROM calls o
+                                WHERE o.route = c.route AND o.id != c.id
+                                  AND o.started_ms BETWEEN c.started_ms - ?2 AND c.finished_ms
+                                  AND COALESCE(o.finished_ms, 9223372036854775807) > c.started_ms)
+                 FROM calls c
+                 WHERE c.route IS NOT NULL AND c.finished_ms IS NOT NULL
+                   AND (?1 IS NULL OR c.route = ?1)
+                   AND (c.settlement = 'counted' OR c.http_status = 429)
+                 ORDER BY c.started_ms DESC",
+            )?;
+            let rows = stmt.query_map(params![route, CALL_SPAN_SLACK_MS], |row| {
+                Ok(RouteCallRow {
+                    route: row.get(0)?,
+                    call_kind: row.get(1)?,
+                    started_ms: row.get(2)?,
+                    finished_ms: row.get(3)?,
+                    output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    ttft_ms: row.get(5)?,
+                    queued_ms: row.get(6)?,
+                    http_status: row.get::<_, Option<i64>>(7)?.map(|s| s as u16),
+                    retry_after_ms: row.get(8)?,
+                    counted: row.get::<_, String>(9)? == "counted",
+                    overlapped: row.get::<_, i64>(10)? != 0,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                if out.len() >= limit {
+                    break;
+                }
+                let row = row?;
+                let generative = !row
+                    .call_kind
+                    .as_deref()
+                    .is_some_and(kgraf_core::is_non_generative_call_kind);
+                if generative {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// The calls that finished at or after `since_ms` (or, unfinished, started
     /// then), oldest first. Reads through the `started_ms` index, with
     /// [`CALL_SPAN_SLACK_MS`] of slack for a call that started earlier and
@@ -2808,6 +3025,15 @@ fn apply_op(conn: &Connection, tip: &mut Tip, op: &Op) -> Result<Done, LedgerErr
             apply_route(conn, id, route)?;
             Ok(Done::Unit)
         }
+        Op::Wire {
+            id,
+            queued_ms,
+            http_status,
+            retry_after_ms,
+        } => {
+            apply_wire(conn, id, *queued_ms, *http_status, *retry_after_ms)?;
+            Ok(Done::Unit)
+        }
         Op::ToolRound { id, tools } => {
             apply_tool_round(conn, id, tools)?;
             Ok(Done::Unit)
@@ -2935,6 +3161,32 @@ fn apply_route(conn: &Connection, id: &CallId, route: &str) -> Result<(), Ledger
         return Err(LedgerError::NotInFlight {
             call: id.to_string(),
             what: "route",
+        });
+    }
+    Ok(())
+}
+
+/// Record the rate-limit wait and the status answer of a call that has not
+/// settled yet. A `None` leaves the column as it is.
+fn apply_wire(
+    conn: &Connection,
+    id: &CallId,
+    queued_ms: Option<i64>,
+    http_status: Option<i64>,
+    retry_after_ms: Option<i64>,
+) -> Result<(), LedgerError> {
+    let changed = conn
+        .prepare_cached(
+            "UPDATE calls SET queued_ms = COALESCE(?2, queued_ms),
+                 http_status = COALESCE(?3, http_status),
+                 retry_after_ms = COALESCE(?4, retry_after_ms)
+             WHERE id = ?1 AND settlement = 'in_flight'",
+        )?
+        .execute(params![id.as_str(), queued_ms, http_status, retry_after_ms])?;
+    if changed == 0 {
+        return Err(LedgerError::NotInFlight {
+            call: id.to_string(),
+            what: "wire facts",
         });
     }
     Ok(())
@@ -3625,7 +3877,8 @@ const CALL_COLUMNS: &str = "id, adapter, protocol, model, agent_id, task_id, set
      uncached_input, cache_read, cache_write, text_output, reasoning_output,
      raw_usage, request_id, started_ms, finished_ms,
      parent_call, call_kind, call_role, ttft_ms, tool_rounds,
-     given_slice_ids, given_prefix_hash, redacted, route, unsplit_reasoning_chars";
+     given_slice_ids, given_prefix_hash, redacted, route, unsplit_reasoning_chars,
+     queued_ms, http_status, retry_after_ms";
 
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     let protocol: String = row.get(2)?;
@@ -3670,6 +3923,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
         },
         redacted: row.get::<_, i64>(23)? != 0,
         route: row.get(24)?,
+        queued_ms: row.get(26)?,
+        http_status: row.get::<_, Option<i64>>(27)?.map(|s| s as u16),
+        retry_after_ms: row.get(28)?,
     })
 }
 
@@ -3928,6 +4184,13 @@ const MIGRATION_COLUMNS: &[(&str, &str)] = &[
     // split is unknown. NULL means the split is as reported. Part of
     // `content_digest` when set.
     ("unsplit_reasoning_chars", "INTEGER"),
+    // Wire facts, written after `begin` like `route` and so not part of
+    // `content_digest`: the milliseconds a call waited for a rate-limit slot,
+    // and the HTTP status and retry-after (ms) of a call that ended on a
+    // non-success status answer. NULL on rows from before the columns existed.
+    ("queued_ms", "INTEGER"),
+    ("http_status", "INTEGER"),
+    ("retry_after_ms", "INTEGER"),
 ];
 
 /// The hash chain, append-only. One row per mutating event: `begin`, `settle`,
@@ -4906,6 +5169,69 @@ mod tests {
         let report = ledger.verify().expect("verify");
         assert!(report.ok, "{:?}", report.first_broken);
         assert_eq!(report.rows_checked, 4);
+    }
+
+    #[test]
+    fn wire_facts_are_stored_and_the_digest_ignores_them() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+
+        // A row written before the columns existed reads them as absent and
+        // verifies.
+        let old = begin_and_settle(&ledger);
+        let row = ledger.call(&old).expect("read").expect("row");
+        assert_eq!(
+            (row.queued_ms, row.http_status, row.retry_after_ms),
+            (None, None, None)
+        );
+        assert!(ledger.verify().expect("verify").ok);
+
+        // A throttled call: the wait, then the 429 with its retry-after.
+        let token = ledger
+            .begin("test", Protocol::Additive, "m", "a", "t")
+            .expect("begin");
+        token.record_queued_async(250).wait().expect("queued");
+        let error = crate::ProviderError::Http {
+            adapter: "test",
+            status: 429,
+            body: String::new(),
+            retry_after_ms: Some(1_500),
+        };
+        token.close_on_async(&error, None).wait().expect("close");
+        let row = ledger.call(token.id()).expect("read").expect("row");
+        assert_eq!(row.queued_ms, Some(250));
+        assert_eq!(row.http_status, Some(429));
+        assert_eq!(row.retry_after_ms, Some(1_500));
+        assert_eq!(row.settlement, Settlement::Failed);
+        let report = ledger.verify().expect("verify");
+        assert!(report.ok, "{:?}", report.first_broken);
+
+        // A hostile retry-after is capped when it is recorded, never negative.
+        let hostile = ledger
+            .begin("test", Protocol::Additive, "m", "a", "t")
+            .expect("begin");
+        let e = crate::ProviderError::Http {
+            adapter: "test",
+            status: 429,
+            body: String::new(),
+            retry_after_ms: Some(u64::MAX),
+        };
+        hostile.close_on_async(&e, None).wait().expect("close");
+        let row = ledger.call(hostile.id()).expect("read").expect("row");
+        assert_eq!(
+            row.retry_after_ms,
+            Some(crate::limits::MAX_RETRY_AFTER_MS as i64)
+        );
+
+        // The columns are not part of the digest: rewriting one is not
+        // tamper evidence for the content the digest covers.
+        exec(
+            &ledger,
+            &format!(
+                "UPDATE calls SET queued_ms = 1 WHERE id = '{}'",
+                token.id().as_str()
+            ),
+        );
+        assert!(ledger.verify().expect("verify").ok);
     }
 
     #[test]
@@ -6747,6 +7073,134 @@ mod tests {
                 .recent_latencies_ms("none", None, 10)
                 .expect("read")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn route_calls_carry_waits_throttles_and_overlap() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let mk = |route: &str, started: i64, finished: i64, settle_ok: bool| {
+            let t = ledger
+                .begin("a", Protocol::Additive, "m", "agent", "task")
+                .expect("begin");
+            t.record_route_async(route).wait().expect("route");
+            if settle_ok {
+                t.settle(&usage(), None).expect("settle");
+            } else {
+                let e = crate::ProviderError::Http {
+                    adapter: "a",
+                    status: 429,
+                    body: String::new(),
+                    retry_after_ms: Some(2_000),
+                };
+                t.close_on_async(&e, None).wait().expect("close");
+            }
+            exec(
+                &ledger,
+                &format!(
+                    "UPDATE calls SET started_ms = {started}, finished_ms = {finished} WHERE id = '{}'",
+                    t.id().as_str()
+                ),
+            );
+            t.id().clone()
+        };
+        let a = mk("r", 1_000, 2_000, true);
+        let _b = mk("r", 1_500, 2_500, true); // overlaps a
+        let _lone = mk("r", 10_000, 10_100, true);
+        let _throttled = mk("r", 20_000, 20_050, false);
+        let _other = mk("other", 1_200, 1_300, true);
+        exec(
+            &ledger,
+            &format!(
+                "UPDATE calls SET queued_ms = 300, ttft_ms = NULL WHERE id = '{}'",
+                a.as_str()
+            ),
+        );
+        let rows = ledger.recent_route_calls(Some("r"), 10).expect("rows");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].started_ms, 20_000, "newest first");
+        assert!(!rows[0].counted);
+        assert_eq!(
+            (rows[0].http_status, rows[0].retry_after_ms),
+            (Some(429), Some(2_000))
+        );
+        assert!(!rows[1].overlapped, "lone");
+        assert!(rows[2].overlapped && rows[3].overlapped);
+        assert_eq!(rows[3].queued_ms, Some(300));
+        assert_eq!(
+            rows[3].ttft_ms, None,
+            "no first-token time is absent, not zero"
+        );
+        assert_eq!(
+            ledger.recent_route_calls(None, 10).expect("rows").len(),
+            5,
+            "every route"
+        );
+        assert_eq!(
+            ledger.recent_route_calls(Some("r"), 2).expect("rows").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_dispatch_gap_is_anchored_on_the_dispatch_and_lists_planner_calls_inside_it() {
+        let ledger = Ledger::open_in_memory().expect("ledger");
+        let mk = |agent: &str, started: i64, finished: i64| {
+            let t = ledger
+                .begin("a", Protocol::Additive, "m", agent, "task")
+                .expect("begin");
+            t.settle(&usage(), None).expect("settle");
+            exec(
+                &ledger,
+                &format!(
+                    "UPDATE calls SET started_ms = {started}, finished_ms = {finished} WHERE id = '{}'",
+                    t.id().as_str()
+                ),
+            );
+            t.id().clone()
+        };
+        mk("orchestrator:r1", 1_000, 1_900); // the plan
+        mk("orchestrator:r1", 2_000, 2_100); // the last planner call before dispatch
+        mk("orchestrator:r1", 2_300, 2_400); // a re-grounding while dispatching
+        mk("orchestrator:r2", 1_500, 1_950); // another run's planner: not this one
+        let w = mk("run-c1-r0-a0", 2_600, 3_000);
+        exec(
+            &ledger,
+            &format!(
+                "UPDATE calls SET queued_ms = 120 WHERE id = '{}'",
+                w.as_str()
+            ),
+        );
+        mk("run-c1-r0-a0", 2_700, 2_800); // a later row of the same worker
+
+        let f = ledger
+            .dispatch_gap_facts("run-c1-r0-a0", "orchestrator:r1", 2_200)
+            .expect("read")
+            .expect("the worker made calls");
+        assert_eq!(f.worker_started_ms, 2_600, "the worker's first call");
+        assert_eq!(f.worker_queued_ms, Some(120));
+        assert_eq!(
+            f.planner_ended_ms,
+            Some(2_100),
+            "ended before the dispatch at 2,200"
+        );
+        assert_eq!(
+            f.planner_spans,
+            vec![(2_300, 2_400)],
+            "the call inside the gap"
+        );
+        // No dispatch instant known: anchored on the worker's own start.
+        let late = ledger
+            .dispatch_gap_facts("run-c1-r0-a0", "orchestrator:r1", i64::MAX)
+            .expect("read")
+            .expect("facts");
+        assert_eq!(late.planner_ended_ms, Some(2_400));
+        assert!(late.planner_spans.is_empty());
+        assert!(
+            ledger
+                .dispatch_gap_facts("nobody", "orchestrator:r1", 0)
+                .expect("read")
+                .is_none()
         );
     }
 

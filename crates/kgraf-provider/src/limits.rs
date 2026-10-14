@@ -219,6 +219,31 @@ fn parse_bare_seconds_ms(s: &str) -> Option<i64> {
     (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1_000.0) as i64)
 }
 
+/// The longest wait a response can ask for that is recorded: 24 hours. A
+/// header naming more (a vendor bug, `1e30`) is read as this, so a recorded
+/// value always fits a signed 64-bit column.
+pub const MAX_RETRY_AFTER_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// The wait a failed response asks for, in milliseconds, for the call's
+/// ledger row and error: `retry-after-ms`, else `retry-after` as a bare
+/// number of seconds, capped at [`MAX_RETRY_AFTER_MS`]. A negative, non-finite
+/// or non-numeric value, and an HTTP-date `retry-after`, give `None`.
+///
+/// Recorded on the call only. It does not feed [`ObservedLimits`]: what the
+/// per-route limit records read from these headers is unchanged by it.
+pub fn retry_after_ms(h: &HeaderGet) -> Option<u64> {
+    let ok = |v: f64| v.is_finite().then_some(v).filter(|v| *v >= 0.0);
+    h("retry-after-ms")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .and_then(ok)
+        .or_else(|| {
+            h("retry-after")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .and_then(|secs| ok(secs * 1_000.0))
+        })
+        .map(|v| v.min(MAX_RETRY_AFTER_MS as f64) as u64)
+}
+
 /// The key one Azure deployment's limits are recorded under: the resource
 /// origin and the deployment. Azure limits apply per deployment, so two
 /// deployments on one resource must not overwrite each other.
@@ -388,6 +413,73 @@ mod tests {
 
         let date = parse_azure_style(&map(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]));
         assert_eq!(date.reset_ms, None, "an HTTP date is not guessed at");
+    }
+
+    #[test]
+    fn retry_after_is_read_for_the_call_and_never_changes_the_recorded_limits() {
+        let throttled = map(&[
+            ("x-ratelimit-reset-requests", "6m0s"),
+            ("anthropic-ratelimit-requests-reset", "2999-01-01T00:00:00Z"),
+            ("retry-after-ms", "1500"),
+            ("retry-after", "9"),
+        ]);
+        assert_eq!(retry_after_ms(&throttled), Some(1_500));
+        assert_eq!(retry_after_ms(&map(&[("retry-after", "7")])), Some(7_000));
+        // The reset the limits record is what it was without the header.
+        let without = map(&[
+            ("x-ratelimit-reset-requests", "6m0s"),
+            ("anthropic-ratelimit-requests-reset", "2999-01-01T00:00:00Z"),
+        ]);
+        assert_eq!(
+            parse_openai_style(&throttled).reset_ms,
+            parse_openai_style(&without).reset_ms
+        );
+        assert_eq!(parse_openai_style(&throttled).reset_ms, Some(360_000));
+        assert_eq!(
+            parse_anthropic_style(&throttled),
+            parse_anthropic_style(&without),
+            "retry-after changes nothing the anthropic reader records"
+        );
+        assert_eq!(
+            parse_openai_style(&map(&[("retry-after", "7")])).reset_ms,
+            None
+        );
+    }
+
+    fn one(name: &str, value: &str) -> impl Fn(&str) -> Option<String> {
+        let (name, value) = (name.to_owned(), value.to_owned());
+        move |asked| (asked == name).then(|| value.clone())
+    }
+
+    #[test]
+    fn a_hostile_retry_after_is_capped_or_refused() {
+        for huge in ["1e30", "1e300", "18446744073709551616"] {
+            let secs = retry_after_ms(&one("retry-after", huge));
+            let ms = retry_after_ms(&one("retry-after-ms", huge));
+            assert_eq!(secs, Some(MAX_RETRY_AFTER_MS), "{huge}");
+            assert_eq!(ms, Some(MAX_RETRY_AFTER_MS), "{huge}");
+            assert!(i64::try_from(secs.unwrap_or(0)).is_ok());
+        }
+        assert_eq!(
+            retry_after_ms(&map(&[("retry-after", "86400")])),
+            Some(86_400_000)
+        );
+        assert_eq!(
+            retry_after_ms(&map(&[("retry-after", "86401")])),
+            Some(MAX_RETRY_AFTER_MS)
+        );
+        for bad in [
+            "-1",
+            "-0.5",
+            "NaN",
+            "inf",
+            "soon",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "",
+        ] {
+            assert_eq!(retry_after_ms(&one("retry-after", bad)), None, "{bad}");
+            assert_eq!(retry_after_ms(&one("retry-after-ms", bad)), None, "{bad}");
+        }
     }
 
     #[test]

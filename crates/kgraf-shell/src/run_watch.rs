@@ -24,14 +24,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kgraf_graph::GraphStore;
 use kgraf_graph::snapshot::{ProjectIndex, open_existing};
+use kgraf_orchestrator::latency::{LatencyEvent, LatencyKind, attribute};
 use kgraf_orchestrator::{RunStateRecord, StoredRun};
 
 /// How often the store is read.
@@ -58,6 +59,8 @@ pub struct RunWatch {
     rx: Receiver<RunsUpdate>,
     stop: Arc<AtomicBool>,
     values_read: Arc<AtomicU64>,
+    /// The newest poll that found a change, as an interaction split.
+    split: Arc<Mutex<Option<LatencyEvent>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -89,15 +92,25 @@ impl RunWatch {
         let values_read = Arc::new(AtomicU64::new(0));
         let flag = stop.clone();
         let counter = values_read.clone();
+        let split: Arc<Mutex<Option<LatencyEvent>>> = Arc::new(Mutex::new(None));
+        let newest = split.clone();
         let thread = std::thread::Builder::new()
             .name("run-watch".into())
-            .spawn(move || watch(&root, poll, &flag, &counter, &tx, &wake))?;
+            .spawn(move || watch(&root, poll, &flag, &counter, &newest, &tx, &wake))?;
         Ok(Self {
             rx,
             stop,
             values_read,
+            split,
             thread: Some(thread),
         })
+    }
+
+    /// How long the newest poll that found a change took, from the start of
+    /// the read to the update being ready to send: all kGraf time (the watch
+    /// calls no model and runs no check). `None` until a poll found a change.
+    pub fn latest_split(&self) -> Option<LatencyEvent> {
+        self.split.lock().ok().and_then(|g| g.clone())
     }
 
     /// The newest update, if any arrived; older ones are superseded.
@@ -227,6 +240,7 @@ fn watch(
     poll: Duration,
     stop: &AtomicBool,
     values_read: &AtomicU64,
+    split: &Mutex<Option<LatencyEvent>>,
     tx: &Sender<RunsUpdate>,
     wake: &dyn Fn(),
 ) {
@@ -234,6 +248,7 @@ fn watch(
     let mut last_error: Option<String> = None;
     let mut store = None;
     while !stop.load(Ordering::SeqCst) {
+        let polled = std::time::Instant::now();
         let result = (|| -> Result<Option<RunsUpdate>, String> {
             if store.is_none() {
                 match open_existing(root).map_err(|e| e.to_string())? {
@@ -264,6 +279,16 @@ fn watch(
             }
         };
         if let Some(u) = update {
+            if let (RunsUpdate::Runs { .. }, Ok(mut g)) = (&u, split.lock()) {
+                let wall_us = polled.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                let at_ms = kgraf_graph::snapshot::now_ms();
+                *g = Some(LatencyEvent::new(
+                    LatencyKind::WatchPoll,
+                    at_ms,
+                    attribute(wall_us, &[], &[]),
+                    None,
+                ));
+            }
             if tx.send(u).is_err() {
                 return;
             }
@@ -358,6 +383,35 @@ mod tests {
         let r = newest(&runs).expect("record");
         assert_eq!(r.verified_contracts, ["a"]);
         assert!(r.status_line().starts_with("run r1 (running): 1 verified"));
+    }
+
+    /// A poll that finds a change leaves its own time as an interaction split:
+    /// kind `watch_poll`, all kGraf time, the parts summing to the wall time.
+    /// An idle poll leaves the newest split as it was.
+    #[test]
+    fn a_poll_that_finds_a_change_leaves_its_time_split() {
+        let (dir, store) = project();
+        let watch = RunWatch::spawn(dir.path().to_owned(), Duration::from_millis(10), || {})
+            .expect("watch");
+        let record = RunStateRecord::new(RunId::new("r1"), "make a", 10);
+        store.save(&record).expect("save");
+        loop {
+            let (runs, _) = runs_of(wait(&watch));
+            if newest(&runs).is_some() {
+                break;
+            }
+        }
+        let first = watch.latest_split().expect("a split after an update");
+        assert_eq!(first.kind, LatencyKind::WatchPoll);
+        assert!(first.sums(), "{first:?}");
+        assert_eq!((first.model_us, first.tools_us), (0, 0));
+        assert!(first.wall_us > 0);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            watch.latest_split().as_ref(),
+            Some(&first),
+            "an idle poll writes no new split"
+        );
     }
 
     /// Decision 0064: presumed nodes written to the project's graph reach the UI

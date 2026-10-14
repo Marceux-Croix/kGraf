@@ -101,13 +101,20 @@ pub struct Sizer {
     by_model: BTreeMap<String, Vec<TaskHistory>>,
 }
 
-fn p90<T: Copy + Ord>(mut values: Vec<T>) -> Option<T> {
+/// The `pct`th percentile (1 to 100) by nearest rank. `None` for an empty
+/// list. One function for every percentile in the crate's sizing and speed
+/// estimates.
+pub(crate) fn percentile<T: Copy + Ord>(mut values: Vec<T>, pct: usize) -> Option<T> {
     if values.is_empty() {
         return None;
     }
     values.sort_unstable();
-    let idx = ((values.len() as f64) * 0.9).ceil() as usize;
-    Some(values[idx.saturating_sub(1).min(values.len() - 1)])
+    let rank = (values.len() * pct.min(100)).div_ceil(100);
+    Some(values[rank.saturating_sub(1).min(values.len() - 1)])
+}
+
+fn p90<T: Copy + Ord>(values: Vec<T>) -> Option<T> {
+    percentile(values, 90)
 }
 
 impl Sizer {
@@ -327,6 +334,9 @@ mod tests {
             trace: Default::default(),
             redacted: false,
             route: None,
+            queued_ms: None,
+            http_status: None,
+            retry_after_ms: None,
         }
     }
 

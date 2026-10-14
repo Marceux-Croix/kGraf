@@ -1004,6 +1004,7 @@ impl RunLoop {
             if self.stopping {
                 break;
             }
+            let gate_ready = (std::time::Instant::now(), self.now());
             let tried = self.s.admission.gate().try_admit(1);
             let admitted = match tried {
                 Ok(a) => a,
@@ -1148,6 +1149,14 @@ impl RunLoop {
                 },
             });
             self.save()?;
+            self.latency.gates.insert(
+                id.clone(),
+                crate::latency::GateClock {
+                    ready: gate_ready.0,
+                    ready_wall_ms: gate_ready.1,
+                    started: std::time::Instant::now(),
+                },
+            );
             let tx = self.tx.clone();
             let runner = runner.clone();
             // Inner task per the panic-supervisor pattern used for attempts,
@@ -1218,10 +1227,33 @@ impl RunLoop {
             self.s.admission.gate().release(a);
         }
         self.clear_wait(&gate);
+        let clock = self.latency.gates.remove(&gate);
         if self.stopping {
             // Stopped mid-run: it runs again on resume.
             gates::resume(&mut self.record.coordination.gates);
             return self.save();
+        }
+        // The root gate's interaction: from the moment it was ready to run to
+        // its result. The gate's own run is tool time; what is left is the
+        // time kGraf took to start it and to take the result in.
+        if gate == gates::ROOT_GATE
+            && let (Some(clock), Some(ran_ms)) = (clock, duration_ms)
+        {
+            let wall_us = clock.ready.elapsed().as_micros().min(i64::MAX as u128) as i64;
+            let begun = clock
+                .started
+                .saturating_duration_since(clock.ready)
+                .as_micros() as i64;
+            let tools = [crate::latency::Interval::new(
+                begun,
+                begun.saturating_add((ran_ms as i64).saturating_mul(1_000)),
+            )];
+            self.emit_latency(
+                crate::latency::LatencyKind::RootGate,
+                crate::latency::attribute(wall_us, &[], &tools),
+                None,
+            )
+            .await?;
         }
         let at = self.now();
         if let Some((commit, result)) = base {

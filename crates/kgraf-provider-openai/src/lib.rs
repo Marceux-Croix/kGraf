@@ -102,6 +102,7 @@ pub(crate) fn http_error(
     adapter: &'static str,
     status: u16,
     body: String,
+    retry_after_ms: Option<u64>,
 ) -> kgraf_provider::ProviderError {
     if (500..600).contains(&status) && is_malformed_output_body(&body) {
         kgraf_provider::ProviderError::ModelOutputMalformed {
@@ -114,8 +115,21 @@ pub(crate) fn http_error(
             adapter,
             status,
             body,
+            retry_after_ms,
         }
     }
+}
+
+/// The wait a response asked for (`retry-after-ms`, else `retry-after` in
+/// seconds), read before the body is consumed.
+pub(crate) fn retry_after_of(response: &reqwest::Response) -> Option<u64> {
+    let headers = response.headers();
+    kgraf_provider::limits::retry_after_ms(&|name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    })
 }
 
 /// The error for an `error` object a server sent after it had already
@@ -179,7 +193,7 @@ mod http_error_tests {
             r#"{"error":{"message":"error parsing tool call: raw='{\"name\":', err=unexpected end of JSON input"}}"#,
             "Failed to parse tool call",
         ] {
-            let e = http_error("a", 500, body.to_owned());
+            let e = http_error("a", 500, body.to_owned(), None);
             assert!(e.is_malformed_model_output(), "{body}");
         }
     }
@@ -193,7 +207,7 @@ mod http_error_tests {
             r#"{"error":{"message":"unexpected EOF"}}"#,
             r#"{"error":{"message":"read tcp: unexpected EOF while decoding"}}"#,
         ] {
-            let e = http_error("a", 500, body.to_owned());
+            let e = http_error("a", 500, body.to_owned(), None);
             assert!(e.is_malformed_model_output(), "{body}");
         }
     }
@@ -207,13 +221,13 @@ mod http_error_tests {
             r#"{"detail":"EOF"}"#,
             r#"{"error":{"message":"overloaded","code":"EOF"}}"#,
         ] {
-            let e = http_error("a", 500, body.to_owned());
+            let e = http_error("a", 500, body.to_owned(), None);
             assert!(matches!(e, ProviderError::Http { .. }), "{body}");
         }
         // A 4xx with the same body stays a plain HTTP error.
         let body = r#"{"error":{"message":"EOF"}}"#;
         assert!(matches!(
-            http_error("a", 400, body.to_owned()),
+            http_error("a", 400, body.to_owned(), None),
             ProviderError::Http { .. }
         ));
     }
@@ -221,15 +235,15 @@ mod http_error_tests {
     #[test]
     fn a_5xx_is_malformed_output_only_with_a_parse_body() {
         assert!(matches!(
-            http_error("a", 503, "overloaded".to_owned()),
+            http_error("a", 503, "overloaded".to_owned(), None),
             ProviderError::Http { .. }
         ));
         assert!(matches!(
-            http_error("a", 429, "XML syntax error".to_owned()),
+            http_error("a", 429, "XML syntax error".to_owned(), None),
             ProviderError::Http { .. }
         ));
         assert!(matches!(
-            http_error("a", 500, String::new()),
+            http_error("a", 500, String::new(), None),
             ProviderError::Http { .. }
         ));
     }

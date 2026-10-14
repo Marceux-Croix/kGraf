@@ -649,6 +649,15 @@ impl GeminiAdapter {
             kgraf_provider::limits::record_429_now(&self.config.base_url);
         }
         if !status.is_success() {
+            let retry_after_ms = {
+                let headers = response.headers();
+                kgraf_provider::limits::retry_after_ms(&|name: &str| {
+                    headers
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned)
+                })
+            };
             let text = match tokio::time::timeout(self.config.timeout, response.text()).await {
                 Ok(Ok(text)) => text,
                 Ok(Err(_)) | Err(_) => String::new(),
@@ -657,6 +666,7 @@ impl GeminiAdapter {
                 adapter: self.name,
                 status: status.as_u16(),
                 body: text,
+                retry_after_ms,
             });
         }
         Ok(response)

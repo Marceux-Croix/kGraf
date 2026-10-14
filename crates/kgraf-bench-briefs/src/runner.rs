@@ -1262,6 +1262,7 @@ mod error_tests {
             adapter: "bench-test-down",
             status: 503,
             body: "unavailable".into(),
+            retry_after_ms: None,
         }
     }
 

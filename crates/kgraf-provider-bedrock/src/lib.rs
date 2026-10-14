@@ -304,6 +304,8 @@ impl BedrockAdapter {
                     adapter: ADAPTER,
                     status: status.as_u16(),
                     body: scrub_error_body(&text),
+                    // AWS signals throttling in the body, not a retry header.
+                    retry_after_ms: None,
                 },
                 request_id,
             ));
